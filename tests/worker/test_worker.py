@@ -284,7 +284,9 @@ def test_serve_delivers_queued_alerts_then_stops(
     assert code == 0
     assert serving.stalls == []
     assert _loop_threads() == set()
-    assert fake_telegram.sent == [{"chat_id": DEFAULT_CHAT_ID, "text": OFF_EN, "parse_mode": "HTML"}]
+    assert fake_telegram.sent == [
+        {"chat_id": DEFAULT_CHAT_ID, "text": OFF_EN, "parse_mode": "HTML"}
+    ]
     assert _status(row) == ("sent", 1)
     assert lease.pid is None
     # The lock is free again for the next worker.
@@ -493,7 +495,7 @@ def test_db_down_iterations_stamp_progress_but_not_the_health_file(
         for _ in range(7):
             clock.advance(seconds=10)
             target = clock.monotonic()
-            assert wait_for(lambda: bool(calls) and calls[-1] == target)
+            assert wait_for(lambda target=target: bool(calls) and calls[-1] == target)
         assert lease.current().state == "db_down"
         assert serving.thread.is_alive()
     finally:

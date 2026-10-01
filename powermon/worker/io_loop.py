@@ -37,17 +37,23 @@ count from when Telegram answered, never from when the pass started (INV-16 #3).
 Once ``stop`` is set (SIGTERM), the pass claims no further row. A send already in flight
 ends within the client's timeouts and its outcome is written; every other due row stays
 pending for the next worker. A row claimed and then cut off by the process exit would be
-left "sending", and activation turns that into "uncertain", never sent (INV-15).
+left "sending", and ``activate`` turns that into "uncertain", never sent (INV-15). The
+I/O thread calls ``activate`` once per lease generation, before that generation's first
+pass (D-15).
 
 Bots are keyed by a short hash of the token, never the token. Log lines name the location
 and a short code only (OPS-08). Loop-body pattern of ``detection.run_cycle``:
-``close_old_connections()`` first, then each location in its own ``try``.
+``close_old_connections()`` first in every entry point (``activate`` and
+``run_iteration``), so a connection the database dropped is replaced before the first
+statement (D-16, MON-06), then each location in its own ``try``, with a progress ``tick``
+after each one for the watchdog (D-15).
 Expiry (ALRT-03) and late-alert times (ALRT-04) arrive in 02-07.
 """
 
 import hashlib
 import logging
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -84,10 +90,35 @@ def bot_key(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()[:12]
 
 
-def run_iteration(clock: Clock, state: RelayState, stop: threading.Event | None = None) -> bool:
+def activate(state: RelayState, clock: Clock) -> int:
+    """Start a lease generation's relay term; return the sends marked uncertain.
+
+    The I/O thread calls this once per new lease generation, before that generation's
+    first pass, and calls it again while it raises. Rows the previous holder left in
+    "sending" become uncertain with one notice each, never resent (INV-16, D-13).
+
+    It starts with ``close_old_connections()``: Django health-checks or drops a dead
+    connection only after that call, so a retry without it would hit the same dead
+    session on every attempt (D-16). 02-07 flushes unapplied outcomes from ``state``
+    after the connection step and before the recovery.
+    """
+    close_old_connections()
+    recovered = ops.recover_interrupted(clock.now())
+    log.info("relay activated: %d interrupted send(s) marked uncertain", recovered)
+    return recovered
+
+
+def run_iteration(
+    clock: Clock,
+    state: RelayState,
+    stop: threading.Event | None = None,
+    tick: Callable[[], None] | None = None,
+) -> bool:
     """One pass over each location's oldest open alert; True if any send was attempted.
 
-    Returns early, before claiming another row, once ``stop`` is set.
+    Returns early, before claiming another row, once ``stop`` is set. ``tick`` (the
+    watchdog's progress stamp) runs after every subscriber head, whether it was sent,
+    skipped or failed, and after the ops step, so a long pass still shows progress.
     """
     close_old_connections()
     attempted = False
@@ -95,19 +126,22 @@ def run_iteration(clock: Clock, state: RelayState, stop: threading.Event | None 
         if stop is not None and stop.is_set():
             break
         # Read per row: earlier sends in this pass may have taken seconds each.
-        if row.status != "pending" or row.next_attempt_at > clock.now():
-            continue
-        try:
-            attempted = _deliver(row, clock, state) or attempted
-        except Exception as exc:
-            # The type only: an exception's text can carry connection details or a URL.
-            log.error("relay failed for location %s: %s", row.location_id, type(exc).__name__)
+        if row.status == "pending" and row.next_attempt_at <= clock.now():
+            try:
+                attempted = _deliver(row, clock, state) or attempted
+            except Exception as exc:
+                # The type only: an exception's text can carry connection details or a URL.
+                log.error("relay failed for location %s: %s", row.location_id, type(exc).__name__)
+        if tick is not None:
+            tick()
     # Ops notices go after every subscriber head (INV-20 #2), and only to a configured chat.
     if not (stop is not None and stop.is_set()):
         try:
             attempted = _deliver_ops(clock, state) or attempted
         except Exception as exc:
             log.error("relay failed for the ops chat: %s", type(exc).__name__)
+        if tick is not None:
+            tick()
     return attempted
 
 
