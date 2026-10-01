@@ -1,9 +1,11 @@
 """The single writer of the stored power timeline (KD1, ARCHITECTURE Pattern 3).
 
-``set_open_state`` runs on the caller's cursor, inside the caller's transaction, right
-after the caller's gate UPDATE on ``location_state``. That UPDATE already holds the
-location's row lock, so two writers never interleave here. Raw SQL with ``%s``
-parameters only; nothing reads the clock, every time is passed in.
+Everything here runs on the caller's cursor, inside the caller's transaction, while the
+caller holds the location's ``location_state`` row lock: ``SELECT ... FOR UPDATE`` in
+``record_heartbeat``, the OFF CAS UPDATE in ``mark_off`` (and every later writer, such
+as the lapse carve, takes the same lock first). So no two writers of a location ever
+interleave here. Raw SQL with ``%s`` parameters only; nothing reads the clock, every
+time is passed in.
 """
 
 from datetime import datetime
@@ -21,6 +23,20 @@ OPEN_SQL = """
 INSERT INTO power_interval (location_id, state, start_at, end_at, outage_start_at)
 VALUES (%s, %s, %s, NULL, %s)
 """
+
+
+def open_start(cur: CursorWrapper, location_id: int) -> datetime | None:
+    """The start of the location's open interval, or None when it has none.
+
+    A restore must not close the open interval before this instant (IN-01: a lapse carve
+    can move the open off piece's start past a waiting heartbeat's receive time).
+    """
+    cur.execute(SELECT_OPEN_SQL, [location_id])
+    row = cur.fetchone()
+    if row is None:
+        return None
+    start: datetime = row[2]
+    return start
 
 
 def set_open_state(

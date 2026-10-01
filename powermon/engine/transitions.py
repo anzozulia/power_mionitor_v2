@@ -23,6 +23,8 @@ transition and its alert commit together or not at all. The worker relay sends t
 later.
 """
 
+import logging
+import threading
 from datetime import datetime, timedelta
 
 from django.db import connection, transaction
@@ -30,6 +32,14 @@ from django.db.backends.utils import CursorWrapper
 
 from powermon.alerts import outbox
 from powermon.engine import rules, timeline
+
+log = logging.getLogger(__name__)
+
+# IN-01: a clamped restore (see record_heartbeat) logs one WARNING per process, not one
+# per heartbeat. After a backward clock step every location clamps at once, from several
+# web threads, so the flag is set under a lock.
+_restore_clamp_warned = False
+_restore_clamp_lock = threading.Lock()
 
 # The heartbeat's first statement: lock the location's state row, then read the status
 # that chooses the gate. One table only, so it locks the state row and never the location
@@ -122,6 +132,24 @@ def _run_gate(cur: CursorWrapper, sql: str, params: dict[str, int | datetime]) -
         )
 
 
+def _warn_restore_clamped(location_id: int, at: datetime) -> None:
+    """Log the first clamped restore of this process at WARNING; later ones stay silent.
+
+    The line names only the location id and the restore time: never the key or a token.
+    """
+    global _restore_clamp_warned
+    with _restore_clamp_lock:
+        if _restore_clamp_warned:
+            return
+        _restore_clamp_warned = True
+    log.warning(
+        "heartbeat for location %s restored at %s, after its receive time: the server "
+        "clock stepped back or a lapse carve ran at the same time",
+        location_id,
+        at.isoformat(),
+    )
+
+
 def record_heartbeat(location_id: int, now: datetime) -> str:
     """Apply one accepted heartbeat that the server received at ``now``.
 
@@ -131,6 +159,12 @@ def record_heartbeat(location_id: int, now: datetime) -> str:
     and sees its result (WR-01). Returns "restored" (off -> on, with one power_on alert
     queued when alerts are on), "started" (waiting -> on, silent), "plain" (already on) or
     "ignored" (only when this location has no state row; nothing is written).
+
+    A restore is stamped at ``max(now, outage start, open interval start)`` (IN-01). After
+    a backward clock step ``now`` can lie before the outage start, and a heartbeat that
+    waited on a lapse carve's lock can lie before the open off piece's new start. Closing
+    the off interval there would violate ``power_interval_end_after_start`` and answer 500
+    on every heartbeat; the clamp keeps the CHECK true and "was OFF for" never negative.
     """
     params: dict[str, int | datetime] = {"id": location_id, "now": now}
     with transaction.atomic(), connection.cursor() as cur:
@@ -140,21 +174,24 @@ def record_heartbeat(location_id: int, now: datetime) -> str:
             return "ignored"
         status, outage_started_at = locked
         if status == "off":
-            _run_gate(cur, RESTORE_SQL, params)
+            open_start = timeline.open_start(cur, location_id)
+            at = max(t for t in (now, outage_started_at, open_start) if t is not None)
+            if at > now:
+                _warn_restore_clamped(location_id, at)
+            _run_gate(cur, RESTORE_SQL, {"id": location_id, "now": at})
             maintenance, alerts_enabled = _config_row(cur, location_id)
-            # Closes the off interval at ``now``. A restore dated before the outage start
-            # would close it before its start: the CHECK rejects that and the whole
-            # transaction rolls back, so nothing is half-written.
+            # Closes the off interval at ``at``, never before its start (the clamp above):
+            # an off piece that starts at ``at`` is deleted instead.
             timeline.set_open_state(
-                cur, location_id, now, rules.desired_open_state("on", maintenance)
+                cur, location_id, at, rules.desired_open_state("on", maintenance)
             )
             if alerts_enabled:
                 outbox.enqueue(
                     outbox.KIND_POWER_ON,
                     location_id,
-                    event_at=now,
-                    recorded_at=now,
-                    payload={"was_off_us": _us(now - outage_started_at)},
+                    event_at=at,
+                    recorded_at=at,
+                    payload={"was_off_us": _us(at - outage_started_at)},
                 )
             return "restored"
         if status == "waiting":
