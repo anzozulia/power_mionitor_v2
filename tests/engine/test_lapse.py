@@ -45,7 +45,7 @@ from django.test import RequestFactory
 
 from powermon.alerts import ops, outbox, texts
 from powermon.alerts.models import OpsIncident, OutboxMessage
-from powermon.engine import lapse, timeline, transitions
+from powermon.engine import lapse, rules, timeline, transitions
 from powermon.engine.models import LocationState, PowerInterval, SystemState
 from powermon.web.views import HeartbeatView
 from powermon.worker import detection
@@ -489,6 +489,65 @@ def test_INV10_a_losing_carver_with_a_later_now_never_blocks_the_off(
     assert transitions.record_heartbeat(location.pk, _at(12, 10)) == "restored"
     _off, on = _subscriber_rows(location)
     assert on.payload == {"was_off_us": (_at(12, 10) - loser) // timedelta(microseconds=1)}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV10_an_off_that_waits_on_a_carve_starts_where_the_carve_left_the_open_piece(
+    location_factory: Callable[..., Any], ops_settings: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # D2: mark_off reads the open piece's start under the row lock. An OFF decided before
+    # the losing carve of the test above commits waits for its lock, then sees the moved
+    # start, so it never closes the open piece before that start.
+    _system(cursor=_at(10, 0), resumed=_at(7, 0))
+    location = location_factory()
+    assert transitions.record_heartbeat(location.pk, _at(8, 0)) == "started"
+    assert transitions.record_heartbeat(location.pk, _at(9, 59)) == "plain"
+    winner, loser = _at(10, 10), _at(10, 10, 0, 200_000)
+    assert lapse.carve_if_needed(winner, force=True) == lapse.Gap(_at(10, 0), winner)
+    [(snap, alerts_enabled)] = transitions.read_snapshots()
+    decision = rules.decide(snap, rules.Anchors(detection_resumed_at=winner), _at(10, 11, 31))
+    assert decision.outage_start == winner
+    inside, release = threading.Event(), threading.Event()
+    real = timeline.overwrite
+
+    def paused(
+        cur: CursorWrapper, location_id: int, a: datetime, b: datetime, state: str = "not_monitored"
+    ) -> int:
+        changed = real(cur, location_id, a, b, state)
+        # Still inside the carve's transaction, holding the location's row lock.
+        inside.set()
+        if not release.wait(5):
+            raise AssertionError("the race hook was never released")
+        return changed
+
+    monkeypatch.setattr(timeline, "overwrite", paused)
+    carve = Actor(lambda: lapse.carve_window(_at(10, 0), loser))
+    off = Actor(lambda: transitions.mark_off(snap, decision, _at(10, 11, 31), alerts_enabled))
+    try:
+        carve.start()
+        assert inside.wait(5)
+        off.start()
+        assert wait_for(lambda: off.pid is not None and blocked_on_lock(off.pid))
+        release.set()
+        carve.join(5)
+        off.join(5)
+    finally:
+        release.set()
+        for actor in (carve, off):
+            if actor.ident is not None:
+                actor.join(5)
+        if carve.is_alive() or off.is_alive():
+            terminate_backends(Actor.APPLICATION_NAME)
+
+    assert carve.exc is None, carve.exc
+    assert off.exc is None, off.exc  # never an IntegrityError (power_interval_end_after_start)
+    assert (carve.result, off.result) == (1, True)
+    [row] = _subscriber_rows(location)
+    assert (row.kind, row.event_at) == (outbox.KIND_POWER_OFF, loser)
+    assert _intervals(location)[-2:] == [
+        ("not_monitored", winner, loser, None),
+        ("off", loser, None, loser),
+    ]
 
 
 @pytest.mark.django_db(transaction=True)
