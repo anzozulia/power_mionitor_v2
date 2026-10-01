@@ -4,13 +4,13 @@ The location's ``location_state`` row lock is the per-location mutex for every w
 that location's state and timeline (MON-04, WR-01). ``record_heartbeat`` takes it first
 with ``SELECT ... FOR UPDATE`` and only then chooses its gate from the locked status;
 ``mark_off`` takes it the same way before it reads the open interval and runs its CAS
-UPDATE (D2). Writers of one location therefore run one
-after the other, and under the lock two of them can neither both win nor both lose: a
-heartbeat that arrives while the detector's OFF transaction is open waits for it and then
-restores the location, instead of finding no gate that matches. The conditional UPDATEs
-(decided by the row count) and the timeline's exclusion constraint stay as the second
-line of defence. Every transaction locks exactly one location_state row and takes that
-lock first, so two of them never wait on each other's second lock (no deadlock).
+UPDATE (D2). Writers of one location therefore run one after the other, and under the
+lock two of them can neither both win nor both lose: a heartbeat that arrives while the
+detector's OFF transaction is open waits for it and then restores the location, instead
+of finding no gate that matches. The conditional UPDATEs (decided by the row count) and
+the timeline's exclusion constraint stay as the second line of defence. Every
+transaction locks exactly one location_state row and takes that lock first, so two of
+them never wait on each other's second lock (no deadlock).
 
 Every function runs its statements in one transaction on Django's connection. Nothing
 here does network I/O, and time always comes from the caller's Clock (``now``), never
