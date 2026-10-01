@@ -10,13 +10,21 @@ rendered at send time in the location's current language. The D-14 delivery poli
 A bot that is backing off is skipped, and other bots' alerts go out in the same pass: no
 thread ever sleeps out one bot's wait (INV-14).
 
+WR-04 (D-13): an error after a row was claimed never blocks its queue. A known outcome
+that could not be written is kept in ``RelayState.unapplied`` and written at the start of
+the next pass (and at activation), so a known "ok" becomes "sent", never "uncertain"; an
+error before the HTTP call puts the row back to "pending". The same holds for ops rows.
+INV-14 #1 and INV-15 #1/#2 drive detection and the relay together on the injected clock.
+
 ``run_iteration`` calls ``close_old_connections()``, so every test that runs it is
 ``django_db(transaction=True)``. Time comes only from the ``FakeClock`` passed in; a fake
 send can move it forward while the request is in flight (``fake_telegram.answer``).
 Telegram is faked at the HTTP boundary (``fake_telegram``).
 """
 
+import dataclasses
 import hashlib
+import json
 import logging
 import re
 import threading
@@ -27,13 +35,25 @@ from typing import Any
 
 import pytest
 import requests
-from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, FakeClock
-from django.db import transaction
+import responses
+from conftest import (
+    DEFAULT_BOT_TOKEN,
+    DEFAULT_CHAT_ID,
+    OPS_BOT_TOKEN,
+    OPS_CHAT_ID,
+    Actor,
+    FakeClock,
+)
+from django.db import OperationalError, connection, transaction
+from requests import PreparedRequest
 from urllib3.exceptions import MaxRetryError, NewConnectionError
 
-from powermon.alerts import outbox
+from powermon.alerts import ops, outbox
 from powermon.alerts.models import OutboxMessage
-from powermon.worker import io_loop
+from powermon.engine import transitions
+from powermon.engine.models import SystemState
+from powermon.telegram.client import SendResult
+from powermon.worker import detection, io_loop
 
 TOKEN_A = DEFAULT_BOT_TOKEN
 TOKEN_B = "987654321:" + "B" * 35
@@ -736,3 +756,534 @@ def test_recover_interrupted_marks_sending_uncertain(location_factory: Callable[
     assert _row(finished).status == "sent"
     # Nothing left to recover.
     assert outbox.recover_interrupted() == []
+
+
+# WR-04 (D-13): an error after the claim never blocks a queue or loses a known outcome
+
+OUTCOME_LINE = "relay: could not record the outcome of alert {} (OperationalError); retrying"
+
+
+def _db_blip() -> OperationalError:
+    return OperationalError("server closed the connection unexpectedly")
+
+
+def _fail_once(monkeypatch: pytest.MonkeyPatch, target: Any, name: str) -> None:
+    """Make ``target.name`` raise a DB error on its first call only."""
+    real = getattr(target, name)
+    failures = [_db_blip()]
+
+    def flaky(*args: Any, **kwargs: Any) -> Any:
+        if failures:
+            raise failures.pop()
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(target, name, flaky)
+
+
+def _client_fails_once(monkeypatch: pytest.MonkeyPatch, token: str) -> None:
+    """The relay's TelegramClient raises once, after the claim and before any HTTP call."""
+    real = io_loop.TelegramClient
+    failures = [RuntimeError(f"client setup failed for /bot{token}/")]
+
+    def client(bot_token: str, **kwargs: Any) -> Any:
+        if failures:
+            raise failures.pop()
+        return real(bot_token, **kwargs)
+
+    monkeypatch.setattr(io_loop, "TelegramClient", client)
+
+
+def _relay_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == RELAY_LOGGER]
+
+
+def _gap_notice(start: datetime, end: datetime, at: datetime = T0) -> OutboxMessage:
+    payload = {"start_us": ops.instant_us(start), "end_us": ops.instant_us(end)}
+    with transaction.atomic():
+        return outbox.enqueue_ops(outbox.KIND_OPS_GAP, payload=payload, recorded_at=at)
+
+
+def _kill_my_session() -> None:
+    """End this thread's own DB session from another one while it is idle (a DB restart)."""
+    with connection.cursor() as cur:
+        cur.execute("SELECT pg_backend_pid()")
+        row = cur.fetchone()
+    assert row is not None
+
+    def terminate() -> bool:
+        with connection.cursor() as cur:
+            cur.execute("SELECT pg_terminate_backend(%s, 5000)", [row[0]])
+            result = cur.fetchone()
+        return bool(result and result[0])
+
+    killer = Actor(terminate)
+    killer.start()
+    killer.join(10)
+    assert killer.exc is None
+    assert killer.result is True
+
+
+def _kept_ok(location: Any, answered_at: datetime) -> tuple[OutboxMessage, io_loop.RelayState]:
+    """A claimed OFF that Telegram accepted at ``answered_at``, its "sent" not yet written."""
+    row = _queue(location)
+    assert outbox.claim(row.pk) is True
+    state = io_loop.RelayState()
+    state.unapplied[row.pk] = io_loop.Unapplied(
+        _row(row), 1, SendResult("ok"), answered_at, io_loop.bot_key(TOKEN_A)
+    )
+    return row, state
+
+
+@pytest.mark.django_db(transaction=True)
+def test_WR04_apply_failure_does_not_block_location(
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    location = location_factory()
+    off = _queue(location)
+    on = _queue(location, "power_on", at=T0 + _seconds(30))
+    clock = FakeClock(T0 + _seconds(60))
+    # Telegram accepts the OFF after 2 s; then writing "sent" fails once (a DB blip).
+    fake_telegram.answer(TOKEN_A, lambda: clock.advance(seconds=2))
+    fake_telegram.accept(TOKEN_A)
+    _fail_once(monkeypatch, outbox, "mark_sent")
+    caplog.set_level(logging.WARNING, logger=RELAY_LOGGER)
+    state = io_loop.RelayState()
+
+    assert io_loop.run_iteration(clock, state) is True
+
+    assert (_row(off).status, _row(on).status) == ("sending", "pending")
+    assert _relay_lines(caplog) == [OUTCOME_LINE.format(off.pk)]
+    assert list(state.unapplied) == [off.pk]
+
+    clock.advance(seconds=1)
+    assert io_loop.run_iteration(clock, state) is True
+
+    # The known outcome is written first, at the time Telegram answered; then the ON goes.
+    assert (_row(off).status, _row(off).sent_at) == ("sent", T0 + _seconds(62))
+    assert (_row(on).status, _row(on).sent_at) == ("sent", T0 + _seconds(63))
+    assert fake_telegram.sent == [_body(OFF_EN), _body(ON_EN)]
+    assert state.unapplied == {}
+    assert _relay_lines(caplog) == [OUTCOME_LINE.format(off.pk)]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_WR04_unapplied_ok_becomes_sent_not_uncertain_at_activation(
+    location_factory: Callable[..., Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    answered = T0 + _seconds(3)
+    row, state = _kept_ok(location_factory(), answered)
+    caplog.set_level(logging.INFO)
+
+    # A new lease generation: the known outcome is written before leftover "sending" rows
+    # are declared uncertain, so nothing is left for the recovery.
+    assert io_loop.activate(state, FakeClock(T0 + timedelta(minutes=10))) == 0
+
+    assert (_row(row).status, _row(row).sent_at, _row(row).last_error) == ("sent", answered, "")
+    assert state.unapplied == {}
+    assert "may not have been delivered" not in caplog.text
+
+
+@pytest.mark.django_db(transaction=True)
+def test_WR04_activation_retries_while_the_flush_fails(
+    location_factory: Callable[..., Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answered = T0 + _seconds(3)
+    row, state = _kept_ok(location_factory(), answered)
+    clock = FakeClock(T0 + timedelta(minutes=10))
+
+    def broken(message_id: int, now: datetime) -> bool:
+        raise _db_blip()
+
+    monkeypatch.setattr(outbox, "mark_sent", broken)
+
+    # The DB is still failing: activation raises (the I/O thread retries it), and the row
+    # is neither declared uncertain nor forgotten.
+    with pytest.raises(OperationalError):
+        io_loop.activate(state, clock)
+    assert _row(row).status == "sending"
+    assert list(state.unapplied) == [row.pk]
+
+    monkeypatch.undo()
+    assert io_loop.activate(state, clock) == 0
+    assert (_row(row).status, _row(row).sent_at) == ("sent", answered)
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("result", "status", "last_error", "next_attempt_s"),
+    [
+        (SendResult("maybe_delivered", code="read_timeout"), "uncertain", "read_timeout", None),
+        (SendResult("rate_limited", retry_after=30, code="429"), "pending", "429", 33),
+        (SendResult("not_sent", code="connect_error"), "pending", "connect_error", 5),
+    ],
+    ids=["maybe_delivered", "rate_limited", "not_sent"],
+)
+def test_WR04_flush_applies_each_kept_outcome(
+    location_factory: Callable[..., Any],
+    result: SendResult,
+    status: str,
+    last_error: str,
+    next_attempt_s: int | None,
+) -> None:
+    # The outcome is applied as if it had been written right away: waits count from when
+    # Telegram answered (T0 + 3 s), and the bot's backoff is set under the kept key.
+    row = _queue(location_factory())
+    assert outbox.claim(row.pk) is True
+    state = io_loop.RelayState()
+    key = io_loop.bot_key(TOKEN_A)
+    state.unapplied[row.pk] = io_loop.Unapplied(_row(row), 1, result, T0 + _seconds(3), key)
+
+    assert io_loop.run_iteration(FakeClock(T0 + _seconds(4)), state) is False
+
+    after = _row(row)
+    assert (after.status, after.last_error) == (status, last_error)
+    if next_attempt_s is not None:
+        assert after.next_attempt_at == T0 + _seconds(next_attempt_s)
+        assert state.not_before[key] == T0 + _seconds(next_attempt_s)
+    assert state.unapplied == {}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_WR04_error_before_http_call_returns_to_pending(
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    row = _queue(location_factory())
+    fake_telegram.accept(TOKEN_A)
+    _client_fails_once(monkeypatch, TOKEN_A)
+    caplog.set_level(logging.DEBUG)
+    state = io_loop.RelayState()
+
+    # The exception came before the HTTP call, so the request provably never left.
+    assert io_loop.run_iteration(FakeClock(T0), state) is False
+
+    after = _row(row)
+    assert (after.status, after.last_error, after.next_attempt_at) == (
+        "pending",
+        "pre_send_error",
+        T0,
+    )
+    assert len(fake_telegram.calls) == 0
+    assert _relay_lines(caplog) == [
+        f"relay: alert {row.pk} failed before the send (RuntimeError); it is pending again"
+    ]
+    assert TOKEN_A not in caplog.text
+
+    assert io_loop.run_iteration(FakeClock(T0 + _seconds(1)), state) is True
+    assert fake_telegram.sent == [_body(OFF_EN)]
+    assert _row(row).status == "sent"
+    for seconds in (2, 60):
+        assert io_loop.run_iteration(FakeClock(T0 + _seconds(seconds)), state) is False
+    assert len(fake_telegram.calls) == 1
+    assert not OutboxMessage.objects.filter(status="uncertain").exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_WR04_pre_send_error_with_a_failed_reset_is_retried(
+    location_factory: Callable[..., Any], fake_telegram: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The client fails before the send, and putting the row back to "pending" fails too:
+    # the row stays "sending" for one pass, and the next pass resets it before any claim.
+    row = _queue(location_factory())
+    fake_telegram.accept(TOKEN_A)
+    _client_fails_once(monkeypatch, TOKEN_A)
+    _fail_once(monkeypatch, outbox, "mark_retry")
+    state = io_loop.RelayState()
+
+    assert io_loop.run_iteration(FakeClock(T0), state) is False
+    assert _row(row).status == "sending"
+    assert list(state.unapplied) == [row.pk]
+
+    assert io_loop.run_iteration(FakeClock(T0 + _seconds(1)), state) is True
+    assert (_row(row).status, len(fake_telegram.calls)) == ("sent", 1)
+    assert state.unapplied == {}
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("committed", [False, True], ids=["claim_lost", "claimed_then_error"])
+def test_WR04_claim_with_unknown_outcome_is_reset(
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    committed: bool,
+) -> None:
+    # The claim raises: either it never reached the DB, or it committed and the answer was
+    # lost. No HTTP call was made in either case, so the row may go back to "pending".
+    row = _queue(location_factory())
+    fake_telegram.accept(TOKEN_A)
+    real_claim = outbox.claim
+    failures = [_db_blip()]
+
+    def claim(message_id: int) -> bool:
+        if failures:
+            if committed:
+                real_claim(message_id)
+            raise failures.pop()
+        return real_claim(message_id)
+
+    monkeypatch.setattr(outbox, "claim", claim)
+    caplog.set_level(logging.WARNING, logger=RELAY_LOGGER)
+    state = io_loop.RelayState()
+
+    assert io_loop.run_iteration(FakeClock(T0), state) is False
+
+    assert len(fake_telegram.calls) == 0
+    assert _row(row).status == ("sending" if committed else "pending")
+    assert list(state.unapplied) == [row.pk]
+    assert _relay_lines(caplog) == [
+        f"relay: could not claim alert {row.pk} (OperationalError); retrying"
+    ]
+
+    assert io_loop.run_iteration(FakeClock(T0 + _seconds(1)), state) is True
+    assert fake_telegram.sent == [_body(OFF_EN)]
+    assert (_row(row).status, _row(row).last_error) == ("sent", "")
+    assert state.unapplied == {}
+    assert not OutboxMessage.objects.filter(status="uncertain").exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_WR04_flush_runs_on_a_replaced_connection(location_factory: Callable[..., Any]) -> None:
+    answered = T0 + _seconds(3)
+    row, state = _kept_ok(location_factory(), answered)
+
+    try:
+        # The DB dropped this thread's session while it was idle (D-16): the pass replaces
+        # the connection before it writes the kept outcome.
+        _kill_my_session()
+        assert io_loop.run_iteration(FakeClock(T0 + _seconds(5)), state) is False
+    finally:
+        # On a failure, never leave this thread's dead session to the teardown flush.
+        connection.close()
+
+    assert (_row(row).status, _row(row).sent_at) == ("sent", answered)
+    assert state.unapplied == {}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_WR04_ops_outcome_failure_does_not_block_the_ops_queue(
+    fake_telegram: Any,
+    ops_settings: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    ops_settings.CFG = dataclasses.replace(ops_settings.CFG, display_tz="Europe/Kyiv")
+    # 10:00:12 - 10:10:40 and 10:20:00 - 10:25:00 in Kyiv (UTC+3 on 2026-10-01).
+    first = _gap_notice(
+        datetime(2026, 10, 1, 7, 0, 12, tzinfo=UTC), datetime(2026, 10, 1, 7, 10, 40, tzinfo=UTC)
+    )
+    second = _gap_notice(
+        datetime(2026, 10, 1, 7, 20, tzinfo=UTC), datetime(2026, 10, 1, 7, 25, tzinfo=UTC)
+    )
+    fake_telegram.accept(OPS_BOT_TOKEN)
+    _fail_once(monkeypatch, outbox, "mark_sent")
+    caplog.set_level(logging.WARNING, logger=RELAY_LOGGER)
+    state = io_loop.RelayState()
+
+    assert io_loop.run_iteration(FakeClock(T0), state) is True
+
+    assert (_row(first).status, _row(second).status) == ("sending", "pending")
+    assert _relay_lines(caplog) == [OUTCOME_LINE.format(first.pk)]
+
+    assert io_loop.run_iteration(FakeClock(T0 + _seconds(1)), state) is True
+
+    # The kept "sent" is written first; the second notice follows, and the first was
+    # sent exactly once.
+    assert (_row(first).status, _row(first).sent_at) == ("sent", T0)
+    assert (_row(second).status, _row(second).sent_at) == ("sent", T0 + _seconds(1))
+    texts = [body["text"] for body in fake_telegram.sent]
+    assert len(texts) == 2
+    assert texts[0].startswith("⏸ Monitoring gap 01.10 10:00:12 – ")
+    assert texts[1].startswith("⏸ Monitoring gap 01.10 10:20:00 – ")
+    assert {body["chat_id"] for body in fake_telegram.sent} == {OPS_CHAT_ID}
+    assert state.unapplied == {}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_WR04_ops_pre_send_error_returns_to_pending(
+    fake_telegram: Any, ops_settings: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    notice = _gap_notice(T0 - timedelta(minutes=10), T0)
+    fake_telegram.accept(OPS_BOT_TOKEN)
+    _client_fails_once(monkeypatch, OPS_BOT_TOKEN)
+    state = io_loop.RelayState()
+
+    assert io_loop.run_iteration(FakeClock(T0), state) is False
+
+    after = _row(notice)
+    assert (after.status, after.last_error) == ("pending", "pre_send_error")
+    assert len(fake_telegram.calls) == 0
+
+    assert io_loop.run_iteration(FakeClock(T0 + _seconds(1)), state) is True
+    assert (_row(notice).status, len(fake_telegram.calls)) == ("sent", 1)
+    assert not OutboxMessage.objects.filter(status="uncertain").exists()
+
+
+# INV-14 #1: a 429 on one bot never delays another (ALRT-06, D-14)
+
+
+def _resume_detection(at: datetime) -> None:
+    SystemState.objects.update_or_create(
+        pk=1, defaults={"detection_resumed_at": at, "web_started_at": None}
+    )
+
+
+def _beat(location: Any, first: datetime, last: datetime) -> None:
+    at = first
+    while at <= last:
+        transitions.record_heartbeat(location.pk, at)
+        at += timedelta(minutes=1)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV14_429_on_bot_a_never_delays_b(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    _resume_detection(T0 - timedelta(hours=1))
+    a = location_factory(bot_token=TOKEN_A)
+    b = location_factory(bot_token=TOKEN_B, chat_id=CHAT_B)
+    row_a = _queue(a)
+    # B beats every minute until 10:05:10 and then goes silent: its OFF is due at 10:06:41.
+    _beat(b, T0.replace(minute=0, second=10), T0.replace(minute=5, second=10))
+    fake_telegram.fail(TOKEN_A, status=429, json_body=_too_many_requests(30))
+    fake_telegram.accept(TOKEN_A)
+    fake_telegram.accept(TOKEN_B)
+    state = io_loop.RelayState()
+
+    # A cycle and a pass every second; bot A answered 429 retry_after=30 at T0.
+    for second in range(31):
+        now = T0 + _seconds(second)
+        detection.run_cycle(now)
+        io_loop.run_iteration(FakeClock(now), state)
+        if second == 10:
+            [off_b] = OutboxMessage.objects.filter(location=b)
+            assert (off_b.recorded_at, off_b.status, off_b.sent_at) == (now, "sent", now)
+        assert _calls_to(fake_telegram, TOKEN_A) == (1 if second < 30 else 2)
+
+    assert fake_telegram.sent == [_body(OFF_EN, CHAT_B), _body(OFF_EN)]
+    assert _row(row_a).status == "sent"
+
+
+# INV-15 #1 and #2: Telegram blocked for 10 min, and a worker killed mid-delivery
+
+
+def _blocked_until(fake: Any, token: str, clock: FakeClock, until: datetime) -> list[Any]:
+    """One callback for ``token``: connections refused before ``until``, accepted from then.
+
+    Returns the list of (time, text) of every accepted message.
+    """
+    delivered: list[Any] = []
+
+    def callback(request: PreparedRequest) -> tuple[int, dict[str, str], str]:
+        if clock.now() < until:
+            raise _refused(token)
+        body = json.loads(request.body or b"{}")
+        delivered.append((clock.now(), body["text"]))
+        return 200, {}, json.dumps({"ok": True, "result": {"message_id": len(delivered)}})
+
+    fake.rsps.add_callback(
+        responses.POST,
+        f"{fake.API}/bot{token}/sendMessage",
+        callback=callback,
+        content_type="application/json",
+    )
+    return delivered
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV15_telegram_blocked_10_min_off_then_on_once_with_event_times(
+    location_factory: Callable[..., Any], fake_telegram: Any, settings: Any
+) -> None:
+    settings.CFG = dataclasses.replace(settings.CFG, display_tz="Europe/Kyiv")
+    # In Kyiv (UTC+3): last heartbeat 10:02:00, power back 10:06:00, Telegram blocked
+    # until 10:10:00.
+    last_beat = datetime(2026, 10, 1, 7, 2, tzinfo=UTC)
+    off_recorded = datetime(2026, 10, 1, 7, 3, 31, tzinfo=UTC)
+    restored_at = datetime(2026, 10, 1, 7, 6, tzinfo=UTC)
+    unblocked = datetime(2026, 10, 1, 7, 10, tzinfo=UTC)
+    _resume_detection(last_beat - timedelta(hours=1))
+    location = location_factory()
+    _beat(location, last_beat - timedelta(minutes=7), last_beat)
+    clock = FakeClock(off_recorded)
+    delivered = _blocked_until(fake_telegram, TOKEN_A, clock, unblocked)
+    state = io_loop.RelayState()
+
+    # A detection cycle and a relay pass every 5 s from 10:03:31 to 10:12:01. From 10:06:00
+    # the device beats every minute again.
+    beats = [restored_at + timedelta(minutes=n) for n in range(7)]
+    while clock.now() <= unblocked + timedelta(minutes=2):
+        while beats and beats[0] <= clock.now():
+            gate = transitions.record_heartbeat(location.pk, beats.pop(0))
+            assert gate == ("restored" if len(beats) == 6 else "plain")
+        detection.run_cycle(clock.now())
+        io_loop.run_iteration(clock, state)
+        clock.advance(seconds=5)
+
+    assert [text for _, text in delivered] == [
+        "🔴 10:02 <b>POWER OFF</b>\n⚡ Power was ON for: <b>7m</b>",
+        "🟢 10:06 <b>POWER ON</b>\n⚡ Power was OFF for: <b>4m</b>",
+    ]
+    assert all(unblocked <= at <= unblocked + _seconds(60) for at, _ in delivered)
+    rows = OutboxMessage.objects.filter(location=location).order_by("id")
+    assert [(r.kind, r.status, r.recorded_at) for r in rows] == [
+        ("power_off", "sent", off_recorded),
+        ("power_on", "sent", restored_at),
+    ]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV15_worker_killed_after_commit_delivers_once(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    _resume_detection(T0 - timedelta(hours=1))
+    location = location_factory()
+    _beat(location, T0.replace(minute=0, second=0), T0.replace(minute=5, second=0))
+    # The OFF commits with its transition; the worker dies before any relay pass.
+    assert detection.run_cycle(T0) == 1
+    fake_telegram.accept(TOKEN_A)
+
+    # The next worker starts with nothing in memory.
+    state = io_loop.RelayState()
+    clock = FakeClock(T0 + _seconds(20))
+    assert io_loop.activate(state, clock) == 0
+    for _ in range(3):
+        io_loop.run_iteration(clock, state)
+        clock.advance(seconds=1)
+
+    assert fake_telegram.sent == [_body(OFF_EN)]
+    [row] = OutboxMessage.objects.all()
+    assert (row.status, row.attempts, row.sent_at) == ("sent", 1, T0 + _seconds(20))
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV15_killed_after_claim_is_uncertain_never_sent(
+    location_factory: Callable[..., Any], fake_telegram: Any, ops_settings: Any
+) -> None:
+    location = location_factory()
+    row = _queue(location)
+    # Claimed by a worker that died before the outcome was written: it may have been sent.
+    OutboxMessage.objects.filter(pk=row.pk).update(status="sending", attempts=1)
+    fake_telegram.accept(TOKEN_A)
+    fake_telegram.accept(OPS_BOT_TOKEN)
+    state = io_loop.RelayState()
+    clock = FakeClock(T0 + _seconds(60))
+
+    assert io_loop.activate(state, clock) == 1
+    for _ in range(3):
+        io_loop.run_iteration(clock, state)
+        clock.advance(seconds=1)
+
+    assert (_row(row).status, _row(row).last_error) == ("uncertain", "interrupted")
+    assert _calls_to(fake_telegram, TOKEN_A) == 0
+    [notice] = OutboxMessage.objects.filter(channel="ops")
+    assert (notice.kind, notice.payload, notice.status) == (
+        "ops_uncertain",
+        {"message_id": row.pk},
+        "sent",
+    )
+    assert _calls_to(fake_telegram, OPS_BOT_TOKEN) == 1
