@@ -53,8 +53,9 @@ _NO_ASSIST = {"autocomplete": "off", "spellcheck": "false"}
 class SignInForm(AuthenticationForm):
     """The admin sign-in form (UI-SPEC screen 1, E1).
 
-    Wrong, inactive and blank credentials all get the same form-level error, so Django's
-    per-field "This field is required." never appears. The username keeps
+    Wrong, inactive and blank credentials, and credentials with a NUL, all get the same
+    error, so Django's per-field "This field is required." and "Null characters are not
+    allowed." never appear. The username keeps
     ``autocomplete="username"`` and ``autofocus``, the password keeps
     ``autocomplete="current-password"``, and the password is never rendered back.
     """
@@ -66,9 +67,12 @@ class SignInForm(AuthenticationForm):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        # A blank field is reported by clean() with the generic error instead.
         for field in self.fields.values():
+            # A blank field is reported by clean() with the generic error instead.
             field.required = False
+            # A NUL (only a hand-made request sends one) is a wrong credential too.
+            # Each form instance has its own copy of error_messages.
+            field.error_messages["null_characters_not_allowed"] = SIGN_IN_ERROR
 
     def clean(self) -> dict[str, Any]:
         if not self.cleaned_data.get("username") or not self.cleaned_data.get("password"):
@@ -113,8 +117,10 @@ class LocationForm(forms.Form):
 
     Validation is local only: the token and chat ID are checked for shape by the 01-09
     validators, and nothing is sent to Telegram. Every message is UI-SPEC copy; the
-    validators' ValueError text is already that copy. The bot token is a password input
-    that is never rendered back, not even after an invalid submit.
+    validators' ValueError text is already that copy. One exception: no UI-SPEC row fits a
+    NUL in the name, so that hand-made case keeps Django's "Null characters are not
+    allowed." The bot token is a password input that is never rendered back, not even
+    after an invalid submit.
     """
 
     bound_field_class = LocationBoundField
@@ -131,11 +137,16 @@ class LocationForm(forms.Form):
     )
     period_s = _seconds_field("Heartbeat period (seconds)", 60, PERIOD_TOO_SHORT, HELP_PERIOD)
     grace_s = _seconds_field("Grace period (seconds)", 30, GRACE_TOO_SHORT, HELP_GRACE)
+    # CharField refuses a NUL before clean_<field> runs. Its code maps to the copy the
+    # 01-09 validator gives any value with a NUL, so Django's text never shows.
     bot_token = forms.CharField(
         label="Bot token",
         help_text=HELP_BOT_TOKEN,
         widget=forms.PasswordInput(render_value=False, attrs=_NO_ASSIST),
-        error_messages={"required": validators.TOKEN_EMPTY},
+        error_messages={
+            "required": validators.TOKEN_EMPTY,
+            "null_characters_not_allowed": validators.TOKEN_FORMAT,
+        },
     )
     # Text, not number: the ID is signed and 64-bit. No max_length: parse_chat_id bounds
     # the length itself and answers any oversized paste with the too-long copy.
@@ -143,7 +154,10 @@ class LocationForm(forms.Form):
         label="Channel chat ID",
         help_text=HELP_CHAT_ID,
         widget=forms.TextInput(attrs=_NO_ASSIST),
-        error_messages={"required": validators.CHAT_ID_EMPTY},
+        error_messages={
+            "required": validators.CHAT_ID_EMPTY,
+            "null_characters_not_allowed": validators.CHAT_ID_NOT_INTEGER,
+        },
     )
     language = forms.ChoiceField(
         label="Language",
