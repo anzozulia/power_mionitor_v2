@@ -13,8 +13,8 @@ from typing import Any
 import pytest
 from django.db import IntegrityError, connection, transaction
 
-from powermon.engine import transitions
-from powermon.engine.models import LocationState
+from powermon.engine import timeline, transitions
+from powermon.engine.models import LocationState, PowerInterval, SystemState
 
 Interval = tuple[str, datetime, datetime | None, datetime | None]
 
@@ -26,8 +26,6 @@ def _at(hour: int, minute: int, second: int = 0) -> datetime:
 
 def _intervals(location: Any) -> list[Interval]:
     """The location's stored intervals as (state, start_at, end_at, outage_start_at)."""
-    from powermon.engine.models import PowerInterval
-
     rows = PowerInterval.objects.filter(location=location).order_by("start_at")
     return [(r.state, r.start_at, r.end_at, r.outage_start_at) for r in rows]
 
@@ -35,15 +33,11 @@ def _intervals(location: Any) -> list[Interval]:
 def _set_open_state(
     location: Any, at: datetime, state: str | None, outage_start_at: datetime | None = None
 ) -> None:
-    from powermon.engine import timeline
-
     with transaction.atomic(), connection.cursor() as cur:
         timeline.set_open_state(cur, location.pk, at, state, outage_start_at)
 
 
 def _insert(location: Any, state: str, start: datetime, end: datetime | None, **extra: Any) -> None:
-    from powermon.engine.models import PowerInterval
-
     PowerInterval.objects.create(
         location=location, state=state, start_at=start, end_at=end, **extra
     )
@@ -62,8 +56,6 @@ def _assert_rejected(constraint: str, location: Any, *args: Any, **extra: Any) -
 def test_K1_first_heartbeat_opens_one_on_interval(
     location_factory: Callable[..., Any], fixed_now: datetime
 ) -> None:
-    from powermon.engine.models import PowerInterval
-
     location = location_factory()
     assert fixed_now == _at(8, 0)
 
@@ -79,8 +71,6 @@ def test_K1_first_heartbeat_opens_one_on_interval(
 def test_plain_heartbeats_keep_one_open_interval(
     location_factory: Callable[..., Any], fixed_now: datetime
 ) -> None:
-    from powermon.engine.models import PowerInterval
-
     location = location_factory()
     transitions.record_heartbeat(location.pk, fixed_now)
     opened = PowerInterval.objects.get(location=location)
@@ -109,13 +99,23 @@ def test_first_heartbeat_in_maintenance_opens_not_monitored(
 def test_record_heartbeat_for_an_unknown_location_writes_no_interval(
     location_factory: Callable[..., Any], fixed_now: datetime
 ) -> None:
-    from powermon.engine.models import PowerInterval
-
     location_factory()
 
     assert transitions.record_heartbeat(10**9, fixed_now) == "ignored"
 
     assert not PowerInterval.objects.exists()
+
+
+@pytest.mark.django_db
+def test_config_row_reads_maintenance_and_alerts(location_factory: Callable[..., Any]) -> None:
+    default = location_factory()
+    toggled = location_factory(maintenance=True, alerts_enabled=False)
+
+    with connection.cursor() as cur:
+        assert transitions._config_row(cur, default.pk) == (False, True)
+        assert transitions._config_row(cur, toggled.pk) == (True, False)
+        with pytest.raises(LookupError, match="no location row"):
+            transitions._config_row(cur, 10**9)
 
 
 # set_open_state: close then open, never zero length, idempotent
@@ -281,15 +281,11 @@ def test_db_rejects_unknown_interval_state(location_factory: Callable[..., Any])
 
 @pytest.mark.django_db
 def test_system_state_is_a_singleton() -> None:
-    from powermon.engine.models import SystemState
-
+    # Migration 0002 inserts the row; .get() also proves there is exactly one.
     row = SystemState.objects.get()
     assert row.pk == 1
-    assert (row.web_started_at, row.last_cycle_completed_at, row.detection_resumed_at) == (
-        None,
-        None,
-        None,
-    )
+    anchors = (row.web_started_at, row.last_cycle_completed_at, row.detection_resumed_at)
+    assert anchors == (None, None, None)
 
     with pytest.raises(IntegrityError, match="system_state_singleton"), transaction.atomic():
         SystemState.objects.create(id=2)
