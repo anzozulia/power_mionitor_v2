@@ -18,8 +18,10 @@ from typing import Any
 import pytest
 
 from powermon.alerts import texts
+from powermon.alerts.models import OutboxMessage
 from powermon.engine import rules, transitions
 from powermon.engine.models import LocationState, PowerInterval, SystemState
+from powermon.worker import detection
 
 Interval = tuple[str, datetime, datetime | None, datetime | None]
 
@@ -29,16 +31,8 @@ def _at(hour: int, minute: int, second: int = 0) -> datetime:
     return datetime(2026, 10, 1, hour, minute, second, tzinfo=UTC)
 
 
-def _run_cycle(now: datetime) -> int:
-    from powermon.worker import detection
-
-    return detection.run_cycle(now)
-
-
-def _outbox(location: Any = None) -> list[Any]:
+def _outbox(location: Any = None) -> list[OutboxMessage]:
     """The outbox rows (of one location, or all), oldest first."""
-    from powermon.alerts.models import OutboxMessage
-
     rows = OutboxMessage.objects.order_by("id")
     return list(rows if location is None else rows.filter(location=location))
 
@@ -83,11 +77,11 @@ def test_K2_off_after_period_plus_grace_not_at_it(location_factory: Callable[...
     location = _silent_since_1005(location_factory)
 
     # 10:06:30 is exactly period + grace after 10:05:00: not yet OFF.
-    assert _run_cycle(_at(10, 6, 30)) == 0
+    assert detection.run_cycle(_at(10, 6, 30)) == 0
     assert _state(location).status == "on"
     assert _outbox() == []
 
-    assert _run_cycle(_at(10, 6, 31)) == 1
+    assert detection.run_cycle(_at(10, 6, 31)) == 1
 
     state = _state(location)
     assert state.status == "off"
@@ -116,7 +110,7 @@ def test_K2_alert_uses_the_location_language(location_factory: Callable[..., Any
     _resume_detection(_at(9, 0))
     location = _silent_since_1005(location_factory, language="uk")
 
-    assert _run_cycle(_at(10, 6, 31)) == 1
+    assert detection.run_cycle(_at(10, 6, 31)) == 1
 
     [row] = _outbox(location)
     assert texts.render_alert(row.kind, location.language, row.payload["was_on_us"]) == (
@@ -128,13 +122,13 @@ def test_K2_alert_uses_the_location_language(location_factory: Callable[..., Any
 def test_second_cycle_does_not_duplicate_off(location_factory: Callable[..., Any]) -> None:
     _resume_detection(_at(9, 0))
     location = _silent_since_1005(location_factory)
-    assert _run_cycle(_at(10, 6, 31)) == 1
+    assert detection.run_cycle(_at(10, 6, 31)) == 1
     version = _state(location).state_version
     timeline = _intervals(location)
 
     # An off location is no longer a snapshot, so later cycles find nothing to do.
-    assert _run_cycle(_at(10, 6, 36)) == 0
-    assert _run_cycle(_at(12, 0)) == 0
+    assert detection.run_cycle(_at(10, 6, 36)) == 0
+    assert detection.run_cycle(_at(12, 0)) == 0
 
     state = _state(location)
     assert (state.status, state.state_version) == ("off", version)
@@ -149,10 +143,10 @@ def test_fresh_window_after_worker_start_D14(location_factory: Callable[..., Any
     _resume_detection(_at(10, 6))
     location = _silent_since_1005(location_factory)
 
-    assert _run_cycle(_at(10, 7, 30)) == 0
+    assert detection.run_cycle(_at(10, 7, 30)) == 0
     assert _state(location).status == "on"
 
-    assert _run_cycle(_at(10, 7, 31)) == 1
+    assert detection.run_cycle(_at(10, 7, 31)) == 1
 
     state = _state(location)
     assert (state.status, state.outage_started_at) == ("off", _at(10, 6))
@@ -172,7 +166,7 @@ def test_alerts_off_records_off_without_alert(location_factory: Callable[..., An
     _resume_detection(_at(9, 0))
     location = _silent_since_1005(location_factory, alerts_enabled=False)
 
-    assert _run_cycle(_at(10, 6, 31)) == 1
+    assert detection.run_cycle(_at(10, 6, 31)) == 1
 
     state = _state(location)
     assert (state.status, state.outage_started_at) == ("off", _at(10, 5))
@@ -196,7 +190,7 @@ def test_maintenance_and_waiting_locations_are_not_marked_off(
     before = list(LocationState.objects.order_by("pk").values())
     timelines = [_intervals(loc) for loc in (in_maintenance, deleted, waiting)]
 
-    assert _run_cycle(_at(18, 0)) == 0
+    assert detection.run_cycle(_at(18, 0)) == 0
 
     assert list(LocationState.objects.order_by("pk").values()) == before
     assert _state(waiting).status == "waiting"
@@ -224,7 +218,7 @@ def test_INV13_error_in_one_location_does_not_stop_others(
     monkeypatch.setattr(transitions, "mark_off", mark_off)
     caplog.set_level(logging.ERROR, logger="powermon.worker.detection")
 
-    assert _run_cycle(_at(10, 6, 31)) == 1
+    assert detection.run_cycle(_at(10, 6, 31)) == 1
 
     assert _state(broken).status == "on"
     assert _state(healthy).status == "off"
@@ -244,7 +238,7 @@ def test_run_cycle_recreates_a_missing_system_state_row(
     SystemState.objects.all().delete()
     location = _silent_since_1005(location_factory)
 
-    assert _run_cycle(_at(10, 6, 31)) == 1
+    assert detection.run_cycle(_at(10, 6, 31)) == 1
 
     assert SystemState.objects.get().detection_resumed_at is None
     assert _state(location).outage_started_at == _at(10, 5)

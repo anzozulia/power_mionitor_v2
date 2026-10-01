@@ -12,24 +12,19 @@ from typing import Any
 import pytest
 from django.db import IntegrityError, connection, transaction
 
+from powermon.alerts import outbox
+from powermon.alerts.models import OutboxMessage
+
 EVENT_AT = datetime(2026, 10, 1, 10, 5, tzinfo=UTC)
 RECORDED_AT = datetime(2026, 10, 1, 10, 6, 31, tzinfo=UTC)
 
 
-def _outbox() -> Any:
-    from powermon.alerts import outbox
-
-    return outbox
-
-
-def _rows() -> list[Any]:
-    from powermon.alerts.models import OutboxMessage
-
+def _rows() -> list[OutboxMessage]:
     return list(OutboxMessage.objects.order_by("id"))
 
 
-def _enqueue(location: Any, kind: str = "power_off", **payload: Any) -> Any:
-    return _outbox().enqueue(
+def _enqueue(location: Any, kind: str = "power_off", **payload: Any) -> OutboxMessage:
+    return outbox.enqueue(
         kind,
         location.pk,
         event_at=EVENT_AT,
@@ -53,8 +48,8 @@ def test_enqueue_writes_a_pending_subscriber_row(location_factory: Callable[...,
     # Due at once; expiry is written now and enforced in Phase 2 (ALRT-03).
     assert row.next_attempt_at == RECORDED_AT
     assert row.expires_at == RECORDED_AT + timedelta(hours=6)
-    assert _outbox().MAX_AGE == timedelta(hours=6)
-    assert (_outbox().KIND_POWER_OFF, _outbox().KIND_POWER_ON) == ("power_off", "power_on")
+    assert outbox.MAX_AGE == timedelta(hours=6)
+    assert (outbox.KIND_POWER_OFF, outbox.KIND_POWER_ON) == ("power_off", "power_on")
 
 
 @pytest.mark.django_db
@@ -102,8 +97,6 @@ def test_enqueue_rejects_a_payload_that_is_not_integer_durations(
 def test_db_rejects_unknown_status_and_channel(
     location_factory: Callable[..., Any], field: str, value: str, constraint: str
 ) -> None:
-    from powermon.alerts.models import OutboxMessage
-
     location = location_factory()
     fields: dict[str, Any] = {
         "channel": "subscriber",
