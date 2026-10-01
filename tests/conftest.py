@@ -15,12 +15,16 @@ router-reconnect grace off, language en, display TZ Europe/Kyiv.
   really waits on the row lock (RESEARCH Pitfall 8).
 - The admin ops chat is not configured in the test env, so ops notices go to the log;
   ``ops_settings`` configures it with ``OPS_BOT_TOKEN`` and ``OPS_CHAT_ID`` (D-09).
+- pytest-django's own sessions run without the web role's 5 s ``statement_timeout``
+  (02-03, D-16), every test session keeps it (``django_db_modify_db_settings`` and
+  ``django_db_setup`` below).
 
 Test modules import the helper classes directly: ``from conftest import FakeClock``.
 """
 
 import dataclasses
 import json
+import re
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -29,7 +33,7 @@ from typing import Any
 
 import pytest
 import responses
-from django.db import connection, transaction
+from django.db import connection, connections, transaction
 from requests import PreparedRequest
 
 TELEGRAM_API = "https://api.telegram.org"
@@ -41,6 +45,53 @@ OPS_BOT_TOKEN = "555555555:" + "C" * 35
 OPS_CHAT_ID = -1005555555555
 # check --deploy (security.W009) wants at least 50 characters and 5 distinct ones.
 PRODUCTION_SECRET_KEY = ("test-only-not-a-secret-" * 3)[:64]
+
+
+_STATEMENT_TIMEOUT = re.compile(r"statement_timeout=[0-9]+")
+
+
+def without_statement_timeout(options: dict[str, Any]) -> dict[str, Any]:
+    """A copy of DATABASES OPTIONS whose libpq ``options`` set ``statement_timeout=0``."""
+    text = options.get("options", "")
+    return {**options, "options": _STATEMENT_TIMEOUT.sub("statement_timeout=0", text)}
+
+
+@pytest.fixture(scope="session")
+def django_db_modify_db_settings(
+    django_db_modify_db_settings: None,
+) -> Iterator[dict[str, Any]]:
+    """Create the test database (and migrate it) without the 5 s statement cap.
+
+    The web role's ``statement_timeout`` (5 s, 02-03 D-16) would also bound pytest-django's
+    own sessions. ``CREATE DATABASE`` and ``DROP DATABASE`` on the bind-mounted data
+    directory can take longer: a cancelled session-end drop left ``test_powermon`` behind
+    for the next session to drop (02-06 deferred item). Yields the capped OPTIONS, which
+    ``django_db_setup`` puts back for the tests.
+    """
+    capped = connection.settings_dict["OPTIONS"]
+    connection.settings_dict["OPTIONS"] = without_statement_timeout(capped)
+    try:
+        yield capped
+    finally:
+        connection.settings_dict["OPTIONS"] = capped
+
+
+@pytest.fixture(scope="session")
+def django_db_setup(
+    django_db_setup: None, django_db_modify_db_settings: dict[str, Any]
+) -> Iterator[None]:
+    """Tests run with the web cap; the session-end ``DROP DATABASE`` runs without it.
+
+    The setup's sessions are closed, so every test connection opens with the cap again
+    (tests/test_db_sessions.py asserts "5s"). pytest-django's teardown runs after this
+    fixture's, on a fresh connection built from the uncapped OPTIONS.
+    """
+    uncapped = connection.settings_dict["OPTIONS"]
+    connection.settings_dict["OPTIONS"] = django_db_modify_db_settings
+    connections.close_all()
+    yield
+    connection.settings_dict["OPTIONS"] = uncapped
+    connections.close_all()
 
 
 @pytest.fixture
