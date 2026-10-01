@@ -1,4 +1,4 @@
-"""The running worker records every lapse once and keeps detecting (MON-06, D-04; INV-13 #1).
+"""The running worker records every lapse once and keeps detecting (MON-06, D-04; INV-13 #1, #2).
 
 This is the in-process half of INV-13. A dropped lease session, a dropped Django session,
 or both (what a database restart does to the worker) are simulated with
@@ -9,6 +9,12 @@ the OFF and the gap notice are delivered by the same process, so the I/O thread 
 its dead connection too. No exit, no stall, no manual action. Restarting the real
 containers (the database, the worker) is a manual check in 02-09, never a test harness
 here (docs/v1-lessons.md section 1).
+
+INV-13 #2 (OPS-02, D-11 #2): a database unreachable for more than 5 min is reported once,
+straight to the admin chat with the ops bot, because the outbox lives in the database;
+only a worker that held the lease when the database went away sends it, and the gap
+notice follows through the outbox once the database is back. "Unreachable" is the lease
+pointed at 127.0.0.1:1 on a mutable settings copy after its session was terminated.
 
 Timing rule. The ``FakeClock`` is shared by everything in ``serve``: ``advance`` also
 moves the monotonic time that the watchdog's 60 s detection limit and the 15 s lapse
@@ -39,6 +45,8 @@ Hygiene: every test that touches the database from another thread is
 fixture or ``finally``; a thread whose own session was killed closes its connection.
 """
 
+import dataclasses
+import json
 import logging
 import threading
 from collections.abc import Callable, Iterator
@@ -48,6 +56,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import requests
+import responses
 from conftest import (
     DEFAULT_BOT_TOKEN,
     DEFAULT_CHAT_ID,
@@ -59,13 +69,15 @@ from conftest import (
     wait_for,
 )
 from django.db import IntegrityError, OperationalError, connection
+from requests import PreparedRequest
+from urllib3.exceptions import MaxRetryError, NewConnectionError
 
 from powermon.alerts import outbox, texts
 from powermon.alerts.models import OpsIncident, OutboxMessage
 from powermon.engine import lapse, timeline, transitions
 from powermon.engine.models import PowerInterval, SystemState
-from powermon.worker import detection, supervision
-from powermon.worker.lease import Lease
+from powermon.worker import detection, io_loop, supervision
+from powermon.worker.lease import Lease, LeaseState, LeaseStatus
 from powermon.worker.management.commands import run_worker
 
 T0 = datetime(2026, 10, 1, 10, 0, tzinfo=UTC)
@@ -244,9 +256,13 @@ def _step_clock(
 
 
 class _Serve:
-    """``run_worker.serve`` in a thread, with the timing rule's intervals and a stall recorder."""
+    """``run_worker.serve`` in a thread, with the timing rule's intervals and a stall recorder.
 
-    def __init__(self, lease: Lease, clock: FakeClock, tmp_path: Path) -> None:
+    ``intervals`` overrides SERVE_INTERVALS (``check_interval``, ``detection_interval``,
+    ``io_idle_wait``).
+    """
+
+    def __init__(self, lease: Lease, clock: FakeClock, tmp_path: Path, **intervals: float) -> None:
         self.stop = threading.Event()
         self.code: int | None = None
         self.stalls: list[str] = []
@@ -259,7 +275,7 @@ class _Serve:
                 lease,
                 health=health,
                 on_stall=self.stalls.append,
-                **SERVE_INTERVALS,
+                **{**SERVE_INTERVALS, **intervals},
             )
 
         self.thread = threading.Thread(target=target, name="serve-under-test")
@@ -739,3 +755,378 @@ def test_decisions_failing_every_cycle_give_at_most_one_gap_notice(
     assert len(_gap_notices()) == 1
     assert [failed for _generation, failed in seen.entries] == [False] * len(seen.entries)
     assert _cursor() is not None and _cursor() >= T0 + _seconds(45)
+
+
+# INV-13 #2: the database unreachable for more than 5 min (OPS-02, D-11 #2)
+
+IO_LOGGER = io_loop.__name__
+NOT_CONFIGURED = "ops notice (ops chat not configured): "
+
+
+@pytest.fixture
+def kyiv(settings: Any) -> Any:
+    """The default display TZ, set explicitly so no expected text depends on the env file."""
+    settings.CFG = dataclasses.replace(settings.CFG, display_tz="Europe/Kyiv")
+    return settings
+
+
+@pytest.fixture
+def no_ops_chat(settings: Any) -> Any:
+    """``settings.CFG`` with no ops chat, whatever the env file says (D-09)."""
+    settings.CFG = dataclasses.replace(settings.CFG, ops_bot_token="", ops_chat_id=None)
+    return settings
+
+
+def _db_down_text(since: str) -> str:
+    return (
+        f"🛑 Database unreachable since {since} (over 5 min). Detection is paused; "
+        "the gap will be recorded as not monitored when it is back."
+    )
+
+
+def _point_away(settings_dict: dict[str, Any]) -> None:
+    """The lease's database is unreachable from now on: nothing listens on port 1."""
+    settings_dict.update(HOST="127.0.0.1", PORT=1)
+
+
+def _point_back(settings_dict: dict[str, Any]) -> None:
+    real = connection.settings_dict
+    settings_dict.update(HOST=real["HOST"], PORT=real["PORT"])
+
+
+def _refused(token: str) -> requests.ConnectionError:
+    # A real connect-phase exception carries the URL, and so the token, in its text (P-12).
+    path = f"/bot{token}/sendMessage"
+    reason = NewConnectionError(None, f"Failed to establish a new connection for {path}")
+    return requests.ConnectionError(MaxRetryError(None, path, reason))
+
+
+def _ops_bot_answers(fake: Any, *answers: Any) -> list[dict[str, Any]]:
+    """The ops bot answers each sendMessage with the next answer; the last one repeats.
+
+    An answer is an exception (raised by the transport), ``(status, json_body)`` or "ok".
+    Returns the JSON bodies of the accepted messages.
+    """
+    accepted: list[dict[str, Any]] = []
+    calls: list[PreparedRequest] = []
+
+    def callback(request: PreparedRequest) -> tuple[int, dict[str, str], str]:
+        answer = answers[min(len(calls), len(answers) - 1)]
+        calls.append(request)
+        if isinstance(answer, BaseException):
+            raise answer
+        if answer == "ok":
+            accepted.append(json.loads(request.body or b"{}"))
+            return 200, {}, json.dumps({"ok": True, "result": {"message_id": len(accepted)}})
+        status, body = answer
+        return status, {}, json.dumps(body)
+
+    fake.rsps.add_callback(
+        responses.POST,
+        f"{fake.API}/bot{OPS_BOT_TOKEN}/sendMessage",
+        callback=callback,
+        content_type="application/json",
+    )
+    return accepted
+
+
+def _ops_bot_calls(fake: Any) -> list[Any]:
+    return [c for c in fake.calls if f"/bot{OPS_BOT_TOKEN}/" in c.request.url]
+
+
+def _down(clock: FakeClock, generation: int = 1) -> LeaseStatus:
+    """The status of a lease this process held, lost at the clock's current time."""
+    return LeaseStatus(LeaseState.DB_DOWN, generation, clock.now(), clock.monotonic())
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV13_db_down_over_5_min_one_direct_notice_then_gap_notice(
+    ops_settings: Any, kyiv: Any, fake_telegram: Any
+) -> None:
+    _system(cursor=None)
+    clock = FakeClock(T0)
+    settings_dict = dict(connection.settings_dict)
+    lease = Lease(settings_dict, clock)
+    fake_telegram.accept(OPS_BOT_TOKEN)
+    state = io_loop.RelayState()
+    tracker = lapse.CycleTracker()
+    try:
+        held = lease.ensure_held()
+        assert (held.state, held.generation) == ("held", 1)
+        detection.run_detection(clock, held.generation, tracker)
+        assert _cursor() == T0  # the first cycle started fresh
+
+        # The database goes away 5 s later, while this process holds the lease.
+        clock.advance(seconds=5)
+        _point_away(settings_dict)
+        assert terminate_backends(LEASE) == 1
+        down = lease.ensure_held()
+        assert (down.state, down.down_since) == ("db_down", T0 + _seconds(5))
+
+        # Nothing at 0 s, nor at exactly 300 s (strict).
+        assert io_loop.notify_db_down(down, clock, state) is False
+        clock.advance(seconds=300)
+        assert io_loop.notify_db_down(lease.ensure_held(), clock, state) is False
+        assert len(fake_telegram.calls) == 0
+
+        # One direct notice once it is over 5 min, with the ops bot to the ops chat only.
+        clock.advance(seconds=1)
+        assert io_loop.notify_db_down(lease.ensure_held(), clock, state) is True
+        assert fake_telegram.sent == [
+            {"chat_id": OPS_CHAT_ID, "text": _db_down_text("13:00:05"), "parse_mode": "HTML"}
+        ]
+        assert len(_ops_bot_calls(fake_telegram)) == len(fake_telegram.calls) == 1
+
+        # Never again while the outage lasts.
+        for _ in range(60):
+            clock.advance(seconds=10)
+            assert io_loop.notify_db_down(lease.ensure_held(), clock, state) is False
+        assert len(fake_telegram.calls) == 1
+
+        # The database is back: the lease is held again, the gap is recorded once, and its
+        # notice goes through the outbox.
+        _point_back(settings_dict)
+        back = lease.ensure_held()
+        assert (back.state, back.generation) == ("held", 2)
+        assert io_loop.notify_db_down(back, clock, state) is False
+        assert state.db_down_notified is False
+        detection.run_detection(clock, back.generation, tracker)
+        assert _gaps() == [(T0, clock.now())]
+        assert io_loop.run_iteration(clock, state) is True
+    finally:
+        lease.close()
+
+    assert len(fake_telegram.sent) == 2
+    assert fake_telegram.sent[1]["chat_id"] == OPS_CHAT_ID
+    assert fake_telegram.sent[1]["text"].startswith(GAP_PREFIX)
+    assert [n.status for n in _gap_notices()] == ["sent"]
+
+
+def test_db_down_notice_only_from_a_worker_that_held_the_lease(
+    ops_settings: Any, fake_telegram: Any
+) -> None:
+    # A standby, or a worker restarted during the outage: it never held the lease, so it
+    # has no down timer and never reports the outage, however long it lasts (D-11 #2).
+    settings_dict = dict(connection.settings_dict)
+    _point_away(settings_dict)
+    clock = FakeClock(T0)
+    lease = Lease(settings_dict, clock)
+    state = io_loop.RelayState()
+    try:
+        for _ in range(90):
+            status = lease.ensure_held()
+            assert (status.state, status.down_since, status.down_since_mono) == (
+                "db_down",
+                None,
+                None,
+            )
+            assert io_loop.notify_db_down(status, clock, state) is False
+            clock.advance(seconds=10)
+    finally:
+        lease.close()
+
+    assert len(fake_telegram.calls) == 0
+    assert state.db_down_notified is False
+
+
+def test_db_down_notice_logged_when_the_ops_chat_is_not_configured(
+    no_ops_chat: Any, kyiv: Any, fake_telegram: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG, logger=IO_LOGGER)
+    clock = FakeClock(T0)
+    state = io_loop.RelayState()
+    down = _down(clock)
+    clock.advance(seconds=301)
+
+    # Logged once, and no request (D-09).
+    assert io_loop.notify_db_down(down, clock, state) is False
+    clock.advance(seconds=60)
+    assert io_loop.notify_db_down(down, clock, state) is False
+
+    lines = [(r.levelno, r.getMessage()) for r in caplog.records if r.name == IO_LOGGER]
+    assert lines == [(logging.WARNING, NOT_CONFIGURED + _db_down_text("13:00:00"))]
+    assert len(fake_telegram.calls) == 0
+    assert state.db_down_notified is True
+
+
+def test_db_down_notice_retries_a_refused_send(
+    ops_settings: Any, kyiv: Any, fake_telegram: Any
+) -> None:
+    accepted = _ops_bot_answers(fake_telegram, _refused(OPS_BOT_TOKEN), "ok")
+    clock = FakeClock(T0)
+    state = io_loop.RelayState()
+    down = _down(clock)
+    clock.advance(seconds=301)
+
+    # Refused: nothing was sent, so the notice is not counted, and the ops chat backs off.
+    assert io_loop.notify_db_down(down, clock, state) is True
+    assert (accepted, state.db_down_notified) == ([], False)
+    clock.advance(seconds=io_loop.BACKOFF_CAP_S - 1)
+    assert io_loop.notify_db_down(down, clock, state) is False
+    assert len(_ops_bot_calls(fake_telegram)) == 1
+
+    # The ops bot reachable again after the backoff: one notice, then never again.
+    clock.advance(seconds=1)
+    assert io_loop.notify_db_down(down, clock, state) is True
+    for _ in range(10):
+        clock.advance(seconds=60)
+        assert io_loop.notify_db_down(down, clock, state) is False
+    assert [m["text"] for m in accepted] == [_db_down_text("13:00:00")]
+    assert len(_ops_bot_calls(fake_telegram)) == 2
+    assert state.db_down_notified is True
+
+
+@pytest.mark.parametrize(
+    ("first", "wait_s"),
+    [
+        ((502, {"ok": False, "error_code": 502, "description": "Bad Gateway"}), 30),
+        (
+            (
+                429,
+                {
+                    "ok": False,
+                    "error_code": 429,
+                    "description": "Too Many Requests: retry after 120",
+                    "parameters": {"retry_after": 120},
+                },
+            ),
+            120,
+        ),
+        (
+            (
+                429,
+                {
+                    "ok": False,
+                    "error_code": 429,
+                    "description": "Too Many Requests",
+                    "parameters": {"retry_after": 999_999},
+                },
+            ),
+            io_loop.MAX_RETRY_AFTER_S,
+        ),
+    ],
+    ids=["transient", "rate-limited", "rate-limited-capped"],
+)
+def test_db_down_notice_waits_before_a_retry(
+    ops_settings: Any, kyiv: Any, fake_telegram: Any, first: Any, wait_s: int
+) -> None:
+    accepted = _ops_bot_answers(fake_telegram, first, "ok")
+    clock = FakeClock(T0)
+    state = io_loop.RelayState()
+    down = _down(clock)
+    clock.advance(seconds=301)
+
+    assert io_loop.notify_db_down(down, clock, state) is True
+    clock.advance(seconds=wait_s - 1)
+    assert io_loop.notify_db_down(down, clock, state) is False
+    clock.advance(seconds=1)
+    assert io_loop.notify_db_down(down, clock, state) is True
+
+    assert [m["text"] for m in accepted] == [_db_down_text("13:00:00")]
+    assert len(_ops_bot_calls(fake_telegram)) == 2
+
+
+@pytest.mark.parametrize(
+    ("answer", "warning"),
+    [
+        (
+            (403, {"ok": False, "error_code": 403, "description": "Forbidden"}),
+            "relay: permanent error http_403 for the ops chat; "
+            "the database-down notice is not resent",
+        ),
+        (requests.ReadTimeout("read timed out"), None),
+    ],
+    ids=["permanent", "maybe-delivered"],
+)
+def test_db_down_notice_is_never_resent_after_a_final_answer(
+    ops_settings: Any,
+    kyiv: Any,
+    fake_telegram: Any,
+    caplog: pytest.LogCaptureFixture,
+    answer: Any,
+    warning: str | None,
+) -> None:
+    # A 400/401/403 will not get better by retrying, and a send that may have reached
+    # Telegram is never repeated (at-most-once, INV-16).
+    _ops_bot_answers(fake_telegram, answer)
+    caplog.set_level(logging.WARNING, logger=IO_LOGGER)
+    clock = FakeClock(T0)
+    state = io_loop.RelayState()
+    down = _down(clock)
+    clock.advance(seconds=301)
+
+    assert io_loop.notify_db_down(down, clock, state) is True
+    for _ in range(30):
+        clock.advance(seconds=60)
+        assert io_loop.notify_db_down(down, clock, state) is False
+
+    assert len(_ops_bot_calls(fake_telegram)) == 1
+    assert state.db_down_notified is True
+    lines = [r.getMessage() for r in caplog.records if r.name == IO_LOGGER]
+    assert lines == ([] if warning is None else [warning])
+    assert OPS_BOT_TOKEN not in caplog.text
+
+
+@pytest.mark.parametrize("recovered", [LeaseState.HELD, LeaseState.STANDBY])
+def test_db_down_notice_resets_after_recovery(
+    ops_settings: Any, kyiv: Any, fake_telegram: Any, recovered: LeaseState
+) -> None:
+    fake_telegram.accept(OPS_BOT_TOKEN)
+    clock = FakeClock(T0)
+    state = io_loop.RelayState()
+    first = _down(clock)
+    clock.advance(seconds=301)
+    assert io_loop.notify_db_down(first, clock, state) is True
+
+    # The database answered again: the next outage is a new one.
+    assert io_loop.notify_db_down(LeaseStatus(recovered, 2, None, None), clock, state) is False
+    assert state.db_down_notified is False
+    clock.advance(minutes=10)
+    second = _down(clock, generation=2)
+    clock.advance(seconds=300)
+    assert io_loop.notify_db_down(second, clock, state) is False
+    clock.advance(seconds=1)
+    assert io_loop.notify_db_down(second, clock, state) is True
+    clock.advance(minutes=10)
+    assert io_loop.notify_db_down(second, clock, state) is False
+
+    assert [m["text"] for m in fake_telegram.sent] == [
+        _db_down_text("13:00:00"),
+        _db_down_text("13:15:01"),
+    ]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_io_thread_sends_the_db_down_notice(
+    ops_settings: Any, kyiv: Any, fake_telegram: Any, seen: _Seen, tmp_path: Path
+) -> None:
+    _system(cursor=None)
+    fake_telegram.accept(OPS_BOT_TOKEN)
+    clock = FakeClock(T0)
+    settings_dict = dict(connection.settings_dict)
+    lease = Lease(settings_dict, clock)
+    serving = _Serve(lease, clock, tmp_path, detection_interval=0.05, io_idle_wait=0.05)
+    try:
+        assert wait_for(lambda: lease.current().state == "held", WAIT_S)
+        _point_away(settings_dict)
+        assert _terminate(LEASE) == 1
+        # The detection loop finds the session gone and the database unreachable.
+        assert wait_for(lambda: lease.current().state == "db_down", WAIT_S)
+        assert lease.current().down_since == T0
+
+        # 310 s in 10 s steps, each after both loops stamped progress (the timing rule):
+        # no stamp is ever more than about 10 s old at a watchdog check, and no cycle runs
+        # while the lease is down, so no lapse rule applies.
+        _step_clock(clock, 310, seen, cycles=False)
+        assert wait_for(lambda: len(fake_telegram.sent) == 1, WAIT_S)
+        _step_clock(clock, 60, seen, cycles=False)
+    finally:
+        code = serving.finish()
+        lease.close()
+
+    assert code == 0
+    assert serving.stalls == []
+    assert len(fake_telegram.calls) == 1
+    assert fake_telegram.sent == [
+        {"chat_id": OPS_CHAT_ID, "text": _db_down_text("13:00:00"), "parse_mode": "HTML"}
+    ]
