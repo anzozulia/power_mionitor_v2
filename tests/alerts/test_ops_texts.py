@@ -120,9 +120,7 @@ def test_expired_on_another_local_date_shows_the_date() -> None:
 def test_uncertain() -> None:
     event, now = _utc("2026-10-01T14:45:00"), _utc("2026-10-01T14:50:00")
 
-    text = ops_texts.uncertain(
-        "power_on", event, "Office", interrupted=False, now=now, tz=KYIV
-    )
+    text = ops_texts.uncertain("power_on", event, "Office", interrupted=False, now=now, tz=KYIV)
 
     assert text == UNCERTAIN
 
@@ -280,9 +278,7 @@ def test_render_text_all_silent_end_reads_the_name_at_call_time(
     )
     Location.objects.filter(pk=first.pk).update(name=RAW)
     escaped = ops.render_text(outbox.KIND_OPS_ALL_SILENT_END, payload, first.pk, now=now)
-    raw = ops.render_text(
-        outbox.KIND_OPS_ALL_SILENT_END, payload, first.pk, now=now, escape=False
-    )
+    raw = ops.render_text(outbox.KIND_OPS_ALL_SILENT_END, payload, first.pk, now=now, escape=False)
     assert ESCAPED in escaped and RAW not in escaped
     assert RAW in raw
 
@@ -290,9 +286,7 @@ def test_render_text_all_silent_end_reads_the_name_at_call_time(
 @pytest.mark.django_db
 def test_render_text_expired_uses_the_alert_row(location_factory: Callable[..., Any]) -> None:
     location = location_factory(name="Office")
-    alert = _alert(
-        location, "power_off", _utc("2026-10-01T14:27:00"), _utc("2026-10-01T14:28:31")
-    )
+    alert = _alert(location, "power_off", _utc("2026-10-01T14:27:00"), _utc("2026-10-01T14:28:31"))
 
     text = ops.render_text(
         outbox.KIND_OPS_EXPIRED,
@@ -352,4 +346,6 @@ def test_render_text_refuses_unknown_kinds_and_missing_rows(
     with pytest.raises(KeyError):
         ops.render_text(outbox.KIND_OPS_GAP, {"start_us": 0}, None, now=now)
     with pytest.raises(TypeError):
-        ops.render_text(outbox.KIND_OPS_ALL_SILENT_START, {"since_us": 0, "count": "3"}, None, now=now)
+        ops.render_text(
+            outbox.KIND_OPS_ALL_SILENT_START, {"since_us": 0, "count": "3"}, None, now=now
+        )

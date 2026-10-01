@@ -103,6 +103,32 @@ def render_text(
     non-integer value TypeError, and an unknown kind ValueError.
     """
     tz = settings.CFG.display_tz
+    if kind == outbox.KIND_OPS_GAP:
+        return ops_texts.gap(_instant(payload, "start_us"), _instant(payload, "end_us"), tz)
+    if kind == outbox.KIND_OPS_ALL_SILENT_START:
+        return ops_texts.all_silent_start(
+            _instant(payload, "since_us"), _int(payload, "count"), now, tz
+        )
+    if kind == outbox.KIND_OPS_ALL_SILENT_END:
+        return ops_texts.all_silent_end(
+            _instant(payload, "since_us"),
+            _instant(payload, "first_us"),
+            _location_name(location_id),
+            tz,
+            escape=escape,
+        )
+    if kind == outbox.KIND_OPS_EXPIRED:
+        alert = _alert(_int(payload, "message_id"))
+        return ops_texts.expired(
+            alert.kind,
+            alert.event_at,
+            # The row's own maximum age, whatever the setting is now.
+            alert.expires_at - alert.recorded_at,
+            _location_name(alert.location_id),
+            now,
+            tz,
+            escape=escape,
+        )
     if kind == outbox.KIND_OPS_UNCERTAIN:
         alert = _alert(_int(payload, "message_id"))
         return ops_texts.uncertain(
@@ -152,6 +178,10 @@ def _int(payload: object, key: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         raise TypeError(f"ops payload {key!r} is not an integer")
     return value
+
+
+def _instant(payload: object, key: str) -> datetime:
+    return from_instant_us(_int(payload, key))
 
 
 def _alert(message_id: int) -> OutboxMessage:
