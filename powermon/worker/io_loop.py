@@ -27,9 +27,12 @@ The result decides the row's next status, for both channels (D-14 policy):
 - rate_limited (429): retried after retry_after seconds, capped at MAX_RETRY_AFTER_S.
 - permanent (400/401/403/404): retried after PERMANENT_BACKOFF, with one warning.
 
-Every retry also backs off the whole bot in ``RelayState.not_before``; the ops bot has its
-own key there. A bot that is backing off is skipped, and the pass moves on to other bots:
-nothing here sleeps (INV-14).
+Every retry also backs off the whole bot in ``RelayState.not_before``. The admin chat has
+its own key there (``ops_key``), apart from its bot's: when the admin reuses a location's
+bot for the ops chat, a failure that concerns only the admin chat never delays that
+location's alerts, while the bot's own backoff still holds the ops rows (B1). A bot that
+is backing off is skipped, and the pass moves on to other bots: nothing here sleeps
+(INV-14).
 The thread's only blocking wait is its idle ``stop.wait`` in ``run_worker``.
 
 Sends are one after another, and each can block for the client's connect plus read
@@ -149,6 +152,17 @@ class RelayState:
 def bot_key(token: str) -> str:
     """A short, stable name for a bot: the first 12 hex digits of SHA-256 of its token."""
     return hashlib.sha256(token.encode()).hexdigest()[:12]
+
+
+def ops_key(token: str) -> str:
+    """The admin chat's own backoff key, apart from the bot's (B1, INV-20 #2).
+
+    The admin may reuse a location's bot as ``OPS_BOT_TOKEN``. A failure on an ops send
+    (a 403 for the admin chat, a per-chat 429, a 5xx) then backs off only the ops rows,
+    never that location's subscriber alerts. The other direction holds: ops sends also
+    wait while the bot itself is backing off for a subscriber row.
+    """
+    return "ops:" + bot_key(token)
 
 
 def activate(state: RelayState, clock: Clock) -> int:
@@ -274,8 +288,9 @@ def _deliver_ops(clock: Clock, state: RelayState) -> bool:
     now = clock.now()
     if row.status != "pending" or row.next_attempt_at > now:
         return False
-    key = bot_key(token)
-    if state.not_before.get(key, now) > now:
+    key = ops_key(token)
+    # The admin chat's own backoff, or the bot's when a location shares it (B1).
+    if max(state.not_before.get(key, now), state.not_before.get(bot_key(token), now)) > now:
         return False
     try:
         text = ops.render_text(row.kind, row.payload, row.location_id, now=now)
