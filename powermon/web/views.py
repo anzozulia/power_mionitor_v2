@@ -1,9 +1,12 @@
-"""Web views: the device heartbeat endpoint and the container health check."""
+"""Web views: admin sign-in and sign-out, the device heartbeat endpoint and the health check."""
 
 import logging
 import re
+from typing import Any
 
+from django.contrib import messages
 from django.contrib.auth.decorators import login_not_required
+from django.contrib.auth.views import LoginView, LogoutView
 from django.db import DatabaseError, connection
 from django.http import HttpRequest, HttpResponse
 from django.utils.decorators import method_decorator
@@ -16,8 +19,39 @@ from django.views.decorators.http import require_GET
 from powermon.clock import Clock, SystemClock
 from powermon.engine import transitions
 from powermon.locations.models import Location
+from powermon.web.forms import SignInForm
 
 log = logging.getLogger(__name__)
+
+SIGNED_OUT_MESSAGE = "You are signed out."
+
+
+class SignInView(LoginView):
+    """``/login/``: the env-defined admin signs in (LOC-01, D-09).
+
+    LoginView is already login-exempt and CSRF-protected. It honours ``next`` only when
+    ``url_has_allowed_host_and_scheme`` accepts it (same host), else it goes to
+    LOGIN_REDIRECT_URL. A signed-in admin who opens the page is sent there directly.
+    """
+
+    template_name = "web/login.html"
+    authentication_form = SignInForm
+    redirect_authenticated_user = True
+
+
+# P-23: login-exempt, so a signed-out tab's Sign out lands on /login/ and not on
+# /login/?next=/logout/, which would GET the POST-only /logout/ (405) after sign-in.
+@method_decorator(login_not_required, name="dispatch")
+class SignOutView(LogoutView):
+    """``/logout/``: POST only (GET is 405), CSRF-protected, then back to the sign-in page."""
+
+    def post(self, request: HttpRequest, *args: Any, **kwargs: Any) -> HttpResponse:
+        response = super().post(request, *args, **kwargs)
+        # Added after the logout: the session is flushed by then, and the default message
+        # storage keeps a short message in its own cookie, so the flash survives.
+        messages.info(request, SIGNED_OUT_MESSAGE)
+        return response
+
 
 # D-07: exactly 32 characters from [A-Za-z0-9]. Explicit ASCII classes with fullmatch:
 # \w would accept non-ASCII letters and digits, and $ a trailing newline (P-10).

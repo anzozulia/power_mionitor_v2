@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% comment %}
+Django renders this for a CSRF failure with a plain context and no request, so nothing here
+may need one. Fixed copy only: the failure reason stays out of the page.
+{% endcomment %}
+{% block title %}Form expired{% endblock %}
+{% block header %}<header class="site-header"><span class="wordmark">Power Monitor</span></header>{% endblock %}
+{% block main_class %} main--single{% endblock %}
+{% block content %}
+<h1>Form expired</h1>
+<p>This form was open too long, or the browser blocked cookies. Go back, reload the page and try again.</p>
+<p><a href="/">Back to locations</a></p>
+{% endblock %}
