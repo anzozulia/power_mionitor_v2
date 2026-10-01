@@ -13,7 +13,10 @@ pass sends at most one ops notice: the oldest open row of the ops queue
 (``outbox.ops_head``), rendered at send time (``ops.render_text``) and sent with
 ``settings.CFG.ops_bot_token`` to ``settings.CFG.ops_chat_id``, never to any other chat
 (D-09, INV-20). So a broken or rate-limited admin chat never delays a subscriber alert
-(INV-20 #2, ALRT-06), and with no ops chat no request is made for an ops row at all.
+(INV-20 #2, ALRT-06), and with no ops chat no request is made for an ops row at all. An
+ops notice that cannot be rendered is dropped at once with one WARNING naming its id and
+kind: its payload holds integers only, so the error is permanent, and left in place it
+would hold the one-line queue and block every later notice (B2).
 
 The result decides the row's next status, for both channels (D-14 policy):
 
@@ -295,9 +298,10 @@ def _deliver_ops(clock: Clock, state: RelayState) -> bool:
     try:
         text = ops.render_text(row.kind, row.payload, row.location_id, now=now)
     except LookupError, TypeError, ValueError:
-        # A broken notice backs off alone: the ops bot is fine.
-        outbox.mark_retry(row.pk, now + PERMANENT_BACKOFF, "render_error")
-        log.warning("relay: cannot render ops notice %s", row.pk)
+        # The payload holds integers only, so a render error is permanent: retire the row
+        # at once, or it would hold the one-line ops queue (B2). The ops bot is fine.
+        outbox.mark_dropped(row.pk, "render_error")
+        log.warning("relay: ops notice %s (%s) cannot be rendered; it is dropped", row.pk, row.kind)
         return False
     return _send(row, text, token, chat_id, key, clock, state)
 

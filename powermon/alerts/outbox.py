@@ -20,9 +20,14 @@ during it:
        '---mark_retry-----'
     sending --recover_interrupted (worker activation)--> uncertain
     pending --expire_due (expires_at <= now)--> expired (never sent, ALRT-03)
+    pending --mark_dropped (an ops notice that cannot be rendered)--> dropped (never sent)
 
 A subscriber row that becomes uncertain queues one ``ops_uncertain`` notice in the same
 transaction (``powermon.alerts.ops``, D-11 #5); an uncertain ops row is only logged.
+
+An ops notice whose text cannot be built from its integer payload (a referenced row gone,
+an end before its start after a backward clock step) never will be: it is dropped at
+once, so it never holds the one-line ops queue (B2). Expiry leaves dropped rows alone.
 
 Every row expires ``ALERT_MAX_AGE_HOURS`` after it was recorded (D-07): ``expires_at`` is
 set at enqueue from ``settings.CFG.alert_max_age_hours``, read at call time. The relay
@@ -198,6 +203,14 @@ def mark_uncertain(message_id: int, code: str) -> bool:
     """The claimed row may have reached Telegram: it is never sent again (INV-16)."""
     updated = OutboxMessage.objects.filter(pk=message_id, status="sending").update(
         status="uncertain", last_error=_short(code)
+    )
+    return updated == 1
+
+
+def mark_dropped(message_id: int, code: str) -> bool:
+    """Retire a pending row that can never be sent (B2); it is not sent and not expired."""
+    updated = OutboxMessage.objects.filter(pk=message_id, status="pending").update(
+        status="dropped", last_error=_short(code)
     )
     return updated == 1
 
