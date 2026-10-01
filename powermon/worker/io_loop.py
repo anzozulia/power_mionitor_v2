@@ -18,6 +18,11 @@ Every retry also backs off the whole bot in ``RelayState.not_before``. A bot tha
 backing off is skipped, and the pass moves on to other bots: nothing here sleeps (INV-14).
 The thread's only blocking wait is its idle ``stop.wait`` in ``run_worker``.
 
+Sends are one after another, and each can block for the client's connect plus read
+timeouts. So the pass reads the injected ``Clock`` again for each row's due checks, and
+once more after each send returns: a retry wait (429 retry_after, backoff) and ``sent_at``
+count from when Telegram answered, never from when the pass started (INV-16 #3).
+
 Bots are keyed by a short hash of the token, never the token. Log lines name the location
 and a short code only (OPS-08). Loop-body pattern of ``detection.run_cycle``:
 ``close_old_connections()`` first, then each location in its own ``try``.
@@ -34,6 +39,7 @@ from django.db import close_old_connections
 from powermon.alerts import outbox
 from powermon.alerts.models import OutboxMessage
 from powermon.alerts.texts import render_alert
+from powermon.clock import Clock
 from powermon.telegram.client import DEFAULT_RETRY_AFTER_S, SendResult, TelegramClient
 
 log = logging.getLogger(__name__)
@@ -60,27 +66,29 @@ def bot_key(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()[:12]
 
 
-def run_iteration(now: datetime, state: RelayState) -> bool:
+def run_iteration(clock: Clock, state: RelayState) -> bool:
     """One pass over each location's oldest open alert; True if any send was attempted."""
     close_old_connections()
     attempted = False
     for row in outbox.subscriber_heads():
-        if row.status != "pending" or row.next_attempt_at > now:
+        # Read per row: earlier sends in this pass may have taken seconds each.
+        if row.status != "pending" or row.next_attempt_at > clock.now():
             continue
         try:
-            attempted = _deliver(row, now, state) or attempted
+            attempted = _deliver(row, clock, state) or attempted
         except Exception as exc:
             # The type only: an exception's text can carry connection details or a URL.
             log.error("relay failed for location %s: %s", row.location_id, type(exc).__name__)
     return attempted
 
 
-def _deliver(row: OutboxMessage, now: datetime, state: RelayState) -> bool:
+def _deliver(row: OutboxMessage, clock: Clock, state: RelayState) -> bool:
     """Send one due head row unless its bot is backing off; True if a send was attempted."""
     location = row.location
     if location is None:
         raise ValueError("a subscriber alert without a location")
     key = bot_key(location.bot_token)
+    now = clock.now()
     if state.not_before.get(key, now) > now:
         return False
     try:
@@ -93,7 +101,8 @@ def _deliver(row: OutboxMessage, now: datetime, state: RelayState) -> bool:
     if not outbox.claim(row.pk):
         return False
     result = TelegramClient(location.bot_token).send_message(location.chat_id, text)
-    _apply(row, row.attempts + 1, result, now, state, key)
+    # The send may have blocked for seconds: waits and sent_at count from its answer.
+    _apply(row, row.attempts + 1, result, clock.now(), state, key)
     return True
 
 

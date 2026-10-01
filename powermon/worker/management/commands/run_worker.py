@@ -5,7 +5,7 @@ One process, three threads:
   connection), activates, starts the two loops, then checks every few seconds that the
   lock session and both loops are alive;
 - ``detection``: ``detection.run_cycle(now)`` every DETECTION_INTERVAL_S seconds;
-- ``telegram-io``: ``io_loop.run_iteration(now, state)`` back to back while there is work,
+- ``telegram-io``: ``io_loop.run_iteration(clock, state)`` back to back while there is work,
   waiting IO_IDLE_WAIT_S seconds when a pass sent nothing.
 
 A second instance (a deploy overlap, or one started by mistake) polls the lock in
@@ -88,7 +88,7 @@ def io_thread(stop: threading.Event, clock: Clock, idle_wait: float) -> None:
     try:
         while not stop.is_set():
             try:
-                busy = run_iteration(clock.now(), state)
+                busy = run_iteration(clock, state)
             except Exception:
                 log.exception("telegram I/O iteration failed")
                 busy = False

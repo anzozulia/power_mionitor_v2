@@ -336,7 +336,7 @@ def test_loops_survive_a_failing_iteration(
         calls["cycle"] += 1
         raise RuntimeError("cycle failed")
 
-    def failing_relay(now: datetime, state: Any) -> bool:
+    def failing_relay(clock: Any, state: Any) -> bool:
         calls["relay"] += 1
         raise RuntimeError("relay failed")
 

@@ -273,7 +273,7 @@ def test_walking_skeleton_off_and_on_alerts_reach_telegram(
 
     # 10:06:31 is past period + grace (90 s) after the last heartbeat: OFF at 10:05:00.
     assert run_cycle(_at(10, 6, 31)) == 1
-    assert run_iteration(_at(10, 6, 32), state) is True
+    assert run_iteration(FakeClock(_at(10, 6, 32)), state) is True
 
     off = {
         "chat_id": -1001234567890,
@@ -285,7 +285,7 @@ def test_walking_skeleton_off_and_on_alerts_reach_telegram(
     # Power is back: the first heartbeat restores the location at 11:00:00.
     response = beat(_at(11, 0))
     assert (response.status_code, response.content) == (200, b"ok")
-    assert run_iteration(_at(11, 0, 1), state) is True
+    assert run_iteration(FakeClock(_at(11, 0, 1)), state) is True
 
     on = {
         "chat_id": DEFAULT_CHAT_ID,
@@ -298,4 +298,4 @@ def test_walking_skeleton_off_and_on_alerts_reach_telegram(
     assert list(rows) == [("power_off", "sent"), ("power_on", "sent")]
     # Nothing else is due: no third message.
     assert run_cycle(_at(11, 0, 2)) == 0
-    assert run_iteration(_at(11, 0, 3), state) is False
+    assert run_iteration(FakeClock(_at(11, 0, 3)), state) is False

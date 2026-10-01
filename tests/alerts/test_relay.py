@@ -11,7 +11,8 @@ A bot that is backing off is skipped, and other bots' alerts go out in the same 
 thread ever sleeps out one bot's wait (INV-14).
 
 ``run_iteration`` calls ``close_old_connections()``, so every test that runs it is
-``django_db(transaction=True)``. Time is driven only through the ``now`` argument.
+``django_db(transaction=True)``. Time comes only from the ``FakeClock`` passed in; a fake
+send can move it forward while the request is in flight (``fake_telegram.answer``).
 Telegram is faked at the HTTP boundary (``fake_telegram``).
 """
 
@@ -104,18 +105,18 @@ def test_off_before_on_head_of_line(
     now = T0 + timedelta(hours=1)
 
     # Both rows are due, but only the location's oldest row goes out in a pass.
-    assert io_loop.run_iteration(now, state) is True
+    assert io_loop.run_iteration(FakeClock(now), state) is True
 
     assert fake_telegram.sent == [_body(OFF_EN)]
     sent = _row(off)
     assert (sent.status, sent.sent_at, sent.attempts, sent.last_error) == ("sent", now, 1, "")
     assert _row(on).status == "pending"
 
-    assert io_loop.run_iteration(now + _seconds(1), state) is True
+    assert io_loop.run_iteration(FakeClock(now + _seconds(1)), state) is True
 
     assert fake_telegram.sent == [_body(OFF_EN), _body(ON_EN)]
     assert (_row(on).status, _row(on).sent_at) == ("sent", now + _seconds(1))
-    assert io_loop.run_iteration(now + _seconds(2), state) is False
+    assert io_loop.run_iteration(FakeClock(now + _seconds(2)), state) is False
     assert len(fake_telegram.calls) == 2
 
 
@@ -129,7 +130,7 @@ def test_text_rendered_at_send_time_in_current_language(
     type(location).objects.filter(pk=location.pk).update(language="uk")
     fake_telegram.accept(TOKEN_A)
 
-    assert io_loop.run_iteration(T0, io_loop.RelayState()) is True
+    assert io_loop.run_iteration(FakeClock(T0), io_loop.RelayState()) is True
 
     assert fake_telegram.sent == [_body(OFF_UK)]
 
@@ -150,7 +151,7 @@ def test_read_timeout_marks_uncertain_and_never_resends(
     state = io_loop.RelayState()
     now = T0 + timedelta(hours=1)
 
-    assert io_loop.run_iteration(now, state) is True
+    assert io_loop.run_iteration(FakeClock(now), state) is True
 
     row = _row(off)
     assert (row.status, row.last_error, row.attempts, row.sent_at) == (
@@ -160,11 +161,11 @@ def test_read_timeout_marks_uncertain_and_never_resends(
         None,
     )
     # The uncertain OFF no longer holds the line: the ON is the location's head now.
-    assert io_loop.run_iteration(now + _seconds(1), state) is True
+    assert io_loop.run_iteration(FakeClock(now + _seconds(1)), state) is True
     assert fake_telegram.sent == [_body(ON_EN)]
     assert _row(on).status == "sent"
     for minutes in (1, 10, 60):
-        assert io_loop.run_iteration(now + timedelta(minutes=minutes), state) is False
+        assert io_loop.run_iteration(FakeClock(now + timedelta(minutes=minutes)), state) is False
     assert len(fake_telegram.calls) == 2
     assert _row(off).status == "uncertain"
 
@@ -183,11 +184,11 @@ def test_a_sending_head_blocks_its_location_until_recovered(
     state = io_loop.RelayState()
     now = T0 + timedelta(hours=1)
 
-    assert io_loop.run_iteration(now, state) is False
+    assert io_loop.run_iteration(FakeClock(now), state) is False
     assert len(fake_telegram.calls) == 0
 
     assert outbox.recover_interrupted() == 1
-    assert io_loop.run_iteration(now, state) is True
+    assert io_loop.run_iteration(FakeClock(now), state) is True
     assert fake_telegram.sent == [_body(ON_EN)]
     assert _row(on).status == "sent"
     assert _row(interrupted).status == "uncertain"
@@ -205,18 +206,18 @@ def test_connect_timeout_retries_with_capped_backoff(
     fake_telegram.fail(TOKEN_A, exc=requests.ConnectTimeout("connect timed out"))
     state = io_loop.RelayState()
 
-    assert io_loop.run_iteration(T0, state) is True
+    assert io_loop.run_iteration(FakeClock(T0), state) is True
 
     row = _row(off)
     assert (row.status, row.attempts, row.last_error) == ("pending", 1, "connect_timeout")
     assert row.next_attempt_at == T0 + _seconds(2)
     # Not due yet: nothing is sent, and nothing sleeps.
-    assert io_loop.run_iteration(T0 + _seconds(1), state) is False
+    assert io_loop.run_iteration(FakeClock(T0 + _seconds(1)), state) is False
     assert len(fake_telegram.calls) == 1
     due = row.next_attempt_at
     # 2 ** attempts: 4, 8, 16, then 30 instead of 32.
     for attempts, delay in [(2, 4), (3, 8), (4, 16), (5, 30)]:
-        assert io_loop.run_iteration(due, state) is True
+        assert io_loop.run_iteration(FakeClock(due), state) is True
         row = _row(off)
         assert (row.status, row.attempts) == ("pending", attempts)
         assert row.next_attempt_at == due + _seconds(delay)
@@ -233,12 +234,12 @@ def test_server_error_is_retried(location_factory: Callable[..., Any], fake_tele
     fake_telegram.accept(TOKEN_A)
     state = io_loop.RelayState()
 
-    assert io_loop.run_iteration(T0, state) is True
+    assert io_loop.run_iteration(FakeClock(T0), state) is True
 
     row = _row(off)
     assert (row.status, row.attempts, row.last_error) == ("pending", 1, "http_502")
     assert row.next_attempt_at == T0 + _seconds(2)
-    assert io_loop.run_iteration(T0 + _seconds(2), state) is True
+    assert io_loop.run_iteration(FakeClock(T0 + _seconds(2)), state) is True
     row = _row(off)
     assert (row.status, row.attempts, row.last_error) == ("sent", 2, "")
     assert fake_telegram.sent == [_body(OFF_EN)]
@@ -265,7 +266,7 @@ def test_429_waits_retry_after_while_other_bots_send(
     state = io_loop.RelayState()
 
     started = time.monotonic()
-    assert io_loop.run_iteration(T0, state) is True
+    assert io_loop.run_iteration(FakeClock(T0), state) is True
     assert time.monotonic() - started < 1.0
 
     waiting = _row(row_a)
@@ -275,10 +276,10 @@ def test_429_waits_retry_after_while_other_bots_send(
     assert _row(row_b).status == "sent"
     assert fake_telegram.sent == [_body(OFF_EN, CHAT_B)]
     for offset in (1, 15, 29):
-        assert io_loop.run_iteration(T0 + _seconds(offset), state) is False
+        assert io_loop.run_iteration(FakeClock(T0 + _seconds(offset)), state) is False
     assert _calls_to(fake_telegram, TOKEN_A) == 1
 
-    assert io_loop.run_iteration(T0 + _seconds(30), state) is True
+    assert io_loop.run_iteration(FakeClock(T0 + _seconds(30)), state) is True
     assert _row(row_a).status == "sent"
     assert _calls_to(fake_telegram, TOKEN_A) == 2
 
@@ -295,7 +296,7 @@ def test_huge_retry_after_is_capped(
     fake_telegram.fail(TOKEN_A, status=429, json_body=flood)
     state = io_loop.RelayState()
 
-    assert io_loop.run_iteration(T0, state) is True
+    assert io_loop.run_iteration(FakeClock(T0), state) is True
 
     row = _row(off)
     assert (row.status, row.last_error) == ("pending", "429")
@@ -309,11 +310,6 @@ def test_huge_retry_after_is_capped(
 # 10 s read. So every wait is counted from when Telegram answered, not from when the pass
 # started, and each row's due check reads the clock again. The fake sends below move the
 # clock forward while the request is in flight.
-
-
-def _pass(clock: FakeClock, state: io_loop.RelayState) -> bool:
-    """One relay pass with the clock as it stands when the pass starts."""
-    return io_loop.run_iteration(clock.now(), state)
 
 
 def _too_many_requests(retry_after: int) -> dict[str, Any]:
@@ -333,7 +329,7 @@ def test_sent_at_is_the_time_telegram_answered(
     clock = FakeClock(T0)
     fake_telegram.answer(TOKEN_A, lambda: clock.advance(seconds=3))
 
-    assert _pass(clock, io_loop.RelayState()) is True
+    assert io_loop.run_iteration(clock, io_loop.RelayState()) is True
 
     assert fake_telegram.sent == [_body(OFF_EN)]
     assert (_row(off).status, _row(off).sent_at) == ("sent", T0 + _seconds(3))
@@ -355,7 +351,7 @@ def test_INV16_429_after_a_slow_send_waits_retry_after_from_the_429(
     fake_telegram.accept(TOKEN_B)
     state = io_loop.RelayState()
 
-    assert _pass(clock, state) is True
+    assert io_loop.run_iteration(clock, state) is True
 
     limited_at = T0 + _seconds(10)
     waiting = _row(row_b)
@@ -365,11 +361,11 @@ def test_INV16_429_after_a_slow_send_waits_retry_after_from_the_429(
     # The busy pass is followed by the next one at once: B's bot is still not called.
     for offset in (0, 20, 29):
         clock.set(limited_at + _seconds(offset))
-        assert _pass(clock, state) is False
+        assert io_loop.run_iteration(clock, state) is False
     assert _calls_to(fake_telegram, TOKEN_B) == 1
 
     clock.set(limited_at + _seconds(30))
-    assert _pass(clock, state) is True
+    assert io_loop.run_iteration(clock, state) is True
     assert _row(row_b).status == "sent"
     assert _calls_to(fake_telegram, TOKEN_B) == 2
 
@@ -397,7 +393,7 @@ def test_INV16_retry_backoff_counts_from_the_failure(
     fake_telegram.accept(TOKEN_A)
     state = io_loop.RelayState()
 
-    assert _pass(clock, state) is True
+    assert io_loop.run_iteration(clock, state) is True
 
     failed_at = T0 + _seconds(5)
     row = _row(off)
@@ -405,11 +401,11 @@ def test_INV16_retry_backoff_counts_from_the_failure(
     assert row.next_attempt_at == failed_at + _seconds(2)
     assert state.not_before[io_loop.bot_key(TOKEN_A)] == failed_at + _seconds(2)
     clock.set(failed_at + _seconds(1))
-    assert _pass(clock, state) is False
+    assert io_loop.run_iteration(clock, state) is False
     assert len(fake_telegram.calls) == 1
 
     clock.set(failed_at + _seconds(2))
-    assert _pass(clock, state) is True
+    assert io_loop.run_iteration(clock, state) is True
     assert (_row(off).status, _row(off).sent_at) == ("sent", failed_at + _seconds(2))
 
 
@@ -427,7 +423,7 @@ def test_a_row_that_falls_due_during_a_slow_pass_goes_out_in_that_pass(
     fake_telegram.answer(TOKEN_A, lambda: clock.advance(seconds=10))
     fake_telegram.accept(TOKEN_B)
 
-    assert _pass(clock, io_loop.RelayState()) is True
+    assert io_loop.run_iteration(clock, io_loop.RelayState()) is True
 
     assert fake_telegram.sent == [_body(OFF_EN), _body(OFF_EN, CHAT_B)]
     assert (_row(row_b).status, _row(row_b).sent_at) == ("sent", T0 + _seconds(10))
@@ -446,7 +442,7 @@ def test_permanent_error_backs_off_15_minutes(
     state = io_loop.RelayState()
     caplog.set_level(logging.WARNING, logger=RELAY_LOGGER)
 
-    assert io_loop.run_iteration(T0, state) is True
+    assert io_loop.run_iteration(FakeClock(T0), state) is True
 
     row = _row(off)
     assert (row.status, row.attempts, row.last_error) == ("pending", 1, "http_403")
@@ -461,7 +457,7 @@ def test_permanent_error_backs_off_15_minutes(
     # before the 15 minutes are up.
     assert _row(other).status == "pending"
     assert _row(other).attempts == 0
-    assert io_loop.run_iteration(T0 + timedelta(minutes=14, seconds=59), state) is False
+    assert io_loop.run_iteration(FakeClock(T0 + timedelta(minutes=14, seconds=59)), state) is False
     assert len(fake_telegram.calls) == 1
 
 
@@ -480,7 +476,7 @@ def test_no_token_in_outbox_or_logs(
     state = io_loop.RelayState()
     caplog.set_level(logging.DEBUG)
 
-    assert io_loop.run_iteration(T0, state) is True
+    assert io_loop.run_iteration(FakeClock(T0), state) is True
 
     assert (_row(row_a).last_error, _row(row_b).last_error) == ("http_403", "connect_error")
     rows = repr(list(OutboxMessage.objects.values()))
@@ -519,7 +515,7 @@ def test_render_failure_does_not_block_other_locations(
     fake_telegram.accept(TOKEN_A)
     state = io_loop.RelayState()
 
-    assert io_loop.run_iteration(T0, state) is True
+    assert io_loop.run_iteration(FakeClock(T0), state) is True
 
     row = _row(bad)
     assert (row.status, row.attempts, row.last_error) == ("pending", 0, "render_error")
@@ -539,7 +535,7 @@ def test_a_payload_that_is_not_an_object_is_a_render_error(
     OutboxMessage.objects.filter(pk=row.pk).update(payload=payload)
     fake_telegram.accept(TOKEN_A)
 
-    assert io_loop.run_iteration(T0, io_loop.RelayState()) is False
+    assert io_loop.run_iteration(FakeClock(T0), io_loop.RelayState()) is False
 
     assert (_row(row).status, _row(row).last_error) == ("pending", "render_error")
     assert len(fake_telegram.calls) == 0
@@ -555,7 +551,7 @@ def test_a_row_that_cannot_be_claimed_is_not_sent(
     fake_telegram.accept(TOKEN_A)
     monkeypatch.setattr(outbox, "claim", lambda message_id: False)
 
-    assert io_loop.run_iteration(T0, io_loop.RelayState()) is False
+    assert io_loop.run_iteration(FakeClock(T0), io_loop.RelayState()) is False
 
     assert len(fake_telegram.calls) == 0
     assert (_row(row).status, _row(row).attempts) == ("pending", 0)
@@ -583,7 +579,7 @@ def test_unexpected_error_is_logged_without_details_and_others_continue(
     monkeypatch.setattr(outbox, "claim", claim)
     caplog.set_level(logging.DEBUG)
 
-    assert io_loop.run_iteration(T0, io_loop.RelayState()) is True
+    assert io_loop.run_iteration(FakeClock(T0), io_loop.RelayState()) is True
 
     assert fake_telegram.sent == [_body(OFF_EN, CHAT_B)]
     assert _row(bad).status == "pending"
@@ -603,10 +599,10 @@ def test_idle_iteration_returns_false(
     state = io_loop.RelayState()
 
     # Nothing queued at all.
-    assert io_loop.run_iteration(T0, state) is False
+    assert io_loop.run_iteration(FakeClock(T0), state) is False
     # Queued, but not due until T0.
     off = _queue(location_factory())
-    assert io_loop.run_iteration(T0 - _seconds(1), state) is False
+    assert io_loop.run_iteration(FakeClock(T0 - _seconds(1)), state) is False
 
     assert len(fake_telegram.calls) == 0
     assert _row(off).status == "pending"
