@@ -3,11 +3,13 @@
 The list is read-only: one row per location, sorted by name without regard to case, with
 the status label, the last heartbeat in the display TZ (``display_time``, P-3) and the
 language label. With no locations it shows the empty-state panel instead of the table.
-Every page escapes the user-typed location name (UI-SPEC security rule 1).
+While the admin ops chat is not configured, both states show a warning callout (D-09,
+INV-20). Every page escapes the user-typed location name (UI-SPEC security rule 1).
 """
 
 import re
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -24,6 +26,8 @@ User = get_user_model()
 
 XSS_NAME = "<script>alert(1)</script>"
 ESCAPED_XSS_NAME = "&lt;script&gt;alert(1)&lt;/script&gt;"
+OPS_WARNING = '<p class="callout"><strong>Warning:</strong> The ops chat is not configured'
+OPS_TOKEN = "555555555:" + "C" * 35
 
 
 @pytest.fixture
@@ -196,6 +200,42 @@ def test_list_database_failure_renders_500_without_a_table(
     assert "<table" not in html
     assert "Office" not in html
     assert "could not connect" not in html
+
+
+@pytest.mark.django_db
+def test_list_warns_when_the_ops_chat_is_not_configured(
+    admin: Client, settings: Any, location_factory: Callable[..., Any]
+) -> None:
+    settings.CFG = replace(settings.CFG, ops_bot_token="", ops_chat_id=None)
+
+    empty = admin.get("/").content.decode()
+    location_factory(name="Office")
+    table = admin.get("/").content.decode()
+
+    assert "<h2>No locations yet</h2>" in empty
+    assert "<table" in table
+    for html in (empty, table):
+        assert html.count(OPS_WARNING) == 1
+        assert "Set OPS_BOT_TOKEN and OPS_CHAT_ID in the env file" in html
+        assert "go to the worker log only." in html
+
+
+@pytest.mark.django_db
+def test_list_has_no_ops_warning_when_configured(
+    admin: Client, settings: Any, location_factory: Callable[..., Any]
+) -> None:
+    settings.CFG = replace(settings.CFG, ops_bot_token=OPS_TOKEN, ops_chat_id=-1005555555555)
+
+    empty = admin.get("/").content.decode()
+    location_factory(name="Office")
+    table = admin.get("/").content.decode()
+
+    assert "<h2>No locations yet</h2>" in empty
+    assert "<table" in table
+    for html in (empty, table):
+        assert "ops chat is not configured" not in html
+        assert "<strong>Warning:</strong>" not in html
+        assert OPS_TOKEN not in html
 
 
 def test_anonymous_list_redirects_to_sign_in(client: Client, db: None) -> None:
