@@ -1,0 +1,64 @@
+[project]
+name = "power-monitor"
+version = "0.1.0"
+requires-python = "==3.14.*"
+dependencies = [
+  "Django>=5.2.17,<5.3",
+  "psycopg[binary]>=3.3.6,<3.4",
+  "gunicorn>=26.2.0,<27",
+  "whitenoise>=6.12.0,<7",
+  "requests>=2.34.2,<3",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=9.1.1,<10",
+  "pytest-django>=4.14.0,<5",
+  "pytest-cov>=7.1.0,<8",
+  "coverage>=7.16.1,<8",
+  "pytest-socket>=0.8.1,<0.9",
+  "responses>=0.26.3,<0.27",
+  "pyyaml>=6.0.3,<7",
+  "ruff>=0.16.8,<0.17",
+  "mypy>=2.3.1,<2.4",
+  "django-stubs>=6.1.1,<6.2",
+]
+
+[tool.uv]
+# An application, not an installable package
+package = false
+exclude-newer = "7 days"
+required-version = "==0.12.18"
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "powermon.settings"
+addopts = "--allow-hosts=db,localhost,127.0.0.1,::1 --strict-markers -p no:cacheprovider"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+patch = ["subprocess", "_exit"]
+source = ["powermon"]
+omit = ["*/migrations/*"]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+extend-exclude = ["powermon/migrations"]
+# /app is root-owned in the image and the tools run as uid 10001
+cache-dir = "/tmp/.ruff_cache"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "DTZ", "S"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S603", "S607", "S105", "S106"]
+
+[tool.mypy]
+python_version = "3.14"
+plugins = ["mypy_django_plugin.main"]
+# /app is root-owned in the image and the tools run as uid 10001
+cache_dir = "/tmp/.mypy_cache"
+
+[tool.django-stubs]
+django_settings_module = "powermon.settings"

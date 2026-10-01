@@ -1,1 +1,8 @@
 .planning/
+.env.docker_local
+.env.docker_production
+docker_data/
+.venv/
+staticfiles/
+__pycache__/
+.coverage*

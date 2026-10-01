@@ -1,0 +1,9 @@
+.git
+.venv
+docker_data
+.env*
+!.env.example
+**/__pycache__
+.planning
+.claude
+staticfiles
