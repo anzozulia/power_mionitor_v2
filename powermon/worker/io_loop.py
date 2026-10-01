@@ -33,12 +33,15 @@ The result decides the row's next status, for both channels (D-14 policy):
 - rate_limited (429): retried after retry_after seconds, capped at MAX_RETRY_AFTER_S.
 - permanent (400/401/403/404): retried after PERMANENT_BACKOFF, with one warning.
 
-Every retry also backs off the whole bot in ``RelayState.not_before``. The admin chat has
-its own key there (``ops_key``), apart from its bot's: when the admin reuses a location's
-bot for the ops chat, a failure that concerns only the admin chat never delays that
-location's alerts, while the bot's own backoff still holds the ops rows (B1). A bot that
-is backing off is skipped, and the pass moves on to other bots: nothing here sleeps
-(INV-14).
+Every retry of a subscriber row also backs off the whole bot in ``RelayState.not_before``
+(``bot_key``), for every location on that bot (D-14). The admin chat has its own key there
+(``ops_key``), apart from its bot's, because the admin may reuse a location's bot for the
+ops chat (D-09). Each direction concerns one chat only: a failure of the admin chat never
+delays that location's alerts (B1), and a 400/401/403 for the location's channel (the bot
+removed from it) never holds the ops rows (D1). Only a bot-wide outcome of a subscriber
+send, a 429, a 5xx or a refused connection, also sets ``bot_wide_key``, which the ops
+sends wait for as well. A bot that is backing off is skipped, and the pass moves on to
+other bots: nothing here sleeps (INV-14).
 The thread's only blocking wait is its idle ``stop.wait`` in ``run_worker``.
 
 Sends are one after another, and each can block for the client's connect plus read
@@ -105,9 +108,10 @@ once at WARNING when no ops chat is configured (D-09). A process that never held
 lease (a standby, a worker restarted during the outage) has no down timer and stays
 silent. A refused, 5xx or 429 send backs off under the admin chat's key (``ops_key``) and
 is tried again; an accepted, ambiguous (never resent, INV-16) or permanently refused one
-ends it for this outage. The flag resets as soon as the lease is HELD or STANDBY again,
-when the database answers; the monitoring-gap notice then reports the outage through the
-outbox. Nothing in this path touches the database.
+ends it for this outage. Like the ops rows, it also waits for ``bot_wide_key`` only, never
+for a location's own refusal on a shared bot (D1). The flag resets as soon as the lease is
+HELD or STANDBY again, when the database answers; the monitoring-gap notice then reports
+the outage through the outbox. Nothing in this path touches the database.
 """
 
 import hashlib
@@ -143,6 +147,10 @@ LATE_AFTER = timedelta(seconds=120)
 DB_DOWN_NOTICE_AFTER_S = 300
 # Which payload value holds the previous state's duration for each alert kind.
 _DURATION_KEYS = {outbox.KIND_POWER_OFF: "was_on_us", outbox.KIND_POWER_ON: "was_off_us"}
+# Outcomes of a subscriber send that concern the whole bot, not the one chat (D1): Telegram
+# limits the bot (429), or the bot cannot be reached (5xx, a refused connection).
+_BOT_WIDE_KINDS = ("rate_limited", "transient", "not_sent")
+_BOT_WIDE_PREFIX = "bot:"
 
 
 @dataclass(frozen=True)
@@ -190,10 +198,21 @@ def ops_key(token: str) -> str:
 
     The admin may reuse a location's bot as ``OPS_BOT_TOKEN``. A failure on an ops send
     (a 403 for the admin chat, a per-chat 429, a 5xx) then backs off only the ops rows,
-    never that location's subscriber alerts. The other direction holds: ops sends also
-    wait while the bot itself is backing off for a subscriber row.
+    never that location's subscriber alerts. In the other direction, ops sends wait for
+    ``bot_wide_key`` only, never for a location's own refusal (D1).
     """
     return "ops:" + bot_key(token)
+
+
+def bot_wide_key(token: str) -> str:
+    """The backoff every chat of a bot waits for, the admin chat included (D1).
+
+    Set only by a bot-wide outcome of a subscriber send (``_BOT_WIDE_KINDS``: a 429, a
+    5xx, a refused connection), next to the bot's own ``bot_key``. A 400/401/403 concerns
+    one location's channel (the bot removed from it), so it backs off only that bot's
+    subscriber rows (D-14) and never holds the ops chat when the admin shares the bot.
+    """
+    return _BOT_WIDE_PREFIX + bot_key(token)
 
 
 def activate(state: RelayState, clock: Clock) -> int:
@@ -287,8 +306,8 @@ def notify_db_down(status: LeaseStatus, clock: Clock, state: RelayState) -> bool
         state.db_down_notified = True
         return False
     key = ops_key(token)
-    # The admin chat's own backoff, or the bot's when a location shares it (B1).
-    if max(state.not_before.get(key, now), state.not_before.get(bot_key(token), now)) > now:
+    # The admin chat's own backoff, or a bot-wide one when a location shares the bot (D1).
+    if max(state.not_before.get(key, now), state.not_before.get(bot_wide_key(token), now)) > now:
         return False
     result = TelegramClient(token).send_message(chat_id, text)
     if result.kind in ("ok", "maybe_delivered"):
@@ -369,8 +388,8 @@ def _deliver_ops(clock: Clock, state: RelayState) -> bool:
     if row.status != "pending" or row.next_attempt_at > now:
         return False
     key = ops_key(token)
-    # The admin chat's own backoff, or the bot's when a location shares it (B1).
-    if max(state.not_before.get(key, now), state.not_before.get(bot_key(token), now)) > now:
+    # The admin chat's own backoff, or a bot-wide one when a location shares the bot (D1).
+    if max(state.not_before.get(key, now), state.not_before.get(bot_wide_key(token), now)) > now:
         return False
     try:
         text = ops.render_text(row.kind, row.payload, row.location_id, now=now)
@@ -515,4 +534,8 @@ def _apply(
     next_attempt_at = now + delay
     # In memory first: if the write below fails, the bot still waits (WR-04).
     state.not_before[key] = next_attempt_at
+    if row.channel == outbox.CHANNEL_SUBSCRIBER and result.kind in _BOT_WIDE_KINDS:
+        # A subscriber row's key is its bot's ``bot_key``: the whole bot is limited or
+        # unreachable, so a shared admin chat waits too (D1).
+        state.not_before[_BOT_WIDE_PREFIX + key] = next_attempt_at
     outbox.mark_retry(row.pk, next_attempt_at, result.code or result.kind)
