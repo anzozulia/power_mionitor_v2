@@ -21,9 +21,15 @@ from urllib3.exceptions import (
     NameResolutionError,
     NewConnectionError,
     ProtocolError,
+    SSLError,
 )
 
-from powermon.telegram.client import SendResult, TelegramClient
+from powermon.telegram.client import (
+    SendResult,
+    TelegramClient,
+    _HandshakeError,
+    _HandshakeTimeout,
+)
 
 TOKEN = DEFAULT_BOT_TOKEN
 SEND_PATH = f"/bot{TOKEN}/sendMessage"
@@ -52,6 +58,18 @@ def _dropped() -> requests.ConnectionError:
     return requests.ConnectionError(
         ProtocolError("Connection aborted.", ConnectionResetError(104, "reset"))
     )
+
+
+# What the client's own HTTPS connection raises when the TLS handshake fails (audit F1).
+def _handshake(error: type[NewConnectionError]) -> requests.ConnectionError:
+    reason = error(None, f"TLS handshake for {SEND_PATH}")
+    return requests.ConnectionError(MaxRetryError(None, SEND_PATH, reason))
+
+
+# A TLS error once the handshake is done: the request may have been written.
+def _ssl_after_handshake() -> requests.ConnectionError:
+    reason = SSLError(f"decryption failed for {SEND_PATH}")
+    return requests.exceptions.SSLError(MaxRetryError(None, SEND_PATH, reason))
 
 
 # (id, FakeTelegram.fail kwargs, expected kind, expected code)
@@ -103,6 +121,24 @@ FAILURES: list[tuple[str, dict[str, Any], str, str]] = [
     ),
     ("refused", {"exc": _refused()}, "not_sent", "connect_error"),
     ("dns", {"exc": _dns_failure()}, "not_sent", "connect_error"),
+    (
+        "tls_handshake_timeout",
+        {"exc": _handshake(_HandshakeTimeout)},
+        "not_sent",
+        "tls_handshake_timeout",
+    ),
+    (
+        "tls_handshake_error",
+        {"exc": _handshake(_HandshakeError)},
+        "not_sent",
+        "tls_handshake_error",
+    ),
+    (
+        "ssl_after_handshake",
+        {"exc": _ssl_after_handshake()},
+        "maybe_delivered",
+        "connection_dropped",
+    ),
     (
         "read_timeout",
         {"exc": requests.ReadTimeout(f"read timed out: {SEND_URL}")},
@@ -307,8 +343,11 @@ def test_send_result_defaults() -> None:
 
 
 def test_client_source_never_raises_for_status_or_mounts_retries() -> None:
-    # STACK G2/G3: raise_for_status() puts the URL (token) in the error text, and a Retry
-    # adapter would resend on its own; retry timing belongs to the outbox (INV-15/16).
+    # STACK G2/G3: raise_for_status() puts the URL (token) in the error text, and a retry
+    # policy would resend on its own; retry timing belongs to the outbox (INV-15/16). The
+    # client mounts one HTTPAdapter subclass (the connect/send split, audit F1) that keeps
+    # requests' default of no retries; test_client_tls.py checks every real failure uses
+    # exactly one connection.
     names = {
         node.attr if isinstance(node, ast.Attribute) else node.id
         for node in ast.walk(ast.parse(CLIENT_SOURCE.read_text(encoding="utf-8")))
@@ -316,4 +355,4 @@ def test_client_source_never_raises_for_status_or_mounts_retries() -> None:
     }
 
     assert "post" in names  # the scan saw the real client, so an empty pass proves nothing
-    assert not names & {"raise_for_status", "Retry", "mount", "HTTPAdapter"}
+    assert not names & {"raise_for_status", "Retry", "max_retries"}
