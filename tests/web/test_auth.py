@@ -14,14 +14,9 @@ from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model
 from django.core.management import call_command
 
+from powermon.web.admin_sync import sync_admin
+
 User = get_user_model()
-
-
-def _sync_admin(username: str, password: str) -> None:
-    # Imported in the body so each test fails on its own until the module exists (RED).
-    from powermon.web.admin_sync import sync_admin
-
-    sync_admin(username, password)
 
 
 def _snapshot() -> list[tuple[Any, ...]]:
@@ -33,7 +28,7 @@ def _snapshot() -> list[tuple[Any, ...]]:
 
 @pytest.mark.django_db
 def test_INV21_sync_creates_the_single_admin() -> None:
-    _sync_admin("admin", "pw-one")
+    sync_admin("admin", "pw-one")
 
     user = User.objects.get()
     assert user.username == "admin"
@@ -44,8 +39,8 @@ def test_INV21_sync_creates_the_single_admin() -> None:
 
 @pytest.mark.django_db
 def test_INV21_password_change_only_new_works() -> None:
-    _sync_admin("admin", "pw-one")
-    _sync_admin("admin", "pw-two")
+    sync_admin("admin", "pw-one")
+    sync_admin("admin", "pw-two")
 
     assert User.objects.count() == 1
     assert authenticate(username="admin", password="pw-two") is not None
@@ -54,10 +49,10 @@ def test_INV21_password_change_only_new_works() -> None:
 
 @pytest.mark.django_db
 def test_INV21_username_rename_keeps_one_account() -> None:
-    _sync_admin("admin", "pw")
+    sync_admin("admin", "pw")
     pk = User.objects.get().pk
 
-    _sync_admin("root", "pw")
+    sync_admin("root", "pw")
 
     user = User.objects.get()
     assert (user.pk, user.username) == (pk, "root")
@@ -70,7 +65,7 @@ def test_INV21_extra_accounts_removed() -> None:
     User.objects.create_user("intruder", password="x")
     User.objects.create_user("second-admin", password="y")
 
-    _sync_admin("admin", "pw")
+    sync_admin("admin", "pw")
 
     assert list(User.objects.values_list("username", flat=True)) == ["admin"]
     assert authenticate(username="intruder", password="x") is None
@@ -81,7 +76,7 @@ def test_INV21_account_with_the_env_username_is_the_one_kept() -> None:
     User.objects.create_user("older", password="x")
     admin = User.objects.create_user("admin", password="pw")
 
-    _sync_admin("admin", "pw")
+    sync_admin("admin", "pw")
 
     assert list(User.objects.values_list("pk", "username")) == [(admin.pk, "admin")]
 
@@ -90,7 +85,7 @@ def test_INV21_account_with_the_env_username_is_the_one_kept() -> None:
 def test_sync_reactivates_a_disabled_admin() -> None:
     User.objects.create_user("admin", password="pw", is_active=False)
 
-    _sync_admin("admin", "pw")
+    sync_admin("admin", "pw")
 
     assert User.objects.get().is_active
     assert authenticate(username="admin", password="pw") is not None
@@ -99,10 +94,10 @@ def test_sync_reactivates_a_disabled_admin() -> None:
 @pytest.mark.django_db
 def test_sync_without_change_keeps_the_password_hash() -> None:
     # P-13: re-hashing on every deploy would change the session hash and sign the admin out.
-    _sync_admin("admin", "pw")
+    sync_admin("admin", "pw")
     before = User.objects.get().password
 
-    _sync_admin("admin", "pw")
+    sync_admin("admin", "pw")
 
     assert User.objects.get().password == before
 
@@ -123,7 +118,7 @@ def test_sync_rejects_empty_credentials(username: str, password: str, message: s
     before = _snapshot()
 
     with pytest.raises(ValueError, match=message):
-        _sync_admin(username, password)
+        sync_admin(username, password)
 
     assert _snapshot() == before
 
