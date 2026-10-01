@@ -4,7 +4,9 @@ Heartbeats write the timeline in the same transaction as the state change, and
 PostgreSQL itself rejects overlapping, zero-length, second-open and inconsistent
 intervals, so no code path can corrupt the one source of truth. The first heartbeat is
 silent (K-1); the first heartbeat after an outage turns the location ON and queues
-exactly one ON alert in the same transaction (K-3, D-14).
+exactly one ON alert in the same transaction (K-3, D-14). A restore clamped after a
+backward clock step (IN-01) dates the ON alert at the clamp but records it at the
+heartbeat's receive time, so the relay can send it at once (audit A2).
 
 Tests that reach OFF through ``detection.run_cycle`` are ``django_db(transaction=True)``:
 the cycle calls ``close_old_connections()``, which would close the connection inside
@@ -17,13 +19,14 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from conftest import DEFAULT_BOT_TOKEN, FakeClock
 from django.db import IntegrityError, connection, transaction
 
 from powermon.alerts import texts
 from powermon.alerts.models import OutboxMessage
 from powermon.engine import timeline, transitions
 from powermon.engine.models import LocationState, PowerInterval, SystemState
-from powermon.worker import detection
+from powermon.worker import detection, io_loop
 
 Interval = tuple[str, datetime, datetime | None, datetime | None]
 
@@ -185,7 +188,9 @@ def test_IN01_backward_clock_step_heartbeat_restores_at_outage_start(
         ("on", _at(10, 5), None, None),
     ]
     on = OutboxMessage.objects.get(location=location, kind="power_on")
-    assert (on.event_at, on.recorded_at) == (_at(10, 5), _at(10, 5))
+    # The alert is dated at the clamped restore, but recorded (and so due) at the receive
+    # time: the relay sends it now, not when the wall clock catches up (audit A2).
+    assert (on.event_at, on.recorded_at, on.next_attempt_at) == (_at(10, 5), _at(10, 4), _at(10, 4))
     assert on.payload == {"was_off_us": 0}
 
     # One WARNING per process: a second clamped restore logs nothing more.
@@ -228,7 +233,13 @@ def test_IN01_restore_never_closes_before_the_open_interval_start(
         ("on", _at(10, 10), None, None),
     ]
     [on] = OutboxMessage.objects.filter(location=location)
-    assert (on.kind, on.event_at, on.recorded_at) == ("power_on", _at(10, 10), _at(10, 10))
+    # Dated at the open piece's start, recorded (and due) at the receive time.
+    assert (on.kind, on.event_at, on.recorded_at, on.next_attempt_at) == (
+        "power_on",
+        _at(10, 10),
+        _at(10, 9, 59),
+        _at(10, 9, 59),
+    )
     # D-02: "was OFF for" runs from the original outage start, 10:10 - 09:00.
     assert on.payload == {"was_off_us": 4_200_000_000}
 
@@ -254,6 +265,29 @@ def test_IN01_restore_without_an_open_interval_clamps_to_the_outage_start(
     assert _intervals(location) == [("on", _at(10, 5), None, None)]
     [on] = OutboxMessage.objects.filter(location=location)
     assert (on.event_at, on.payload) == (_at(10, 5), {"was_off_us": 0})
+
+
+@pytest.mark.django_db(transaction=True)
+def test_IN01_clamped_on_alert_is_sent_at_the_receive_time(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    # OFF since 10:05, recorded and sent at 10:06:31. Then the server clock steps back
+    # 1 h, and power returns at 09:07:30 by the stepped clock. The restore is clamped to
+    # 10:05, but the ON alert goes out on the relay's next pass at 09:07:30, not about an
+    # hour later when the wall clock reaches 10:05 again (audit A2).
+    location = _off_since_1005(location_factory)
+    fake_telegram.accept(DEFAULT_BOT_TOKEN)
+    state = io_loop.RelayState()
+    assert io_loop.run_iteration(FakeClock(_at(10, 6, 31)), state) is True
+
+    assert transitions.record_heartbeat(location.pk, _at(9, 7, 30)) == "restored"
+
+    assert io_loop.run_iteration(FakeClock(_at(9, 7, 30)), state) is True
+    on = OutboxMessage.objects.get(location=location, kind="power_on")
+    assert (on.status, on.sent_at) == ("sent", _at(9, 7, 30))
+    assert [message["text"] for message in fake_telegram.sent][1:] == [
+        texts.render_alert("power_on", location.language, 0)
+    ]
 
 
 @pytest.mark.django_db
