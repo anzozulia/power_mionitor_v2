@@ -137,6 +137,9 @@ def test_lease_is_exclusive_and_never_blocks(leases: Callable[[], Lease]) -> Non
     assert a.alive() is True
     assert isinstance(a.pid, int)
     assert a.pid != b.pid
+    # The repr names the session only: no connection details, no password.
+    assert repr(a) == f"Lease(pid={a.pid})"
+    assert connection.settings_dict["PASSWORD"] not in repr(a)
     a.close()
     assert a.pid is None
     assert a.alive() is False

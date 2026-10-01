@@ -400,6 +400,38 @@ def test_render_failure_does_not_block_other_locations(
 
 
 @pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("payload", [[300_000_000], 300_000_000, "5m"], ids=repr)
+def test_a_payload_that_is_not_an_object_is_a_render_error(
+    location_factory: Callable[..., Any], fake_telegram: Any, payload: Any
+) -> None:
+    # enqueue only writes objects, but the row is read back from a jsonb column.
+    row = _queue(location_factory())
+    OutboxMessage.objects.filter(pk=row.pk).update(payload=payload)
+    fake_telegram.accept(TOKEN_A)
+
+    assert io_loop.run_iteration(T0, io_loop.RelayState()) is False
+
+    assert (_row(row).status, _row(row).last_error) == ("pending", "render_error")
+    assert len(fake_telegram.calls) == 0
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a_row_that_cannot_be_claimed_is_not_sent(
+    location_factory: Callable[..., Any], fake_telegram: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The claim is the last gate before the HTTP call: a row that is no longer pending
+    # (claimed elsewhere) is skipped, never sent twice.
+    row = _queue(location_factory())
+    fake_telegram.accept(TOKEN_A)
+    monkeypatch.setattr(outbox, "claim", lambda message_id: False)
+
+    assert io_loop.run_iteration(T0, io_loop.RelayState()) is False
+
+    assert len(fake_telegram.calls) == 0
+    assert (_row(row).status, _row(row).attempts) == ("pending", 0)
+
+
+@pytest.mark.django_db(transaction=True)
 def test_unexpected_error_is_logged_without_details_and_others_continue(
     location_factory: Callable[..., Any],
     fake_telegram: Any,
