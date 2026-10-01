@@ -188,7 +188,9 @@ def test_a_sending_head_blocks_its_location_until_recovered(
     assert io_loop.run_iteration(FakeClock(now), state) is False
     assert len(fake_telegram.calls) == 0
 
-    assert outbox.recover_interrupted() == 1
+    assert outbox.recover_interrupted() == [
+        outbox.RowRef(interrupted.pk, "subscriber", location.pk)
+    ]
     assert io_loop.run_iteration(FakeClock(now), state) is True
     assert fake_telegram.sent == [_body(ON_EN)]
     assert _row(on).status == "sent"
@@ -724,11 +726,13 @@ def test_recover_interrupted_marks_sending_uncertain(location_factory: Callable[
     OutboxMessage.objects.filter(pk=interrupted.pk).update(status="sending", attempts=1)
     OutboxMessage.objects.filter(pk=finished.pk).update(status="sent", sent_at=T0)
 
-    assert outbox.recover_interrupted() == 1
+    assert outbox.recover_interrupted() == [
+        outbox.RowRef(interrupted.pk, "subscriber", location.pk)
+    ]
 
     row = _row(interrupted)
     assert (row.status, row.last_error, row.attempts) == ("uncertain", "interrupted", 1)
     assert _row(waiting).status == "pending"
     assert _row(finished).status == "sent"
     # Nothing left to recover.
-    assert outbox.recover_interrupted() == 0
+    assert outbox.recover_interrupted() == []

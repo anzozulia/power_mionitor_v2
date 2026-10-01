@@ -18,8 +18,11 @@ Telegram is faked at the HTTP boundary (``fake_telegram``). Expected local times
 Europe/Kyiv, UTC+3 on 2026-10-01.
 """
 
+import ast
 import dataclasses
 import logging
+import pathlib
+import re
 import threading
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -29,10 +32,13 @@ import pytest
 import requests
 from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, OPS_BOT_TOKEN, OPS_CHAT_ID, FakeClock
 from django.db import transaction
+from urllib3.exceptions import MaxRetryError, NewConnectionError
 
+import powermon
 from powermon.alerts import ops, outbox
 from powermon.alerts.models import OutboxMessage
 from powermon.worker import io_loop
+from powermon.worker.management.commands import run_worker
 
 TOKEN_A = DEFAULT_BOT_TOKEN
 TOKEN_B = "987654321:" + "B" * 35
@@ -48,6 +54,8 @@ UNCERTAIN_OFF = (
 )
 OPS_LOGGER = "powermon.alerts.ops"
 RELAY_LOGGER = "powermon.worker.io_loop"
+WORKER_LOGGER = "powermon.worker.management.commands.run_worker"
+GAP_SAMPLE = "⏸ Monitoring gap 01.10 10:00:12 – 10:10:40 (10m 28s)"
 
 
 @pytest.fixture(autouse=True)
@@ -120,6 +128,25 @@ def _bots(fake: Any) -> list[str]:
     for call in fake.calls:
         found.extend(name for token, name in names.items() if f"/bot{token}/" in call.request.url)
     return found
+
+
+def _ops_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == OPS_LOGGER]
+
+
+def _gap_payload() -> dict[str, int]:
+    """The D-11 gap sample: 10:00:12 - 10:10:40 in Kyiv on 01.10."""
+    return {
+        "start_us": ops.instant_us(datetime(2026, 10, 1, 7, 0, 12, tzinfo=UTC)),
+        "end_us": ops.instant_us(datetime(2026, 10, 1, 7, 10, 40, tzinfo=UTC)),
+    }
+
+
+def _refused(token: str) -> requests.ConnectionError:
+    # A real connect-phase exception carries the URL, and so the token, in its text (P-12).
+    path = f"/bot{token}/sendMessage"
+    reason = NewConnectionError(None, f"Failed to establish a new connection for {path}")
+    return requests.ConnectionError(MaxRetryError(None, path, reason))
 
 
 def _too_many_requests(retry_after: int) -> dict[str, Any]:
@@ -504,3 +531,276 @@ def test_render_text_refuses_an_unknown_kind_and_a_missing_row() -> None:
         ops.render_text(outbox.KIND_OPS_UNCERTAIN, {}, None, now=T0)
     with pytest.raises(TypeError):
         ops.render_text(outbox.KIND_OPS_UNCERTAIN, [1], None, now=T0)
+
+
+# No ops chat: notices go to the log (D-09, INV-20)
+
+
+@pytest.mark.django_db
+def test_ops_notice_is_logged_when_the_ops_chat_is_not_configured(
+    no_ops_chat: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger=OPS_LOGGER)
+
+    with transaction.atomic():
+        ops.notify(
+            outbox.KIND_OPS_GAP,
+            payload=_gap_payload(),
+            recorded_at=datetime(2026, 10, 1, 7, 10, 41, tzinfo=UTC),
+        )
+
+    assert not OutboxMessage.objects.exists()
+    records = [r for r in caplog.records if r.name == OPS_LOGGER]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert records[0].getMessage() == (
+        f"ops notice (ops chat not configured): {GAP_SAMPLE}. "
+        "Recorded as not monitored; no subscriber alerts were sent for it."
+    )
+
+
+@pytest.mark.django_db
+def test_notify_queues_the_notice_when_the_ops_chat_is_configured(
+    ops_settings: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG, logger=OPS_LOGGER)
+
+    with transaction.atomic():
+        ops.notify(outbox.KIND_OPS_GAP, payload=_gap_payload(), recorded_at=T0)
+
+    [notice] = _ops_rows()
+    assert (notice.kind, notice.payload, notice.status) == ("ops_gap", _gap_payload(), "pending")
+    assert _ops_lines(caplog) == []
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("configured", [True, False], ids=["configured", "not-configured"])
+def test_notify_refuses_a_bad_kind_or_payload_in_both_modes(
+    settings: Any, configured: bool
+) -> None:
+    token, chat = (OPS_BOT_TOKEN, OPS_CHAT_ID) if configured else ("", None)
+    settings.CFG = dataclasses.replace(settings.CFG, ops_bot_token=token, ops_chat_id=chat)
+    bad_payload: dict[str, Any] = {"start_us": "x"}
+
+    with pytest.raises(ValueError, match="unknown ops notice kind"):
+        ops.notify("power_off", payload={"message_id": 1}, recorded_at=T0)
+    with pytest.raises(TypeError, match="must be an integer"):
+        ops.notify(outbox.KIND_OPS_GAP, payload=bad_payload, recorded_at=T0)
+
+    assert not OutboxMessage.objects.exists()
+
+
+@pytest.mark.django_db
+def test_an_unrenderable_logged_notice_never_aborts_the_caller(
+    location_factory: Callable[..., Any], no_ops_chat: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    location = location_factory()
+    caplog.set_level(logging.WARNING, logger=OPS_LOGGER)
+
+    with transaction.atomic():
+        # The referenced alert does not exist: the notice cannot be rendered.
+        ops.notify(outbox.KIND_OPS_UNCERTAIN, payload={"message_id": 10**9}, recorded_at=T0)
+        # The caller's transaction is still usable and commits.
+        alert = outbox.enqueue(
+            outbox.KIND_POWER_OFF,
+            location.pk,
+            event_at=T0,
+            recorded_at=T0,
+            payload={"was_on_us": 1},
+        )
+
+    assert OutboxMessage.objects.filter(pk=alert.pk).exists()
+    assert _ops_lines(caplog) == [
+        "ops notice ops_uncertain (ops chat not configured) could not be rendered: LookupError"
+    ]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_unconfigured_notice_logs_the_name_unescaped(
+    location_factory: Callable[..., Any], no_ops_chat: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    off = _queue(location_factory(name="<b>A&B</b>"))
+    assert outbox.claim(off.pk) is True
+    caplog.set_level(logging.WARNING, logger=OPS_LOGGER)
+
+    assert ops.mark_uncertain(off.pk, "read_timeout", T0) is True
+
+    assert _ops_rows() == []
+    [line] = _ops_lines(caplog)
+    # A log line is plain text, not Telegram HTML.
+    assert "OFF alert for <b>A&B</b> (event 13:05) may not have been delivered" in line
+    assert "&lt;" not in line and "&amp;" not in line
+
+
+# Sends interrupted by a stopped worker (D-11 #5, D-13, INV-15)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_recover_interrupted_notifies_once_per_subscriber_row(
+    location_factory: Callable[..., Any], ops_settings: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    location = location_factory()
+    alert = _queue(location)
+    notice = _uncertain_notice(location)
+    # Both were claimed when the previous worker stopped.
+    OutboxMessage.objects.filter(pk__in=[alert.pk, notice.pk]).update(status="sending", attempts=1)
+    caplog.set_level(logging.WARNING, logger=OPS_LOGGER)
+
+    assert ops.recover_interrupted(T0) == 2
+
+    for row in (alert, notice):
+        assert (_row(row).status, _row(row).last_error) == ("uncertain", "interrupted")
+    new = [r for r in _ops_rows() if r.pk != notice.pk]
+    assert [(r.kind, r.payload, r.location_id, r.recorded_at) for r in new] == [
+        ("ops_uncertain", {"message_id": alert.pk}, location.pk, T0)
+    ]
+    text = ops.render_text(new[0].kind, new[0].payload, new[0].location_id, now=T0)
+    assert "OFF alert for Test location (event 13:05)" in text
+    assert "(the worker stopped while sending it)" in text
+    # The interrupted ops row is only logged: no notice about a notice.
+    assert _ops_lines(caplog) == [
+        f"ops notice {notice.pk} was interrupted while sending; it is not resent"
+    ]
+
+    assert ops.recover_interrupted(T0 + _seconds(1)) == 0
+    assert len(_ops_rows()) == 2
+
+
+@pytest.mark.django_db(transaction=True)
+def test_run_worker_activation_turns_interrupted_sends_into_one_notice(
+    location_factory: Callable[..., Any], no_ops_chat: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    # 02-05 moves this recovery into io_loop.activate and ports this test there.
+    off = _queue(location_factory())
+    OutboxMessage.objects.filter(pk=off.pk).update(status="sending", attempts=1)
+    caplog.set_level(logging.INFO)
+
+    run_worker.activate(T0 + timedelta(hours=1))
+
+    assert (_row(off).status, _row(off).last_error) == ("uncertain", "interrupted")
+    assert _ops_rows() == []
+    [line] = _ops_lines(caplog)
+    assert line.startswith("ops notice (ops chat not configured): ❓ OFF alert for Test location")
+    assert "(the worker stopped while sending it)" in line
+    worker = [r.getMessage() for r in caplog.records if r.name == WORKER_LOGGER]
+    assert any("1 interrupted send(s) marked uncertain" in m for m in worker)
+
+
+# A broken admin chat never delays subscribers (INV-20 #2, ALRT-06)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV20_broken_admin_chat_never_delays_subscribers(
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    ops_settings: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    a = location_factory(bot_token=TOKEN_A)
+    b = location_factory(bot_token=TOKEN_B, chat_id=CHAT_B)
+    with transaction.atomic():
+        notice = outbox.enqueue_ops(outbox.KIND_OPS_GAP, payload=_gap_payload(), recorded_at=T0)
+    # The admin chat refuses connections twice, then the ops bot is kicked (403).
+    fake_telegram.fail(OPS_BOT_TOKEN, exc=_refused(OPS_BOT_TOKEN))
+    fake_telegram.fail(OPS_BOT_TOKEN, exc=_refused(OPS_BOT_TOKEN))
+    kicked = {"ok": False, "error_code": 403, "description": "Forbidden: bot was kicked"}
+    fake_telegram.fail(OPS_BOT_TOKEN, status=403, json_body=kicked)
+    fake_telegram.accept(TOKEN_A)
+    fake_telegram.accept(TOKEN_B)
+    state = io_loop.RelayState()
+    caplog.set_level(logging.WARNING, logger=RELAY_LOGGER)
+    alerts: list[OutboxMessage] = []
+    waits: list[timedelta] = []
+
+    for second in range(21):
+        clock = FakeClock(T0 + _seconds(second))
+        if second % 3 == 0:
+            # A new subscriber alert every 3 s, alternating between the two locations.
+            alerts.append(_queue(a if second % 6 == 0 else b, at=clock.now()))
+        attempts = _row(notice).attempts
+
+        io_loop.run_iteration(clock, state)
+
+        # Every alert went out in the first pass after it was due.
+        assert [(_row(r).status, _row(r).sent_at) for r in alerts] == [
+            ("sent", r.recorded_at) for r in alerts
+        ]
+        row = _row(notice)
+        assert row.status == "pending"
+        if row.attempts != attempts:
+            waits.append(row.next_attempt_at - clock.now())
+
+    # The ops row backs off on its own: 2 s, 4 s, then 15 min after the 403.
+    assert waits == [_seconds(2), _seconds(4), timedelta(minutes=15)]
+    assert _row(notice).next_attempt_at == T0 + _seconds(6) + timedelta(minutes=15)
+    assert set(state.not_before) == {io_loop.bot_key(OPS_BOT_TOKEN)}
+    assert _bots(fake_telegram).count("ops") == 3
+    assert len(fake_telegram.sent) == len(alerts) == 7
+    assert [r.getMessage() for r in caplog.records if r.name == RELAY_LOGGER] == [
+        "relay: permanent error http_403 for the ops chat; the ops bot backs off for 15 min"
+    ]
+
+
+# No hard-coded destination anywhere in the code (INV-20, D-09)
+
+TOKEN_SHAPE = re.compile(r"[0-9]{5,}:[A-Za-z0-9_-]{30,}")
+CHAT_ID_SHAPE = re.compile(r"-100[0-9]{7,}")
+
+
+def _destination_literals(source: str, filename: str) -> list[str]:
+    """Literals that could be a Telegram destination: a bot token or a channel ID.
+
+    A string counts only if it is the whole value, so UI copy such as "like
+    -1001234567890." inside a longer sentence is allowed.
+    """
+    found = []
+    for node in ast.walk(ast.parse(source, filename)):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if TOKEN_SHAPE.fullmatch(node.value) or CHAT_ID_SHAPE.fullmatch(node.value):
+                found.append(f"{filename}:{node.lineno}")
+        elif (
+            isinstance(node, ast.UnaryOp)
+            and isinstance(node.op, ast.USub)
+            and isinstance(node.operand, ast.Constant)
+            and type(node.operand.value) is int
+            and CHAT_ID_SHAPE.fullmatch(f"-{node.operand.value}")
+        ):
+            found.append(f"{filename}:{node.lineno}")
+    return found
+
+
+def test_INV20_no_hard_coded_chat_in_the_code() -> None:
+    root = pathlib.Path(powermon.__file__).parent
+    sources = sorted(root.rglob("*.py"))
+    # The whole package, migrations included.
+    assert len(sources) > 30
+    assert any(path.parent.name == "migrations" for path in sources)
+
+    offenders = [
+        hit
+        for path in sources
+        for hit in _destination_literals(
+            path.read_text(encoding="utf-8"), str(path.relative_to(root))
+        )
+    ]
+
+    assert offenders == []
+
+
+def test_the_hard_coded_chat_scan_catches_planted_literals() -> None:
+    # The scan must be able to fail (Pitfall 13).
+    token = "123456789:" + "A" * 35
+    planted = (
+        f'TOKEN = "{token}"\n'
+        "CHAT = -1001234567890\n"
+        'CHAT_TEXT = "-1001234567890"\n'
+        'HELP = "like -1001234567890."\n'
+        "POSITIVE = 1001234567890\n"
+        "SHORT = -100123\n"
+    )
+
+    assert _destination_literals(planted, "planted.py") == [
+        "planted.py:1",
+        "planted.py:2",
+        "planted.py:3",
+    ]
