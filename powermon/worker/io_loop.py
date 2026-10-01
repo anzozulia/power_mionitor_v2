@@ -1,9 +1,12 @@
 """The worker's Telegram I/O loop body: deliver queued alerts and ops notices (D-11, D-14).
 
-``run_iteration`` is one pass over the outbox. For each location it looks only at the
-oldest open row (``outbox.subscriber_heads``), so OFF always goes before ON. A due row is
-rendered at send time in the location's current language, claimed with one conditional
-UPDATE (committed at once, Django autocommit), and sent with no transaction open.
+``run_iteration`` is one pass over the outbox, always in this order: the connection step
+(``close_old_connections()``), the flush of outcomes kept from an earlier pass (WR-04),
+expiry (ALRT-03), the subscriber heads, then at most one ops row. For each location it
+looks only at the oldest open row (``outbox.subscriber_heads``), so OFF always goes before
+ON. A due row is rendered at send time in the location's current language, claimed with
+one conditional UPDATE (committed at once, Django autocommit), and sent with no
+transaction open.
 
 After every subscriber head of the pass, and only when an ops chat is configured, the
 pass sends at most one ops notice: the oldest open row of the ops queue
@@ -63,6 +66,25 @@ queues one ``ops_expired`` notice; an expired ops row is only logged, so a broke
 chat cannot loop. The location's next alert (the ON after an expired OFF) is then its head
 and goes out in the same pass. A database error in this step ends the pass before any
 claim and reaches the caller (``run_worker`` logs it once per outage, by class name).
+
+WR-04 (D-13): an error after a row was claimed never blocks its queue (a location's line,
+or the ops queue) for the rest of a lease generation, and never turns a known send into an
+uncertain one. Both channels go through one helper, ``_send``:
+
+- the claim raises a database error: no request was made, so the row may go back to
+  "pending"; that reset is kept in ``RelayState.unapplied``;
+- an exception after the claim and before the HTTP call (building the client): the
+  request provably never left, so the row goes back to "pending" ("pre_send_error");
+- the outcome write raises a database error after Telegram answered: the known outcome
+  (``Unapplied``: the row, attempts, result, answer time and bot key) is kept.
+
+Kept outcomes are written by ``_flush_unapplied`` at the start of the next pass, right
+after the connection step and before any new claim, and at activation before leftover
+"sending" rows are declared uncertain; so a known "ok" becomes "sent", never "uncertain".
+A database error stops the flush and propagates: the pass (or the activation) ends and is
+retried on a replaced connection. Only database errors are kept: any other error is a bug,
+logged by class name, and the row waits for activation as before. The flush runs before
+any head, so a head with a kept outcome is never seen by the same process.
 """
 
 import hashlib
@@ -73,7 +95,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from django.conf import settings
-from django.db import close_old_connections, transaction
+from django.db import Error, close_old_connections, transaction
 
 from powermon.alerts import ops, outbox
 from powermon.alerts.models import OutboxMessage
@@ -96,11 +118,32 @@ LATE_AFTER = timedelta(seconds=120)
 _DURATION_KEYS = {outbox.KIND_POWER_OFF: "was_on_us", outbox.KIND_POWER_ON: "was_off_us"}
 
 
+@dataclass(frozen=True)
+class Unapplied:
+    """A claimed row's outcome that this process knows but could not write yet (WR-04).
+
+    ``result`` None means no request was made (the claim's own outcome is unknown, or an
+    error came before the HTTP call): the row goes back to "pending". Otherwise it is
+    Telegram's answer at ``answered_at``, applied as if it had been written then.
+    """
+
+    row: OutboxMessage
+    attempts: int
+    result: SendResult | None
+    answered_at: datetime
+    key: str
+
+
 @dataclass
 class RelayState:
-    """What the relay remembers between passes: when each bot may be called again."""
+    """What the relay remembers between passes.
+
+    ``not_before``: when each bot may be called again. ``unapplied``: outcomes kept after
+    a database error, by row id, written before the next claim (WR-04).
+    """
 
     not_before: dict[str, datetime] = field(default_factory=dict)
+    unapplied: dict[int, Unapplied] = field(default_factory=dict)
 
 
 def bot_key(token: str) -> str:
@@ -117,10 +160,13 @@ def activate(state: RelayState, clock: Clock) -> int:
 
     It starts with ``close_old_connections()``: Django health-checks or drops a dead
     connection only after that call, so a retry without it would hit the same dead
-    session on every attempt (D-16). 02-07 flushes unapplied outcomes from ``state``
-    after the connection step and before the recovery.
+    session on every attempt (D-16). Then this process's own kept outcomes are written
+    (WR-04), so a send it knows went through becomes "sent" and is not declared uncertain
+    by the recovery. A database error there propagates, and the recovery waits for the
+    next attempt.
     """
     close_old_connections()
+    _flush_unapplied(state)
     recovered = ops.recover_interrupted(clock.now())
     log.info("relay activated: %d interrupted send(s) marked uncertain", recovered)
     return recovered
@@ -136,9 +182,13 @@ def run_iteration(
 
     Returns early, before claiming another row, once ``stop`` is set. ``tick`` (the
     watchdog's progress stamp) runs after every subscriber head, whether it was sent,
-    skipped or failed, and after the ops step, so a long pass still shows progress.
+    skipped or failed, and after the ops step, so a long pass still shows progress. A
+    database error in the flush or in expiry ends the pass before any claim and
+    propagates to the caller.
     """
     close_old_connections()
+    # Outcomes kept after a DB error are written before any new claim (WR-04).
+    _flush_unapplied(state)
     # Nothing past its maximum age may go out, so expiry runs before any head (ALRT-03).
     _expire(clock.now())
     attempted = False
@@ -205,12 +255,7 @@ def _deliver(row: OutboxMessage, clock: Clock, state: RelayState) -> bool:
         outbox.mark_retry(row.pk, now + PERMANENT_BACKOFF, "render_error")
         log.warning("relay: cannot render alert %s for location %s", row.pk, row.location_id)
         return False
-    if not outbox.claim(row.pk):
-        return False
-    result = TelegramClient(location.bot_token).send_message(location.chat_id, text)
-    # The send may have blocked for seconds: waits and sent_at count from its answer.
-    _apply(row, row.attempts + 1, result, clock.now(), state, key)
-    return True
+    return _send(row, text, location.bot_token, location.chat_id, key, clock, state)
 
 
 def _deliver_ops(clock: Clock, state: RelayState) -> bool:
@@ -239,11 +284,81 @@ def _deliver_ops(clock: Clock, state: RelayState) -> bool:
         outbox.mark_retry(row.pk, now + PERMANENT_BACKOFF, "render_error")
         log.warning("relay: cannot render ops notice %s", row.pk)
         return False
-    if not outbox.claim(row.pk):
+    return _send(row, text, token, chat_id, key, clock, state)
+
+
+def _send(
+    row: OutboxMessage,
+    text: str,
+    token: str,
+    chat_id: int,
+    key: str,
+    clock: Clock,
+    state: RelayState,
+) -> bool:
+    """Claim, send and record one row of either channel; True if the request was made.
+
+    From the claim on, no error leaves the row "sending" for good (WR-04, D-13): a
+    database error keeps what is known in ``state.unapplied``, and an error before the
+    HTTP call puts the row back to "pending".
+    """
+    attempts = row.attempts + 1
+    try:
+        claimed = outbox.claim(row.pk)
+    except Error as exc:
+        # The claim may or may not have committed; either way no request was made.
+        state.unapplied[row.pk] = Unapplied(row, attempts, None, clock.now(), key)
+        log.warning("relay: could not claim alert %s (%s); retrying", row.pk, type(exc).__name__)
         return False
-    result = TelegramClient(token).send_message(chat_id, text)
-    _apply(row, row.attempts + 1, result, clock.now(), state, key)
+    if not claimed:
+        return False
+    try:
+        client = TelegramClient(token)
+    except Exception as exc:
+        # Raised before the HTTP call: the request provably never left.
+        log.warning(
+            "relay: alert %s failed before the send (%s); it is pending again",
+            row.pk,
+            type(exc).__name__,
+        )
+        _write(Unapplied(row, attempts, None, clock.now(), key), state)
+        return False
+    result = client.send_message(chat_id, text)
+    # The send may have blocked for seconds: waits and sent_at count from its answer.
+    _write(Unapplied(row, attempts, result, clock.now(), key), state)
     return True
+
+
+def _write(outcome: Unapplied, state: RelayState) -> None:
+    """Write a known outcome now, or keep it for the next pass if the database fails."""
+    try:
+        _record(outcome, state)
+    except Error as exc:
+        state.unapplied[outcome.row.pk] = outcome
+        log.warning(
+            "relay: could not record the outcome of alert %s (%s); retrying",
+            outcome.row.pk,
+            type(exc).__name__,
+        )
+
+
+def _flush_unapplied(state: RelayState) -> None:
+    """Write every kept outcome, oldest first; a database error stops and propagates.
+
+    Each entry is removed once written, so a flush cut short by the error resumes where it
+    stopped on the next call.
+    """
+    for outcome in list(state.unapplied.values()):
+        _record(outcome, state)
+        del state.unapplied[outcome.row.pk]
+
+
+def _record(outcome: Unapplied, state: RelayState) -> None:
+    """Write one outcome on its claimed row: back to pending if nothing was sent."""
+    if outcome.result is None:
+        outbox.mark_retry(outcome.row.pk, outcome.answered_at, "pre_send_error")
+        return
+    _apply(outcome.row, outcome.attempts, outcome.result, outcome.answered_at, state, outcome.key)
 
 
 def _late_prefix(row: OutboxMessage, now: datetime) -> str | None:
@@ -299,5 +414,6 @@ def _apply(
     else:  # not_sent or transient: nothing was delivered, retry with a capped backoff
         delay = timedelta(seconds=min(2**attempts, BACKOFF_CAP_S))
     next_attempt_at = now + delay
-    outbox.mark_retry(row.pk, next_attempt_at, result.code or result.kind)
+    # In memory first: if the write below fails, the bot still waits (WR-04).
     state.not_before[key] = next_attempt_at
+    outbox.mark_retry(row.pk, next_attempt_at, result.code or result.kind)
