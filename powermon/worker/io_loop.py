@@ -47,7 +47,15 @@ and a short code only (OPS-08). Loop-body pattern of ``detection.run_cycle``:
 ``run_iteration``), so a connection the database dropped is replaced before the first
 statement (D-16, MON-06), then each location in its own ``try``, with a progress ``tick``
 after each one for the watchdog (D-15).
-Expiry (ALRT-03) and late-alert times (ALRT-04) arrive in 02-07.
+
+A late alert states when its event happened (ALRT-04, D-05 to D-07). Right before a
+subscriber row is claimed, ``_deliver`` reads the clock and, when the row goes out more
+than ``LATE_AFTER`` (120 s) after its ``recorded_at``, renders the event's local time
+(``times.event_prefix`` in ``settings.CFG.display_tz``: ``HH:MM``, or ``DD.MM HH:MM`` on
+another local date) before the bold status. Lateness counts from ``recorded_at``, never
+from the backdated outage start (INV-15). Ops notices carry their own times and never get
+this prefix.
+Expiry (ALRT-03) arrives later in 02-07.
 """
 
 import hashlib
@@ -64,6 +72,7 @@ from powermon.alerts import ops, outbox
 from powermon.alerts.models import OutboxMessage
 from powermon.alerts.texts import render_alert
 from powermon.clock import Clock
+from powermon.i18n import times
 from powermon.telegram.client import DEFAULT_RETRY_AFTER_S, SendResult, TelegramClient
 
 log = logging.getLogger(__name__)
@@ -74,6 +83,8 @@ PERMANENT_BACKOFF = timedelta(minutes=15)
 # a bug or a hostile answer (and could overflow the datetime arithmetic): after an hour
 # the next try simply gets a fresh 429 with the remaining wait.
 MAX_RETRY_AFTER_S = 3600
+# An alert sent later than this after it was recorded states its event time (D-07).
+LATE_AFTER = timedelta(seconds=120)
 # Which payload value holds the previous state's duration for each alert kind.
 _DURATION_KEYS = {outbox.KIND_POWER_OFF: "was_on_us", outbox.KIND_POWER_ON: "was_off_us"}
 
@@ -155,7 +166,8 @@ def _deliver(row: OutboxMessage, clock: Clock, state: RelayState) -> bool:
     if state.not_before.get(key, now) > now:
         return False
     try:
-        text = _render(row, location.language)
+        # Rendered now, right before the claim: lateness is measured at send time (D-07).
+        text = _render(row, location.language, _late_prefix(row, now))
     except KeyError, TypeError, ValueError:
         # A broken row backs off alone: the bot is fine, so other locations keep sending.
         outbox.mark_retry(row.pk, now + PERMANENT_BACKOFF, "render_error")
@@ -202,11 +214,22 @@ def _deliver_ops(clock: Clock, state: RelayState) -> bool:
     return True
 
 
-def _render(row: OutboxMessage, language: str) -> str:
+def _late_prefix(row: OutboxMessage, now: datetime) -> str | None:
+    """The event's local time if the alert goes out more than LATE_AFTER after it was recorded.
+
+    The event time is the outage start for OFF and the restore time for ON (``event_at``);
+    lateness counts from ``recorded_at`` (D-05 to D-07, INV-15).
+    """
+    if now - row.recorded_at <= LATE_AFTER:
+        return None
+    return times.event_prefix(row.event_at, now, settings.CFG.display_tz)
+
+
+def _render(row: OutboxMessage, language: str, prefix: str | None) -> str:
     payload = row.payload
     if not isinstance(payload, dict):
         raise TypeError("the alert payload is not an object")
-    return render_alert(row.kind, language, payload[_DURATION_KEYS[row.kind]])
+    return render_alert(row.kind, language, payload[_DURATION_KEYS[row.kind]], prefix)
 
 
 def _apply(
