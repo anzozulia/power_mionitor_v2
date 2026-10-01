@@ -368,8 +368,12 @@ Undo: plug A back in (one ON follows).
 
 ### DoD 3: Telegram blocked for 10 minutes during an outage
 
-1. Unplug device A. As soon as the location list shows A as **Off** (the OFF is
-   recorded), make Telegram refuse connections from the worker:
+Telegram is blocked before A's OFF is recorded, so both of A's alerts have to wait in the
+outbox and go out late (INV-15: blocked 10:00-10:10, last heartbeat 10:02, power back
+10:06). Block first: the worker sends a new alert within about a second of recording it.
+
+1. Make Telegram refuse connections from the worker, and note the time (the 10 minutes
+   start now):
 
    ```sh
    docker compose -f docker-compose.prod.yml exec -u root worker sh -c 'echo "127.0.0.1 api.telegram.org" >> /etc/hosts'
@@ -383,8 +387,20 @@ Undo: plug A back in (one ON follows).
 
    Never block Telegram with a dead HTTPS proxy: the client counts a failed proxy as
    "may have been delivered", so the alert would not be resent.
-2. After a few minutes, restore A's power.
-3. While Telegram is blocked, time heartbeats from another machine, with the key of a
+2. Only now unplug device A. Reload the location list until it shows A as **Off**
+   (within A's period plus grace), and note A's **Last heartbeat**: that is the outage
+   start. Check that the OFF is waiting in the outbox and was not sent:
+
+   ```sh
+   docker compose -f docker-compose.prod.yml exec db psql -U <POSTGRES_USER> -d <POSTGRES_DB> -c "SELECT id, kind, status, last_error FROM outbox_message WHERE channel = 'subscriber' ORDER BY id DESC LIMIT 1"
+   ```
+
+   It must show `power_off`, `pending` and `connect_error`. If it shows `sent`, the
+   block did not work: remove it (step 5), plug A back in and start again.
+3. A few minutes later, and at least 3 minutes before the block ends, restore A's power
+   and note the time: that is the restore time (A's first heartbeat follows within its
+   period).
+4. While Telegram is blocked, time heartbeats from another machine, with the key of a
    location whose device is on (never A's key while A is unplugged: every request
    counts as a heartbeat):
 
@@ -392,8 +408,8 @@ Undo: plug A back in (one ON follows).
    curl -s -o /dev/null -w '%{time_total}\n' 'https://DOMAIN/hb' -H 'Authorization: Bearer <key>'
    ```
 
-4. After 10 minutes, remove the block (`sed -i` cannot edit the container's
-   `/etc/hosts`, so the file is rewritten in place):
+5. When the block has lasted 10 minutes, remove it (`sed -i` cannot edit the
+   container's `/etc/hosts`, so the file is rewritten in place):
 
    ```sh
    docker compose -f docker-compose.prod.yml exec -u root worker sh -c 'grep -v api.telegram.org /etc/hosts > /tmp/hosts && cat /tmp/hosts > /etc/hosts'
@@ -403,8 +419,11 @@ Undo: plug A back in (one ON follows).
 
 Expected:
 
-- within about 60 s of unblocking, A's OFF and then its ON arrive exactly once each, both
-  starting with their local event time (the outage start, then the restore time);
+- while Telegram is blocked, the test channel gets nothing from A;
+- within about 60 s of unblocking, A's OFF and then A's ON arrive, exactly once each.
+  Both start with their local event time: the OFF with the outage start (step 2), the
+  ON with the restore time (step 3), for example `🔴 10:02 POWER OFF`, then
+  `🟢 10:06 POWER ON`;
 - every timed heartbeat took under 1 s;
 - no `❓ … may not have been delivered` notice: a refused connection means "not sent",
   so the alerts were retried.
