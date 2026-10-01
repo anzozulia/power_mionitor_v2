@@ -1,4 +1,4 @@
-"""The Compose files and the Caddyfile, checked as data (SEC-02, INV-22 #1, D-02 to D-05).
+"""The Compose files and the Caddyfile, checked as data (SEC-02, INV-22 #1, INV-23, D-02-05).
 
 Production is never started on a dev machine; it is deployed on the VPS (01-11). These
 parse checks keep the committed deploy shape honest: only the TLS proxy is exposed,
@@ -311,7 +311,8 @@ def test_caddyfile_https_only_proxy() -> None:
     site = blocks["{$DOMAIN}"]
     assert "reverse_proxy web:8000 {" in site
     assert "request_buffers 64KB" in site
-    # No access log: device keys in ?key= never reach a proxy log.
+    # No access log, which would print every ?key= device key. The error log still sees
+    # request URIs; test_INV23_caddy_logs_cut_the_query_out_of_request_uris covers it.
     assert not [line for line in site if line.split()[0] == "log"]
 
 
