@@ -49,3 +49,30 @@ def enqueue(
         next_attempt_at=recorded_at,
         expires_at=recorded_at + MAX_AGE,
     )
+
+
+# RED-phase interface stubs (replaced in GREEN).
+
+
+def subscriber_heads() -> list[OutboxMessage]:
+    return []
+
+
+def claim(message_id: int) -> bool:
+    return False
+
+
+def mark_sent(message_id: int, now: datetime) -> bool:
+    return False
+
+
+def mark_uncertain(message_id: int, code: str) -> bool:
+    return False
+
+
+def mark_retry(message_id: int, next_attempt_at: datetime, code: str) -> bool:
+    return False
+
+
+def recover_interrupted() -> int:
+    return 0
