@@ -1,0 +1,22 @@
+{% load static %}<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Server error · Power Monitor</title>
+<link rel="stylesheet" href="{% static 'web/app.css' %}">
+</head>
+<body>
+{% comment %}
+Standalone on purpose: Django's 500 handler renders this with no context and no request,
+so it must not inherit the page shell, which needs both.
+{% endcomment %}
+<header class="site-header"><span class="wordmark">Power Monitor</span></header>
+<main class="main flow main--single">
+<h1>Something went wrong</h1>
+<p>The server could not finish this request. Details are in the web container logs. Try again in a moment.</p>
+<p><a href="/">Back to locations</a></p>
+</main>
+</body>
+</html>
