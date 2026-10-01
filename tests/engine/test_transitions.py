@@ -234,6 +234,29 @@ def test_IN01_restore_never_closes_before_the_open_interval_start(
 
 
 @pytest.mark.django_db
+def test_IN01_restore_without_an_open_interval_clamps_to_the_outage_start(
+    location_factory: Callable[..., Any],
+) -> None:
+    # An off location with no stored interval (none to clamp to): the outage start alone
+    # keeps "was OFF for" from going negative after a backward clock step.
+    location = location_factory()
+    LocationState.objects.filter(pk=location.pk).update(
+        status="off",
+        on_since=_at(10, 0),
+        last_heartbeat_at=_at(10, 5),
+        outage_started_at=_at(10, 5),
+    )
+
+    assert transitions.record_heartbeat(location.pk, _at(10, 4)) == "restored"
+
+    state = LocationState.objects.get(pk=location.pk)
+    assert (state.status, state.on_since, state.last_heartbeat_at) == ("on", _at(10, 5), _at(10, 5))
+    assert _intervals(location) == [("on", _at(10, 5), None, None)]
+    [on] = OutboxMessage.objects.filter(location=location)
+    assert (on.event_at, on.payload) == (_at(10, 5), {"was_off_us": 0})
+
+
+@pytest.mark.django_db
 @pytest.mark.parametrize(
     ("status", "stale"),
     [("waiting", "on"), ("waiting", "off"), ("on", "waiting")],
