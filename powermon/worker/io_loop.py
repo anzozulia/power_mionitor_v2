@@ -103,7 +103,7 @@ def run_iteration(clock: Clock, state: RelayState, stop: threading.Event | None 
             # The type only: an exception's text can carry connection details or a URL.
             log.error("relay failed for location %s: %s", row.location_id, type(exc).__name__)
     # Ops notices go after every subscriber head (INV-20 #2), and only to a configured chat.
-    if settings.CFG.ops_configured and not (stop is not None and stop.is_set()):
+    if not (stop is not None and stop.is_set()):
         try:
             attempted = _deliver_ops(clock, state) or attempted
         except Exception as exc:
@@ -140,15 +140,16 @@ def _deliver_ops(clock: Clock, state: RelayState) -> bool:
 
     At most one ops row per pass; True if a send was attempted.
     """
+    token = settings.CFG.ops_bot_token
+    chat_id = settings.CFG.ops_chat_id
+    if not token or chat_id is None:
+        # No ops chat: notices go to the log (D-09); a row queued earlier just waits.
+        return False
     row = outbox.ops_head()
     if row is None:
         return False
     now = clock.now()
     if row.status != "pending" or row.next_attempt_at > now:
-        return False
-    token = settings.CFG.ops_bot_token
-    chat_id = settings.CFG.ops_chat_id
-    if not token or chat_id is None:
         return False
     key = bot_key(token)
     if state.not_before.get(key, now) > now:

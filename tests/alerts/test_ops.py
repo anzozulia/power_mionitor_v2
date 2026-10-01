@@ -330,6 +330,48 @@ def test_ops_bot_backoff_is_its_own(
 
 
 @pytest.mark.django_db(transaction=True)
+def test_a_bot_shared_by_a_location_and_the_ops_chat_backs_off_once(
+    location_factory: Callable[..., Any], fake_telegram: Any, settings: Any
+) -> None:
+    # Telegram limits each bot, not each chat: when the admin reuses a location's bot for the
+    # ops chat, that location's 429 also holds back a due ops notice, and nothing else.
+    settings.CFG = dataclasses.replace(settings.CFG, ops_bot_token=TOKEN_A, ops_chat_id=OPS_CHAT_ID)
+    with transaction.atomic():
+        notice = outbox.enqueue_ops(outbox.KIND_OPS_GAP, payload=_gap_payload(), recorded_at=T0)
+    alert = _queue(location_factory(bot_token=TOKEN_A))
+    fake_telegram.fail(TOKEN_A, status=429, json_body=_too_many_requests(30))
+    fake_telegram.accept(TOKEN_A)
+    state = io_loop.RelayState()
+
+    assert io_loop.run_iteration(FakeClock(T0), state) is True
+
+    assert len(fake_telegram.calls) == 1
+    assert (_row(notice).status, _row(notice).attempts) == ("pending", 0)
+    assert io_loop.run_iteration(FakeClock(T0 + _seconds(29)), state) is False
+
+    assert io_loop.run_iteration(FakeClock(T0 + _seconds(30)), state) is True
+    assert (_row(alert).status, _row(notice).status) == ("sent", "sent")
+    assert [body["chat_id"] for body in fake_telegram.sent] == [DEFAULT_CHAT_ID, OPS_CHAT_ID]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_an_ops_row_that_cannot_be_claimed_is_not_sent(
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    ops_settings: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notice = _uncertain_notice(location_factory())
+    fake_telegram.accept(OPS_BOT_TOKEN)
+    monkeypatch.setattr(outbox, "claim", lambda message_id: False)
+
+    assert io_loop.run_iteration(FakeClock(T0), io_loop.RelayState()) is False
+
+    assert len(fake_telegram.calls) == 0
+    assert (_row(notice).status, _row(notice).attempts) == ("pending", 0)
+
+
+@pytest.mark.django_db(transaction=True)
 def test_no_ops_request_when_the_ops_chat_is_not_configured(
     location_factory: Callable[..., Any], fake_telegram: Any, no_ops_chat: Any
 ) -> None:

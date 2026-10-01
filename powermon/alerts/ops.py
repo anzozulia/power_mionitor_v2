@@ -171,6 +171,29 @@ def mark_uncertain(message_id: int, code: str, now: datetime) -> bool:
         return True
 
 
+def recover_interrupted(now: datetime) -> int:
+    """Rows a stopped worker left in "sending" become uncertain, each notified once (D-13).
+
+    One transaction: every such row becomes "uncertain" (``last_error`` "interrupted") and
+    is never resent; each subscriber row queues (or logs) one ``ops_uncertain`` notice and
+    each ops row is only logged. Returns how many rows changed. Only the active worker
+    calls this, on activation.
+    """
+    with transaction.atomic():
+        rows = outbox.recover_interrupted()
+        for ref in rows:
+            if ref.channel == outbox.CHANNEL_SUBSCRIBER:
+                notify(
+                    outbox.KIND_OPS_UNCERTAIN,
+                    payload={"message_id": ref.id},
+                    recorded_at=now,
+                    location_id=ref.location_id,
+                )
+            else:
+                log.warning("ops notice %s was interrupted while sending; it is not resent", ref.id)
+    return len(rows)
+
+
 def _int(payload: object, key: str) -> int:
     if not isinstance(payload, dict):
         raise TypeError("an ops payload is not an object")

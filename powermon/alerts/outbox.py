@@ -26,7 +26,9 @@ transaction (``powermon.alerts.ops``, D-11 #5); an uncertain ops row is only log
 """
 
 from datetime import datetime, timedelta
+from typing import NamedTuple
 
+from django.db import connection
 from django.db.models import F
 
 from powermon.alerts.models import OPEN_STATUSES, OutboxMessage
@@ -53,6 +55,20 @@ OPS_KINDS = (
 MAX_AGE = timedelta(hours=6)
 # The database column is varchar(64).
 MAX_ERROR_LENGTH = 64
+
+RECOVER_SQL = """
+UPDATE outbox_message SET status = 'uncertain', last_error = 'interrupted'
+ WHERE status = 'sending'
+RETURNING id, channel, location_id
+"""
+
+
+class RowRef(NamedTuple):
+    """Which row a transition changed: enough to queue a notice about it."""
+
+    id: int
+    channel: str
+    location_id: int | None
 
 
 def enqueue(
@@ -181,15 +197,17 @@ def mark_retry(message_id: int, next_attempt_at: datetime, code: str) -> bool:
     return updated == 1
 
 
-def recover_interrupted() -> int:
-    """Turn rows left in "sending" by a stopped worker into "uncertain"; return the count.
+def recover_interrupted() -> list[RowRef]:
+    """Turn rows left in "sending" by a stopped worker into "uncertain"; return them by id.
 
     Such a send may have reached Telegram, so it is never repeated (at-most-once, INV-16).
-    Only the active worker calls this, on activation, before its loops start.
+    One UPDATE ... RETURNING, so the caller can queue one notice per subscriber row in the
+    same transaction. Only the active worker calls this, through
+    ``powermon.alerts.ops.recover_interrupted`` on activation, before its loops start.
     """
-    return OutboxMessage.objects.filter(status="sending").update(
-        status="uncertain", last_error="interrupted"
-    )
+    with connection.cursor() as cur:
+        cur.execute(RECOVER_SQL)
+        return sorted(RowRef(*row) for row in cur.fetchall())
 
 
 def _check_payload(payload: dict[str, int], rule: str) -> None:

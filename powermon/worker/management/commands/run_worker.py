@@ -38,7 +38,7 @@ from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 from django.db import connection
 
-from powermon.alerts import outbox
+from powermon.alerts import ops
 from powermon.clock import Clock, SystemClock
 from powermon.engine.models import SystemState
 from powermon.worker.detection import run_cycle
@@ -61,7 +61,7 @@ EXIT_LEASE_LOST = 3
 
 def activate(now: datetime) -> None:
     """Start the active term: interrupted sends become uncertain, detection restarts at now."""
-    recovered = outbox.recover_interrupted()
+    recovered = ops.recover_interrupted(now)
     # update_or_create: a missing singleton row must not stop the worker.
     SystemState.objects.update_or_create(pk=1, defaults={"detection_resumed_at": now})
     log.info(
