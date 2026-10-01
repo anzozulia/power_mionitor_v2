@@ -135,5 +135,6 @@ LOGOUT_REDIRECT_URL = "login"
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
-# stdout only, through the redacting formatter; urllib3 and django.db.backends at WARNING.
-LOGGING = logging_setup.LOGGING
+# stdout only, through the redacting formatter, with UTC ISO 8601 timestamps (IN-03).
+# LOG_LEVEL sets root and django; urllib3 and django.db.backends stay at WARNING (D-16).
+LOGGING = logging_setup.build_logging(CFG.log_level)
