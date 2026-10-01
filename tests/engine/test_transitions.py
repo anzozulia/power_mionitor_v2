@@ -6,7 +6,9 @@ intervals, so no code path can corrupt the one source of truth. The first heartb
 silent (K-1); the first heartbeat after an outage turns the location ON and queues
 exactly one ON alert in the same transaction (K-3, D-14). A restore clamped after a
 backward clock step (IN-01) dates the ON alert at the clamp but records it at the
-heartbeat's receive time, so the relay can send it at once (audit A2).
+heartbeat's receive time, so the relay can send it at once (audit A2). An OFF is
+recorded from the open interval's start when a lapse carve moved that start past the
+decided outage start (D2), so it never closes an interval before its start.
 
 Tests that reach OFF through ``detection.run_cycle`` are ``django_db(transaction=True)``:
 the cycle calls ``close_old_connections()``, which would close the connection inside
@@ -15,7 +17,7 @@ pytest-django's per-test transaction.
 
 import logging
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -24,7 +26,7 @@ from django.db import IntegrityError, connection, transaction
 
 from powermon.alerts import texts
 from powermon.alerts.models import OutboxMessage
-from powermon.engine import timeline, transitions
+from powermon.engine import lapse, rules, timeline, transitions
 from powermon.engine.models import LocationState, PowerInterval, SystemState
 from powermon.worker import detection, io_loop
 
@@ -288,6 +290,94 @@ def test_IN01_clamped_on_alert_is_sent_at_the_receive_time(
     assert [message["text"] for message in fake_telegram.sent][1:] == [
         texts.render_alert("power_on", location.language, 0)
     ]
+
+
+# D2 (final audit): an OFF never starts before the open interval it closes. A lapse carve
+# can move the open on piece's start past the decided outage start (a carver that lost
+# the cursor CAS with a later now, or a carve between the snapshot and the CAS). The OFF
+# is then recorded from the open piece's start, the same clamp as IN-01's restore.
+
+
+def _on_since_0800_carved_until_1010(location: Any) -> None:
+    """On since 08:00, last heartbeat 09:59, a carved gap [10:00, 10:10), on again from 10:10."""
+    _insert(location, "on", _at(8, 0), _at(10, 0))
+    _insert(location, "not_monitored", _at(10, 0), _at(10, 10))
+    _insert(location, "on", _at(10, 10), None)
+    LocationState.objects.filter(pk=location.pk).update(
+        status="on", on_since=_at(8, 0), last_heartbeat_at=_at(9, 59), state_version=1
+    )
+
+
+def _decided(resumed: datetime, now: datetime) -> tuple[rules.Snapshot, rules.Decision]:
+    [(snap, _alerts_enabled)] = transitions.read_snapshots()
+    decision = rules.decide(snap, rules.Anchors(detection_resumed_at=resumed), now)
+    assert decision.off
+    return snap, decision
+
+
+def _transition_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == transitions.__name__]
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("shape", ["on_before_the_start", "on_from_the_start"])
+def test_D2_mark_off_keeps_the_decided_outage_start_in_the_normal_case(
+    location_factory: Callable[..., Any], caplog: pytest.LogCaptureFixture, shape: str
+) -> None:
+    location = location_factory()
+    if shape == "on_before_the_start":
+        # K-2: on since 10:00, silent after 10:05; the open piece began long before.
+        for minute in range(6):
+            transitions.record_heartbeat(location.pk, _at(10, minute))
+        snap, decision = _decided(_at(9, 0), _at(10, 6, 31))
+        start, previous = _at(10, 5), ("on", _at(10, 0), _at(10, 5), None)
+    else:
+        # INV-11 #1: the fresh window and the open piece both start at the carve end.
+        _on_since_0800_carved_until_1010(location)
+        snap, decision = _decided(_at(10, 10), _at(10, 11, 31))
+        start, previous = _at(10, 10), ("not_monitored", _at(10, 0), _at(10, 10), None)
+    assert decision.outage_start == start
+    caplog.set_level(logging.WARNING, logger=transitions.__name__)
+
+    assert transitions.mark_off(snap, decision, _at(10, 11, 31), True) is True
+
+    assert LocationState.objects.get(pk=location.pk).outage_started_at == start
+    assert _intervals(location)[-2:] == [previous, ("off", start, None, start)]
+    [off] = OutboxMessage.objects.filter(location=location)
+    assert (off.kind, off.event_at) == ("power_off", start)
+    assert _transition_warnings(caplog) == []
+
+
+@pytest.mark.django_db
+def test_D2_mark_off_starts_the_off_where_a_later_carve_moved_the_open_piece(
+    location_factory: Callable[..., Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    location = location_factory()
+    _on_since_0800_carved_until_1010(location)
+    snap, decision = _decided(_at(10, 10), _at(10, 11, 31))
+    assert decision.outage_start == _at(10, 10)
+    # After the snapshot, a carve up to 10:10:00.2 commits: the open piece starts later.
+    moved = _at(10, 10) + timedelta(milliseconds=200)
+    assert lapse.carve_window(_at(10, 0), moved) == 1
+    caplog.set_level(logging.WARNING, logger=transitions.__name__)
+
+    # Before D2 this closed the open piece before its start: power_interval_end_after_start.
+    assert transitions.mark_off(snap, decision, _at(10, 11, 31), True) is True
+
+    state = LocationState.objects.get(pk=location.pk)
+    assert (state.status, state.outage_started_at) == ("off", moved)
+    assert _intervals(location)[-2:] == [
+        ("not_monitored", _at(10, 10), moved, None),
+        ("off", moved, None, moved),
+    ]
+    [off] = OutboxMessage.objects.filter(location=location)
+    assert (off.kind, off.event_at, off.recorded_at) == ("power_off", moved, _at(10, 11, 31))
+    # "Was ON for" is still last heartbeat - on time (D-03), unaffected by the clamp.
+    assert off.payload == {"was_on_us": (_at(9, 59) - _at(8, 0)) // timedelta(microseconds=1)}
+    [warning] = _transition_warnings(caplog)
+    assert warning.levelno == logging.WARNING
+    assert f"location {location.pk} " in warning.getMessage()
+    assert warning.exc_info is None
 
 
 @pytest.mark.django_db

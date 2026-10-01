@@ -442,6 +442,56 @@ def test_INV10_a_second_carver_with_a_stale_cursor_records_nothing(
 
 
 @pytest.mark.django_db(transaction=True)
+def test_INV10_a_losing_carver_with_a_later_now_never_blocks_the_off(
+    location_factory: Callable[..., Any], ops_settings: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # D2 (final audit): two carvers read the same cursor. The winner records the gap with
+    # now 10:10:00.000; the loser carves up to 10:10:00.200 and loses the cursor CAS. The
+    # open on piece then starts after the fresh window the winner opened.
+    _system(cursor=_at(10, 0), resumed=_at(7, 0))
+    location = location_factory()
+    assert transitions.record_heartbeat(location.pk, _at(8, 0)) == "started"
+    assert transitions.record_heartbeat(location.pk, _at(9, 59)) == "plain"
+    winner, loser = _at(10, 10), _at(10, 10, 0, 200_000)
+    assert lapse.carve_if_needed(winner, force=True) == lapse.Gap(_at(10, 0), winner)
+    monkeypatch.setattr(lapse, "read_cursor", lambda: _at(10, 0))
+
+    assert lapse.carve_if_needed(loser, force=True) is None
+
+    assert _anchors() == (winner, winner)
+    assert _intervals(location)[-2:] == [
+        ("not_monitored", winner, loser, None),
+        ("on", loser, None, None),
+    ]
+
+    # Silent since 09:59: the fresh window from 10:10:00.000 runs out after 10:11:30.
+    assert detection.run_cycle(_at(10, 11, 30)) == 0
+    assert detection.run_cycle(_at(10, 11, 31)) == 1
+    for later in (_at(10, 30), _at(12, 0)):
+        assert detection.run_cycle(later) == 0
+
+    # Exactly one OFF and one alert, starting where the open piece starts, never before.
+    [off] = _subscriber_rows(location)
+    assert (off.kind, off.event_at, off.recorded_at) == (
+        outbox.KIND_POWER_OFF,
+        loser,
+        _at(10, 11, 31),
+    )
+    # D-03: "was ON for" is still last heartbeat - on time.
+    assert off.payload == {"was_on_us": (_at(9, 59) - _at(8, 0)) // timedelta(microseconds=1)}
+    assert _intervals(location)[-2:] == [
+        ("not_monitored", winner, loser, None),
+        ("off", loser, None, loser),
+    ]
+    assert LocationState.objects.get(pk=location.pk).outage_started_at == loser
+
+    # "Was OFF for" then counts from that start.
+    assert transitions.record_heartbeat(location.pk, _at(12, 10)) == "restored"
+    _off, on = _subscriber_rows(location)
+    assert on.payload == {"was_off_us": (_at(12, 10) - loser) // timedelta(microseconds=1)}
+
+
+@pytest.mark.django_db(transaction=True)
 def test_INV10_two_carvers_one_gap_notice(ops_settings: Any) -> None:
     _system(cursor=_at(10, 0), resumed=_at(9, 0))
 
