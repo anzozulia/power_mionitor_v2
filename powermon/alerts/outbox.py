@@ -19,15 +19,24 @@ during it:
        ^                  |----mark_uncertain--> uncertain (never resent, INV-16)
        '---mark_retry-----'
     sending --recover_interrupted (worker activation)--> uncertain
+    pending --expire_due (expires_at <= now)--> expired (never sent, ALRT-03)
 
 A subscriber row that becomes uncertain queues one ``ops_uncertain`` notice in the same
 transaction (``powermon.alerts.ops``, D-11 #5); an uncertain ops row is only logged.
+
+Every row expires ``ALERT_MAX_AGE_HOURS`` after it was recorded (D-07): ``expires_at`` is
+set at enqueue from ``settings.CFG.alert_max_age_hours``, read at call time. The relay
+runs ``expire_due`` at the start of every pass, before any head is sent, and queues one
+``ops_expired`` notice per expired subscriber row in the same transaction; an expired ops
+row is only logged (D-08). Only a pending row expires: a "sending" row belongs to the send
+in flight (or to activation's recovery).
 ``last_error`` is always a short code (at most 64 characters), never a URL or a token.
 """
 
 from datetime import datetime, timedelta
 from typing import NamedTuple
 
+from django.conf import settings
 from django.db import connection
 from django.db.models import F
 
@@ -51,14 +60,18 @@ OPS_KINDS = (
     KIND_OPS_EXPIRED,
     KIND_OPS_UNCERTAIN,
 )
-# Written into expires_at now; enforced in Phase 2 (ALRT-03, default maximum age 6 h).
-MAX_AGE = timedelta(hours=6)
 # The database column is varchar(64).
 MAX_ERROR_LENGTH = 64
 
 RECOVER_SQL = """
 UPDATE outbox_message SET status = 'uncertain', last_error = 'interrupted'
  WHERE status = 'sending'
+RETURNING id, channel, location_id
+"""
+
+EXPIRE_SQL = """
+UPDATE outbox_message SET status = 'expired', last_error = 'expired'
+ WHERE status = 'pending' AND expires_at <= %(now)s
 RETURNING id, channel, location_id
 """
 
@@ -97,7 +110,7 @@ def enqueue(
         payload=dict(payload),
         status="pending",
         next_attempt_at=recorded_at,
-        expires_at=recorded_at + MAX_AGE,
+        expires_at=_expires_at(recorded_at),
     )
 
 
@@ -132,7 +145,7 @@ def enqueue_ops(
         payload=dict(payload),
         status="pending",
         next_attempt_at=recorded_at,
-        expires_at=recorded_at + MAX_AGE,
+        expires_at=_expires_at(recorded_at),
     )
 
 
@@ -208,6 +221,24 @@ def recover_interrupted() -> list[RowRef]:
     with connection.cursor() as cur:
         cur.execute(RECOVER_SQL)
         return sorted(RowRef(*row) for row in cur.fetchall())
+
+
+def expire_due(now: datetime) -> list[RowRef]:
+    """Turn pending rows whose ``expires_at`` has come into "expired"; return them by id.
+
+    An expired row is never sent (ALRT-03). One UPDATE ... RETURNING on the caller's
+    connection, so the caller can queue one notice per subscriber row in the same
+    transaction (D-08). A row expires at exactly ``expires_at``. Rows in "sending" and
+    finished rows are left alone.
+    """
+    with connection.cursor() as cur:
+        cur.execute(EXPIRE_SQL, {"now": now})
+        return sorted(RowRef(*row) for row in cur.fetchall())
+
+
+def _expires_at(recorded_at: datetime) -> datetime:
+    """``recorded_at`` plus the configured maximum age, read now (D-07)."""
+    return recorded_at + timedelta(hours=settings.CFG.alert_max_age_hours)
 
 
 def _check_payload(payload: dict[str, int], rule: str) -> None:

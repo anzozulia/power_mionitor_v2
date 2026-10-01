@@ -55,7 +55,14 @@ than ``LATE_AFTER`` (120 s) after its ``recorded_at``, renders the event's local
 another local date) before the bold status. Lateness counts from ``recorded_at``, never
 from the backdated outage start (INV-15). Ops notices carry their own times and never get
 this prefix.
-Expiry (ALRT-03) arrives later in 02-07.
+
+Expiry (ALRT-03, D-07, D-08) is the first work step of every pass, before any head is
+sent: in one transaction every pending row whose ``expires_at`` has come becomes
+"expired" (``outbox.expire_due``) and is never sent, and each expired subscriber alert
+queues one ``ops_expired`` notice; an expired ops row is only logged, so a broken admin
+chat cannot loop. The location's next alert (the ON after an expired OFF) is then its head
+and goes out in the same pass. A database error in this step ends the pass before any
+claim and reaches the caller (``run_worker`` logs it once per outage, by class name).
 """
 
 import hashlib
@@ -66,7 +73,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from django.conf import settings
-from django.db import close_old_connections
+from django.db import close_old_connections, transaction
 
 from powermon.alerts import ops, outbox
 from powermon.alerts.models import OutboxMessage
@@ -132,6 +139,8 @@ def run_iteration(
     skipped or failed, and after the ops step, so a long pass still shows progress.
     """
     close_old_connections()
+    # Nothing past its maximum age may go out, so expiry runs before any head (ALRT-03).
+    _expire(clock.now())
     attempted = False
     for row in outbox.subscriber_heads():
         if stop is not None and stop.is_set():
@@ -154,6 +163,29 @@ def run_iteration(
         if tick is not None:
             tick()
     return attempted
+
+
+def _expire(now: datetime) -> int:
+    """Expire every pending row past its ``expires_at``; notify once per subscriber alert.
+
+    One transaction: the rows become "expired" and each subscriber row queues (or, with no
+    ops chat, logs) one ``ops_expired`` notice with them (D-08). An expired ops row is only
+    logged: a notice about a notice would loop on a broken admin chat. Returns how many
+    rows expired.
+    """
+    with transaction.atomic():
+        rows = outbox.expire_due(now)
+        for ref in rows:
+            if ref.channel == outbox.CHANNEL_SUBSCRIBER:
+                ops.notify(
+                    outbox.KIND_OPS_EXPIRED,
+                    payload={"message_id": ref.id},
+                    recorded_at=now,
+                    location_id=ref.location_id,
+                )
+            else:
+                log.warning("ops notice %s expired undelivered; it is not resent", ref.id)
+    return len(rows)
 
 
 def _deliver(row: OutboxMessage, clock: Clock, state: RelayState) -> bool:
