@@ -11,6 +11,7 @@ the cycle calls ``close_old_connections()``, which would close the connection in
 pytest-django's per-test transaction.
 """
 
+import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
@@ -161,22 +162,109 @@ def test_heartbeat_after_restore_is_plain(location_factory: Callable[..., Any]) 
 
 
 @pytest.mark.django_db(transaction=True)
-def test_restore_dated_before_the_outage_start_writes_nothing(
+def test_IN01_backward_clock_step_heartbeat_restores_at_outage_start(
+    location_factory: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # IN-01: the server clock stepped back after the OFF, so the heartbeat's receive time
+    # (10:04) lies before the outage start (10:05). The restore is clamped to the outage
+    # start: no 500, the CHECK holds, and "was OFF for" is 0, never negative.
+    location = _off_since_1005(location_factory)
+    other = _off_since_1005(location_factory, name="Other location")
+    monkeypatch.setattr(transitions, "_restore_clamp_warned", False)
+    caplog.set_level(logging.WARNING, logger=transitions.__name__)
+
+    assert transitions.record_heartbeat(location.pk, _at(10, 4)) == "restored"
+
+    state = LocationState.objects.get(pk=location.pk)
+    assert (state.status, state.on_since, state.last_heartbeat_at) == ("on", _at(10, 5), _at(10, 5))
+    # The off piece would end where it starts: it is deleted, never closed before its start.
+    assert _intervals(location) == [
+        ("on", _at(10, 0), _at(10, 5), None),
+        ("on", _at(10, 5), None, None),
+    ]
+    on = OutboxMessage.objects.get(location=location, kind="power_on")
+    assert (on.event_at, on.recorded_at) == (_at(10, 5), _at(10, 5))
+    assert on.payload == {"was_off_us": 0}
+
+    # One WARNING per process: a second clamped restore logs nothing more.
+    assert transitions.record_heartbeat(other.pk, _at(10, 4)) == "restored"
+    warnings = [r for r in caplog.records if r.name == transitions.__name__]
+    assert [r.levelno for r in warnings] == [logging.WARNING]
+    assert f"location {location.pk} " in warnings[0].getMessage()
+    assert warnings[0].exc_info is None
+
+
+@pytest.mark.django_db
+def test_IN01_restore_never_closes_before_the_open_interval_start(
     location_factory: Callable[..., Any],
 ) -> None:
-    # INV-01: a restore stamped before the recorded outage start would give a negative
-    # "was OFF for" and close the off interval before it starts. The timeline CHECK
-    # rejects it and the whole transition rolls back: no half-written state, no alert.
-    location = _off_since_1005(location_factory)
+    # What a lapse carve leaves (MON-05): an outage since 09:00 cut by a not-monitored
+    # span [10:00, 10:10), its open off piece now starting at 10:10. A heartbeat received
+    # at 10:09:59 that commits after the carve restores at 10:10, the open piece's start.
+    location = location_factory()
+    _insert(location, "off", _at(9, 0), _at(10, 0), outage_start_at=_at(9, 0))
+    _insert(location, "not_monitored", _at(10, 0), _at(10, 10))
+    _insert(location, "off", _at(10, 10), None, outage_start_at=_at(9, 0))
+    LocationState.objects.filter(pk=location.pk).update(
+        status="off",
+        on_since=_at(8, 0),
+        last_heartbeat_at=_at(9, 0),
+        outage_started_at=_at(9, 0),
+    )
+
+    assert transitions.record_heartbeat(location.pk, _at(10, 9, 59)) == "restored"
+
+    state = LocationState.objects.get(pk=location.pk)
+    assert (state.status, state.on_since, state.last_heartbeat_at) == (
+        "on",
+        _at(10, 10),
+        _at(10, 10),
+    )
+    assert _intervals(location) == [
+        ("off", _at(9, 0), _at(10, 0), _at(9, 0)),
+        ("not_monitored", _at(10, 0), _at(10, 10), None),
+        ("on", _at(10, 10), None, None),
+    ]
+    [on] = OutboxMessage.objects.filter(location=location)
+    assert (on.kind, on.event_at, on.recorded_at) == ("power_on", _at(10, 10), _at(10, 10))
+    # D-02: "was OFF for" runs from the original outage start, 10:10 - 09:00.
+    assert on.payload == {"was_off_us": 4_200_000_000}
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("status", "stale"),
+    [("waiting", "on"), ("waiting", "off"), ("on", "waiting")],
+)
+def test_MON04_gate_that_misses_the_locked_row_raises_and_writes_nothing(
+    location_factory: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+    fixed_now: datetime,
+    status: str,
+    stale: str,
+) -> None:
+    # The second line of defence: under the row lock every gate matches its row. If one
+    # ever changes 0 rows (here the lock read is faked to return a stale status), the
+    # heartbeat raises and rolls back instead of writing a transition or an alert.
+    location = location_factory()
+    if status == "on":
+        assert transitions.record_heartbeat(location.pk, fixed_now) == "started"
     before = LocationState.objects.filter(pk=location.pk).values().get()
     stored = _intervals(location)
+    stale_lock = (
+        f"SELECT '{stale}', NULL::timestamptz FROM location_state "  # noqa: S608
+        "WHERE location_id = %s FOR UPDATE"
+    )
+    monkeypatch.setattr(transitions, "LOCK_SQL", stale_lock)
 
-    with pytest.raises(IntegrityError, match="power_interval_end_after_start"):
-        transitions.record_heartbeat(location.pk, _at(10, 4))
+    with pytest.raises(RuntimeError, match=f"location {location.pk}: heartbeat gate changed 0"):
+        transitions.record_heartbeat(location.pk, _at(8, 1))
 
     assert LocationState.objects.filter(pk=location.pk).values().get() == before
     assert _intervals(location) == stored
-    assert _kinds() == ["power_off"]
+    assert _kinds() == []
 
 
 @pytest.mark.django_db
