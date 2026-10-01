@@ -56,17 +56,21 @@ connect_timeout, keepalives and tcp_user_timeout stay.
 Supervision (D-15, OPS-05, INV-13 #3): each loop stamps its progress at the top of every
 iteration (DB-down iterations included), after every location and after every outbox row.
 The main thread checks every WATCHDOG_CHECK_S seconds. A loop that has not stamped for
-DETECTION_STALL_S / IO_STALL_S seconds, or whose thread died, runs the stall action:
-by default one CRITICAL line, a stack dump of every thread, a flush and exit 70, after
-which Docker's restart policy restarts the worker. A loop blocked inside a call that never
-returns ends this way. The worker touches the health file (``supervision.HEALTH_FILE``)
-after every successful HELD cycle and on every STANDBY cycle, never while the database is
-down; the compose healthcheck that reads it arrives in 02-10.
+DETECTION_STALL_S / IO_STALL_S seconds, or whose thread died while the worker was not
+stopping, runs the stall action: by default one CRITICAL line, a stack dump of every
+thread, a flush and exit 70, after which Docker's restart policy restarts the worker. A
+loop blocked inside a call that never returns ends this way. The worker touches the
+health file (``supervision.HEALTH_FILE``) after every successful HELD cycle and on every
+STANDBY cycle, never while the database is down; the worker's compose healthcheck
+requires it to be under 30 s old.
 
 SIGTERM and SIGINT set the stop event (Python as PID 1 ignores SIGTERM without a handler,
 Pitfall 14). The loops notice it at their next wait, and the relay also checks it before
 claiming each row, so no new send starts after a stop request. The joins wait up to
 JOIN_TIMEOUT_S for a send already in flight, which ends inside the 30 s stop_grace_period.
+The watchdog gets the stop event too: a loop thread that ended because of it is a
+shutdown, never a stall, so a clean stop always exits 0, even when a check was already
+running as the stop came (E1).
 """
 
 import logging
@@ -262,7 +266,10 @@ def serve(
             {"detection": DETECTION_STALL_S, "telegram-io": IO_STALL_S},
             threads,
             default_on_stall if on_stall is None else on_stall,
+            stop=stop,
         )
+        # No check once the stop is seen here; a check already past this wait when the
+        # stop comes finds the loops it ended as a shutdown, not a stall (E1).
         while not stop.wait(check_interval):
             if watchdog.check() is not None:
                 stop.set()

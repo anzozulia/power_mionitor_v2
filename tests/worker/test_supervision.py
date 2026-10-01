@@ -10,6 +10,8 @@ flushes and exits 70. These tests inject the stall action and drive time with
 
 - INV-13 #3: a loop that stops stamping (stuck inside a call) triggers the stall action
   strictly after its limit, and a dead loop thread triggers it at once.
+- E1: a loop thread that ended while the stop event is set (SIGTERM) is a shutdown, never
+  a stall; the thread's state is read before the stop's.
 - The health file is touched on every healthy cycle; a path that cannot be written logs
   one WARNING per run of failures and never raises.
 - An unreachable database is progress, not a stall: ``DbOutageLog`` logs one WARNING when
@@ -134,6 +136,82 @@ def test_watchdog_acts_once_when_both_loops_stall() -> None:
     # The limits are walked in their given order; the action runs exactly once.
     assert found == ["detection", "detection", "detection"]
     assert stalls == ["detection"]
+
+
+# E1 (final audit): a loop thread that ended because of the stop (SIGTERM) is a shutdown,
+# not a stall. Only a loop that dies or hangs while the worker is not stopping is one.
+
+
+class _EndsWithTheStop(threading.Thread):
+    """A loop thread that sees the stop and returns while the watchdog asks about it.
+
+    Never started: ``is_alive()`` sets the stop and answers False, as a real loop thread
+    that ends between the watchdog's two reads would look.
+    """
+
+    def __init__(self, name: str, stop: threading.Event) -> None:
+        super().__init__(name=name)
+        self.stop_event = stop
+
+    def is_alive(self) -> bool:
+        self.stop_event.set()
+        return False
+
+
+def test_E1_a_loop_that_ended_because_of_the_stop_is_not_a_stall() -> None:
+    clock = FakeClock(T0)
+    progress = supervision.Progress(clock)
+    stalls: list[str] = []
+    stop = threading.Event()
+    progress.stamp("detection")
+    progress.stamp("telegram-io")
+    # SIGTERM: the stop is set, and both loops saw it and returned.
+    stop.set()
+    threads = {name: _finished(name) for name in LIMITS}
+    watchdog = supervision.Watchdog(clock, progress, LIMITS, threads, stalls.append, stop=stop)
+
+    assert watchdog.check() is None
+    assert stalls == []
+
+
+def test_E1_the_stop_is_read_after_the_thread_state() -> None:
+    # Read the other way round, a loop that ends between the two reads would look dead.
+    clock = FakeClock(T0)
+    progress = supervision.Progress(clock)
+    stalls: list[str] = []
+    stop = threading.Event()
+    progress.stamp("detection")
+    progress.stamp("telegram-io")
+    threads = {name: _EndsWithTheStop(name, stop) for name in LIMITS}
+    watchdog = supervision.Watchdog(clock, progress, LIMITS, threads, stalls.append, stop=stop)
+
+    assert watchdog.check() is None
+    assert stop.is_set()
+    assert stalls == []
+
+
+@pytest.mark.parametrize("failure", ["dead", "hung"])
+def test_E1_a_loop_that_dies_or_hangs_while_not_stopping_is_still_a_stall(failure: str) -> None:
+    clock = FakeClock(T0)
+    progress = supervision.Progress(clock)
+    stalls: list[str] = []
+    stop = threading.Event()
+    with _running("detection", "telegram-io") as running:
+        progress.stamp("detection")
+        progress.stamp("telegram-io")
+        threads = dict(running)
+        if failure == "dead":
+            threads["telegram-io"] = _finished("telegram-io")
+        else:
+            # Stuck inside a call: the I/O loop stamps nothing for over its 180 s.
+            clock.advance(seconds=180, milliseconds=1)
+            progress.stamp("detection")
+        watchdog = supervision.Watchdog(clock, progress, LIMITS, threads, stalls.append, stop=stop)
+
+        assert watchdog.check() == "telegram-io"
+
+    assert stalls == ["telegram-io"]
+    assert not stop.is_set()
 
 
 def test_a_loop_that_never_stamped_counts_from_the_watchdog_start() -> None:

@@ -16,6 +16,11 @@ the next pass (and at activation), so a known "ok" becomes "sent", never "uncert
 error before the HTTP call puts the row back to "pending". The same holds for ops rows.
 INV-14 #1 and INV-15 #1/#2 drive detection and the relay together on the injected clock.
 
+A bot shared by a location and the admin chat (OPS_BOT_TOKEN may reuse a location's bot,
+D-09): a failure that concerns only one of the two chats never delays the other (B1, D1),
+while a bot-wide outcome of a location send (429, 5xx, a refused connection) also holds
+the ops notices, the direct database-down notice included.
+
 ``run_iteration`` calls ``close_old_connections()``, so every test that runs it is
 ``django_db(transaction=True)``. Time comes only from the ``FakeClock`` passed in; a fake
 send can move it forward while the request is in flight (``fake_telegram.answer``).
@@ -54,6 +59,7 @@ from powermon.engine import transitions
 from powermon.engine.models import SystemState
 from powermon.telegram.client import SendResult
 from powermon.worker import detection, io_loop
+from powermon.worker.lease import LeaseState, LeaseStatus
 
 TOKEN_A = DEFAULT_BOT_TOKEN
 TOKEN_B = "987654321:" + "B" * 35
@@ -1128,20 +1134,26 @@ def test_WR04_ops_pre_send_error_returns_to_pending(
 # admin reuses a location's bot as OPS_BOT_TOKEN (INV-20 #2, ALRT-06)
 
 
-def _shared_bot(fake: Any, token: str, ops_answers: list[tuple[int, Any]]) -> list[int]:
+def _shared_bot(
+    fake: Any, token: str, answers: list[Any], failing_chat: int = OPS_CHAT_ID
+) -> list[int]:
     """One bot for a location and the admin chat, faked per chat.
 
-    The admin chat gets ``ops_answers`` (status, JSON body) in turn, then ok; every other
-    chat is accepted. Returns the chat id of every request, in order.
+    ``failing_chat`` (the admin chat unless given) gets ``answers`` in turn, then ok: each
+    is ``(status, JSON body)``, or an exception the transport raises. Every other chat is
+    accepted. Returns the chat id of every request, in order.
     """
     chats: list[int] = []
 
     def callback(request: PreparedRequest) -> tuple[int, dict[str, str], str]:
         body = json.loads(request.body or b"{}")
         chats.append(body["chat_id"])
-        if body["chat_id"] == OPS_CHAT_ID and ops_answers:
-            status, answer = ops_answers.pop(0)
-            return status, {}, json.dumps(answer)
+        if body["chat_id"] == failing_chat and answers:
+            answer = answers.pop(0)
+            if isinstance(answer, BaseException):
+                raise answer
+            status, payload = answer
+            return status, {}, json.dumps(payload)
         fake.sent.append(body)
         return 200, {}, json.dumps({"ok": True, "result": {"message_id": len(fake.sent)}})
 
@@ -1199,6 +1211,133 @@ def test_B1_an_admin_chat_failure_on_a_shared_bot_never_delays_the_location(
     assert io_loop.run_iteration(FakeClock(due), state) is True
     assert (_row(notice).status, _row(notice).sent_at) == ("sent", due)
     assert chats == [OPS_CHAT_ID, DEFAULT_CHAT_ID, OPS_CHAT_ID]
+
+
+# D1 (final audit): the other direction of B1. A refusal that concerns one location's
+# channel (400/401/403) is not the bot's: it never holds the admin chat on a shared bot.
+# A bot-wide outcome of a location send (429, 5xx, a refused connection) still does.
+
+KICKED = {"ok": False, "error_code": 403, "description": "Forbidden: bot was kicked"}
+
+
+def _ops_rows() -> list[OutboxMessage]:
+    return list(OutboxMessage.objects.filter(channel=outbox.CHANNEL_OPS).order_by("id"))
+
+
+@pytest.mark.django_db(transaction=True)
+def test_D1_a_location_chat_refusal_on_a_shared_bot_never_holds_the_ops_notices(
+    location_factory: Callable[..., Any], fake_telegram: Any, settings: Any
+) -> None:
+    settings.CFG = dataclasses.replace(settings.CFG, ops_bot_token=TOKEN_A, ops_chat_id=OPS_CHAT_ID)
+    location = location_factory(bot_token=TOKEN_A)
+    off = _queue(location)
+    first = _gap_notice(T0 - timedelta(minutes=10), T0)
+    # The bot was removed from the location's channel: every send there is refused.
+    chats = _shared_bot(fake_telegram, TOKEN_A, [(403, KICKED)] * 50, DEFAULT_CHAT_ID)
+    state = io_loop.RelayState()
+
+    # The OFF is refused, and the notice still goes out in the same pass.
+    assert io_loop.run_iteration(FakeClock(T0), state) is True
+    assert chats == [DEFAULT_CHAT_ID, OPS_CHAT_ID]
+    assert (_row(first).status, _row(first).sent_at) == ("sent", T0)
+    # D-14 for subscriber rows is unchanged: the location's bot backs off 15 min.
+    assert (_row(off).status, _row(off).next_attempt_at) == ("pending", T0 + timedelta(minutes=15))
+
+    # A notice queued while the bot backs off for the location goes out when due.
+    minute = T0 + _seconds(60)
+    second = _gap_notice(T0, minute, at=minute)
+    assert io_loop.run_iteration(FakeClock(minute), state) is True
+    assert (_row(second).status, _row(second).sent_at) == ("sent", minute)
+    assert chats == [DEFAULT_CHAT_ID, OPS_CHAT_ID, OPS_CHAT_ID]
+
+    # The OFF is refused once more a minute before its maximum age (6 h), so the bot backs
+    # off for the location past that age; its "expired" notice is still sent at once.
+    expiry = T0 + timedelta(hours=6)
+    assert io_loop.run_iteration(FakeClock(expiry - _seconds(60)), state) is True
+    assert io_loop.run_iteration(FakeClock(expiry), state) is True
+
+    assert _row(off).status == "expired"
+    assert [(r.kind, r.status) for r in _ops_rows()] == [
+        (outbox.KIND_OPS_GAP, "sent"),
+        (outbox.KIND_OPS_GAP, "sent"),
+        (outbox.KIND_OPS_EXPIRED, "sent"),
+    ]
+    assert _ops_rows()[-1].sent_at == expiry
+    assert fake_telegram.sent[-1]["text"].startswith("⌛ OFF alert for ")
+    assert chats == [DEFAULT_CHAT_ID, OPS_CHAT_ID, OPS_CHAT_ID, DEFAULT_CHAT_ID, OPS_CHAT_ID]
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("answer", "bot_wait"),
+    [
+        ((429, _too_many_requests(30)), _seconds(30)),
+        ((502, {"ok": False, "error_code": 502}), _seconds(2)),
+        (_refused(TOKEN_A), _seconds(2)),
+    ],
+    ids=["429", "502", "refused"],
+)
+def test_D1_a_bot_wide_failure_of_a_location_send_still_holds_the_ops_notices(
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    settings: Any,
+    answer: Any,
+    bot_wait: timedelta,
+) -> None:
+    settings.CFG = dataclasses.replace(settings.CFG, ops_bot_token=TOKEN_A, ops_chat_id=OPS_CHAT_ID)
+    off = _queue(location_factory(bot_token=TOKEN_A))
+    notice = _gap_notice(T0 - timedelta(minutes=10), T0)
+    chats = _shared_bot(fake_telegram, TOKEN_A, [answer], DEFAULT_CHAT_ID)
+    state = io_loop.RelayState()
+
+    # The whole bot is limited or unreachable: the notice waits with the location.
+    assert io_loop.run_iteration(FakeClock(T0), state) is True
+    assert chats == [DEFAULT_CHAT_ID]
+    assert (_row(notice).status, _row(notice).attempts) == ("pending", 0)
+
+    due = T0 + bot_wait
+    assert io_loop.run_iteration(FakeClock(due - _seconds(1)), state) is False
+    assert io_loop.run_iteration(FakeClock(due), state) is True
+    assert (_row(off).sent_at, _row(notice).sent_at) == (due, due)
+    assert chats == [DEFAULT_CHAT_ID, DEFAULT_CHAT_ID, OPS_CHAT_ID]
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("answer", "sent_after_s"),
+    [((403, KICKED), 301), ((429, _too_many_requests(600)), 600)],
+    ids=["403", "429"],
+)
+def test_D1_the_db_down_notice_waits_only_for_a_bot_wide_backoff(
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    settings: Any,
+    answer: Any,
+    sent_after_s: int,
+) -> None:
+    settings.CFG = dataclasses.replace(settings.CFG, ops_bot_token=TOKEN_A, ops_chat_id=OPS_CHAT_ID)
+    _queue(location_factory(bot_token=TOKEN_A))
+    chats = _shared_bot(fake_telegram, TOKEN_A, [answer], DEFAULT_CHAT_ID)
+    clock = FakeClock(T0)
+    state = io_loop.RelayState()
+    assert io_loop.run_iteration(clock, state) is True
+    assert chats == [DEFAULT_CHAT_ID]
+
+    # The lease is lost right after that pass, and the database stays unreachable.
+    down = LeaseStatus(LeaseState.DB_DOWN, 1, clock.now(), clock.monotonic())
+    clock.advance(seconds=301)
+    if sent_after_s > 301:
+        # A 429 limits the whole bot: the direct notice waits for its retry_after.
+        assert io_loop.notify_db_down(down, clock, state) is False
+        clock.advance(seconds=sent_after_s - 302)
+        assert io_loop.notify_db_down(down, clock, state) is False
+        clock.advance(seconds=1)
+
+    # A 403 for the location's channel never holds the admin chat (15 min for the location).
+    assert io_loop.notify_db_down(down, clock, state) is True
+    assert chats == [DEFAULT_CHAT_ID, OPS_CHAT_ID]
+    assert fake_telegram.sent[-1]["text"].startswith("🛑 Database unreachable since ")
+    assert state.db_down_notified is True
 
 
 # B2 (wave 2 audit): one ops notice that cannot be rendered never blocks later notices

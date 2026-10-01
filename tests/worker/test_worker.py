@@ -187,10 +187,37 @@ class _WatchdogGate:
             pass
 
 
+class _StopAsTheCheckWaitEnds(threading.Event):
+    """serve's stop event, for a SIGTERM that lands just as the watchdog's wait times out.
+
+    Once ``armed`` is set, the next ``wait`` of serve's own thread sets the stop, waits
+    until both loop threads have returned because of it, and then answers False, as a
+    wait that ended a moment before the stop would. serve then runs a watchdog check on
+    loops that ended normally (E1). Every other wait, and every loop thread's, is the
+    plain event's.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.armed = threading.Event()
+        self.raced = threading.Event()
+        self.loops_ended = False
+
+    def wait(self, timeout: float | None = None) -> bool:
+        serving = threading.current_thread().name == "serve-under-test"
+        if serving and self.armed.is_set() and not self.raced.is_set():
+            self.raced.set()
+            self.set()
+            self.loops_ended = wait_for(lambda: _loop_threads() == set())
+            return False
+        return super().wait(timeout)
+
+
 class _Serve:
     """``run_worker.serve`` in a thread, with fast intervals and an injected stall action.
 
-    With a ``gate``, ``finish()`` ends the watchdog's checks before it stops serve.
+    With a ``gate``, ``finish()`` ends the watchdog's checks before it stops serve. A
+    ``stop`` replaces the plain stop event.
     """
 
     def __init__(
@@ -200,9 +227,10 @@ class _Serve:
         health: supervision.HealthFile,
         on_stall: Callable[[str], None] | None = None,
         gate: _WatchdogGate | None = None,
+        stop: threading.Event | None = None,
         **overrides: float,
     ) -> None:
-        self.stop = threading.Event()
+        self.stop = threading.Event() if stop is None else stop
         self.code: int | None = None
         self.stalls: list[str] = []
         self.gate = gate
@@ -512,6 +540,42 @@ def test_a_dead_loop_goes_through_the_watchdog(
 
     assert serving.stalls == ["telegram-io"]
     assert serving.code == 70
+    assert _loop_threads() == set()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_E1_a_check_after_the_loops_stopped_for_sigterm_finds_no_stall_and_serve_exits_0(
+    leases: Callable[..., Lease], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # E1 (final audit): a watchdog check that runs after a SIGTERM's stop, with both loop
+    # threads already returned because of it, is a clean stop: exit 0, no stall action.
+    _resume(None)
+    stop = _StopAsTheCheckWaitEnds()
+    after_the_stop: list[str | None] = []
+    real_check = supervision.Watchdog.check
+
+    def check(watchdog: supervision.Watchdog) -> str | None:
+        found = real_check(watchdog)
+        if stop.raced.is_set():
+            after_the_stop.append(found)
+        return found
+
+    monkeypatch.setattr(supervision.Watchdog, "check", check)
+    clock = FakeClock(T0)
+    serving = _Serve(leases(clock), clock, supervision.HealthFile(tmp_path / "health"), stop=stop)
+    try:
+        assert wait_for(lambda: _loop_threads() == LOOP_NAMES)
+        stop.armed.set()
+        serving.thread.join(10)
+        assert not serving.thread.is_alive()
+    finally:
+        code = serving.finish()
+
+    assert stop.raced.is_set() and stop.loops_ended
+    # The check ran on the ended loops, and found nothing.
+    assert after_the_stop == [None]
+    assert serving.stalls == []
+    assert code == 0
     assert _loop_threads() == set()
 
 

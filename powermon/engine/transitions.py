@@ -3,13 +3,14 @@
 The location's ``location_state`` row lock is the per-location mutex for every writer of
 that location's state and timeline (MON-04, WR-01). ``record_heartbeat`` takes it first
 with ``SELECT ... FOR UPDATE`` and only then chooses its gate from the locked status;
-``mark_off``'s CAS UPDATE takes the same lock. Writers of one location therefore run one
-after the other, and under the lock two of them can neither both win nor both lose: a
-heartbeat that arrives while the detector's OFF transaction is open waits for it and then
-restores the location, instead of finding no gate that matches. The conditional UPDATEs
-(decided by the row count) and the timeline's exclusion constraint stay as the second
-line of defence. Every transaction locks exactly one location_state row and takes that
-lock first, so two of them never wait on each other's second lock (no deadlock).
+``mark_off`` takes it the same way before it reads the open interval and runs its CAS
+UPDATE (D2). Writers of one location therefore run one after the other, and under the
+lock two of them can neither both win nor both lose: a heartbeat that arrives while the
+detector's OFF transaction is open waits for it and then restores the location, instead
+of finding no gate that matches. The conditional UPDATEs (decided by the row count) and
+the timeline's exclusion constraint stay as the second line of defence. Every
+transaction locks exactly one location_state row and takes that lock first, so two of
+them never wait on each other's second lock (no deadlock).
 
 Every function runs its statements in one transaction on Django's connection. Nothing
 here does network I/O, and time always comes from the caller's Clock (``now``), never
@@ -239,31 +240,53 @@ def read_snapshots() -> list[tuple[rules.Snapshot, bool]]:
 def mark_off(snap: rules.Snapshot, d: rules.Decision, now: datetime, alerts_enabled: bool) -> bool:
     """Record the OFF transition ``d`` for ``snap``, decided by the detector at ``now``.
 
-    One transaction: the CAS UPDATE, then the timeline (on closed at the outage start, off
-    opened from it), then the power_off outbox row when alerts are on. Returns False and
-    writes nothing when the CAS changes 0 rows: a heartbeat or another writer got there
-    first, so the decision is stale and is skipped quietly (INV-01).
+    One transaction: the row lock (LOCK_SQL), the CAS UPDATE, then the timeline (on closed
+    at the outage start, off opened from it), then the power_off outbox row when alerts
+    are on. Returns False and writes nothing when the CAS changes 0 rows: a heartbeat or
+    another writer got there first, so the decision is stale and is skipped quietly
+    (INV-01).
+
+    The outage starts at ``max(decided outage start, open interval start)`` (D2), read
+    under the row lock, so a lapse carve that committed after the snapshot is seen. A
+    carve can move the open on piece's start past the decided start: a carver that lost
+    the cursor CAS with a later ``now``, or a carve between the snapshot and this call.
+    Closing the open piece there would violate ``power_interval_end_after_start``, and
+    every later OFF of the location would fail the same way. The clamp keeps the CHECK
+    true, as IN-01's does for a restore; "was ON for" is unchanged (D-03). Without a carve
+    the open piece starts at or before the decided start, and nothing changes.
     """
     if not d.off or d.outage_start is None or d.was_on is None:
         raise ValueError("mark_off needs an OFF decision with an outage start and was_on")
-    params: dict[str, int | datetime] = {
-        "id": snap.location_id,
-        "v": snap.state_version,
-        "start": d.outage_start,
-    }
     with transaction.atomic(), connection.cursor() as cur:
+        # The row lock first, as every timeline writer takes it: the open interval read
+        # next is the one this transaction closes. With no state row the CAS changes 0 rows.
+        cur.execute(LOCK_SQL, [snap.location_id])
+        open_start = timeline.open_start(cur, snap.location_id)
+        start = d.outage_start if open_start is None else max(d.outage_start, open_start)
+        params: dict[str, int | datetime] = {
+            "id": snap.location_id,
+            "v": snap.state_version,
+            "start": start,
+        }
         cur.execute(OFF_CAS_SQL, params)
         if cur.rowcount != 1:
             return False
-        timeline.set_open_state(
-            cur, snap.location_id, d.outage_start, "off", outage_start_at=d.outage_start
-        )
+        timeline.set_open_state(cur, snap.location_id, start, "off", outage_start_at=start)
         if alerts_enabled:
             outbox.enqueue(
                 outbox.KIND_POWER_OFF,
                 snap.location_id,
-                event_at=d.outage_start,
+                event_at=start,
                 recorded_at=now,
                 payload={"was_on_us": _us(d.was_on)},
             )
+    if start != d.outage_start:
+        # Ids and times only: never a key or a token.
+        log.warning(
+            "OFF for location %s starts at %s, where its open interval starts, not at %s: "
+            "a lapse carve moved that start",
+            snap.location_id,
+            start.isoformat(),
+            d.outage_start.isoformat(),
+        )
     return True
