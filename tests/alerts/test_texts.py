@@ -73,6 +73,79 @@ SNAPSHOTS = [
 )
 def test_alert_snapshots(kind: str, lang: str, duration_us: int, expected: str) -> None:
     assert render_alert(kind, lang, duration_us) == expected
+    # An alert that is not late has no prefix: byte-identical to Phase 1 (D-05).
+    assert render_alert(kind, lang, duration_us, prefix=None) == expected
+
+
+# A late alert (D-05, D-06): the event's local time goes before the bold status, with no
+# preposition, so all three languages share one format. The first four are the accepted
+# examples in 02-CONTEXT.md.
+PREFIXED = [
+    (
+        "power_off",
+        "uk",
+        5 * H + 12 * MIN,
+        "17:27",
+        "🔴 17:27 <b>СВІТЛО ЗНИКЛО</b>\n⚡ Світло було: <b>5 год 12 хв</b>",
+    ),
+    (
+        "power_on",
+        "en",
+        18 * MIN,
+        "17:45",
+        "🟢 17:45 <b>POWER ON</b>\n⚡ Power was OFF for: <b>18m</b>",
+    ),
+    (
+        "power_off",
+        "en",
+        2 * H + 4 * MIN,
+        "30.09 23:58",
+        "🔴 30.09 23:58 <b>POWER OFF</b>\n⚡ Power was ON for: <b>2h 4m</b>",
+    ),
+    (
+        "power_on",
+        "ru",
+        18 * MIN,
+        "17:45",
+        "🟢 17:45 <b>СВЕТ ВЕРНУЛСЯ</b>\n⚡ Света не было: <b>18 мин</b>",
+    ),
+    (
+        "power_off",
+        "ru",
+        5 * H + 12 * MIN,
+        "30.09 23:58",
+        "🔴 30.09 23:58 <b>СВЕТ ВЫКЛЮЧИЛСЯ</b>\n⚡ Свет был: <b>5 ч 12 мин</b>",
+    ),
+    (
+        "power_on",
+        "uk",
+        3 * H + 15 * MIN,
+        "17:45",
+        "🟢 17:45 <b>СВІТЛО ПОВЕРНУЛОСЯ</b>\n⚡ Світла не було: <b>3 год 15 хв</b>",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("kind", "lang", "duration_us", "prefix", "expected"),
+    PREFIXED,
+    ids=[f"{kind}-{lang}-{prefix}" for kind, lang, _, prefix, _ in PREFIXED],
+)
+def test_late_alert_snapshots(
+    kind: str, lang: str, duration_us: int, prefix: str, expected: str
+) -> None:
+    assert render_alert(kind, lang, duration_us, prefix=prefix) == expected
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    ["<b>", "17:27x", "", "1:05", "17:27 ", "30.09  23:58", "17:27\n", "１７:２７"],
+    ids=repr,
+)
+def test_a_prefix_that_is_not_a_time_raises(prefix: str) -> None:
+    # Only "HH:MM" or "DD.MM HH:MM" in ASCII digits: nothing that needs HTML escaping.
+    with pytest.raises(ValueError, match="prefix"):
+        render_alert("power_off", "en", 5 * MIN, prefix=prefix)
 
 
 def test_K2_off_alert_states_the_on_time() -> None:

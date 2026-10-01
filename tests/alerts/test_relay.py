@@ -100,10 +100,10 @@ def test_off_before_on_head_of_line(
 ) -> None:
     location = location_factory()
     off = _queue(location, "power_off")
-    on = _queue(location, "power_on", at=T0 + timedelta(minutes=53))
+    on = _queue(location, "power_on", at=T0 + _seconds(30))
     fake_telegram.accept(TOKEN_A)
     state = io_loop.RelayState()
-    now = T0 + timedelta(hours=1)
+    now = T0 + _seconds(60)
 
     # Both rows are due, but only the location's oldest row goes out in a pass.
     assert io_loop.run_iteration(FakeClock(now), state) is True
@@ -145,12 +145,12 @@ def test_read_timeout_marks_uncertain_and_never_resends(
 ) -> None:
     location = location_factory()
     off = _queue(location, "power_off")
-    on = _queue(location, "power_on", at=T0 + timedelta(minutes=53))
+    on = _queue(location, "power_on", at=T0 + _seconds(30))
     # The first call (the OFF) reaches Telegram, then the answer times out; later calls succeed.
     fake_telegram.fail(TOKEN_A, exc=requests.ReadTimeout("read timed out"))
     fake_telegram.accept(TOKEN_A)
     state = io_loop.RelayState()
-    now = T0 + timedelta(hours=1)
+    now = T0 + _seconds(60)
 
     assert io_loop.run_iteration(FakeClock(now), state) is True
 
@@ -179,11 +179,11 @@ def test_a_sending_head_blocks_its_location_until_recovered(
     # line (it is never resent) until activation turns it into "uncertain".
     location = location_factory()
     interrupted = _queue(location, "power_off")
-    on = _queue(location, "power_on", at=T0 + timedelta(minutes=53))
+    on = _queue(location, "power_on", at=T0 + _seconds(30))
     OutboxMessage.objects.filter(pk=interrupted.pk).update(status="sending", attempts=1)
     fake_telegram.accept(TOKEN_A)
     state = io_loop.RelayState()
-    now = T0 + timedelta(hours=1)
+    now = T0 + _seconds(60)
 
     assert io_loop.run_iteration(FakeClock(now), state) is False
     assert len(fake_telegram.calls) == 0
