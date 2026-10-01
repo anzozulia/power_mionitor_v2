@@ -1,19 +1,30 @@
 """Engine transitions as gate SQL: each change is one conditional UPDATE (KD2, INV-01).
 
-Every function runs its statements in one transaction on Django's connection and decides
-by the row count. Under Read Committed a competing UPDATE re-checks its WHERE clause after
-the first one commits and changes 0 rows, so two writers never both win. Nothing here does
-network I/O, and time always comes from the caller's Clock (``now``), never from SQL
-``now()``. Parameters go in as ``%(name)s`` / ``%s`` placeholders, never formatted into
-the SQL.
+The location's ``location_state`` row lock is the per-location mutex for every writer of
+that location's state and timeline (MON-04, WR-01). ``record_heartbeat`` takes it first
+with ``SELECT ... FOR UPDATE`` and only then chooses its gate from the locked status;
+``mark_off``'s CAS UPDATE takes the same lock. Writers of one location therefore run one
+after the other, and under the lock two of them can neither both win nor both lose: a
+heartbeat that arrives while the detector's OFF transaction is open waits for it and then
+restores the location, instead of finding no gate that matches. The conditional UPDATEs
+(decided by the row count) and the timeline's exclusion constraint stay as the second
+line of defence. Every transaction locks exactly one location_state row and takes that
+lock first, so two of them never wait on each other's second lock (no deadlock).
+
+Every function runs its statements in one transaction on Django's connection. Nothing
+here does network I/O, and time always comes from the caller's Clock (``now``), never
+from SQL ``now()``. Parameters go in as ``%(name)s`` / ``%s`` placeholders, never
+formatted into the SQL.
 
 A gate that changes the status also writes the stored timeline (KD1) through
-``timeline.set_open_state`` in the same transaction, while the gate UPDATE holds the
-location_state row lock. When alerts are on, it also queues the alert in the outbox in
-that same transaction (KD2, D-14): the transition and its alert commit together or not at
-all. The worker relay sends the alert later.
+``timeline.set_open_state`` in the same transaction, under the row lock. When alerts are
+on, it also queues the alert in the outbox in that same transaction (KD2, D-14): the
+transition and its alert commit together or not at all. The worker relay sends the alert
+later.
 """
 
+import logging
+import threading
 from datetime import datetime, timedelta
 
 from django.db import connection, transaction
@@ -22,15 +33,32 @@ from django.db.backends.utils import CursorWrapper
 from powermon.alerts import outbox
 from powermon.engine import rules, timeline
 
-# off -> on: the first heartbeat after an outage (MON-03). RETURNING gives the stored
-# outage start for "was OFF for"; the UPDATE must not clear it, or RETURNING sees NULL.
+log = logging.getLogger(__name__)
+
+# IN-01: a clamped restore (see record_heartbeat) logs one WARNING per process, not one
+# per heartbeat. After a backward clock step every location clamps at once, from several
+# web threads, so the flag is set under a lock.
+_restore_clamp_warned = False
+_restore_clamp_lock = threading.Lock()
+
+# The heartbeat's first statement: lock the location's state row, then read the status
+# that chooses the gate. One table only, so it locks the state row and never the location
+# row (inserting an outbox row only needs KEY SHARE on that one).
+LOCK_SQL = """
+SELECT status, outage_started_at
+  FROM location_state
+ WHERE location_id = %s
+   FOR UPDATE
+"""
+
+# off -> on: the first heartbeat after an outage (MON-03). outage_started_at is left as
+# it is; "was OFF for" is computed from the value LOCK_SQL read under the lock.
 RESTORE_SQL = """
 UPDATE location_state
    SET status = 'on', on_since = %(now)s,
        last_heartbeat_at = GREATEST(last_heartbeat_at, %(now)s),
        state_version = state_version + 1
  WHERE location_id = %(id)s AND status = 'off'
-RETURNING outage_started_at
 """
 
 # waiting -> on: the first heartbeat starts monitoring, silently (MON-01).
@@ -89,48 +117,93 @@ def _config_row(cur: CursorWrapper, location_id: int) -> tuple[bool, bool]:
     return bool(row[0]), bool(row[1])
 
 
+def _run_gate(cur: CursorWrapper, sql: str, params: dict[str, int | datetime]) -> None:
+    """Run one heartbeat gate UPDATE; it must change exactly the locked row.
+
+    Under the row lock the status cannot change between LOCK_SQL and the gate, so the
+    gate's WHERE clause always matches. If it ever changes 0 rows (a writer that skipped
+    the lock), raise and roll back instead of writing a second transition or alert.
+    """
+    cur.execute(sql, params)
+    if cur.rowcount != 1:
+        raise RuntimeError(
+            f"location {params['id']}: heartbeat gate changed {cur.rowcount} rows "
+            "under the row lock"
+        )
+
+
+def _warn_restore_clamped(location_id: int, at: datetime) -> None:
+    """Log the first clamped restore of this process at WARNING; later ones stay silent.
+
+    The line names only the location id and the restore time: never the key or a token.
+    """
+    global _restore_clamp_warned
+    with _restore_clamp_lock:
+        if _restore_clamp_warned:
+            return
+        _restore_clamp_warned = True
+    log.warning(
+        "heartbeat for location %s restored at %s, after its receive time: the server "
+        "clock stepped back or a lapse carve ran at the same time",
+        location_id,
+        at.isoformat(),
+    )
+
+
 def record_heartbeat(location_id: int, now: datetime) -> str:
     """Apply one accepted heartbeat that the server received at ``now``.
 
-    The gates run in the order RESTORE, FIRST, PLAIN, each a conditional UPDATE, all in
-    one transaction with no network I/O (INV-01). Returns "restored" (off -> on, with one
-    power_on alert queued when alerts are on), "started" (waiting -> on, silent), "plain"
-    (already on) or "ignored" (no state row for this location).
+    First the location's state row is locked (LOCK_SQL), then one gate is chosen by the
+    locked status, all in one transaction with no network I/O (INV-01, HB-03). A heartbeat
+    that arrives while another writer of this location is mid-transaction waits for it
+    and sees its result (WR-01). Returns "restored" (off -> on, with one power_on alert
+    queued when alerts are on), "started" (waiting -> on, silent), "plain" (already on) or
+    "ignored" (only when this location has no state row; nothing is written).
+
+    A restore is stamped at ``max(now, outage start, open interval start)`` (IN-01). After
+    a backward clock step ``now`` can lie before the outage start, and a heartbeat that
+    waited on a lapse carve's lock can lie before the open off piece's new start. Closing
+    the off interval there would violate ``power_interval_end_after_start`` and answer 500
+    on every heartbeat; the clamp keeps the CHECK true and "was OFF for" never negative.
     """
     params: dict[str, int | datetime] = {"id": location_id, "now": now}
     with transaction.atomic(), connection.cursor() as cur:
-        cur.execute(RESTORE_SQL, params)
-        restored = cur.fetchone()
-        if restored is not None:
-            (outage_started_at,) = restored
+        cur.execute(LOCK_SQL, [location_id])
+        locked = cur.fetchone()
+        if locked is None:
+            return "ignored"
+        status, outage_started_at = locked
+        if status == "off":
+            open_start = timeline.open_start(cur, location_id)
+            at = max(t for t in (now, outage_started_at, open_start) if t is not None)
+            if at > now:
+                _warn_restore_clamped(location_id, at)
+            _run_gate(cur, RESTORE_SQL, {"id": location_id, "now": at})
             maintenance, alerts_enabled = _config_row(cur, location_id)
-            # Closes the off interval at ``now``. A restore dated before the outage start
-            # would close it before its start: the CHECK rejects that and the whole
-            # transaction rolls back, so nothing is half-written.
+            # Closes the off interval at ``at``, never before its start (the clamp above):
+            # an off piece that starts at ``at`` is deleted instead.
             timeline.set_open_state(
-                cur, location_id, now, rules.desired_open_state("on", maintenance)
+                cur, location_id, at, rules.desired_open_state("on", maintenance)
             )
             if alerts_enabled:
                 outbox.enqueue(
                     outbox.KIND_POWER_ON,
                     location_id,
-                    event_at=now,
-                    recorded_at=now,
-                    payload={"was_off_us": _us(now - outage_started_at)},
+                    event_at=at,
+                    recorded_at=at,
+                    payload={"was_off_us": _us(at - outage_started_at)},
                 )
             return "restored"
-        cur.execute(FIRST_SQL, params)
-        if cur.rowcount == 1:
+        if status == "waiting":
+            _run_gate(cur, FIRST_SQL, params)
             # MON-01 stays silent: the timeline opens, no outbox row is written.
             maintenance, _alerts_enabled = _config_row(cur, location_id)
             timeline.set_open_state(
                 cur, location_id, now, rules.desired_open_state("on", maintenance)
             )
             return "started"
-        cur.execute(PLAIN_SQL, params)
-        if cur.rowcount == 1:
-            return "plain"
-    return "ignored"
+        _run_gate(cur, PLAIN_SQL, params)
+        return "plain"
 
 
 def read_snapshots() -> list[tuple[rules.Snapshot, bool]]:

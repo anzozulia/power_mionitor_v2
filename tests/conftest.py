@@ -9,18 +9,24 @@ router-reconnect grace off, language en, display TZ Europe/Kyiv.
 - Telegram is faked at the HTTP boundary (``responses``), and any unregistered URL raises.
 - pytest-socket (``--allow-hosts`` in pyproject.toml) fails every real outbound connection
   except the database and localhost.
+- Races run on real PostgreSQL with the actor harness below (``Actor``, ``blocked_on_lock``,
+  ``wait_for``, ``terminate_backends``): one connection per actor thread, a hook inside the
+  transaction instead of ``time.sleep``, and a ``pg_stat_activity`` check that the waiter
+  really waits on the row lock (RESEARCH Pitfall 8).
 
 Test modules import the helper classes directly: ``from conftest import FakeClock``.
 """
 
 import json
+import threading
+import time
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 import responses
-from django.db import transaction
+from django.db import connection, transaction
 from requests import PreparedRequest
 
 TELEGRAM_API = "https://api.telegram.org"
@@ -162,6 +168,81 @@ class FakeTelegram:
 def fake_telegram() -> Iterator[FakeTelegram]:
     with responses.RequestsMock(assert_all_requests_are_fired=False) as rsps:
         yield FakeTelegram(rsps)
+
+
+def wait_for(predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
+    """Poll ``predicate`` every 0.02 s until it is true or ``timeout`` seconds have passed.
+
+    Returns the predicate's last value, so ``assert wait_for(...)`` fails on a timeout.
+    Measured on ``time.monotonic()``: it is for real threads, not for the injected clock.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+class Actor(threading.Thread):
+    """Run ``fn`` in a daemon thread on its own Django connection (a race participant).
+
+    Before ``fn`` runs, the thread records its PostgreSQL backend pid in ``pid`` and names
+    its session ``APPLICATION_NAME``, so a test can check ``blocked_on_lock(actor.pid)`` and,
+    if an actor is stuck after a failed assertion, end it with ``terminate_backends``. The
+    return value lands in ``result`` and any exception (BaseException) in ``exc``. The
+    connection is always closed at the end, or pytest-django could not truncate or drop
+    the test database.
+    """
+
+    APPLICATION_NAME = "powermon-test-actor"
+
+    def __init__(self, fn: Callable[[], Any]) -> None:
+        super().__init__(daemon=True)
+        self.fn = fn
+        self.result: Any = None
+        self.exc: BaseException | None = None
+        self.pid: int | None = None
+
+    def run(self) -> None:
+        try:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_backend_pid(), set_config('application_name', %s, false)",
+                    [self.APPLICATION_NAME],
+                )
+                self.pid = cur.fetchone()[0]
+            self.result = self.fn()
+        except BaseException as exc:
+            self.exc = exc
+        finally:
+            connection.close()
+
+
+def blocked_on_lock(pid: int) -> bool:
+    """True while the backend ``pid`` waits for a lock (``pg_stat_activity``)."""
+    with connection.cursor() as cur:
+        cur.execute("SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s", [pid])
+        row = cur.fetchone()
+    return row is not None and row[0] == "Lock"
+
+
+def terminate_backends(application_name: str) -> int:
+    """End every session of this test database named ``application_name``; return how many.
+
+    The way to drop a stuck actor's transaction (so teardown never waits on it), or to
+    kill a worker's lease session from outside as a DB restart would.
+    """
+    with connection.cursor() as cur:
+        cur.execute(
+            "SELECT pid FROM pg_stat_activity "
+            "WHERE application_name = %s AND datname = current_database()",
+            [application_name],
+        )
+        pids = [row[0] for row in cur.fetchall()]
+        for pid in pids:
+            cur.execute("SELECT pg_terminate_backend(%s, 5000)", [pid])
+    return len(pids)
 
 
 @pytest.fixture
