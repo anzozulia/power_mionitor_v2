@@ -51,6 +51,8 @@ services:
     command:
       - gunicorn
       - powermon.wsgi
+      - --config
+      - python:powermon.web.gunicorn_conf
       - --worker-class
       - gthread
       - --workers
