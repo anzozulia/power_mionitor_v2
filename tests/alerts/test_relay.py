@@ -25,7 +25,7 @@ from typing import Any
 
 import pytest
 import requests
-from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID
+from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, FakeClock
 from django.db import transaction
 from urllib3.exceptions import MaxRetryError, NewConnectionError
 
@@ -301,6 +301,136 @@ def test_huge_retry_after_is_capped(
     assert (row.status, row.last_error) == ("pending", "429")
     assert row.next_attempt_at == T0 + _seconds(io_loop.MAX_RETRY_AFTER_S)
     assert io_loop.MAX_RETRY_AFTER_S == 3600
+
+
+# Retry and sent times come from the clock after the send returns (D-14, INV-16)
+#
+# A pass sends one row after another, and each send can block for up to 5 s connect plus
+# 10 s read. So every wait is counted from when Telegram answered, not from when the pass
+# started, and each row's due check reads the clock again. The fake sends below move the
+# clock forward while the request is in flight.
+
+
+def _pass(clock: FakeClock, state: io_loop.RelayState) -> bool:
+    """One relay pass with the clock as it stands when the pass starts."""
+    return io_loop.run_iteration(clock.now(), state)
+
+
+def _too_many_requests(retry_after: int) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error_code": 429,
+        "description": f"Too Many Requests: retry after {retry_after}",
+        "parameters": {"retry_after": retry_after},
+    }
+
+
+@pytest.mark.django_db(transaction=True)
+def test_sent_at_is_the_time_telegram_answered(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    off = _queue(location_factory())
+    clock = FakeClock(T0)
+    fake_telegram.answer(TOKEN_A, lambda: clock.advance(seconds=3))
+
+    assert _pass(clock, io_loop.RelayState()) is True
+
+    assert fake_telegram.sent == [_body(OFF_EN)]
+    assert (_row(off).status, _row(off).sent_at) == ("sent", T0 + _seconds(3))
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV16_429_after_a_slow_send_waits_retry_after_from_the_429(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    # INV-16 acceptance #3: after a 429 with retry_after=30, the next attempt for that bot
+    # comes at least 30 s later. A's send takes 10 s, so B's 429 arrives at T0 + 10 s.
+    a = location_factory(bot_token=TOKEN_A)
+    b = location_factory(bot_token=TOKEN_B, chat_id=CHAT_B)
+    _queue(a)
+    row_b = _queue(b)
+    clock = FakeClock(T0)
+    fake_telegram.answer(TOKEN_A, lambda: clock.advance(seconds=10))
+    fake_telegram.fail(TOKEN_B, status=429, json_body=_too_many_requests(30))
+    fake_telegram.accept(TOKEN_B)
+    state = io_loop.RelayState()
+
+    assert _pass(clock, state) is True
+
+    limited_at = T0 + _seconds(10)
+    waiting = _row(row_b)
+    assert (waiting.status, waiting.attempts, waiting.last_error) == ("pending", 1, "429")
+    assert waiting.next_attempt_at == limited_at + _seconds(30)
+    assert state.not_before[io_loop.bot_key(TOKEN_B)] == limited_at + _seconds(30)
+    # The busy pass is followed by the next one at once: B's bot is still not called.
+    for offset in (0, 20, 29):
+        clock.set(limited_at + _seconds(offset))
+        assert _pass(clock, state) is False
+    assert _calls_to(fake_telegram, TOKEN_B) == 1
+
+    clock.set(limited_at + _seconds(30))
+    assert _pass(clock, state) is True
+    assert _row(row_b).status == "sent"
+    assert _calls_to(fake_telegram, TOKEN_B) == 2
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("failure", "code"),
+    [
+        ({"exc": requests.ConnectTimeout("connect timed out")}, "connect_timeout"),
+        ({"status": 502}, "http_502"),
+    ],
+    ids=["not_sent", "5xx"],
+)
+def test_INV16_retry_backoff_counts_from_the_failure(
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    failure: dict[str, Any],
+    code: str,
+) -> None:
+    # The failed send takes 5 s (the client's connect timeout). The 2 s backoff starts when
+    # it fails; it must not be used up while the send was still running.
+    off = _queue(location_factory())
+    clock = FakeClock(T0)
+    fake_telegram.answer(TOKEN_A, lambda: clock.advance(seconds=5), **failure)
+    fake_telegram.accept(TOKEN_A)
+    state = io_loop.RelayState()
+
+    assert _pass(clock, state) is True
+
+    failed_at = T0 + _seconds(5)
+    row = _row(off)
+    assert (row.status, row.attempts, row.last_error) == ("pending", 1, code)
+    assert row.next_attempt_at == failed_at + _seconds(2)
+    assert state.not_before[io_loop.bot_key(TOKEN_A)] == failed_at + _seconds(2)
+    clock.set(failed_at + _seconds(1))
+    assert _pass(clock, state) is False
+    assert len(fake_telegram.calls) == 1
+
+    clock.set(failed_at + _seconds(2))
+    assert _pass(clock, state) is True
+    assert (_row(off).status, _row(off).sent_at) == ("sent", failed_at + _seconds(2))
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a_row_that_falls_due_during_a_slow_pass_goes_out_in_that_pass(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    # Each row's due check reads the clock again: B is due at T0 + 5 s, and A's 10 s send
+    # ends after that, so B is sent in the same pass.
+    a = location_factory(bot_token=TOKEN_A)
+    b = location_factory(bot_token=TOKEN_B, chat_id=CHAT_B)
+    _queue(a)
+    row_b = _queue(b, at=T0 + _seconds(5))
+    clock = FakeClock(T0)
+    fake_telegram.answer(TOKEN_A, lambda: clock.advance(seconds=10))
+    fake_telegram.accept(TOKEN_B)
+
+    assert _pass(clock, io_loop.RelayState()) is True
+
+    assert fake_telegram.sent == [_body(OFF_EN), _body(OFF_EN, CHAT_B)]
+    assert (_row(row_b).status, _row(row_b).sent_at) == ("sent", T0 + _seconds(10))
 
 
 @pytest.mark.django_db(transaction=True)

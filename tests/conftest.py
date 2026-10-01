@@ -120,6 +120,40 @@ class FakeTelegram:
         else:
             raise TypeError("FakeTelegram.fail() needs status= or exc=")
 
+    def answer(
+        self,
+        token: str,
+        during: Callable[[], None],
+        *,
+        status: int = 200,
+        json_body: Any = None,
+        exc: BaseException | None = None,
+    ) -> None:
+        """Answer the bot's next sendMessage call only after ``during`` has run.
+
+        ``during`` runs while the request is in flight: ``lambda: clock.advance(seconds=10)``
+        is a send that takes 10 s, ``stop.set`` is a SIGTERM that arrives mid-send. The call
+        then raises ``exc``, or answers ``status`` with ``json_body``, or (200 and no body)
+        accepts the message as ``accept`` does.
+        """
+
+        def callback(request: PreparedRequest) -> tuple[int, dict[str, str], str]:
+            during()
+            if exc is not None:
+                raise exc
+            body = json_body
+            if status == 200 and body is None:
+                self.sent.append(json.loads(request.body or b"{}"))
+                body = {"ok": True, "result": {"message_id": len(self.sent)}}
+            return status, {}, json.dumps(body)
+
+        self.rsps.add_callback(
+            responses.POST,
+            self._url(token),
+            callback=callback,
+            content_type="application/json",
+        )
+
     def _url(self, token: str) -> str:
         return f"{self.API}/bot{token}/sendMessage"
 
