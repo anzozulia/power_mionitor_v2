@@ -7,10 +7,12 @@ thread watches the loops (D-15, OPS-05):
 - Each loop stamps ``Progress`` at the top of every iteration, after every location of a
   detection cycle and after every outbox row.
 - ``Watchdog.check()`` finds a loop whose last stamp is more than its limit old
-  (detection 60 s, Telegram I/O 180 s), or whose thread has died, and runs the stall
-  action once. ``default_on_stall`` logs CRITICAL, dumps every thread's stack with
-  ``faulthandler`` (file, line, function and thread names only, never local values),
-  flushes, and exits with ``EXIT_STALL`` so Docker's restart policy restarts the worker.
+  (detection 60 s, Telegram I/O 180 s), or whose thread has died while the worker is not
+  stopping, and runs the stall action once. A loop thread that ended because of the stop
+  event is a clean shutdown (E1). ``default_on_stall`` logs CRITICAL, dumps every
+  thread's stack with ``faulthandler`` (file, line, function and thread names only,
+  never local values), flushes, and exits with ``EXIT_STALL`` so Docker's restart policy
+  restarts the worker.
   A loop blocked inside a call that never returns is exactly the case this catches.
   Tests inject the stall action instead.
 - An unreachable database is progress, not a stall: a loop that retries the database
@@ -18,7 +20,7 @@ thread watches the loops (D-15, OPS-05):
   Docker's health status: the worker touches it after every successful cycle while it
   holds the lock and on every standby cycle, never while the database is down, so the
   container shows unhealthy during an outage without being restarted (INV-13). The
-  compose healthcheck that requires it to be under 30 s old arrives in 02-10.
+  worker's compose healthcheck requires it to be under 30 s old.
 - ``DbOutageLog`` turns a run of database errors into one WARNING when the database goes
   away and one when it is back, with the error class only (D-16, OPS-08).
 
@@ -75,7 +77,13 @@ class Progress:
 
 
 class Watchdog:
-    """Run ``on_stall(name)`` once when a loop is stale or its thread has died."""
+    """Run ``on_stall(name)`` once when a loop is stale or its thread has died.
+
+    ``stop`` is the worker's stop event (SIGTERM, SIGINT). The loops return once it is
+    set, so a loop thread that has ended while it is set is a shutdown, never a stall
+    (E1): a check that began just before the stop then finds nothing, and the worker
+    exits 0. A loop that dies or hangs while the stop is not set is a stall, as before.
+    """
 
     def __init__(
         self,
@@ -84,12 +92,14 @@ class Watchdog:
         limits: Mapping[str, float],
         threads: Mapping[str, threading.Thread],
         on_stall: Callable[[str], None],
+        stop: threading.Event | None = None,
     ) -> None:
         self._clock = clock
         self._progress = progress
         self._limits = dict(limits)
         self._threads = dict(threads)
         self._on_stall = on_stall
+        self._stop = stop
         # A loop that never stamped counts from here.
         self._started = clock.monotonic()
         self._fired = False
@@ -99,9 +109,15 @@ class Watchdog:
         now = self._clock.monotonic()
         for name, limit in self._limits.items():
             thread = self._threads.get(name)
+            # The thread's state first, then the stop's: a loop thread returns normally
+            # only after the stop is set, so a thread seen ended with the stop seen set
+            # after it ended because of the stop. Read the other way round, a loop that
+            # ends between the two reads would look dead (E1).
+            dead = thread is not None and not thread.is_alive()
+            if dead and self._stop is not None and self._stop.is_set():
+                continue
             last = self._progress.last(name)
             since = self._started if last is None else last
-            dead = thread is not None and not thread.is_alive()
             if dead or now - since > limit:
                 if not self._fired:
                     self._fired = True
