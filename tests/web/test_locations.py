@@ -15,16 +15,17 @@ import pytest
 from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID
 from django.db import IntegrityError, transaction
 
+from powermon.engine.models import LocationState
+from powermon.locations.keys import KEY_ALPHABET, KEY_LENGTH, generate_device_key, mask_key
+from powermon.locations.models import Location
+
 # D-07: 32 characters from [A-Za-z0-9], so a key never needs URL-encoding.
 KEY_SHAPE = re.compile(r"[A-Za-z0-9]{32}")
 SAMPLE_KEY = "Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4z"
 
 
-def _new_location(now: datetime, **overrides: Any) -> Any:
+def _new_location(now: datetime, **overrides: Any) -> Location:
     """A Location saved with only its required fields, plus ``overrides``."""
-    from powermon.locations.keys import generate_device_key
-    from powermon.locations.models import Location
-
     fields: dict[str, Any] = {
         "name": "Office",
         "bot_token": DEFAULT_BOT_TOKEN,
@@ -115,8 +116,6 @@ def test_device_key_is_unique(fixed_now: datetime) -> None:
 
 
 def test_generate_device_key_shape() -> None:
-    from powermon.locations.keys import KEY_ALPHABET, KEY_LENGTH, generate_device_key
-
     keys = [generate_device_key() for _ in range(1000)]
 
     assert KEY_LENGTH == 32
@@ -127,8 +126,6 @@ def test_generate_device_key_shape() -> None:
 
 
 def test_mask_key() -> None:
-    from powermon.locations.keys import mask_key
-
     masked = mask_key(SAMPLE_KEY)
 
     assert masked == "•" * 12 + "Xy4z"
@@ -141,8 +138,6 @@ def test_mask_key() -> None:
     ids=["empty", "31-characters", "33-characters"],
 )
 def test_mask_key_rejects_other_lengths(key: str) -> None:
-    from powermon.locations.keys import mask_key
-
     with pytest.raises(ValueError, match="32 characters"):
         mask_key(key)
 
@@ -152,8 +147,6 @@ def test_mask_key_rejects_other_lengths(key: str) -> None:
 
 @pytest.mark.django_db
 def test_location_state_off_requires_outage_start(fixed_now: datetime) -> None:
-    from powermon.engine.models import LocationState
-
     location = _new_location(fixed_now)
 
     with (
@@ -165,8 +158,6 @@ def test_location_state_off_requires_outage_start(fixed_now: datetime) -> None:
 
 @pytest.mark.django_db
 def test_location_state_off_with_outage_start_is_accepted(fixed_now: datetime) -> None:
-    from powermon.engine.models import LocationState
-
     location = _new_location(fixed_now)
     outage_start = fixed_now - timedelta(minutes=5)
 
@@ -178,8 +169,6 @@ def test_location_state_off_with_outage_start_is_accepted(fixed_now: datetime) -
 
 @pytest.mark.django_db
 def test_location_state_rejects_unknown_status(fixed_now: datetime) -> None:
-    from powermon.engine.models import LocationState
-
     location = _new_location(fixed_now)
 
     with pytest.raises(IntegrityError, match="location_state_status_valid"), transaction.atomic():
@@ -188,8 +177,6 @@ def test_location_state_rejects_unknown_status(fixed_now: datetime) -> None:
 
 @pytest.mark.django_db
 def test_location_factory_creates_waiting_state(location_factory: Any, fixed_now: datetime) -> None:
-    from powermon.engine.models import LocationState
-
     location = location_factory()
 
     state = LocationState.objects.get(pk=location.pk)
