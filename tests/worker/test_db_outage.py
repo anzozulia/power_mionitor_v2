@@ -20,6 +20,12 @@ C1 (wave 3 audit): a worker whose lease session is gone claims and sends no outb
 either channel, even while its last published status still says HELD and another worker
 holds the lock; it sends again only after it holds the lock itself.
 
+WR-01 (code review): an outcome the relay kept after a database error is written back only
+onto this worker's own claim. A "no request made" reset needs the claim's lease session to
+still hold the lock and is dropped by a new lease generation; a kept retry concerns only
+the attempt its claim counted. So another worker's send of the row is never reset to
+"pending" and never repeated.
+
 Timing rule. The ``FakeClock`` is shared by everything in ``serve``: ``advance`` also
 moves the monotonic time that the watchdog's 60 s detection limit and the 15 s lapse
 rule read. One large advance would therefore make the next cycle carve a gap by itself
@@ -1260,3 +1266,150 @@ def test_C1_old_holder_never_sends_after_losing_the_lock(
         }
     ]
     assert _claim_state(off) == ("sent", 1)
+
+
+# WR-01 (code review): a kept outcome is written back only onto this worker's own claim, so
+# another worker's send of the row is never reset and never repeated (ALRT-05, MON-04)
+
+
+def _db_error() -> OperationalError:
+    return OperationalError("server closed the connection unexpectedly")
+
+
+def _claim_raises_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The relay's next claim raises a database error without committing (a DB blip)."""
+    real = outbox.claim
+
+    def claim(message_id: int, lease_pid: int | None = None) -> bool:
+        monkeypatch.setattr(outbox, "claim", real)
+        raise _db_error()
+
+    monkeypatch.setattr(outbox, "claim", claim)
+
+
+def _claim_kept_by_a_lost_worker(
+    leases: Callable[[FakeClock], Lease],
+    location: Any,
+    clock: FakeClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[OutboxMessage, Lease, io_loop.RelayState, Lease]:
+    """Worker A keeps a "no request made" reset of an OFF, then loses its lease session.
+
+    A's claim raises and does not commit, so the OFF is still pending; then A's session is
+    terminated and worker B takes the lock. Returns the OFF, A's lease and relay state (its
+    lease_pid still names the lost session, as a stale HELD status does) and B's lease.
+    """
+    old, new = leases(clock), leases(clock)
+    assert old.ensure_held().state == "held"
+    off = _queue_off(location)
+    a = io_loop.RelayState(lease_pid=old.current().pid)
+    _claim_raises_once(monkeypatch)
+    assert io_loop.run_iteration(clock, a) is False
+    assert (list(a.unapplied), _claim_state(off)) == ([off.pk], ("pending", 0))
+    assert _terminate(LEASE) == 1  # A's session only: B has none yet
+    assert new.ensure_held().state == "held"
+    return off, old, a, new
+
+
+@pytest.mark.django_db(transaction=True)
+def test_WR01_a_kept_reset_never_resets_another_workers_send(
+    leases: Callable[[FakeClock], Lease],
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The review's reproduction: B claims and sends the OFF, and while B's request is in
+    # flight, A (its published status still HELD) runs a pass that flushes the kept reset.
+    clock = FakeClock(T0)
+    off, _old, a, new = _claim_kept_by_a_lost_worker(leases, location_factory(), clock, monkeypatch)
+    b = io_loop.RelayState(lease_pid=new.current().pid)
+    fake_telegram.answer(DEFAULT_BOT_TOKEN, lambda: io_loop.run_iteration(clock, a))
+    fake_telegram.accept(DEFAULT_BOT_TOKEN)
+
+    assert io_loop.run_iteration(clock, b) is True
+
+    # B's "sent" is recorded, and neither worker sends the OFF again.
+    assert _claim_state(off) == ("sent", 1)
+    for _ in range(3):
+        clock.advance(seconds=1)
+        assert io_loop.run_iteration(clock, b) is False
+        assert io_loop.run_iteration(clock, a) is False
+    assert len(fake_telegram.sent) == 1
+    assert a.unapplied == {}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_WR01_a_kept_retry_never_resets_another_workers_send(
+    leases: Callable[[FakeClock], Lease],
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A's OFF is refused (not sent). A's write of the retry commits, but its answer is lost,
+    # so A keeps the outcome. Then B holds the lock and sends the OFF; A's flush during B's
+    # send concerns A's own attempt only and leaves B's claim alone.
+    location = location_factory()
+    clock = FakeClock(T0)
+    old, new = leases(clock), leases(clock)
+    assert old.ensure_held().state == "held"
+    off = _queue_off(location)
+    a = io_loop.RelayState(lease_pid=old.current().pid)
+    fake_telegram.fail(DEFAULT_BOT_TOKEN, exc=_refused(DEFAULT_BOT_TOKEN))
+    real_retry = outbox.mark_retry
+
+    def committed_then_lost(*args: Any, **kwargs: Any) -> bool:
+        monkeypatch.setattr(outbox, "mark_retry", real_retry)
+        real_retry(*args, **kwargs)
+        raise _db_error()
+
+    monkeypatch.setattr(outbox, "mark_retry", committed_then_lost)
+    assert io_loop.run_iteration(clock, a) is True
+    assert (list(a.unapplied), _claim_state(off)) == ([off.pk], ("pending", 1))
+
+    clock.advance(seconds=2)
+    assert _terminate(LEASE) == 1
+    assert new.ensure_held().state == "held"
+    b = io_loop.RelayState(lease_pid=new.current().pid)
+    fake_telegram.answer(DEFAULT_BOT_TOKEN, lambda: io_loop.run_iteration(clock, a))
+    fake_telegram.accept(DEFAULT_BOT_TOKEN)
+
+    assert io_loop.run_iteration(clock, b) is True
+
+    assert _claim_state(off) == ("sent", 2)
+    for _ in range(3):
+        clock.advance(seconds=30)
+        assert io_loop.run_iteration(clock, b) is False
+    assert len(fake_telegram.sent) == 1
+    assert a.unapplied == {}
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("named", ["lost", "current"])
+def test_WR01_a_new_lease_generation_drops_the_kept_resets(
+    leases: Callable[[FakeClock], Lease],
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    named: str,
+) -> None:
+    # B claims the OFF and its request may have reached Telegram when B's session is lost
+    # too. A then holds the lock again (generation 2): its activation writes no kept reset,
+    # whichever lease session its state names, and declares B's send uncertain.
+    clock = FakeClock(T0)
+    off, old, a, new = _claim_kept_by_a_lost_worker(leases, location_factory(), clock, monkeypatch)
+    assert outbox.claim(off.pk, new.current().pid) is True
+    assert _terminate(LEASE) == 1  # B's session
+    held = old.ensure_held()
+    assert (held.state, held.generation) == ("held", 2)
+    fake_telegram.accept(DEFAULT_BOT_TOKEN)
+    if named == "current":
+        a.lease_pid = held.pid
+
+    assert io_loop.activate(a, clock) == 1
+
+    assert a.unapplied == {}
+    assert _claim_state(off) == ("uncertain", 1)
+    a.lease_pid = held.pid
+    clock.advance(seconds=1)
+    assert io_loop.run_iteration(clock, a) is False
+    assert len(fake_telegram.calls) == 0
