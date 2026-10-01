@@ -208,6 +208,22 @@ def test_prod_migrate_runs_release_before_web_and_worker() -> None:
         assert services[name]["restart"] == "unless-stopped", name
 
 
+def test_local_runs_the_same_release_and_worker_as_prod() -> None:
+    # OPS-07: the local one-command stack runs the deploy steps production runs.
+    local = _services("local")
+    prod = _services("prod")
+
+    assert local["migrate"]["command"] == prod["migrate"]["command"]
+    assert local["worker"]["command"] == ["python", "manage.py", "run_worker"]
+    deps = _depends_on(local["worker"])
+    assert deps["db"] == {"condition": "service_healthy"}
+    assert deps["migrate"] == {"condition": "service_completed_successfully"}
+    assert local["worker"]["restart"] == "unless-stopped"
+    # Above the joins' 15 s budget, so a stop never SIGKILLs a send mid-write.
+    assert local["worker"]["stop_grace_period"] == prod["worker"]["stop_grace_period"] == "30s"
+    assert "ports" not in local["worker"]
+
+
 # Images, env files and data (D-03, D-04)
 
 
