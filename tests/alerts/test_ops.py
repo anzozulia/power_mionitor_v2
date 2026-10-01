@@ -400,7 +400,7 @@ def test_a_stop_request_skips_the_ops_queue(
 
 
 @pytest.mark.django_db(transaction=True)
-def test_an_ops_notice_that_cannot_be_rendered_backs_off_alone(
+def test_an_ops_notice_that_cannot_be_rendered_is_dropped_alone(
     location_factory: Callable[..., Any],
     fake_telegram: Any,
     ops_settings: Any,
@@ -421,14 +421,16 @@ def test_an_ops_notice_that_cannot_be_rendered_backs_off_alone(
     assert io_loop.run_iteration(FakeClock(T0), state) is True
 
     row = _row(broken)
-    assert (row.status, row.attempts, row.last_error) == ("pending", 0, "render_error")
-    assert row.next_attempt_at == T0 + io_loop.PERMANENT_BACKOFF
+    assert (row.status, row.attempts, row.last_error) == ("dropped", 0, "render_error")
+    assert row.sent_at is None
     assert _row(alert).status == "sent"
     assert _bots(fake_telegram) == ["A"]
     # The ops bot itself is fine, so it is not backed off.
-    assert io_loop.bot_key(OPS_BOT_TOKEN) not in state.not_before
+    assert state.not_before == {}
     lines = [r.getMessage() for r in caplog.records if r.name == RELAY_LOGGER]
-    assert lines == [f"relay: cannot render ops notice {broken.pk}"]
+    assert lines == [
+        f"relay: ops notice {broken.pk} (ops_uncertain) cannot be rendered; it is dropped"
+    ]
 
 
 @pytest.mark.django_db(transaction=True)

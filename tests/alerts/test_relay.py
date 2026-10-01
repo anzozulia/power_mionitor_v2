@@ -1201,6 +1201,55 @@ def test_B1_an_admin_chat_failure_on_a_shared_bot_never_delays_the_location(
     assert chats == [OPS_CHAT_ID, DEFAULT_CHAT_ID, OPS_CHAT_ID]
 
 
+# B2 (wave 2 audit): one ops notice that cannot be rendered never blocks later notices
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("kind", [outbox.KIND_OPS_GAP, outbox.KIND_OPS_ALL_SILENT_END])
+def test_B2_an_ops_notice_that_cannot_be_rendered_never_blocks_later_notices(
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    ops_settings: Any,
+    caplog: pytest.LogCaptureFixture,
+    kind: str,
+) -> None:
+    # After a backward clock step a notice's end can come before its start: a negative
+    # length, so its text can never be built from this integer-only payload.
+    start, end = ops.instant_us(T0), ops.instant_us(T0 - timedelta(minutes=10))
+    if kind == outbox.KIND_OPS_GAP:
+        payload, location_id = {"start_us": start, "end_us": end}, None
+    else:
+        payload, location_id = {"since_us": start, "first_us": end}, location_factory().pk
+    with transaction.atomic():
+        broken = outbox.enqueue_ops(kind, payload=payload, recorded_at=T0, location_id=location_id)
+    valid = _gap_notice(T0 - timedelta(minutes=10), T0)
+    fake_telegram.accept(OPS_BOT_TOKEN)
+    caplog.set_level(logging.DEBUG)
+    state = io_loop.RelayState()
+
+    assert io_loop.run_iteration(FakeClock(T0), state) is False
+
+    # Retired at once, with no request; the ops bot is fine, so nothing backs off.
+    after = _row(broken)
+    assert (after.status, after.last_error, after.attempts) == ("dropped", "render_error", 0)
+    assert len(fake_telegram.calls) == 0
+    assert state.not_before == {}
+
+    # The next due pass sends the notice behind it.
+    assert io_loop.run_iteration(FakeClock(T0 + _seconds(1)), state) is True
+    assert (_row(valid).status, _row(valid).sent_at) == ("sent", T0 + _seconds(1))
+
+    # Dropped for good: no later pass and no expiry touches it again.
+    for at in (T0 + timedelta(minutes=15), T0 + timedelta(hours=6)):
+        assert io_loop.run_iteration(FakeClock(at), state) is False
+    assert _row(broken).status == "dropped"
+    assert len(fake_telegram.calls) == 1
+    assert _relay_lines(caplog) == [
+        f"relay: ops notice {broken.pk} ({kind}) cannot be rendered; it is dropped"
+    ]
+    assert OPS_BOT_TOKEN not in caplog.text
+
+
 # INV-14 #1: a 429 on one bot never delays another (ALRT-06, D-14)
 
 
