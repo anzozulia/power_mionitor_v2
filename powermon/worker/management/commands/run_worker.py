@@ -9,7 +9,10 @@ One process, three threads, all started at once and always running:
 - ``telegram-io``: reads the status the detection loop last published
   (``lease.current()``). While HELD it drains the outbox (``io_loop.run_iteration``) back
   to back while there is work, waiting IO_IDLE_WAIT_S seconds after a pass that sent
-  nothing; otherwise it idles.
+  nothing; otherwise it idles. On every iteration it also hands the status to
+  ``io_loop.notify_db_down``: once the database has been unreachable for over 5 min
+  since this process lost a lease it held, the admin gets one notice straight from the
+  ops bot, because the outbox lives in the database (D-11 #2, INV-13 #2).
 - main: the watchdog (below), until SIGTERM or SIGINT.
 
 The lease is HELD, STANDBY or DB_DOWN, with a generation counter that rises on every
@@ -193,6 +196,9 @@ def io_thread(
             busy = False
             try:
                 status = lease.current()
+                # D-11 #2: the direct notice while the database stays unreachable; it
+                # resets itself when the lease is HELD or STANDBY again.
+                busy = io_loop.notify_db_down(status, clock, state)
                 if status.state is LeaseState.HELD:
                     if status.generation != activated:
                         io_loop.activate(state, clock)
