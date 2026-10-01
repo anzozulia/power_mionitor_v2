@@ -2,13 +2,18 @@
 
 Production is never started on a dev machine; it is deployed on the VPS (01-11). These
 parse checks keep the committed deploy shape honest: only the TLS proxy is exposed,
-migrations gate the app, data lives under docker_data/<env>, logs are capped.
+migrations gate the app, data lives under docker_data/<env>, logs are capped. Every
+long-running service has a healthcheck, and the worker's reads its health file (OPS-05).
 
 The checks stay true when 01-11 adds the local worker service and switches local
 migrate to ``release``.
 """
 
+import os
 import re
+import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +23,7 @@ from django.conf import settings
 
 from powermon.telegram.client import DEFAULT_TIMEOUT
 from powermon.worker.management.commands.run_worker import JOIN_TIMEOUT_S
+from powermon.worker.supervision import HEALTH_FILE
 
 BASE_DIR = Path(settings.BASE_DIR)
 COMPOSE_FILES = {"local": "docker-compose.local.yml", "prod": "docker-compose.prod.yml"}
@@ -246,6 +252,100 @@ def test_worker_join_budget_covers_one_send_and_fits_the_grace_period(env: str) 
     grace = _duration_s(_services(env)["worker"]["stop_grace_period"])
 
     assert connect + read < JOIN_TIMEOUT_S < grace
+
+
+# Health checks (OPS-05, D-15)
+
+
+def _worker_healthcheck(env: str) -> dict[str, Any]:
+    healthcheck = _services(env)["worker"].get("healthcheck")
+    assert isinstance(healthcheck, dict), f"{env}/worker has no healthcheck"
+    return healthcheck
+
+
+def _worker_healthcheck_code(env: str) -> str:
+    """The Python source of the worker's exec-form ``python -c`` healthcheck."""
+    test = _worker_healthcheck(env).get("test")
+    assert isinstance(test, list) and len(test) == 4, f"{env}/worker healthcheck is not exec form"
+    assert test[:3] == ["CMD", "python", "-c"], f"{env}/worker healthcheck is not python -c"
+    code = test[3]
+    assert isinstance(code, str) and code, f"{env}/worker healthcheck has no code"
+    return code
+
+
+def _run_healthcheck(code: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize("env", ENVS)
+def test_every_long_running_service_has_a_healthcheck(env: str) -> None:
+    # Docker reports a health status only for a service that has a healthcheck. A one-shot
+    # declares restart "no" and is exempt; a service without a restart key is not.
+    exempt = []
+    for name, svc in _services(env).items():
+        if svc.get("restart") == "no":
+            exempt.append(name)
+            continue
+        healthcheck = svc.get("healthcheck") or {}
+        test = healthcheck.get("test")
+        assert healthcheck.get("disable") is not True, f"{env}/{name} disables its healthcheck"
+        # ["NONE"] or an empty list would turn the inherited check off.
+        assert isinstance(test, list) and len(test) > 1, f"{env}/{name} has no healthcheck"
+        assert test[0] in {"CMD", "CMD-SHELL"}, f"{env}/{name} healthcheck is {test!r}"
+
+    assert exempt == ["migrate"]
+
+
+@pytest.mark.parametrize("env", ENVS)
+def test_worker_healthcheck_checks_the_health_file_age(env: str) -> None:
+    # D-15: healthy only while the file the worker touches is under 30 s old. The path is
+    # the writer's own constant, so the file the worker writes and the one Docker reads
+    # cannot drift apart. Unhealthy alone restarts nothing; a hung loop exits 70 instead.
+    healthcheck = _worker_healthcheck(env)
+    code = _worker_healthcheck_code(env)
+
+    assert f"os.stat({str(HEALTH_FILE)!r}).st_mtime < 30" in code
+    assert {key: value for key, value in healthcheck.items() if key != "test"} == {
+        "interval": "10s",
+        "timeout": "5s",
+        "retries": 3,
+        "start_period": "30s",
+    }
+    assert healthcheck == _worker_healthcheck("prod")
+
+
+def test_worker_healthcheck_command_passes_only_for_a_fresh_file() -> None:
+    # The command Docker runs, run as written against the real path (OPS-05 boundary):
+    # touched 5 s ago is healthy, 31 s ago is not, and a missing file is not.
+    code = _worker_healthcheck_code("local")
+    saved = HEALTH_FILE.stat() if HEALTH_FILE.exists() else None
+    try:
+        HEALTH_FILE.touch()
+        now = time.time()
+        os.utime(HEALTH_FILE, (now - 5, now - 5))
+        fresh = _run_healthcheck(code)
+        now = time.time()
+        os.utime(HEALTH_FILE, (now - 31, now - 31))
+        stale = _run_healthcheck(code)
+        HEALTH_FILE.unlink()
+        missing = _run_healthcheck(code)
+    finally:
+        if saved is None:
+            HEALTH_FILE.unlink(missing_ok=True)
+        else:
+            HEALTH_FILE.touch()
+            os.utime(HEALTH_FILE, ns=(saved.st_atime_ns, saved.st_mtime_ns))
+
+    assert fresh.returncode == 0, fresh.stderr
+    assert stale.returncode == 1, stale.stderr
+    assert missing.returncode != 0
+    assert "FileNotFoundError" in missing.stderr
 
 
 # Images, env files and data (D-03, D-04)
