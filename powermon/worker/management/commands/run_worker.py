@@ -5,8 +5,8 @@ One process, three threads:
   connection), activates, starts the two loops, then checks every few seconds that the
   lock session and both loops are alive;
 - ``detection``: ``detection.run_cycle(now)`` every DETECTION_INTERVAL_S seconds;
-- ``telegram-io``: ``io_loop.run_iteration(clock, state)`` back to back while there is work,
-  waiting IO_IDLE_WAIT_S seconds when a pass sent nothing.
+- ``telegram-io``: ``io_loop.run_iteration(clock, state, stop)`` back to back while there
+  is work, waiting IO_IDLE_WAIT_S seconds when a pass sent nothing.
 
 A second instance (a deploy overlap, or one started by mistake) polls the lock in
 standby and never runs a loop; it does not block and does not exit (Pitfall 2).
@@ -18,8 +18,10 @@ code 3; Docker's restart policy brings it back, and the new process re-takes the
 opens a fresh window (D-18). There is no in-process reacquisition before Phase 2.
 
 SIGTERM and SIGINT set the stop event (Python as PID 1 ignores SIGTERM without a handler,
-Pitfall 14). The loops notice it at their next wait, so ``docker compose stop`` finishes
-well inside the 30 s stop_grace_period; joins are bounded by JOIN_TIMEOUT_S.
+Pitfall 14). The loops notice it at their next wait, and the relay also checks it before
+claiming each row, so no new send starts after a stop request. The joins wait up to
+JOIN_TIMEOUT_S for a send already in flight, which ends inside the 30 s
+stop_grace_period.
 """
 
 import logging
@@ -49,9 +51,11 @@ STANDBY_POLL_S = 5.0
 LEASE_CHECK_INTERVAL_S = 5.0
 DETECTION_INTERVAL_S = 5.0
 IO_IDLE_WAIT_S = 1.0
-# Both joins share this budget: below compose's stop_grace_period of 30 s, above the
-# Telegram client's 5 s connect + 10 s read timeouts.
-JOIN_TIMEOUT_S = 15.0
+# Both joins share this budget. After a stop the relay claims no new row, so the joins
+# only wait for the send in flight: above the Telegram client's 5 s connect + 10 s read
+# timeouts, below compose's 30 s stop_grace_period, after which Docker sends SIGKILL.
+# tests/test_compose.py ties the three together.
+JOIN_TIMEOUT_S = 20.0
 EXIT_LEASE_LOST = 3
 
 
@@ -88,7 +92,7 @@ def io_thread(stop: threading.Event, clock: Clock, idle_wait: float) -> None:
     try:
         while not stop.is_set():
             try:
-                busy = run_iteration(clock, state)
+                busy = run_iteration(clock, state, stop)
             except Exception:
                 log.exception("telegram I/O iteration failed")
                 busy = False

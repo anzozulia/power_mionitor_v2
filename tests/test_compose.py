@@ -222,7 +222,7 @@ def test_local_runs_the_same_release_and_worker_as_prod() -> None:
     assert deps["db"] == {"condition": "service_healthy"}
     assert deps["migrate"] == {"condition": "service_completed_successfully"}
     assert local["worker"]["restart"] == "unless-stopped"
-    # Above the joins' 15 s budget, so a stop never SIGKILLs a send mid-write.
+    # Above the joins' 20 s budget, so a stop never SIGKILLs a send mid-write.
     assert local["worker"]["stop_grace_period"] == prod["worker"]["stop_grace_period"] == "30s"
     assert "ports" not in local["worker"]
 

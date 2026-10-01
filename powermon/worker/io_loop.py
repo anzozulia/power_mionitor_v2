@@ -23,6 +23,11 @@ timeouts. So the pass reads the injected ``Clock`` again for each row's due chec
 once more after each send returns: a retry wait (429 retry_after, backoff) and ``sent_at``
 count from when Telegram answered, never from when the pass started (INV-16 #3).
 
+Once ``stop`` is set (SIGTERM), the pass claims no further row. A send already in flight
+ends within the client's timeouts and its outcome is written; every other due row stays
+pending for the next worker. A row claimed and then cut off by the process exit would be
+left "sending", and activation turns that into "uncertain", never sent (INV-15).
+
 Bots are keyed by a short hash of the token, never the token. Log lines name the location
 and a short code only (OPS-08). Loop-body pattern of ``detection.run_cycle``:
 ``close_old_connections()`` first, then each location in its own ``try``.
@@ -31,6 +36,7 @@ Expiry (ALRT-03), late-alert times (ALRT-04) and ops notices arrive in Phase 2.
 
 import hashlib
 import logging
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -66,11 +72,16 @@ def bot_key(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()[:12]
 
 
-def run_iteration(clock: Clock, state: RelayState) -> bool:
-    """One pass over each location's oldest open alert; True if any send was attempted."""
+def run_iteration(clock: Clock, state: RelayState, stop: threading.Event | None = None) -> bool:
+    """One pass over each location's oldest open alert; True if any send was attempted.
+
+    Returns early, before claiming another row, once ``stop`` is set.
+    """
     close_old_connections()
     attempted = False
     for row in outbox.subscriber_heads():
+        if stop is not None and stop.is_set():
+            break
         # Read per row: earlier sends in this pass may have taken seconds each.
         if row.status != "pending" or row.next_attempt_at > clock.now():
             continue
