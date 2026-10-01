@@ -6,7 +6,8 @@ rendered at send time in the location's current language. The D-14 delivery poli
 - maybe delivered (read timeout, dropped connection): uncertain, never resent (INV-16);
 - not sent (connect failure) or a 5xx: retried after min(2 ** attempts, 30) s;
 - 429: retried no earlier than retry_after;
-- any other answer (400/401/403/404): that bot backs off for 15 min.
+- any other answer (400/401/403/404): that channel backs off for 15 min (CR-01: with one
+  bot per location, that bot).
 A bot that is backing off is skipped, and other bots' alerts go out in the same pass: no
 thread ever sleeps out one bot's wait (INV-14).
 
@@ -301,7 +302,7 @@ def test_429_waits_retry_after_while_other_bots_send(
     waiting = _row(row_a)
     assert (waiting.status, waiting.last_error) == ("pending", "429")
     assert waiting.next_attempt_at >= T0 + _seconds(30)
-    assert state.not_before[io_loop.bot_key(TOKEN_A)] >= T0 + _seconds(30)
+    assert state.not_before[io_loop.bot_wide_key(TOKEN_A)] >= T0 + _seconds(30)
     assert _row(row_b).status == "sent"
     assert fake_telegram.sent == [_body(OFF_EN, CHAT_B)]
     for offset in (1, 15, 29):
@@ -386,7 +387,7 @@ def test_INV16_429_after_a_slow_send_waits_retry_after_from_the_429(
     waiting = _row(row_b)
     assert (waiting.status, waiting.attempts, waiting.last_error) == ("pending", 1, "429")
     assert waiting.next_attempt_at == limited_at + _seconds(30)
-    assert state.not_before[io_loop.bot_key(TOKEN_B)] == limited_at + _seconds(30)
+    assert state.not_before[io_loop.bot_wide_key(TOKEN_B)] == limited_at + _seconds(30)
     # The busy pass is followed by the next one at once: B's bot is still not called.
     for offset in (0, 20, 29):
         clock.set(limited_at + _seconds(offset))
@@ -428,7 +429,7 @@ def test_INV16_retry_backoff_counts_from_the_failure(
     row = _row(off)
     assert (row.status, row.attempts, row.last_error) == ("pending", 1, code)
     assert row.next_attempt_at == failed_at + _seconds(2)
-    assert state.not_before[io_loop.bot_key(TOKEN_A)] == failed_at + _seconds(2)
+    assert state.not_before[io_loop.bot_wide_key(TOKEN_A)] == failed_at + _seconds(2)
     clock.set(failed_at + _seconds(1))
     assert io_loop.run_iteration(clock, state) is False
     assert len(fake_telegram.calls) == 1
@@ -520,12 +521,13 @@ def test_permanent_error_backs_off_15_minutes(
     assert (row.status, row.attempts, row.last_error) == ("pending", 1, "http_403")
     assert row.next_attempt_at == T0 + timedelta(minutes=15)
     assert io_loop.PERMANENT_BACKOFF == timedelta(minutes=15)
-    assert state.not_before[io_loop.bot_key(TOKEN_A)] == T0 + timedelta(minutes=15)
+    channel = io_loop.chat_key(TOKEN_A, DEFAULT_CHAT_ID)
+    assert state.not_before == {channel: T0 + timedelta(minutes=15)}
     relay_lines = [r.getMessage() for r in caplog.records if r.name == RELAY_LOGGER]
     assert len(relay_lines) == 1
     assert "http_403" in relay_lines[0]
     assert str(location.pk) in relay_lines[0]
-    # The bot backs off as a whole: its other location waits too, and nothing is retried
+    # The channel backs off as a whole: its other location waits too, and nothing is retried
     # before the 15 minutes are up.
     assert _row(other).status == "pending"
     assert _row(other).attempts == 0
@@ -594,7 +596,7 @@ def test_render_failure_does_not_block_other_locations(
     assert row.next_attempt_at == T0 + timedelta(minutes=15)
     assert _row(good).status == "sent"
     assert fake_telegram.sent == [_body(OFF_EN, CHAT_B)]
-    assert io_loop.bot_key(TOKEN_A) not in state.not_before
+    assert state.not_before == {}
 
 
 @pytest.mark.django_db(transaction=True)
@@ -834,9 +836,8 @@ def _kept_ok(location: Any, answered_at: datetime) -> tuple[OutboxMessage, io_lo
     row = _queue(location)
     assert outbox.claim(row.pk) is True
     state = io_loop.RelayState()
-    state.unapplied[row.pk] = io_loop.Unapplied(
-        _row(row), 1, SendResult("ok"), answered_at, io_loop.bot_key(TOKEN_A)
-    )
+    key = io_loop.chat_key(TOKEN_A, DEFAULT_CHAT_ID)
+    state.unapplied[row.pk] = io_loop.Unapplied(_row(row), 1, SendResult("ok"), answered_at, key)
     return row, state
 
 
@@ -935,12 +936,15 @@ def test_WR04_flush_applies_each_kept_outcome(
     next_attempt_s: int | None,
 ) -> None:
     # The outcome is applied as if it had been written right away: waits count from when
-    # Telegram answered (T0 + 3 s), and the bot's backoff is set under the kept key.
+    # Telegram answered (T0 + 3 s), and the backoff is set under the kept keys: the channel's
+    # and, for these bot-wide outcomes, the bot's.
     row = _queue(location_factory())
     assert outbox.claim(row.pk) is True
     state = io_loop.RelayState()
-    key = io_loop.bot_key(TOKEN_A)
-    state.unapplied[row.pk] = io_loop.Unapplied(_row(row), 1, result, T0 + _seconds(3), key)
+    key, bot_wide = io_loop.chat_key(TOKEN_A, DEFAULT_CHAT_ID), io_loop.bot_wide_key(TOKEN_A)
+    state.unapplied[row.pk] = io_loop.Unapplied(
+        _row(row), 1, result, T0 + _seconds(3), key, bot_wide
+    )
 
     assert io_loop.run_iteration(FakeClock(T0 + _seconds(4)), state) is False
 
@@ -948,7 +952,7 @@ def test_WR04_flush_applies_each_kept_outcome(
     assert (after.status, after.last_error) == (status, last_error)
     if next_attempt_s is not None:
         assert after.next_attempt_at == T0 + _seconds(next_attempt_s)
-        assert state.not_before[key] == T0 + _seconds(next_attempt_s)
+        assert state.not_before == dict.fromkeys((key, bot_wide), T0 + _seconds(next_attempt_s))
     assert state.unapplied == {}
 
 
@@ -1240,7 +1244,7 @@ def test_D1_a_location_chat_refusal_on_a_shared_bot_never_holds_the_ops_notices(
     assert io_loop.run_iteration(FakeClock(T0), state) is True
     assert chats == [DEFAULT_CHAT_ID, OPS_CHAT_ID]
     assert (_row(first).status, _row(first).sent_at) == ("sent", T0)
-    # D-14 for subscriber rows is unchanged: the location's bot backs off 15 min.
+    # D-14 for subscriber rows is unchanged: the location's channel backs off 15 min.
     assert (_row(off).status, _row(off).next_attempt_at) == ("pending", T0 + timedelta(minutes=15))
 
     # A notice queued while the bot backs off for the location goes out when due.

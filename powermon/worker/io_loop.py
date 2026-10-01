@@ -33,15 +33,17 @@ The result decides the row's next status, for both channels (D-14 policy):
 - rate_limited (429): retried after retry_after seconds, capped at MAX_RETRY_AFTER_S.
 - permanent (400/401/403/404): retried after PERMANENT_BACKOFF, with one warning.
 
-Every retry of a subscriber row also backs off the whole bot in ``RelayState.not_before``
-(``bot_key``), for every location on that bot (D-14). The admin chat has its own key there
-(``ops_key``), apart from its bot's, because the admin may reuse a location's bot for the
-ops chat (D-09). Each direction concerns one chat only: a failure of the admin chat never
-delays that location's alerts (B1), and a 400/401/403 for the location's channel (the bot
-removed from it) never holds the ops rows (D1). Only a bot-wide outcome of a subscriber
-send, a 429, a 5xx or a refused connection, also sets ``bot_wide_key``, which the ops
-sends wait for as well. A bot that is backing off is skipped, and the pass moves on to
-other bots: nothing here sleeps (INV-14).
+Every retry of a subscriber row also backs off its channel in ``RelayState.not_before``
+(``chat_key``: the bot and the chat id), so that channel's rows wait (D-14). Two locations
+may share one bot: a 400/401/403 for one channel (the bot removed from it, the chat gone)
+concerns that channel only, so it never holds another location on the bot (CR-01) nor the
+ops rows (D1). Only a bot-wide outcome of a subscriber send, a 429, a 5xx or a refused
+connection, also sets ``bot_wide_key``, which every chat of that bot waits for: each
+location on it, and the admin chat when the admin reuses a location's bot for it (D-09).
+The admin chat has its own key (``ops_key``), apart from its bot's, so a failure of the
+admin chat never delays a location's alerts (B1). With one bot per location, the default,
+a channel's backoff is its bot's, as D-14 states. A channel or bot that is backing off is
+skipped, and the pass moves on: nothing here sleeps (INV-14).
 The thread's only blocking wait is its idle ``stop.wait`` in ``run_worker``.
 
 Sends are one after another, and each can block for the client's connect plus read
@@ -159,7 +161,10 @@ class Unapplied:
 
     ``result`` None means no request was made (the claim's own outcome is unknown, or an
     error came before the HTTP call): the row goes back to "pending". Otherwise it is
-    Telegram's answer at ``answered_at``, applied as if it had been written then.
+    Telegram's answer at ``answered_at``, applied as if it had been written then. ``key``
+    is the backoff key of the chat the row went to (``chat_key`` or ``ops_key``);
+    ``bot_wide`` is its bot's ``bot_wide_key`` for a subscriber row, which a bot-wide
+    outcome sets as well (D1), and None for an ops row (B1).
     """
 
     row: OutboxMessage
@@ -167,13 +172,15 @@ class Unapplied:
     result: SendResult | None
     answered_at: datetime
     key: str
+    bot_wide: str | None = None
 
 
 @dataclass
 class RelayState:
     """What the relay remembers between passes.
 
-    ``not_before``: when each bot may be called again. ``unapplied``: outcomes kept after
+    ``not_before``: when each chat or bot may be called again, by its key (``chat_key``,
+    ``ops_key``, ``bot_wide_key``). ``unapplied``: outcomes kept after
     a database error, by row id, written before the next claim (WR-04).
     ``db_down_notified``: this database outage's direct notice is done (D-11 #2).
     ``lease_pid``: the lease session of the HELD status the next pass runs under, set by
@@ -193,6 +200,16 @@ def bot_key(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()[:12]
 
 
+def chat_key(token: str, chat_id: int) -> str:
+    """One location channel's backoff key: its bot (by ``bot_key``) and its chat id (CR-01).
+
+    Every retry of a subscriber row sets it, so that channel's rows wait (D-14). A
+    400/401/403 sets only this key: two locations may share one bot, and one channel's
+    refusal must never hold the other location's alerts until they expire.
+    """
+    return f"chat:{bot_key(token)}:{chat_id}"
+
+
 def ops_key(token: str) -> str:
     """The admin chat's own backoff key, apart from the bot's (B1, INV-20 #2).
 
@@ -208,9 +225,10 @@ def bot_wide_key(token: str) -> str:
     """The backoff every chat of a bot waits for, the admin chat included (D1).
 
     Set only by a bot-wide outcome of a subscriber send (``_BOT_WIDE_KINDS``: a 429, a
-    5xx, a refused connection), next to the bot's own ``bot_key``. A 400/401/403 concerns
-    one location's channel (the bot removed from it), so it backs off only that bot's
-    subscriber rows (D-14) and never holds the ops chat when the admin shares the bot.
+    5xx, a refused connection), next to that channel's ``chat_key``; every location on the
+    bot waits for it too (D-14). A 400/401/403 concerns one location's channel (the bot
+    removed from it), so it backs off only that channel: never another location on the
+    bot (CR-01), never the ops chat when the admin shares the bot (D1).
     """
     return _BOT_WIDE_PREFIX + bot_key(token)
 
@@ -352,13 +370,16 @@ def _expire(now: datetime) -> int:
 
 
 def _deliver(row: OutboxMessage, clock: Clock, state: RelayState) -> bool:
-    """Send one due head row unless its bot is backing off; True if a send was attempted."""
+    """Send one due head row unless its channel or bot backs off; True if a send was made."""
     location = row.location
     if location is None:
         raise ValueError("a subscriber alert without a location")
-    key = bot_key(location.bot_token)
+    key = chat_key(location.bot_token, location.chat_id)
+    bot_wide = bot_wide_key(location.bot_token)
     now = clock.now()
-    if state.not_before.get(key, now) > now:
+    # This channel's own backoff, or its bot's: a 400/401/403 for another channel on the
+    # same bot never holds it (CR-01).
+    if max(state.not_before.get(key, now), state.not_before.get(bot_wide, now)) > now:
         return False
     try:
         # Rendered now, right before the claim: lateness is measured at send time (D-07).
@@ -368,7 +389,7 @@ def _deliver(row: OutboxMessage, clock: Clock, state: RelayState) -> bool:
         outbox.mark_retry(row.pk, now + PERMANENT_BACKOFF, "render_error")
         log.warning("relay: cannot render alert %s for location %s", row.pk, row.location_id)
         return False
-    return _send(row, text, location.bot_token, location.chat_id, key, clock, state)
+    return _send(row, text, location.bot_token, location.chat_id, key, clock, state, bot_wide)
 
 
 def _deliver_ops(clock: Clock, state: RelayState) -> bool:
@@ -410,14 +431,16 @@ def _send(
     key: str,
     clock: Clock,
     state: RelayState,
+    bot_wide: str | None = None,
 ) -> bool:
     """Claim, send and record one row of either channel; True if the request was made.
 
-    The claim names ``state.lease_pid`` when it is set: it fails, and nothing is sent,
-    once that lease session no longer holds the worker lock (C1). From the claim on, no
-    error leaves the row "sending" for good (WR-04, D-13): a database error keeps what is
-    known in ``state.unapplied``, and an error before the HTTP call puts the row back to
-    "pending".
+    ``key`` is the chat's backoff key and ``bot_wide`` the bot's, for a subscriber row
+    only (``Unapplied``). The claim names ``state.lease_pid`` when it is set: it fails,
+    and nothing is sent, once that lease session no longer holds the worker lock (C1).
+    From the claim on, no error leaves the row "sending" for good (WR-04, D-13): a
+    database error keeps what is known in ``state.unapplied``, and an error before the
+    HTTP call puts the row back to "pending".
     """
     attempts = row.attempts + 1
     lease_pid = state.lease_pid
@@ -425,7 +448,7 @@ def _send(
         claimed = outbox.claim(row.pk) if lease_pid is None else outbox.claim(row.pk, lease_pid)
     except Error as exc:
         # The claim may or may not have committed; either way no request was made.
-        state.unapplied[row.pk] = Unapplied(row, attempts, None, clock.now(), key)
+        state.unapplied[row.pk] = Unapplied(row, attempts, None, clock.now(), key, bot_wide)
         log.warning("relay: could not claim alert %s (%s); retrying", row.pk, type(exc).__name__)
         return False
     if not claimed:
@@ -439,11 +462,11 @@ def _send(
             row.pk,
             type(exc).__name__,
         )
-        _write(Unapplied(row, attempts, None, clock.now(), key), state)
+        _write(Unapplied(row, attempts, None, clock.now(), key, bot_wide), state)
         return False
     result = client.send_message(chat_id, text)
     # The send may have blocked for seconds: waits and sent_at count from its answer.
-    _write(Unapplied(row, attempts, result, clock.now(), key), state)
+    _write(Unapplied(row, attempts, result, clock.now(), key, bot_wide), state)
     return True
 
 
@@ -476,7 +499,15 @@ def _record(outcome: Unapplied, state: RelayState) -> None:
     if outcome.result is None:
         outbox.mark_retry(outcome.row.pk, outcome.answered_at, "pre_send_error")
         return
-    _apply(outcome.row, outcome.attempts, outcome.result, outcome.answered_at, state, outcome.key)
+    _apply(
+        outcome.row,
+        outcome.attempts,
+        outcome.result,
+        outcome.answered_at,
+        state,
+        outcome.key,
+        outcome.bot_wide,
+    )
 
 
 def _late_prefix(row: OutboxMessage, now: datetime) -> str | None:
@@ -504,8 +535,9 @@ def _apply(
     now: datetime,
     state: RelayState,
     key: str,
+    bot_wide: str | None = None,
 ) -> None:
-    """Record a send's outcome on the claimed row (and on the bot, for a retry)."""
+    """Record a send's outcome on the claimed row (and on the chat or bot, for a retry)."""
     if result.kind == "ok":
         outbox.mark_sent(row.pk, now)
         return
@@ -525,17 +557,18 @@ def _apply(
             )
         else:
             log.warning(
-                "relay: permanent error %s for location %s; its bot backs off for 15 min",
+                "relay: permanent error %s for location %s; its channel backs off for 15 min",
                 result.code,
                 row.location_id,
             )
     else:  # not_sent or transient: nothing was delivered, retry with a capped backoff
         delay = timedelta(seconds=min(2**attempts, BACKOFF_CAP_S))
     next_attempt_at = now + delay
-    # In memory first: if the write below fails, the bot still waits (WR-04).
+    # In memory first: if the write below fails, the chat still waits (WR-04).
     state.not_before[key] = next_attempt_at
-    if row.channel == outbox.CHANNEL_SUBSCRIBER and result.kind in _BOT_WIDE_KINDS:
-        # A subscriber row's key is its bot's ``bot_key``: the whole bot is limited or
-        # unreachable, so a shared admin chat waits too (D1).
-        state.not_before[_BOT_WIDE_PREFIX + key] = next_attempt_at
+    if bot_wide is not None and result.kind in _BOT_WIDE_KINDS:
+        # A subscriber send found the whole bot limited or unreachable: every location on
+        # it waits, and so does a shared admin chat (D1). A 400/401/403 stays with this
+        # channel (CR-01).
+        state.not_before[bot_wide] = next_attempt_at
     outbox.mark_retry(row.pk, next_attempt_at, result.code or result.kind)
