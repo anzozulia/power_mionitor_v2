@@ -397,9 +397,12 @@ outbox and go out late (INV-15: blocked 10:00-10:10, last heartbeat 10:02, power
 
    It must show `power_off`, `pending` and `connect_error`. If it shows `sent`, the
    block did not work: remove it (step 5), plug A back in and start again.
-3. A few minutes later, and at least 3 minutes before the block ends, restore A's power
-   and note the time: that is the restore time (A's first heartbeat follows within its
-   period).
+3. A few minutes later, and at least 5 minutes before the block ends, restore A's power.
+   The restore time is A's **first heartbeat** after power returns, not the moment you
+   plug A in. Reload the location list until A shows **On** and note its **Last
+   heartbeat**: that is the restore time. Wait until at least 3 minutes have passed
+   since then before you remove the block (step 5). Otherwise the ON may go out less
+   than 2 minutes after it was recorded and carry no event time.
 4. While Telegram is blocked, time heartbeats from another machine, with the key of a
    location whose device is on (never A's key while A is unplugged: every request
    counts as a heartbeat):
@@ -422,8 +425,8 @@ Expected:
 - while Telegram is blocked, the test channel gets nothing from A;
 - within about 60 s of unblocking, A's OFF and then A's ON arrive, exactly once each.
   Both start with their local event time: the OFF with the outage start (step 2), the
-  ON with the restore time (step 3), for example `🔴 10:02 POWER OFF`, then
-  `🟢 10:06 POWER ON`;
+  ON with the restore time, which is A's first heartbeat after power returned
+  (step 3). For example `🔴 10:02 POWER OFF`, then `🟢 10:06 POWER ON`;
 - every timed heartbeat took under 1 s;
 - no `❓ … may not have been delivered` notice: a refused connection means "not sent",
   so the alerts were retried.
