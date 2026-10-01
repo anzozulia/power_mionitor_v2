@@ -13,10 +13,13 @@ router-reconnect grace off, language en, display TZ Europe/Kyiv.
   ``wait_for``, ``terminate_backends``): one connection per actor thread, a hook inside the
   transaction instead of ``time.sleep``, and a ``pg_stat_activity`` check that the waiter
   really waits on the row lock (RESEARCH Pitfall 8).
+- The admin ops chat is not configured in the test env, so ops notices go to the log;
+  ``ops_settings`` configures it with ``OPS_BOT_TOKEN`` and ``OPS_CHAT_ID`` (D-09).
 
 Test modules import the helper classes directly: ``from conftest import FakeClock``.
 """
 
+import dataclasses
 import json
 import threading
 import time
@@ -33,6 +36,9 @@ TELEGRAM_API = "https://api.telegram.org"
 # A token with the shape the location form accepts (digits, colon, 30+ characters).
 DEFAULT_BOT_TOKEN = "123456789:" + "A" * 35
 DEFAULT_CHAT_ID = -1001234567890
+# The env-configured admin ops chat (D-09); the test env leaves it unset (ops_settings).
+OPS_BOT_TOKEN = "555555555:" + "C" * 35
+OPS_CHAT_ID = -1005555555555
 # check --deploy (security.W009) wants at least 50 characters and 5 distinct ones.
 PRODUCTION_SECRET_KEY = ("test-only-not-a-secret-" * 3)[:64]
 
@@ -278,6 +284,20 @@ def location_factory(fixed_now: datetime) -> Callable[..., Any]:
         return location
 
     return make
+
+
+@pytest.fixture
+def ops_settings(settings: Any) -> Any:
+    """``settings.CFG`` with the admin ops chat configured (OPS_BOT_TOKEN + OPS_CHAT_ID, D-09).
+
+    Code reads ``settings.CFG`` at call time, so the override applies to the whole test and
+    pytest-django restores the original afterwards. Without this fixture the test env has
+    no ops chat, and ops notices go to the log.
+    """
+    settings.CFG = dataclasses.replace(
+        settings.CFG, ops_bot_token=OPS_BOT_TOKEN, ops_chat_id=OPS_CHAT_ID
+    )
+    return settings
 
 
 @pytest.fixture
