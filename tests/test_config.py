@@ -9,6 +9,10 @@ configured"; one of them alone, or a malformed value, is refused in every mode, 
 error never holds the token. ALERT_MAX_AGE_HOURS (1-48, default 6) and LOG_LEVEL (default
 INFO) are refused when malformed. Build mode reads none of them.
 
+The Config's repr leaves out every secret (SECRET_KEY, ADMIN_PASSWORD, POSTGRES_PASSWORD,
+OPS_BOT_TOKEN), so neither a log line nor the DEBUG technical 500 page, which lists the
+``CFG`` setting by its repr, can show one (wave 1 audit A3).
+
 Every production case starts from one complete valid production env and changes only the
 variable under test, so each error names exactly that variable whatever order ``load()``
 checks in. Envs are plain dicts: no os.environ mutation, no monkeypatching.
@@ -18,11 +22,14 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 from django.conf import settings
+from django.test import RequestFactory
+from django.views.debug import technical_500_response
 
-from powermon.config import EXAMPLE_VALUES, ConfigError, load
+from powermon.config import BUILD_SECRET_KEY, EXAMPLE_VALUES, ConfigError, load
 
 ENV_EXAMPLE = Path(settings.BASE_DIR) / ".env.example"
 SECRETS = ("SECRET_KEY", "ADMIN_PASSWORD", "POSTGRES_PASSWORD")
@@ -376,6 +383,56 @@ def test_build_mode_skips_secrets() -> None:
     assert cfg.ops_chat_id is None
     assert cfg.alert_max_age_hours == 6
     assert cfg.log_level == "INFO"
+
+
+# The config's repr never shows a secret (wave 1 audit A3)
+
+# Every secret Config holds, by the variable it comes from.
+SECRET_VARIABLES = (*SECRETS, "OPS_BOT_TOKEN")
+
+
+def _boom() -> None:
+    raise RuntimeError("a view failed")
+
+
+def test_config_repr_hides_every_secret() -> None:
+    text = repr(load(_env()))
+
+    for name in SECRET_VARIABLES:
+        assert VALID_PRODUCTION[name] not in text, name
+    for field in ("secret_key", "admin_password", "db_password", "ops_bot_token"):
+        assert f"{field}=" not in text, field
+    # Everything else is still shown.
+    assert "admin_username='admin'" in text
+    assert f"ops_chat_id={OPS_CHAT_ID}" in text
+    assert f"domain='{DOMAIN}'" in text
+
+
+def test_build_mode_config_repr_hides_its_placeholder_key() -> None:
+    cfg = load({"APP_BUILD": "1"})
+
+    text = repr(cfg)
+
+    assert cfg.secret_key == BUILD_SECRET_KEY
+    assert BUILD_SECRET_KEY not in text
+    assert text.startswith("Config(app_env='production', production=True, build=True")
+
+
+def test_debug_500_page_never_shows_config_secrets(settings: Any, rf: RequestFactory) -> None:
+    # With DEBUG on (local only), Django's technical 500 page lists every setting. It masks
+    # settings by name, and "CFG" matches none of its patterns, so the page shows CFG as its
+    # repr: that repr must hold no secret.
+    settings.CFG = load(_env())
+    settings.DEBUG = True
+    try:
+        _boom()
+    except RuntimeError:
+        response = technical_500_response(rf.get("/"), *sys.exc_info())
+
+    page = response.content.decode()
+    assert "admin_username" in page
+    for name in SECRET_VARIABLES:
+        assert VALID_PRODUCTION[name] not in page, name
 
 
 @pytest.mark.parametrize("value", ["0", "true", "yes"])

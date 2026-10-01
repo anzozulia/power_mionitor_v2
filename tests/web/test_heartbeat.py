@@ -6,7 +6,12 @@ whole middleware stack (CSRF, login-required, CSP, slash handling) is part of th
 
 While the database fails, /hb answers 503 ``db unavailable``; the log gets one WARNING per
 outage per process (class name only) and one line when the database answers again, not a
-traceback or a django.request line per heartbeat (D-16, OPS-08).
+traceback or a django.request line per heartbeat (D-16, OPS-08). Only errors that mean the
+database cannot be reached count as an outage: OperationalError (statement_timeout
+included), InterfaceError, and the ProgrammingError psycopg raises on a connection that
+already died. Any other database error (IntegrityError, DataError, a genuine
+ProgrammingError) is a bug: Django answers 500 and logs the traceback, and the outage flag
+is left alone (wave 1 audit A1).
 """
 
 import logging
@@ -16,7 +21,14 @@ from typing import Any
 
 import pytest
 from conftest import FakeClock
-from django.db import DatabaseError, OperationalError
+from django.db import (
+    IntegrityError,
+    InterfaceError,
+    OperationalError,
+    ProgrammingError,
+    connection,
+    transaction,
+)
 from django.http import HttpResponse
 from django.test import Client, RequestFactory
 
@@ -78,6 +90,16 @@ def _assert_db_unavailable(response: Any) -> None:
 def _db_down(*args: Any, **kwargs: Any) -> Any:
     # A psycopg message can carry the host, the user and more; none of it may be logged.
     raise OperationalError("connection to server at db failed: password=hunter2")
+
+
+def _integrity_bug(*args: Any, **kwargs: Any) -> Any:
+    # The database answered: the code asked for something the schema refuses.
+    raise IntegrityError('duplicate key value violates unique constraint "power_interval_no"')
+
+
+def _lenient_client() -> Client:
+    """A test client that returns Django's 500 response instead of raising the exception."""
+    return Client(raise_request_exception=False)
 
 
 def _view_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
@@ -556,7 +578,8 @@ def test_heartbeat_503_when_the_key_lookup_fails(
     location = location_factory()
 
     def unreachable(*args: Any, **kwargs: Any) -> Any:
-        raise DatabaseError("could not connect to server: password=hunter2")
+        # Django raises a refused connection as OperationalError.
+        raise OperationalError("could not connect to server: password=hunter2")
 
     monkeypatch.setattr(Location.objects, "filter", unreachable)
     caplog.set_level(logging.DEBUG)
@@ -566,7 +589,7 @@ def test_heartbeat_503_when_the_key_lookup_fails(
 
     _assert_db_unavailable(by_header)
     _assert_db_unavailable(by_query)
-    assert _view_warnings(caplog) == [DB_DOWN.format("DatabaseError")]
+    assert _view_warnings(caplog) == [DB_DOWN.format("OperationalError")]
     assert _request_records(caplog) == []
     assert "hunter2" not in caplog.text
 
@@ -588,3 +611,204 @@ def test_rejected_keys_keep_their_401_while_the_database_fails(
 
     _assert_unauthorized(response)
     assert _view_warnings(caplog) == []
+
+
+# Which errors count as an outage (wave 1 audit A1): only "the database cannot be reached"
+
+
+@pytest.mark.django_db
+def test_heartbeat_503_on_interface_error(
+    location_factory: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    outage_log: Any,
+) -> None:
+    # InterfaceError (a connection the driver can no longer use) is not a DatabaseError
+    # subclass in Django, but it is an outage all the same.
+    location = location_factory()
+
+    def unusable(*args: Any, **kwargs: Any) -> Any:
+        raise InterfaceError("connection already closed")
+
+    monkeypatch.setattr(transitions, "record_heartbeat", unusable)
+    caplog.set_level(logging.DEBUG)
+
+    response = _lenient_client().get("/hb", headers=_bearer(location.device_key))
+
+    _assert_db_unavailable(response)
+    assert _view_warnings(caplog) == [DB_DOWN.format("InterfaceError")]
+    assert _request_records(caplog) == []
+
+
+@pytest.mark.django_db
+def test_heartbeat_503_when_the_statement_times_out(
+    location_factory: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    outage_log: Any,
+) -> None:
+    # A real statement_timeout (QueryCanceled) is an OperationalError: a database too slow
+    # to answer is an outage for the device, not a bug.
+    location = location_factory()
+
+    def too_slow(location_id: int, now: datetime) -> str:
+        with transaction.atomic(), connection.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = 1")
+            cur.execute("SELECT pg_sleep(1)")
+        return "plain"
+
+    monkeypatch.setattr(transitions, "record_heartbeat", too_slow)
+    caplog.set_level(logging.DEBUG)
+
+    response = _lenient_client().get("/hb", headers=_bearer(location.device_key))
+
+    _assert_db_unavailable(response)
+    assert _view_warnings(caplog) == [DB_DOWN.format("OperationalError")]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_heartbeat_503_when_atomic_meets_a_dead_connection(
+    location_factory: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    outage_log: Any,
+) -> None:
+    # When the session has died under Django, psycopg refuses atomic()'s autocommit switch
+    # with a ProgrammingError, not an OperationalError. With the connection gone, that is
+    # an outage.
+    location = location_factory()
+
+    def dead_session(location_id: int, now: datetime) -> str:
+        connection.connection.close()
+        raise ProgrammingError(
+            "can't change 'autocommit' now: connection in transaction status UNKNOWN"
+        )
+
+    monkeypatch.setattr(transitions, "record_heartbeat", dead_session)
+    caplog.set_level(logging.DEBUG)
+
+    try:
+        response = _lenient_client().get("/hb", headers=_bearer(location.device_key))
+    finally:
+        # Drop the dead connection, so the test teardown opens a fresh one.
+        connection.close()
+
+    _assert_db_unavailable(response)
+    assert _view_warnings(caplog) == [DB_DOWN.format("ProgrammingError")]
+    assert _request_records(caplog) == []
+
+
+@pytest.mark.django_db
+def test_heartbeat_integrity_error_is_a_bug_not_an_outage(
+    location_factory: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    outage_log: Any,
+) -> None:
+    location = location_factory()
+    monkeypatch.setattr(transitions, "record_heartbeat", _integrity_bug)
+    caplog.set_level(logging.DEBUG)
+    client = _lenient_client()
+
+    response = client.get("/hb", {"key": location.device_key})
+
+    assert response.status_code == 500
+    assert _view_warnings(caplog) == []
+    assert "database unavailable" not in caplog.text
+    # Django logs the bug once, at ERROR, with its traceback (redacted by the formatter).
+    [record] = _request_records(caplog)
+    assert record.levelno == logging.ERROR
+    assert record.exc_info is not None
+    assert record.exc_info[0] is IntegrityError
+    assert location.device_key not in caplog.text
+
+    # The outage flag was not set: the next real outage still gets its one WARNING.
+    monkeypatch.setattr(transitions, "record_heartbeat", _db_down)
+    _assert_db_unavailable(client.get("/hb", headers=_bearer(location.device_key)))
+    assert _view_warnings(caplog) == [DB_DOWN.format("OperationalError")]
+
+
+@pytest.mark.django_db
+def test_heartbeat_programming_error_on_a_live_connection_is_a_bug(
+    location_factory: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    outage_log: Any,
+) -> None:
+    # A real ProgrammingError from broken SQL, on a connection that still works.
+    location = location_factory()
+
+    def broken_sql(location_id: int, now: datetime) -> str:
+        with transaction.atomic(), connection.cursor() as cur:
+            cur.execute("SELECT * FROM no_such_table")
+        return "plain"
+
+    monkeypatch.setattr(transitions, "record_heartbeat", broken_sql)
+    caplog.set_level(logging.DEBUG)
+
+    response = _lenient_client().get("/hb", headers=_bearer(location.device_key))
+
+    assert response.status_code == 500
+    assert _view_warnings(caplog) == []
+    [record] = _request_records(caplog)
+    assert record.exc_info is not None
+    assert record.exc_info[0] is ProgrammingError
+
+
+@pytest.mark.django_db
+def test_heartbeat_bug_neither_ends_nor_restarts_an_outage(
+    location_factory: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    outage_log: Any,
+) -> None:
+    location = location_factory()
+    client = _lenient_client()
+    caplog.set_level(logging.DEBUG)
+
+    codes = []
+    for record in (_db_down, _integrity_bug, _db_down):
+        monkeypatch.setattr(transitions, "record_heartbeat", record)
+        codes.append(client.get("/hb", headers=_bearer(location.device_key)).status_code)
+
+    assert codes == [503, 500, 503]
+    # Still one outage: the bug in between logged no "reachable again" and no second start.
+    assert _view_warnings(caplog) == [DB_DOWN.format("OperationalError")]
+
+
+@pytest.mark.django_db
+def test_heartbeat_failing_location_next_to_a_healthy_one_logs_no_outage(
+    location_factory: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    outage_log: Any,
+) -> None:
+    # Regression: one location whose heartbeat always hits a bug, beating in turn with a
+    # healthy one, once wrote "unavailable" and "reachable again" for every failing beat.
+    failing = location_factory(name="Failing location")
+    healthy = location_factory(name="Healthy location")
+    real = transitions.record_heartbeat
+
+    def record(location_id: int, now: datetime) -> str:
+        if location_id == failing.pk:
+            _integrity_bug()
+        return real(location_id, now)
+
+    monkeypatch.setattr(transitions, "record_heartbeat", record)
+    client = _lenient_client()
+    caplog.set_level(logging.DEBUG)
+
+    codes = [
+        client.get("/hb", headers=_bearer(location.device_key)).status_code
+        for _ in range(5)
+        for location in (failing, healthy)
+    ]
+
+    assert codes == [500, 200] * 5
+    assert _view_warnings(caplog) == []
+    # Each failing beat is one ERROR with its traceback, never a WARNING pair.
+    errors = _request_records(caplog)
+    assert [r.levelno for r in errors] == [logging.ERROR] * 5
+    assert all(r.exc_info is not None and r.exc_info[0] is IntegrityError for r in errors)
+    assert _state(healthy).status == "on"
+    assert _state(failing).status == "waiting"

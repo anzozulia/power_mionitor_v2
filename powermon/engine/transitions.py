@@ -165,6 +165,9 @@ def record_heartbeat(location_id: int, now: datetime) -> str:
     waited on a lapse carve's lock can lie before the open off piece's new start. Closing
     the off interval there would violate ``power_interval_end_after_start`` and answer 500
     on every heartbeat; the clamp keeps the CHECK true and "was OFF for" never negative.
+    The ON alert is dated at ``at`` but recorded at ``now``: the outbox makes a row due at
+    its recorded_at, so after a backward clock step the alert goes out at once instead of
+    waiting until the wall clock reaches ``at`` again. Without a clamp ``at == now``.
     """
     params: dict[str, int | datetime] = {"id": location_id, "now": now}
     with transaction.atomic(), connection.cursor() as cur:
@@ -190,7 +193,7 @@ def record_heartbeat(location_id: int, now: datetime) -> str:
                     outbox.KIND_POWER_ON,
                     location_id,
                     event_at=at,
-                    recorded_at=at,
+                    recorded_at=now,
                     payload={"was_off_us": _us(at - outage_started_at)},
                 )
             return "restored"

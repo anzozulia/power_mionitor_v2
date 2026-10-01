@@ -13,7 +13,7 @@ value, is refused, and the error never holds the token. Consumers read
 
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from powermon.locations import validators
@@ -61,18 +61,23 @@ _HOST_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?")
 
 @dataclass(frozen=True, slots=True)
 class Config:
-    """The validated configuration every Django entrypoint is built from."""
+    """The validated configuration every Django entrypoint is built from.
+
+    The secrets are left out of the repr, so neither a log line nor Django's DEBUG 500
+    page (which lists the ``CFG`` setting by its repr, its name matching none of
+    Django's masking patterns) can show one (OPS-08).
+    """
 
     app_env: str
     production: bool
     build: bool
     debug: bool
-    secret_key: str
+    secret_key: str = field(repr=False)
     admin_username: str
-    admin_password: str
+    admin_password: str = field(repr=False)
     db_name: str
     db_user: str
-    db_password: str
+    db_password: str = field(repr=False)
     db_host: str
     db_port: int
     domain: str
@@ -80,7 +85,7 @@ class Config:
     allowed_hosts: tuple[str, ...]
     public_base_url: str
     # "" and None when the ops chat is not configured (D-09).
-    ops_bot_token: str
+    ops_bot_token: str = field(repr=False)
     ops_chat_id: int | None
     alert_max_age_hours: int
     log_level: str

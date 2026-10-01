@@ -16,7 +16,15 @@ from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_not_required
 from django.contrib.auth.views import LoginView, LogoutView
-from django.db import DatabaseError, connection, transaction
+from django.db import (
+    DatabaseError,
+    Error,
+    InterfaceError,
+    OperationalError,
+    ProgrammingError,
+    connection,
+    transaction,
+)
 from django.db.models.functions import Lower
 from django.http import HttpRequest, HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
@@ -233,19 +241,38 @@ def _extract_key(request: HttpRequest) -> str | None:
     return key if KEY_RE.fullmatch(key) else None
 
 
+def _db_unreachable(exc: Error) -> bool:
+    """True when ``exc`` means the database cannot be reached, not that the code is wrong.
+
+    OperationalError covers a refused or dropped connection and a statement_timeout
+    (QueryCanceled); InterfaceError a connection the driver can no longer use. psycopg
+    raises ProgrammingError ("can't change 'autocommit' now: connection in transaction
+    status UNKNOWN") when atomic() meets a connection that already died, so a
+    ProgrammingError counts only while this thread's connection is gone. Any other
+    database error (IntegrityError, DataError, a genuine ProgrammingError) is a bug.
+    """
+    if isinstance(exc, OperationalError | InterfaceError):
+        return True
+    if isinstance(exc, ProgrammingError):
+        raw = connection.connection
+        return raw is None or bool(raw.closed)
+    return False
+
+
 class _DbOutageLog:
     """One WARNING when heartbeats start failing on the database, one when it answers again.
 
     Per process (D-16): a device beats every few seconds, so a WARNING or a traceback per
     failed heartbeat would flood the log during an outage. gunicorn's gthread workers
-    serve heartbeats on several threads, hence the lock.
+    serve heartbeats on several threads, hence the lock. Only an outage
+    (``_db_unreachable``) sets the flag; a bug never touches it.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._failing = False
 
-    def failed(self, exc: DatabaseError) -> None:
+    def failed(self, exc: Error) -> None:
         with self._lock:
             first = not self._failing
             self._failing = True
@@ -284,8 +311,10 @@ class HeartbeatView(View):
     GET and POST behave the same: 200 ``ok`` for a valid key, 401 for a missing, malformed
     or unknown key, 405 for any other method, never a redirect. The key is looked up before
     any write, a malformed key costs no query, and the request does no network I/O (KD2).
-    While the database fails, the answer is 503 ``db unavailable`` with one WARNING per
-    outage per process (D-16).
+    While the database cannot be reached, the answer is 503 ``db unavailable`` with one
+    WARNING per outage per process (D-16). Any other database error is a bug: it
+    propagates, so Django answers 500 and logs the traceback through the redacting
+    formatter, and the outage flag stays as it was.
     """
 
     # Everything else, HEAD and OPTIONS included, gets 405.
@@ -312,7 +341,10 @@ class HeartbeatView(View):
                 .first()
             )
             result = None if location_id is None else transitions.record_heartbeat(location_id, now)
-        except DatabaseError as exc:
+        except Error as exc:
+            if not _db_unreachable(exc):
+                # A bug, not an outage (Django's 500 path logs it once per request).
+                raise
             # No exception text and never the key: driver errors can carry connection
             # details (OPS-08).
             _HEARTBEAT_DB.failed(exc)
