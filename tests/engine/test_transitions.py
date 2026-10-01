@@ -225,7 +225,21 @@ def test_db_rejects_second_open_interval(location_factory: Callable[..., Any]) -
     location = location_factory()
     _insert(location, "on", _at(8, 0), None)
 
-    _assert_rejected("power_interval_one_open", location, "on", _at(9, 0), None)
+    # Two open intervals always overlap, so the exclusion constraint (created with the
+    # table) usually reports first; the partial unique index is the second guard.
+    _assert_rejected(
+        "power_interval_(one_open|no_overlap)",
+        location,
+        "off",
+        _at(9, 0),
+        None,
+        outage_start_at=_at(9, 0),
+    )
+    with connection.cursor() as cur:
+        cur.execute("SELECT indexdef FROM pg_indexes WHERE indexname = 'power_interval_one_open'")
+        (indexdef,) = cur.fetchone()
+    assert indexdef.startswith("CREATE UNIQUE INDEX power_interval_one_open")
+    assert indexdef.endswith("(location_id) WHERE (end_at IS NULL)")
 
 
 @pytest.mark.django_db
