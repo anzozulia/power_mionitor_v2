@@ -15,6 +15,7 @@ from conftest import FakeClock
 from django.http import HttpResponse
 from django.test import Client, RequestFactory
 
+from powermon.engine import transitions
 from powermon.engine.models import LocationState
 from powermon.locations.keys import generate_device_key
 from powermon.web import views
@@ -41,8 +42,6 @@ def _all_states() -> list[dict[str, Any]]:
 
 def _spy_on_record_heartbeat(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """Record what each record_heartbeat call returned, while it still runs for real."""
-    from powermon.engine import transitions
-
     real = transitions.record_heartbeat
     results: list[str] = []
 
@@ -172,14 +171,12 @@ def test_older_heartbeat_never_moves_last_heartbeat_back(
 def test_HB01_repeated_first_heartbeat_does_not_restart_monitoring(
     location_factory: Callable[..., Any], fixed_now: datetime
 ) -> None:
-    from powermon.engine.transitions import record_heartbeat
-
     location = location_factory()
 
     # The waiting -> on gate changes 1 row once; a repeat matches 0 rows there.
-    assert record_heartbeat(location.pk, fixed_now) == "started"
-    assert record_heartbeat(location.pk, fixed_now) == "plain"
-    assert record_heartbeat(location.pk, fixed_now + timedelta(seconds=5)) == "plain"
+    assert transitions.record_heartbeat(location.pk, fixed_now) == "started"
+    assert transitions.record_heartbeat(location.pk, fixed_now) == "plain"
+    assert transitions.record_heartbeat(location.pk, fixed_now + timedelta(seconds=5)) == "plain"
 
     state = _state(location)
     assert state.status == "on"
@@ -192,12 +189,10 @@ def test_HB01_repeated_first_heartbeat_does_not_restart_monitoring(
 def test_record_heartbeat_ignores_a_location_without_state(
     location_factory: Callable[..., Any], fixed_now: datetime
 ) -> None:
-    from powermon.engine.transitions import record_heartbeat
-
     location = location_factory()
     before = _all_states()
 
-    assert record_heartbeat(location.pk + 1000, fixed_now) == "ignored"
+    assert transitions.record_heartbeat(location.pk + 1000, fixed_now) == "ignored"
 
     assert _all_states() == before
 
