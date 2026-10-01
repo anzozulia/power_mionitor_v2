@@ -78,8 +78,6 @@ def test_display_time_never_and_bad_input(kyiv: Any, value: object) -> None:
 def test_display_time_is_a_template_filter(kyiv: Any, value: datetime | None) -> None:
     from powermon.web.templatetags.display_time import display_time
 
-    rendered = Template("{% load display_time %}{{ t|display_time }}").render(
-        Context({"t": value})
-    )
+    rendered = Template("{% load display_time %}{{ t|display_time }}").render(Context({"t": value}))
 
     assert rendered == display_time(value)
