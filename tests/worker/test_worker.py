@@ -149,8 +149,49 @@ class _CountingHealth(supervision.HealthFile):
         self.touches += 1
 
 
+class _WatchdogGate:
+    """Records serve's watchdog checks, and ends them before the test stops serve.
+
+    A check that starts just before ``stop.set()`` can find a loop thread that already
+    returned because of that stop, take it for a dead loop and run the stall action, so
+    serve returns 70 instead of 0. ``quiesce()`` closes that window: it waits for a check
+    in flight, and every later check returns None without looking at the loops. Each check
+    made before it is recorded as (the clock's monotonic time, what it found).
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, clock: FakeClock) -> None:
+        self.checks: list[tuple[float, str | None]] = []
+        self._quiet = threading.Event()
+        self._lock = threading.Lock()
+        real_check = supervision.Watchdog.check
+        gate = self
+
+        def check(watchdog: supervision.Watchdog) -> str | None:
+            with gate._lock:
+                if gate._quiet.is_set():
+                    return None
+                at = clock.monotonic()
+                found = real_check(watchdog)
+                gate.checks.append((at, found))
+                return found
+
+        monkeypatch.setattr(supervision.Watchdog, "check", check)
+
+    def checked_at(self, at: float) -> bool:
+        """True once a check ran with the clock at ``at``."""
+        return any(when == at for when, _ in list(self.checks))
+
+    def quiesce(self) -> None:
+        self._quiet.set()
+        with self._lock:
+            pass
+
+
 class _Serve:
-    """``run_worker.serve`` in a thread, with fast intervals and an injected stall action."""
+    """``run_worker.serve`` in a thread, with fast intervals and an injected stall action.
+
+    With a ``gate``, ``finish()`` ends the watchdog's checks before it stops serve.
+    """
 
     def __init__(
         self,
@@ -158,11 +199,13 @@ class _Serve:
         clock: FakeClock,
         health: supervision.HealthFile,
         on_stall: Callable[[str], None] | None = None,
+        gate: _WatchdogGate | None = None,
         **overrides: float,
     ) -> None:
         self.stop = threading.Event()
         self.code: int | None = None
         self.stalls: list[str] = []
+        self.gate = gate
         action = self.stalls.append if on_stall is None else on_stall
         intervals = {**FAST, **overrides}
 
@@ -175,6 +218,8 @@ class _Serve:
         self.thread.start()
 
     def finish(self, timeout: float = 10.0) -> int | None:
+        if self.gate is not None:
+            self.gate.quiesce()
         self.stop.set()
         self.thread.join(timeout)
         return self.code
@@ -471,7 +516,7 @@ def test_a_dead_loop_goes_through_the_watchdog(
 
 
 def test_db_down_iterations_stamp_progress_but_not_the_health_file(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # No django_db mark: with the database down nothing may touch Django's connection, and
     # an attempt would be logged as an error by the loop (asserted below).
@@ -487,15 +532,25 @@ def test_db_down_iterations_stamp_progress_but_not_the_health_file(
     lease = ObservedLease(_unreachable(), clock)
     health = _CountingHealth(tmp_path / "health")
     caplog.set_level(logging.INFO)
+    gate = _WatchdogGate(monkeypatch, clock)
 
-    serving = _Serve(lease, clock, health)
+    serving = _Serve(lease, clock, health, gate=gate)
     try:
+        # The watchdog exists and counts from 0 before the clock moves, and the detection
+        # loop has asked the lease once.
+        assert wait_for(lambda: gate.checked_at(0.0) and bool(calls))
         # 70 s in 10 s steps, past the 60 s detection limit: every step sees a new cycle,
         # which stamped progress just before it asked the lease.
         for _ in range(7):
             clock.advance(seconds=10)
             target = clock.monotonic()
-            assert wait_for(lambda target=target: bool(calls) and calls[-1] == target)
+            assert wait_for(lambda target=target: bool(calls) and calls[-1] == target), (
+                serving.stalls
+            )
+        # A check 70 s after the watchdog started finds no stalled loop. Without the
+        # DB-down stamps it would find detection stale (70 s > 60 s) and stall.
+        assert wait_for(lambda: gate.checked_at(clock.monotonic())), serving.stalls
+        assert serving.stalls == []
         assert lease.current().state == "db_down"
         assert serving.thread.is_alive()
     finally:
@@ -504,6 +559,7 @@ def test_db_down_iterations_stamp_progress_but_not_the_health_file(
 
     assert code == 0
     assert serving.stalls == []
+    assert {found for _, found in gate.checks} == {None}
     assert health.touches == 0
     assert not health.path.exists()
     assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
