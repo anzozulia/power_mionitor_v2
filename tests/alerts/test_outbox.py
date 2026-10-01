@@ -1,0 +1,133 @@
+"""The alert outbox: one durable row per alert, written in the transition's transaction.
+
+KD2 and D-14: alerts leave only through ``outbox_message``, which the worker relay drains
+(01-11). The row holds integer durations only; the text is rendered at send time, and the
+bot token and chat are read from the location then (T-01-45).
+"""
+
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import pytest
+from django.db import IntegrityError, connection, transaction
+
+EVENT_AT = datetime(2026, 10, 1, 10, 5, tzinfo=UTC)
+RECORDED_AT = datetime(2026, 10, 1, 10, 6, 31, tzinfo=UTC)
+
+
+def _outbox() -> Any:
+    from powermon.alerts import outbox
+
+    return outbox
+
+
+def _rows() -> list[Any]:
+    from powermon.alerts.models import OutboxMessage
+
+    return list(OutboxMessage.objects.order_by("id"))
+
+
+def _enqueue(location: Any, kind: str = "power_off", **payload: Any) -> Any:
+    return _outbox().enqueue(
+        kind,
+        location.pk,
+        event_at=EVENT_AT,
+        recorded_at=RECORDED_AT,
+        payload=payload or {"was_on_us": 300_000_000},
+    )
+
+
+@pytest.mark.django_db
+def test_enqueue_writes_a_pending_subscriber_row(location_factory: Callable[..., Any]) -> None:
+    location = location_factory()
+
+    created = _enqueue(location)
+
+    [row] = _rows()
+    assert row.pk == created.pk
+    assert (row.channel, row.location_id, row.kind) == ("subscriber", location.pk, "power_off")
+    assert (row.event_at, row.recorded_at) == (EVENT_AT, RECORDED_AT)
+    assert row.payload == {"was_on_us": 300_000_000}
+    assert (row.status, row.attempts, row.last_error, row.sent_at) == ("pending", 0, "", None)
+    # Due at once; expiry is written now and enforced in Phase 2 (ALRT-03).
+    assert row.next_attempt_at == RECORDED_AT
+    assert row.expires_at == RECORDED_AT + timedelta(hours=6)
+    assert _outbox().MAX_AGE == timedelta(hours=6)
+    assert (_outbox().KIND_POWER_OFF, _outbox().KIND_POWER_ON) == ("power_off", "power_on")
+
+
+@pytest.mark.django_db
+def test_enqueue_rolls_back_with_the_callers_transaction(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = location_factory()
+
+    # The row joins the caller's transaction: if the transition fails, no alert remains.
+    with pytest.raises(RuntimeError, match="transition failed"), transaction.atomic():
+        _enqueue(location, "power_on", was_off_us=3_300_000_000)
+        raise RuntimeError("transition failed")
+
+    assert _rows() == []
+
+
+@pytest.mark.django_db
+def test_enqueue_rejects_an_unknown_kind(location_factory: Callable[..., Any]) -> None:
+    location = location_factory()
+
+    with pytest.raises(ValueError, match="unknown alert kind"):
+        _enqueue(location, "power_flicker")
+
+    assert _rows() == []
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("value", [300.0, True, "300000000", None], ids=repr)
+def test_enqueue_rejects_a_payload_that_is_not_integer_durations(
+    location_factory: Callable[..., Any], value: Any
+) -> None:
+    location = location_factory()
+
+    with pytest.raises(TypeError, match="integer"):
+        _enqueue(location, was_on_us=value)
+
+    assert _rows() == []
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("field", "value", "constraint"),
+    [("status", "lost", "outbox_status_valid"), ("channel", "email", "outbox_channel_valid")],
+)
+def test_db_rejects_unknown_status_and_channel(
+    location_factory: Callable[..., Any], field: str, value: str, constraint: str
+) -> None:
+    from powermon.alerts.models import OutboxMessage
+
+    location = location_factory()
+    fields: dict[str, Any] = {
+        "channel": "subscriber",
+        "location": location,
+        "kind": "power_off",
+        "event_at": EVENT_AT,
+        "recorded_at": RECORDED_AT,
+        "next_attempt_at": RECORDED_AT,
+        "expires_at": RECORDED_AT + timedelta(hours=6),
+        field: value,
+    }
+
+    with pytest.raises(IntegrityError, match=constraint), transaction.atomic():
+        OutboxMessage.objects.create(**fields)
+
+
+@pytest.mark.django_db
+def test_open_rows_index_is_partial() -> None:
+    # The relay's head-of-line query reads only pending and sending rows (01-11).
+    with connection.cursor() as cur:
+        cur.execute("SELECT indexdef FROM pg_indexes WHERE indexname = 'outbox_open_idx'")
+        (indexdef,) = cur.fetchone()
+
+    assert "(channel, location_id, id)" in indexdef
+    assert "WHERE ((status)::text = ANY" in indexdef
+    assert "'pending'" in indexdef
+    assert "'sending'" in indexdef
