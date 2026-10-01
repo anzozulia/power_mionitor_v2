@@ -226,9 +226,7 @@ def test_connect_timeout_retries_with_capped_backoff(
 
 
 @pytest.mark.django_db(transaction=True)
-def test_server_error_is_retried(
-    location_factory: Callable[..., Any], fake_telegram: Any
-) -> None:
+def test_server_error_is_retried(location_factory: Callable[..., Any], fake_telegram: Any) -> None:
     location = location_factory()
     off = _queue(location)
     fake_telegram.fail(TOKEN_A, status=502)
