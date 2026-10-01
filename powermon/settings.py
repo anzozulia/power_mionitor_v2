@@ -11,7 +11,7 @@ from typing import Any
 
 from django.core.exceptions import ImproperlyConfigured
 
-from powermon import config
+from powermon import config, logging_setup
 
 try:
     CFG = config.load(os.environ)
@@ -46,6 +46,9 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    # Outermost, so it also covers responses that other middleware build (a rejected
+    # Host header, a slash redirect); /hb is exempt by exact path.
+    "powermon.web.middleware.ContentSecurityPolicyMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
@@ -129,3 +132,6 @@ LOGIN_REDIRECT_URL = "/"
 LOGOUT_REDIRECT_URL = "login"
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+# stdout only, through the redacting formatter; urllib3 and django.db.backends at WARNING.
+LOGGING = logging_setup.LOGGING

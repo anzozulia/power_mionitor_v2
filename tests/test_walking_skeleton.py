@@ -155,14 +155,20 @@ def _format(msg: str, *args: object, exc_info: Any = None) -> str:
 
 def test_redacting_formatter_scrubs_token_key_and_bearer_value() -> None:
     text = _format(
-        "POST %s; GET /hb?key=%s&x=1; Authorization: Bearer %s", SEND_URL, DEVICE_KEY, DEVICE_KEY
+        "POST %s; GET /hb?key=%s&x=1; Authorization: Bearer %s; authorization: bearer %s",
+        SEND_URL,
+        DEVICE_KEY,
+        DEVICE_KEY,
+        DEVICE_KEY,
     )
 
     assert DEFAULT_BOT_TOKEN not in text
     assert DEVICE_KEY not in text
     assert f"{TELEGRAM_API}/[REDACTED-TOKEN]/sendMessage" in text
     assert "/hb?key=[REDACTED]&x=1" in text
-    assert "Bearer [REDACTED]" in text
+    assert "Authorization: Bearer [REDACTED]" in text
+    # The auth scheme name is case-insensitive.
+    assert "authorization: bearer [REDACTED]" in text
 
 
 def test_redacting_formatter_scrubs_secrets_inside_tracebacks() -> None:
@@ -177,7 +183,8 @@ def test_redacting_formatter_scrubs_secrets_inside_tracebacks() -> None:
 
 
 def test_redacting_formatter_leaves_ordinary_text_alone() -> None:
-    text = "location 12345 period 60 s; ratio 12345:678; key-rotation=done; bearer token unset"
+    # Near misses: a short "digits:text" pair and a parameter whose name only starts with key.
+    text = "location 12345 period 60 s; ratio 12345:678; key-rotation=done; status=on"
 
     assert _format(text) == f"ERROR {text}"
 
@@ -217,6 +224,8 @@ def test_fake_telegram_refuses_unregistered_bots(fake_telegram: Any) -> None:
         requests.post(SEND_URL, json={"chat_id": -1, "text": "hi"}, timeout=(3, 5))
 
 
+# pytest-socket also warns when it blocks; the raise is what this test checks.
+@pytest.mark.filterwarnings("ignore:A test tried to use socket:UserWarning")
 def test_network_guard_blocks_real_outbound_connections() -> None:
     # 192.0.2.1 is TEST-NET-1: even without the guard it would never answer.
     with pytest.raises(SocketConnectBlockedError):
