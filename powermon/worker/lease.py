@@ -16,9 +16,21 @@ The detection loop calls ``ensure_held()`` at the top of every cycle. It returns
   nothing, so the standby keeps its session and tries again next cycle. It never blocks
   and never exits.
 - DB_DOWN: the database did not answer. ``down_since`` and ``down_since_mono`` are set
-  only when this process held the lock as the database went away, because the D-11 #2
+  only when this worker held the lock as the database went away, because the D-11 #2
   "database unreachable" notice is that worker's to send. A process that never held the
-  lock has no timer. The timer clears as soon as the database answers again.
+  lock has no timer, with one exception (WR-02, below). The timer clears as soon as the
+  database answers again.
+
+WR-02: the worker that held the lock may be restarted during the outage (the watchdog's
+exit 70 when the lease's query hangs on a frozen database, an OOM kill, a container
+restart). The worker's lease therefore records in a container-local file
+(``HELD_MARKER``, under /tmp, which survives a restart of the same container and which
+no other container sees) the time of its last held cycle, and removes it on a standby
+result. When the first try of a new process finds the database unreachable and the
+marker is at most HELD_MARKER_MAX_AGE_S old, the down timer starts at that time. The
+worker that held the lock sends the notice only after more than that age, counted from a
+later moment, so it cannot have sent it already: the notice stays exactly once. A
+standby container has no marker, so it never sends it.
 
 While the lock is held, a cycle only runs ``SELECT 1`` on the session. It never calls
 ``pg_try_advisory_lock`` there: session locks stack, so a held session that locked again
@@ -59,6 +71,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 
 import psycopg
@@ -80,6 +93,14 @@ LEASE_PG_OPTIONS = (
     "-c tcp_user_timeout=10000"
 )
 
+# The worker container's record of its last held cycle (WR-02); /tmp is writable for the
+# app user and kept across a restart of the same container.
+HELD_MARKER = Path("/tmp/powermon-worker.held")  # noqa: S108 - container-private path
+# How old the marker may be for a restarted process to count the outage from it: the
+# direct notice's delay (``io_loop.DB_DOWN_NOTICE_AFTER_S``), so the worker that held the
+# lock cannot have sent the notice yet.
+HELD_MARKER_MAX_AGE_S = 300
+
 
 class LeaseState(StrEnum):
     """What the last ``ensure_held()`` found."""
@@ -96,7 +117,8 @@ class LeaseStatus:
     state: LeaseState
     # 0 = never held in this process; +1 on every successful acquisition.
     generation: int
-    # Set only on a HELD -> DB_DOWN loss in this process; cleared once the DB answers.
+    # Set on a HELD -> DB_DOWN loss in this process, or from the held marker in a process
+    # restarted during the outage (WR-02); cleared once the DB answers.
     down_since: datetime | None
     down_since_mono: float | None
     # HELD only: the lock session's backend pid. Every claim of the relay requires this
@@ -107,11 +129,20 @@ class LeaseStatus:
 class Lease:
     """The worker's hold on ``LOCK_KEY``, on its own connection, opened lazily."""
 
-    def __init__(self, settings_dict: Mapping[str, Any], clock: Clock | None = None) -> None:
+    def __init__(
+        self,
+        settings_dict: Mapping[str, Any],
+        clock: Clock | None = None,
+        held_marker: Path | None = None,
+    ) -> None:
         # Django's DATABASES["default"]; tests pass the test database's dict. Read at each
         # connect, so a test can point a lease elsewhere and back.
         self._settings = settings_dict
         self._clock: Clock = SystemClock() if clock is None else clock
+        # The worker's HELD_MARKER (WR-02); None keeps no record (tests, other callers).
+        self._held_marker = held_marker
+        # True until this process's first ensure_held() has returned.
+        self._first = True
         self._mutex = threading.Lock()
         self._conn: psycopg.Connection[TupleRow] | None = None
         self._held = False
@@ -131,6 +162,7 @@ class Lease:
         """Keep or take the lock without waiting for it; never raises (thread-safe)."""
         with self._mutex:
             status = self._ensure_held()
+            self._first = False
             self._published = status
             return status
 
@@ -147,6 +179,11 @@ class Lease:
             return None
         return conn.info.backend_pid
 
+    @property
+    def held_marker(self) -> Path | None:
+        """The container-local file of this lease's last held cycle, or None (WR-02)."""
+        return self._held_marker
+
     def close(self) -> None:
         """Close the session quietly; the lock, if held, is released with it."""
         with self._mutex:
@@ -161,6 +198,7 @@ class Lease:
             except psycopg.Error as exc:
                 self._lose(exc)
             else:
+                self._mark_held()
                 return self._status(LeaseState.HELD)
         try:
             if self._conn is None:
@@ -173,6 +211,8 @@ class Lease:
             if not self._failing:
                 log.warning("worker lock: database unreachable (%s); retrying", type(exc).__name__)
                 self._failing = True
+            if self._first:
+                self._resume_down_timer()
             return self._status(LeaseState.DB_DOWN)
         # The database answered, so any outage is over.
         if self._failing:
@@ -185,10 +225,13 @@ class Lease:
             self._generation += 1
             self._announced_standby = False
             log.info("worker lock held (generation %d)", self._generation)
+            self._mark_held()
             return self._status(LeaseState.HELD)
         if not self._announced_standby:
             log.info("standby: waiting for the worker lock")
             self._announced_standby = True
+        # This container is not the active worker: an outage is not its to report (WR-02).
+        self._unmark_held()
         return self._status(LeaseState.STANDBY)
 
     def _lose(self, exc: psycopg.Error) -> None:
@@ -202,6 +245,40 @@ class Lease:
         self._down_since_mono = self._clock.monotonic()
         self._published = self._status(LeaseState.DB_DOWN)
         log.warning("worker lock: lease session lost (%s)", type(exc).__name__)
+
+    def _mark_held(self) -> None:
+        """Record this held cycle's time in the container (WR-02); never raises."""
+        if self._held_marker is not None:
+            # A failure only loses the WR-02 record; the health file logs an unwritable /tmp.
+            with contextlib.suppress(OSError):
+                self._held_marker.write_text(self._clock.now().isoformat())
+
+    def _unmark_held(self) -> None:
+        """Remove the record: this container is a standby (WR-02); never raises."""
+        if self._held_marker is not None:
+            with contextlib.suppress(OSError):
+                self._held_marker.unlink(missing_ok=True)
+
+    def _resume_down_timer(self) -> None:
+        """Start the down timer at this container's last held cycle, if recent (WR-02).
+
+        Called when this process's first try finds the database unreachable: the process
+        was started during the outage and never held the lock, but its container did, at
+        most HELD_MARKER_MAX_AGE_S ago. A missing, unreadable or older marker (or one in
+        the future) starts no timer, as for a standby.
+        """
+        if self._held_marker is None:
+            return
+        try:
+            held_at = datetime.fromisoformat(self._held_marker.read_text())
+            age = (self._clock.now() - held_at).total_seconds()
+        except OSError, ValueError, TypeError:
+            # TypeError: a naive time, which this lease never writes.
+            return
+        if not 0 <= age <= HELD_MARKER_MAX_AGE_S:
+            return
+        self._down_since = held_at
+        self._down_since_mono = self._clock.monotonic() - age
 
     def _status(self, state: LeaseState) -> LeaseStatus:
         pid = self.pid if state is LeaseState.HELD else None

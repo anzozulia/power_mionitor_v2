@@ -115,8 +115,9 @@ every iteration of the I/O thread with the lease status the detection loop publi
 Once the database has been unreachable for more than DB_DOWN_NOTICE_AFTER_S (300 s,
 strict) since this process lost a lease it held (``LeaseStatus.down_since_mono``, set
 only then), it sends one notice straight to the admin chat with the ops bot, or logs it
-once at WARNING when no ops chat is configured (D-09). A process that never held the
-lease (a standby, a worker restarted during the outage) has no down timer and stays
+once at WARNING when no ops chat is configured (D-09). A worker restarted during the
+outage (the watchdog's exit 70 on a frozen database) counts from its container's last
+held cycle instead (the lease's held marker, WR-02). A standby has no down timer and stays
 silent. A refused, 5xx or 429 send backs off under the admin chat's key (``ops_key``) and
 is tried again; an accepted, ambiguous (never resent, INV-16) or permanently refused one
 ends it for this outage. Like the ops rows, it also waits for ``bot_wide_key`` only, never
@@ -154,7 +155,8 @@ MAX_RETRY_AFTER_S = 3600
 # An alert sent later than this after it was recorded states its event time (D-07).
 LATE_AFTER = timedelta(seconds=120)
 # The direct database-down notice goes out once the database has been unreachable for
-# longer than this, in monotonic seconds since the lease was lost (D-11 #2).
+# longer than this, in monotonic seconds since the lease was lost (D-11 #2). The lease's
+# HELD_MARKER_MAX_AGE_S is the same value (WR-02).
 DB_DOWN_NOTICE_AFTER_S = 300
 # Which payload value holds the previous state's duration for each alert kind.
 _DURATION_KEYS = {outbox.KIND_POWER_OFF: "was_on_us", outbox.KIND_POWER_ON: "was_off_us"}
@@ -315,8 +317,9 @@ def notify_db_down(status: LeaseStatus, clock: Clock, state: RelayState) -> bool
 
     Called on every I/O-thread iteration with the published lease status; True when a
     send was attempted. Any status but DB_DOWN means the database answered, so the next
-    outage gets its own notice. Sent only when this process lost a lease it held more
-    than DB_DOWN_NOTICE_AFTER_S ago (strict), with the ops bot to the ops chat only, or
+    outage gets its own notice. Sent only when this process lost a lease it held, or its
+    container held it before a restart (WR-02), more than DB_DOWN_NOTICE_AFTER_S ago
+    (strict, the status's down timer), with the ops bot to the ops chat only, or
     logged once at WARNING without an ops chat (D-09). Uses no database: the outbox is
     out of reach, and the text comes from the lease's down time alone (OPS-08).
     """

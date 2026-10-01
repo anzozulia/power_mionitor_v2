@@ -294,7 +294,10 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
   takes the lock back by itself (a new generation) and records the outage as a
   monitoring gap, with one gap notice. If the database stays unreachable for more than
   5 minutes, the worker that held the lock sends one `🛑 Database unreachable since …`
-  notice straight to the ops chat, because the outbox lives in the database.
+  notice straight to the ops chat, because the outbox lives in the database. This also
+  holds when that worker was restarted during the outage (for example by the watchdog on
+  a frozen database): its container keeps `/tmp/powermon-worker.held`, the time it last
+  held the lock. A worker container that is recreated (a deploy) starts without it.
 - **Health:** `docker compose -f docker-compose.prod.yml ps` shows `healthy` or
   `unhealthy` for `db`, `web`, `worker` and `caddy`. The worker touches its health file
   (`/tmp/powermon-worker.health` in the container) after every successful cycle and on

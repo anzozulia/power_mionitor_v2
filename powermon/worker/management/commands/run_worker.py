@@ -12,7 +12,9 @@ One process, three threads, all started at once and always running:
   nothing; otherwise it idles. On every iteration it also hands the status to
   ``io_loop.notify_db_down``: once the database has been unreachable for over 5 min
   since this process lost a lease it held, the admin gets one notice straight from the
-  ops bot, because the outbox lives in the database (D-11 #2, INV-13 #2).
+  ops bot, because the outbox lives in the database (D-11 #2, INV-13 #2). A process
+  restarted during the outage counts from its container's last held cycle instead
+  (``lease.HELD_MARKER``, WR-02).
 - main: the watchdog (below), until SIGTERM or SIGINT.
 
 The lease is HELD, STANDBY or DB_DOWN, with a generation counter that rises on every
@@ -89,7 +91,7 @@ from django.db import InterfaceError, OperationalError, connection, connections
 from powermon.clock import Clock, SystemClock
 from powermon.engine.lapse import CycleTracker
 from powermon.worker import detection, io_loop
-from powermon.worker.lease import Lease, LeaseState
+from powermon.worker.lease import HELD_MARKER, Lease, LeaseState
 from powermon.worker.supervision import (
     DETECTION_STALL_S,
     EXIT_STALL,
@@ -320,7 +322,8 @@ class Command(BaseCommand):
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, request_stop)
         clock = SystemClock()
-        code = serve(stop, clock, Lease(connection.settings_dict, clock))
+        # HELD_MARKER: a restart during a database outage still sends its notice (WR-02).
+        code = serve(stop, clock, Lease(connection.settings_dict, clock, held_marker=HELD_MARKER))
         if code != 0:
             # Exit at once with the code, so Docker's restart policy restarts the process;
             # os._exit skips interpreter shutdown, so flush the log lines first.
