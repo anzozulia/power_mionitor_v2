@@ -21,6 +21,14 @@ from django.db import IntegrityError, transaction
 from powermon.engine.models import LocationState
 from powermon.locations.keys import KEY_ALPHABET, KEY_LENGTH, generate_device_key, mask_key
 from powermon.locations.models import Location
+from powermon.locations.validators import (
+    MAX_BOT_TOKEN_LENGTH,
+    MAX_CHAT_ID_DIGITS,
+    clean_bot_token,
+    mask_token,
+    parse_chat_id,
+)
+from powermon.logging_setup import RedactingFormatter
 
 # D-07: 32 characters from [A-Za-z0-9], so a key never needs URL-encoding.
 KEY_SHAPE = re.compile(r"[A-Za-z0-9]{32}")
@@ -223,8 +231,6 @@ def _assert_message(func: Callable[[str], object], value: str, message: str) -> 
 
 
 def test_clean_bot_token() -> None:
-    from powermon.locations.validators import clean_bot_token
-
     assert clean_bot_token(GOOD_TOKEN) == GOOD_TOKEN
     # Whitespace around a pasted token is trimmed.
     assert clean_bot_token(f"  {GOOD_TOKEN}\n") == GOOD_TOKEN
@@ -237,8 +243,6 @@ def test_clean_bot_token() -> None:
 
 @pytest.mark.parametrize("value", ["", "   ", "\n"], ids=["empty", "spaces", "newline"])
 def test_clean_bot_token_empty(value: str) -> None:
-    from powermon.locations.validators import clean_bot_token
-
     _assert_message(clean_bot_token, value, TOKEN_EMPTY_MSG)
 
 
@@ -270,16 +274,11 @@ def test_clean_bot_token_empty(value: str) -> None:
     ],
 )
 def test_clean_bot_token_rejects_bad_format(value: str) -> None:
-    from powermon.locations.validators import clean_bot_token
-
     _assert_message(clean_bot_token, value, TOKEN_FORMAT_MSG)
 
 
 def test_every_accepted_token_is_redacted_in_logs() -> None:
     # D-12: the validator accepts only the shape the log redaction scrubs.
-    from powermon.locations.validators import clean_bot_token
-    from powermon.logging_setup import RedactingFormatter
-
     formatter = RedactingFormatter("%(message)s")
     for token in (GOOD_TOKEN, "12345:" + "a" * 30, "123456789:" + "A" * 245):
         record = logging.LogRecord("t", logging.ERROR, __file__, 1, "token %s", (token,), None)
@@ -299,8 +298,6 @@ def test_every_accepted_token_is_redacted_in_logs() -> None:
     ids=["channel", "trimmed", "positive", "int64-min", "int64-max"],
 )
 def test_parse_chat_id(value: str, expected: int) -> None:
-    from powermon.locations.validators import parse_chat_id
-
     result = parse_chat_id(value)
 
     assert result == expected
@@ -355,8 +352,6 @@ def test_parse_chat_id(value: str, expected: int) -> None:
     ],
 )
 def test_parse_chat_id_rejects(value: str, message: str) -> None:
-    from powermon.locations.validators import parse_chat_id
-
     _assert_message(parse_chat_id, value, message)
 
 
@@ -364,8 +359,6 @@ def test_parse_chat_id_rejects(value: str, message: str) -> None:
     "value", ["1" * 5000, "-" + "9" * 5000], ids=["5000-digits", "minus-5000-digits"]
 )
 def test_parse_chat_id_huge_paste_never_shows_python_text(value: str) -> None:
-    from powermon.locations.validators import parse_chat_id
-
     # int() refuses this many digits with its own "Exceeds the limit" text.
     assert len(value.lstrip("-")) > sys.get_int_max_str_digits()
 
@@ -373,16 +366,12 @@ def test_parse_chat_id_huge_paste_never_shows_python_text(value: str) -> None:
 
 
 def test_validator_bounds_match_int64_and_the_schema() -> None:
-    from powermon.locations.validators import MAX_BOT_TOKEN_LENGTH, MAX_CHAT_ID_DIGITS
-
     # No signed 64-bit integer has more than 19 digits.
     assert MAX_CHAT_ID_DIGITS == len(str(INT64_MAX)) == len(str(INT64_MIN).lstrip("-")) == 19
     assert MAX_BOT_TOKEN_LENGTH == Location._meta.get_field("bot_token").max_length
 
 
 def test_mask_token() -> None:
-    from powermon.locations.validators import mask_token
-
     masked = mask_token(GOOD_TOKEN)
 
     assert masked == "123456789:••••••••"
@@ -393,6 +382,4 @@ def test_mask_token() -> None:
 
 @pytest.mark.parametrize("value", ["no-colon-secret", ""], ids=["no-colon", "empty"])
 def test_mask_token_without_colon_shows_only_bullets(value: str) -> None:
-    from powermon.locations.validators import mask_token
-
     assert mask_token(value) == "••••••••"
