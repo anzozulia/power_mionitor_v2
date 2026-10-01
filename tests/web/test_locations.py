@@ -1,9 +1,10 @@
-"""Locations and device keys at the database level (LOC-02, D-07, D-10, K-6 defence in depth).
+"""Locations and device keys (LOC-02, D-07, D-10, D-11, D-12, K-6).
 
 PostgreSQL itself rejects a period or grace outside 10-3600 s, an unknown language, a
 duplicate device key and an off state without an outage start, so no code path (form,
 shell, later migration) can store them. 01-09 adds the validator tests and 01-10 the
-form-level K-6 tests to this file.
+add-location form tests: K-6 at form level, the UI-SPEC validation copy, the write-only
+token and the create itself (one transaction, no Telegram call).
 """
 
 import logging
@@ -12,11 +13,16 @@ import string
 import sys
 from collections.abc import Callable
 from datetime import datetime, timedelta
+from html import unescape
 from typing import Any
 
 import pytest
-from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID
+from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, FakeClock, FakeTelegram
+from django.contrib.auth import get_user_model
+from django.contrib.messages.storage.fallback import FallbackStorage
+from django.contrib.sessions.backends.db import SessionStore
 from django.db import IntegrityError, transaction
+from django.test import Client, RequestFactory
 
 from powermon.engine.models import LocationState
 from powermon.locations.keys import KEY_ALPHABET, KEY_LENGTH, generate_device_key, mask_key
@@ -29,6 +35,7 @@ from powermon.locations.validators import (
     parse_chat_id,
 )
 from powermon.logging_setup import RedactingFormatter
+from powermon.web.views import LocationCreateView
 
 # D-07: 32 characters from [A-Za-z0-9], so a key never needs URL-encoding.
 KEY_SHAPE = re.compile(r"[A-Za-z0-9]{32}")
@@ -383,3 +390,360 @@ def test_mask_token() -> None:
 @pytest.mark.parametrize("value", ["no-colon-secret", ""], ids=["no-colon", "empty"])
 def test_mask_token_without_colon_shows_only_bullets(value: str) -> None:
     assert mask_token(value) == "••••••••"
+
+
+# The add-location form (LOC-02, UI-SPEC screen 3): K-6 at form level, the UI-SPEC copy,
+# the write-only token (D-11) and a local-only create (D-12). Copy from 01-UI-SPEC.md.
+
+FORM_ERROR_MSG = "The location was not saved. Fix the fields marked below."
+REPASTE_NOTE = "Paste the token again: it is never sent back to the browser."
+NAME_EMPTY_MSG = "Enter a name."
+NAME_TOO_LONG_MSG = "Use at most 100 characters."
+SECONDS_MSG = "Enter a whole number of seconds."
+PERIOD_TOO_SHORT_MSG = "The heartbeat period must be at least 10 seconds."
+GRACE_TOO_SHORT_MSG = "The grace period must be at least 10 seconds."
+SECONDS_TOO_LONG_MSG = "Use at most 3600 seconds (1 hour)."
+CREATED_FLASH = "Location created. Reveal the key below, then copy an example to the device."
+DJANGO_REQUIRED = "This field is required."
+NEW_URL = "/locations/new/"
+SETUP_PATH = re.compile(r"/locations/([0-9]+)/setup/")
+
+User = get_user_model()
+
+
+@pytest.fixture
+def admin(client: Client, db: None) -> Client:
+    """A client signed in as the single admin."""
+    client.force_login(User.objects.create_user("admin", password="not-used-here"))
+    return client
+
+
+def _form(**overrides: str) -> dict[str, str]:
+    """A valid add-location POST, with ``overrides``."""
+    return {
+        "name": "Office",
+        "period_s": "60",
+        "grace_s": "30",
+        "bot_token": GOOD_TOKEN,
+        "chat_id": "-1001234567890",
+        "language": "uk",
+        **overrides,
+    }
+
+
+def _field_error(page: str, field: str) -> str | None:
+    match = re.search(rf'<p class="error" id="id_{field}_error">(.*?)</p>', page, re.S)
+    return unescape(match.group(1)) if match else None
+
+
+def _alerts(page: str) -> list[str]:
+    return [unescape(t.strip()) for t in re.findall(r'role="alert"[^>]*>([^<]*)<', page)]
+
+
+def _tag(page: str, name: str) -> str:
+    """The rendered ``<input>`` or ``<select>`` tag whose name attribute is ``name``."""
+    match = re.search(rf'<(input|select)\b[^>]*\bname="{name}"[^>]*>', page)
+    assert match is not None, f"no field named {name!r} in the page"
+    return match.group(0)
+
+
+def _rejected(admin: Client, **overrides: str) -> str:
+    """POST an invalid form: 200, the form-level callout, nothing saved. Returns the page."""
+    response = admin.post(NEW_URL, _form(**overrides))
+
+    assert response.status_code == 200
+    page = response.content.decode()
+    assert _alerts(page) == [FORM_ERROR_MSG]
+    assert Location.objects.count() == 0
+    assert LocationState.objects.count() == 0
+    assert DJANGO_REQUIRED not in page
+    return page
+
+
+def test_K6_period_below_10_field_error_nothing_saved(admin: Client) -> None:
+    page = _rejected(admin, period_s="9")
+
+    assert _field_error(page, "period_s") == PERIOD_TOO_SHORT_MSG
+    assert _field_error(page, "grace_s") is None
+
+
+def test_K6_grace_below_10_field_error_nothing_saved(admin: Client) -> None:
+    page = _rejected(admin, grace_s="9")
+
+    assert _field_error(page, "grace_s") == GRACE_TOO_SHORT_MSG
+    assert _field_error(page, "period_s") is None
+
+
+@pytest.mark.parametrize(("period", "grace"), [("10", "10"), ("3600", "3600")], ids=["min", "max"])
+def test_K6_bounds_are_accepted(admin: Client, period: str, grace: str) -> None:
+    response = admin.post(NEW_URL, _form(period_s=period, grace_s=grace))
+
+    assert response.status_code == 302
+    location = Location.objects.get()
+    assert (location.period_s, location.grace_s) == (int(period), int(grace))
+
+
+@pytest.mark.parametrize("field", ["period_s", "grace_s"])
+def test_period_above_3600(admin: Client, field: str) -> None:
+    page = _rejected(admin, **{field: "3601"})
+
+    assert _field_error(page, field) == SECONDS_TOO_LONG_MSG
+
+
+@pytest.mark.parametrize(
+    "value", ["", "   ", "abc", "1.5", "60s", "9" * 5000], ids=lambda v: repr(v)[:12]
+)
+@pytest.mark.parametrize("field", ["period_s", "grace_s"])
+def test_period_empty_or_not_a_whole_number(admin: Client, field: str, value: str) -> None:
+    page = _rejected(admin, **{field: value})
+
+    assert _field_error(page, field) == SECONDS_MSG
+    assert "Exceeds the limit" not in page
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [("", NAME_EMPTY_MSG), ("   ", NAME_EMPTY_MSG), ("x" * 101, NAME_TOO_LONG_MSG)],
+    ids=["empty", "whitespace", "101-characters"],
+)
+def test_name_empty_whitespace_and_too_long(admin: Client, value: str, message: str) -> None:
+    page = _rejected(admin, name=value)
+
+    assert _field_error(page, "name") == message
+
+
+def test_name_counts_code_points_after_trimming(admin: Client) -> None:
+    # 100 Cyrillic letters are 200 bytes in UTF-8 but 100 characters.
+    name = "Ж" * 100
+
+    response = admin.post(NEW_URL, _form(name=f"  {name}  "))
+
+    assert response.status_code == 302
+    assert Location.objects.get().name == name
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("bot_token", "", TOKEN_EMPTY_MSG),
+        ("bot_token", "   ", TOKEN_EMPTY_MSG),
+        ("bot_token", "123456789:short", TOKEN_FORMAT_MSG),
+        ("bot_token", "bot" + GOOD_TOKEN, TOKEN_FORMAT_MSG),
+        ("chat_id", "", CHAT_ID_EMPTY_MSG),
+        ("chat_id", "@my_channel", CHAT_ID_USERNAME_MSG),
+        ("chat_id", "1_000", CHAT_ID_NOT_INTEGER_MSG),
+        ("chat_id", "-100 123", CHAT_ID_NOT_INTEGER_MSG),
+        ("chat_id", "1" * 25, CHAT_ID_TOO_LONG_MSG),
+        ("chat_id", "1" * 5000, CHAT_ID_TOO_LONG_MSG),
+        ("chat_id", str(INT64_MAX + 1), CHAT_ID_TOO_LONG_MSG),
+    ],
+    ids=[
+        "token-empty",
+        "token-whitespace",
+        "token-short",
+        "token-bot-prefix",
+        "chat-empty",
+        "chat-username",
+        "chat-separator",
+        "chat-inner-space",
+        "chat-25-digits",
+        "chat-5000-digits",
+        "chat-above-int64",
+    ],
+)
+def test_token_and_chat_id_errors_shown_on_the_form(
+    admin: Client, field: str, value: str, message: str
+) -> None:
+    page = _rejected(admin, **{field: value})
+
+    assert _field_error(page, field) == message
+    # Python's own int() text for a huge paste never reaches the page.
+    assert "Exceeds the limit" not in page
+    assert "invalid literal" not in page
+
+
+def test_missing_fields_show_field_messages_and_keep_the_rest(admin: Client) -> None:
+    page = _rejected(
+        admin, name="", period_s="", grace_s="45", bot_token="", chat_id="", language="ru"
+    )
+
+    assert _field_error(page, "name") == NAME_EMPTY_MSG
+    assert _field_error(page, "period_s") == SECONDS_MSG
+    assert _field_error(page, "bot_token") == TOKEN_EMPTY_MSG
+    assert _field_error(page, "chat_id") == CHAT_ID_EMPTY_MSG
+    assert _field_error(page, "grace_s") is None
+    assert 'value="45"' in _tag(page, "grace_s")
+    assert '<option value="ru" selected>Russian</option>' in page
+
+
+def test_post_without_any_field_never_shows_djangos_required_text(admin: Client) -> None:
+    response = admin.post(NEW_URL, {})
+
+    page = response.content.decode()
+    assert response.status_code == 200
+    assert DJANGO_REQUIRED not in page
+    assert _field_error(page, "language") == "Choose Ukrainian, English or Russian."
+    assert Location.objects.count() == 0
+
+
+def test_unknown_language_gets_ui_copy_not_the_posted_value(admin: Client) -> None:
+    page = _rejected(admin, language="<b>de</b>")
+
+    assert _field_error(page, "language") == "Choose Ukrainian, English or Russian."
+    assert "de</b>" not in page
+    assert "Select a valid choice" not in page
+
+
+def test_invalid_submit_keeps_values_and_marks_the_field(admin: Client) -> None:
+    page = _rejected(admin, name="Kyiv office", period_s="9", chat_id="-100777")
+
+    period = _tag(page, "period_s")
+    assert 'aria-invalid="true"' in period
+    assert 'aria-describedby="id_period_s_helptext id_period_s_error"' in period
+    assert 'value="9"' in period
+    assert 'value="Kyiv office"' in _tag(page, "name")
+    assert "aria-invalid" not in _tag(page, "name")
+    assert 'value="-100777"' in _tag(page, "chat_id")
+
+
+def test_token_never_rendered_back(admin: Client) -> None:
+    # Only the period is wrong: the well-formed token must still come back empty (D-11).
+    page = _rejected(admin, period_s="9")
+
+    assert GOOD_TOKEN not in page
+    assert GOOD_TOKEN.partition(":")[2] not in page
+    token = _tag(page, "bot_token")
+    assert 'type="password"' in token
+    assert "value=" not in token
+    assert f'<p class="help" id="id_bot_token_note">{REPASTE_NOTE}</p>' in page
+    assert 'aria-describedby="id_bot_token_helptext id_bot_token_note"' in token
+
+
+def test_form_defaults_and_attributes(admin: Client) -> None:
+    response = admin.get(NEW_URL)
+
+    assert response.status_code == 200
+    page = response.content.decode()
+    assert "<title>Add location · Power Monitor</title>" in page
+    assert "<h1>Add location</h1>" in page
+    assert re.search(r'<form class="form" method="post" action="/locations/new/" novalidate>', page)
+    assert 'name="csrfmiddlewaretoken"' in page
+    name = _tag(page, "name")
+    assert 'maxlength="100"' in name
+    assert "autofocus" in name
+    assert "value=" not in name
+    for field, initial in (("period_s", "60"), ("grace_s", "30")):
+        tag = _tag(page, field)
+        assert 'type="number"' in tag
+        assert f'value="{initial}"' in tag
+        assert 'min="10"' in tag
+        assert 'max="3600"' in tag
+        assert 'step="1"' in tag
+    token = _tag(page, "bot_token")
+    assert 'type="password"' in token
+    assert "value=" not in token
+    chat = _tag(page, "chat_id")
+    assert 'type="text"' in chat
+    assert "value=" not in chat
+    for tag in (token, chat):
+        assert 'autocomplete="off"' in tag
+        assert 'spellcheck="false"' in tag
+    assert '<option value="uk" selected>Ukrainian</option>' in page
+    assert '<option value="en">English</option>' in page
+    assert '<option value="ru">Russian</option>' in page
+    assert "placeholder" not in page
+    # First load: no error callout, no re-paste note, no invalid marks.
+    assert _alerts(page) == []
+    assert REPASTE_NOTE not in page
+    assert "aria-invalid" not in page
+    assert ">Create location</button>" in page
+    assert '<a class="btn btn--secondary" href="/">Back to locations</a>' in page
+    # The help text is the UI-SPEC copy, linked to its input.
+    assert 'aria-describedby="id_chat_id_helptext"' in chat
+    assert "web.telegram.org/a" in page
+
+
+def test_LOC02_valid_create_redirects_to_setup(admin: Client) -> None:
+    response = admin.post(NEW_URL, _form(name="Home", language="ru", period_s="45"))
+
+    assert response.status_code == 302
+    match = SETUP_PATH.fullmatch(response.url)
+    assert match is not None
+    location = Location.objects.get()
+    assert int(match.group(1)) == location.pk
+    assert location.name == "Home"
+    assert (location.period_s, location.grace_s, location.language) == (45, 30, "ru")
+    assert location.bot_token == GOOD_TOKEN
+    assert location.chat_id == -1001234567890
+    assert type(location.chat_id) is int
+    assert KEY_SHAPE.fullmatch(location.device_key)
+    assert (location.router_grace, location.maintenance, location.alerts_enabled) == (
+        False,
+        False,
+        True,
+    )
+    state = LocationState.objects.get(location=location)
+    assert (state.status, state.last_heartbeat_at) == ("waiting", None)
+
+    setup = admin.get(response.url).content.decode()
+    assert re.findall(r'role="status">([^<]*)<', setup) == [CREATED_FLASH]
+    # The flash shows once.
+    assert CREATED_FLASH not in admin.get(response.url).content.decode()
+
+
+@pytest.mark.django_db
+def test_LOC02_create_stamps_created_at_from_the_clock(
+    rf: RequestFactory, fixed_now: datetime
+) -> None:
+    request = rf.post(NEW_URL, _form())
+    request.session = SessionStore()
+    request._messages = FallbackStorage(request)  # type: ignore[attr-defined]
+
+    response = LocationCreateView.as_view(clock=FakeClock(fixed_now))(request)
+
+    assert response.status_code == 302
+    assert Location.objects.get().created_at == fixed_now
+
+
+def test_double_submit_creates_two_distinct_locations(admin: Client) -> None:
+    first = admin.post(NEW_URL, _form())
+    second = admin.post(NEW_URL, _form())
+
+    assert (first.status_code, second.status_code) == (302, 302)
+    assert first.url != second.url
+    keys = list(Location.objects.values_list("device_key", flat=True))
+    assert len(keys) == 2
+    assert keys[0] != keys[1]
+    assert list(LocationState.objects.values_list("status", flat=True)) == ["waiting"] * 2
+
+
+def test_create_is_atomic(admin: Client, monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("state row insert failed")
+
+    # A failure stub on the second write: the location row must not survive it.
+    monkeypatch.setattr(LocationState.objects, "create", fail)
+
+    with pytest.raises(RuntimeError, match="state row insert failed"):
+        admin.post(NEW_URL, _form())
+
+    assert Location.objects.count() == 0
+
+
+def test_no_telegram_call_on_save(admin: Client, fake_telegram: FakeTelegram) -> None:
+    response = admin.post(NEW_URL, _form())
+
+    assert response.status_code == 302
+    assert Location.objects.count() == 1
+    assert len(fake_telegram.calls) == 0
+
+
+@pytest.mark.django_db
+def test_anonymous_add_form_redirects_to_sign_in(client: Client) -> None:
+    assert client.get(NEW_URL).url == "/login/?next=/locations/new/"
+
+    response = client.post(NEW_URL, _form())
+
+    assert response.status_code == 302
+    assert response.url == "/login/?next=/locations/new/"
+    assert Location.objects.count() == 0
