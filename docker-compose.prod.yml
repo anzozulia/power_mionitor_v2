@@ -1,0 +1,139 @@
+# Production stack. One command on the VPS (D-03), for a fresh install or an update:
+#   git pull
+#   docker compose -f docker-compose.prod.yml up -d --build --wait
+# Env changes (.env.docker_production) also take effect only through that command:
+# `docker compose restart` neither re-reads env_file nor runs migrate (P-14).
+# Only caddy publishes host ports (80/443); web and db are on the internal network (SEC-02).
+name: powermon-prod
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# No `image:` key on the app services: each one gets its own image. A shared image
+# tag once made Compose restart the old migrate container and skip a new migration.
+x-app: &app
+  build:
+    context: .
+    target: runtime
+  env_file: [.env.docker_production]
+  logging: *logging
+
+services:
+  db:
+    image: postgres:18.6-trixie
+    command: ["postgres", "-c", "log_min_error_statement=panic", "-c", "log_error_verbosity=terse"]
+    env_file: [.env.docker_production]
+    volumes:
+      # PostgreSQL 18 layout: PGDATA=/var/lib/postgresql/18/docker (D-04)
+      - ./docker_data/prod/postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+    logging: *logging
+
+  # One-shot on every deploy: apply migrations, then sync the env admin account. web and
+  # worker start only after it exits 0, so a failed migration stops the deploy (D-02).
+  migrate:
+    <<: *app
+    command: ["python", "manage.py", "release"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  web:
+    <<: *app
+    command:
+      - gunicorn
+      - powermon.wsgi
+      - --worker-class
+      - gthread
+      - --workers
+      - "2"
+      - --threads
+      - "4"
+      - --bind
+      - 0.0.0.0:8000
+      - --no-control-socket
+      - --worker-tmp-dir
+      - /dev/shm
+      - --graceful-timeout
+      - "20"
+    # Internal network only; caddy proxies to web:8000.
+    expose:
+      - "8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  # The run_worker command lands in 01-11. Its health-file healthcheck arrives with OPS-05
+  # in Phase 2; until then `up --wait` waits for it to be running.
+  worker:
+    <<: *app
+    command: ["python", "manage.py", "run_worker"]
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  caddy:
+    image: caddy:2.11.4-alpine
+    # The only published ports (SEC-02). HTTP only redirects to HTTPS (D-05).
+    ports:
+      - "80:80"
+      - "443:443"
+    # Compose interpolation cannot read env_file, and Caddy reads DOMAIN and ACME_EMAIL
+    # from its environment. `environment` overrides `env_file`, so every other app
+    # setting is blanked here: the internet-facing proxy holds no app secret (T-01-62).
+    # Keep this list in step with .env.example (tests/test_compose.py checks it).
+    env_file: [.env.docker_production]
+    environment:
+      APP_ENV: ""
+      DEBUG: ""
+      SECRET_KEY: ""
+      ADMIN_USERNAME: ""
+      ADMIN_PASSWORD: ""
+      POSTGRES_DB: ""
+      POSTGRES_USER: ""
+      POSTGRES_PASSWORD: ""
+      POSTGRES_HOST: ""
+      POSTGRES_PORT: ""
+      DISPLAY_TZ: ""
+      PUBLIC_BASE_URL: ""
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates and ACME account: persisted so a redeploy never re-issues (D-04).
+      - ./docker_data/prod/caddy/data:/data
+      - ./docker_data/prod/caddy/config:/config
+    healthcheck:
+      # 127.0.0.1, not localhost: localhost:2019 is refused in the alpine image.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    logging: *logging
