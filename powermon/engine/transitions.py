@@ -9,15 +9,17 @@ the SQL.
 
 A gate that changes the status also writes the stored timeline (KD1) through
 ``timeline.set_open_state`` in the same transaction, while the gate UPDATE holds the
-location_state row lock. 01-08 adds the off -> on gate as the first statement and the
-"restored" result.
+location_state row lock. When alerts are on, it also queues the alert in the outbox in
+that same transaction (KD2, D-14): the transition and its alert commit together or not at
+all. The worker relay sends the alert later.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from django.db import connection, transaction
 from django.db.backends.utils import CursorWrapper
 
+from powermon.alerts import outbox
 from powermon.engine import rules, timeline
 
 # waiting -> on: the first heartbeat starts monitoring, silently (MON-01).
@@ -38,6 +40,33 @@ UPDATE location_state
 
 # The settings a transition reads, inside the same transaction (INV-05).
 CONFIG_SQL = "SELECT maintenance, alerts_enabled FROM location WHERE id = %s"
+
+# What the detector checks: monitored locations that are on, with their CAS token.
+SNAPSHOT_SQL = """
+SELECT s.location_id, s.state_version, s.last_heartbeat_at, s.on_since, s.window_start_at,
+       l.period_s, l.grace_s, l.router_grace, l.alerts_enabled
+  FROM location_state s
+  JOIN location l ON l.id = s.location_id
+ WHERE s.status = 'on' AND NOT l.maintenance AND l.deleted_at IS NULL
+ ORDER BY s.location_id
+"""
+
+# on -> off, only if nothing changed since the snapshot: any heartbeat in between has
+# bumped state_version, and then 0 rows change (INV-01). Maintenance or deletion in
+# between also stops it. Verbatim from RESEARCH Pattern 4.
+OFF_CAS_SQL = """
+UPDATE location_state s
+   SET status='off', outage_started_at=%(start)s, state_version=s.state_version+1
+  FROM location l
+ WHERE s.location_id=%(id)s AND l.id=s.location_id
+   AND s.status='on' AND s.state_version=%(v)s
+   AND NOT l.maintenance AND l.deleted_at IS NULL
+"""
+
+
+def _us(td: timedelta) -> int:
+    """A duration as exact integer microseconds (no float, Pitfall 4)."""
+    return td // timedelta(microseconds=1)
 
 
 def _config_row(cur: CursorWrapper, location_id: int) -> tuple[bool, bool]:
@@ -69,3 +98,63 @@ def record_heartbeat(location_id: int, now: datetime) -> str:
         if cur.rowcount == 1:
             return "plain"
     return "ignored"
+
+
+def read_snapshots() -> list[tuple[rules.Snapshot, bool]]:
+    """Every monitored location that is on, as ``(snapshot, alerts_enabled)``, by id.
+
+    Locations in maintenance, deleted locations and locations still waiting for their
+    first heartbeat are never candidates for OFF.
+    """
+    with connection.cursor() as cur:
+        cur.execute(SNAPSHOT_SQL)
+        rows = cur.fetchall()
+    return [
+        (
+            rules.Snapshot(
+                location_id=row[0],
+                state_version=row[1],
+                last_heartbeat_at=row[2],
+                on_since=row[3],
+                window_start_at=row[4],
+                period_s=row[5],
+                grace_s=row[6],
+                router_grace=row[7],
+            ),
+            bool(row[8]),
+        )
+        for row in rows
+    ]
+
+
+def mark_off(snap: rules.Snapshot, d: rules.Decision, now: datetime, alerts_enabled: bool) -> bool:
+    """Record the OFF transition ``d`` for ``snap``, decided by the detector at ``now``.
+
+    One transaction: the CAS UPDATE, then the timeline (on closed at the outage start, off
+    opened from it), then the power_off outbox row when alerts are on. Returns False and
+    writes nothing when the CAS changes 0 rows: a heartbeat or another writer got there
+    first, so the decision is stale and is skipped quietly (INV-01).
+    """
+    if not d.off or d.outage_start is None or d.was_on is None:
+        raise ValueError("mark_off needs an OFF decision with an outage start and was_on")
+    params: dict[str, int | datetime] = {
+        "id": snap.location_id,
+        "v": snap.state_version,
+        "start": d.outage_start,
+    }
+    with transaction.atomic(), connection.cursor() as cur:
+        cur.execute(OFF_CAS_SQL, params)
+        if cur.rowcount != 1:
+            return False
+        timeline.set_open_state(
+            cur, snap.location_id, d.outage_start, "off", outage_start_at=d.outage_start
+        )
+        if alerts_enabled:
+            outbox.enqueue(
+                outbox.KIND_POWER_OFF,
+                snap.location_id,
+                event_at=d.outage_start,
+                recorded_at=now,
+                payload={"was_on_us": _us(d.was_on)},
+            )
+    return True
