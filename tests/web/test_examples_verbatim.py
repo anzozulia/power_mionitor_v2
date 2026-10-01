@@ -160,11 +160,11 @@ def test_curl_cmd_shapes() -> None:
     from powermon.locations.examples import curl_cmd
 
     assert curl_cmd(URL, KEY) == CURL
-    assert curl_cmd(URL, KEY, multiline=True) == (
-        "curl -fsS -m 10 -o /dev/null \\\n"
-        f'  -H "Authorization: Bearer {KEY}" \\\n'
-        f"  {URL}"
-    )
+    assert curl_cmd(URL, KEY, multiline=True).split("\n") == [
+        "curl -fsS -m 10 -o /dev/null \\",
+        f'  -H "Authorization: Bearer {KEY}" \\',
+        f"  {URL}",
+    ]
     # The multi-line form is the same command, split with backslash-newline.
     assert curl_cmd(URL, KEY, multiline=True).replace(" \\\n  ", " ") == CURL
 
