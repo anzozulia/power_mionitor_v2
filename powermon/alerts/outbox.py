@@ -25,6 +25,16 @@ during it:
 A subscriber row that becomes uncertain queues one ``ops_uncertain`` notice in the same
 transaction (``powermon.alerts.ops``, D-11 #5); an uncertain ops row is only logged.
 
+The worker's claim is fenced by its lease (C1): ``claim(message_id, lease_pid=...)``
+moves the row only while the backend ``lease_pid``, the worker's lease session, holds the
+worker lock (``powermon.worker.lease.LOCK_KEY``) at the moment of the UPDATE, read from
+``pg_locks`` in the same statement. A worker whose lease session was lost (a database
+restart, a terminated backend) therefore claims, and so sends, nothing more, even while
+its last published lease status still says HELD and another worker already holds the
+lock. A send claimed just before the loss is the one in flight: the next holder's
+activation turns it into "uncertain". Without ``lease_pid`` (a direct call, as in tests)
+the claim is unfenced.
+
 An ops notice whose text cannot be built from its integer payload (a referenced row gone,
 an end before its start after a backward clock step) never will be: it is dropped at
 once, so it never holds the one-line ops queue (B2). Expiry leaves dropped rows alone.
@@ -46,6 +56,7 @@ from django.db import connection
 from django.db.models import F
 
 from powermon.alerts.models import OPEN_STATUSES, OutboxMessage
+from powermon.worker.lease import LOCK_KEY
 
 KIND_POWER_OFF = "power_off"
 KIND_POWER_ON = "power_on"
@@ -79,6 +90,22 @@ UPDATE outbox_message SET status = 'expired', last_error = 'expired'
  WHERE status = 'pending' AND expires_at <= %(now)s
 RETURNING id, channel, location_id
 """
+
+# The worker's claim (C1): only while its lease session holds the worker lock. pg_locks
+# shows a session advisory lock on a bigint key as locktype 'advisory' with the key's high
+# 32 bits in classid, its low 32 bits in objid and objsubid 1, in the current database.
+CLAIM_HELD_SQL = """
+UPDATE outbox_message SET status = 'sending', attempts = attempts + 1
+ WHERE id = %(id)s AND status = 'pending'
+   AND EXISTS (
+       SELECT 1 FROM pg_locks
+        WHERE locktype = 'advisory' AND granted AND pid = %(pid)s
+          AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+          AND classid = %(classid)s::oid AND objid = %(objid)s::oid AND objsubid = 1
+   )
+"""
+_LOCK_CLASSID = LOCK_KEY >> 32
+_LOCK_OBJID = LOCK_KEY & 0xFFFFFFFF
 
 
 class RowRef(NamedTuple):
@@ -183,8 +210,24 @@ def ops_head() -> OutboxMessage | None:
     )
 
 
-def claim(message_id: int) -> bool:
-    """Move a pending row to "sending" and count the attempt; False if it was not pending."""
+def claim(message_id: int, lease_pid: int | None = None) -> bool:
+    """Move a pending row to "sending" and count the attempt; False if it was not pending.
+
+    With ``lease_pid`` (the worker's lease session) it is also False unless that session
+    holds the worker lock right now (C1), in the same statement.
+    """
+    if lease_pid is not None:
+        with connection.cursor() as cur:
+            cur.execute(
+                CLAIM_HELD_SQL,
+                {
+                    "id": message_id,
+                    "pid": lease_pid,
+                    "classid": _LOCK_CLASSID,
+                    "objid": _LOCK_OBJID,
+                },
+            )
+            return cur.rowcount == 1
     claimed = OutboxMessage.objects.filter(pk=message_id, status="pending").update(
         status="sending", attempts=F("attempts") + 1
     )

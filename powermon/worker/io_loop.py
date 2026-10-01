@@ -6,7 +6,10 @@ expiry (ALRT-03), the subscriber heads, then at most one ops row. For each locat
 looks only at the oldest open row (``outbox.subscriber_heads``), so OFF always goes before
 ON. A due row is rendered at send time in the location's current language, claimed with
 one conditional UPDATE (committed at once, Django autocommit), and sent with no
-transaction open.
+transaction open. In the worker the claim also names the lease session of the HELD
+status the pass runs under (``RelayState.lease_pid``) and succeeds only while that
+session holds the worker lock: a worker that lost its session claims nothing, even
+before its detection loop notices and while another worker holds the lock (C1).
 
 After every subscriber head of the pass, and only when an ops chat is configured, the
 pass sends at most one ops notice: the oldest open row of the ops queue
@@ -165,11 +168,16 @@ class RelayState:
     ``not_before``: when each bot may be called again. ``unapplied``: outcomes kept after
     a database error, by row id, written before the next claim (WR-04).
     ``db_down_notified``: this database outage's direct notice is done (D-11 #2).
+    ``lease_pid``: the lease session of the HELD status the next pass runs under, set by
+    the I/O thread before every pass; every claim requires that session to hold the
+    worker lock, so a worker whose session is gone claims nothing (C1). None (a direct
+    call, as in tests) claims unfenced.
     """
 
     not_before: dict[str, datetime] = field(default_factory=dict)
     unapplied: dict[int, Unapplied] = field(default_factory=dict)
     db_down_notified: bool = False
+    lease_pid: int | None = None
 
 
 def bot_key(token: str) -> str:
@@ -221,7 +229,8 @@ def run_iteration(
     watchdog's progress stamp) runs after every subscriber head, whether it was sent,
     skipped or failed, and after the ops step, so a long pass still shows progress. A
     database error in the flush or in expiry ends the pass before any claim and
-    propagates to the caller.
+    propagates to the caller. Every claim of the pass names ``state.lease_pid`` when it
+    is set (C1).
     """
     close_old_connections()
     # Outcomes kept after a DB error are written before any new claim (WR-04).
@@ -385,13 +394,16 @@ def _send(
 ) -> bool:
     """Claim, send and record one row of either channel; True if the request was made.
 
-    From the claim on, no error leaves the row "sending" for good (WR-04, D-13): a
-    database error keeps what is known in ``state.unapplied``, and an error before the
-    HTTP call puts the row back to "pending".
+    The claim names ``state.lease_pid`` when it is set: it fails, and nothing is sent,
+    once that lease session no longer holds the worker lock (C1). From the claim on, no
+    error leaves the row "sending" for good (WR-04, D-13): a database error keeps what is
+    known in ``state.unapplied``, and an error before the HTTP call puts the row back to
+    "pending".
     """
     attempts = row.attempts + 1
+    lease_pid = state.lease_pid
     try:
-        claimed = outbox.claim(row.pk)
+        claimed = outbox.claim(row.pk) if lease_pid is None else outbox.claim(row.pk, lease_pid)
     except Error as exc:
         # The claim may or may not have committed; either way no request was made.
         state.unapplied[row.pk] = Unapplied(row, attempts, None, clock.now(), key)

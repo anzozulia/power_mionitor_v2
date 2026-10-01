@@ -1187,14 +1187,15 @@ def test_C1_a_pass_claims_only_while_its_lease_session_holds_the_lock(
     # the old session claims nothing, on either channel.
     assert _terminate(LEASE) == 1
     assert new.ensure_held().state == "held"
-    state = io_loop.RelayState()
+    state = io_loop.RelayState(lease_pid=lost_pid)
     for _ in range(3):
-        assert io_loop.run_iteration(clock, state, lease_pid=lost_pid) is False
+        assert io_loop.run_iteration(clock, state) is False
     assert len(fake_telegram.calls) == 0
     assert (_claim_state(off), _claim_state(notice)) == (("pending", 0), ("pending", 0))
 
     # The holder's session: the subscriber head, then the ops row, in one pass.
-    assert io_loop.run_iteration(clock, state, lease_pid=new.current().pid) is True
+    state.lease_pid = new.current().pid
+    assert io_loop.run_iteration(clock, state) is True
     assert [m["chat_id"] for m in fake_telegram.sent] == [DEFAULT_CHAT_ID, OPS_CHAT_ID]
     assert (_claim_state(off), _claim_state(notice)) == (("sent", 1), ("sent", 1))
 

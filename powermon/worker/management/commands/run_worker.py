@@ -19,6 +19,10 @@ The lease is HELD, STANDBY or DB_DOWN, with a generation counter that rises on e
 successful acquisition (``powermon.worker.lease``). A lost lease session is reacquired in
 process on a fresh connection, and a standby never blocks, never exits and never writes
 or sends (MON-04). This replaces Phase 1's exit with code 3 (D-15 replaces Phase 1 D-18).
+The status the I/O thread reads can be up to one detection interval old, so its passes
+name the lease session of that HELD status (``LeaseStatus.pid``) and every claim requires
+that session to hold the lock: a worker whose session was lost sends nothing more, even
+while another worker already holds the lock (C1).
 
 Every gap in monitoring is recorded once (D-04, MON-05, OPS-02). The detection loop keeps
 one ``CycleTracker`` and passes it, with the lease generation, to every cycle. Each cycle
@@ -203,6 +207,9 @@ def io_thread(
                     if status.generation != activated:
                         io_loop.activate(state, clock)
                         activated = status.generation
+                    # Every claim names the lease session: once it is gone, nothing more
+                    # is claimed, even before the detection loop notices (C1).
+                    state.lease_pid = status.pid
                     busy = io_loop.run_iteration(clock, state, stop, tick=tick)
                     outage.ok()
             except _DB_ERRORS as exc:
