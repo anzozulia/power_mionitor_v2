@@ -12,28 +12,42 @@ What these scenarios prove:
   (D-02).
 - The carve is crash safe and exactly-once: the cursor UPDATE is conditional on the cursor
   that was read, so a re-run after a crash or a second carver adds no second notice.
+- Every detection cycle checks for a lapse before it decides anything (D-04, D-15): a new
+  lease generation, a re-established connection or a failed cycle forces the carve
+  whatever the gap's length; otherwise a gap over 15 s since the last completed cycle (a
+  stall, INV-10 #3 and #4) does. A wall-clock step over 5 s against the monotonic clock
+  skips the cycle's decisions: forward it is a lapse, backward it records nothing.
+- A heartbeat that waited on the carve's row lock restores at the carve end with 200,
+  never a CHECK violation (Pitfall 5).
 
 Histories are built through ``record_heartbeat`` and ``run_cycle`` wherever a scenario
-describes device behaviour. The tests are ``django_db(transaction=True)``: ``run_cycle``
-calls ``close_old_connections()``, which would close the connection inside pytest-django's
-per-test transaction, and the teardown truncates the system_state singleton, so each test
-writes the row it needs. All times are fixed aware datetimes on 2026-10-01 UTC; the
-display TZ is pinned to Europe/Kyiv (UTC+3 that day).
+describes device behaviour, and cycles run through ``detection.run_detection`` with a
+``FakeClock``, a ``CycleTracker`` and explicit lease generations. The tests are
+``django_db(transaction=True)``: ``run_cycle`` calls ``close_old_connections()``, which
+would close the connection inside pytest-django's per-test transaction, and the race test
+needs each actor's commits to be visible to the other; the teardown truncates the
+system_state singleton, so each test writes the row it needs. All times are fixed aware
+datetimes on 2026-10-01 UTC; the display TZ is pinned to Europe/Kyiv (UTC+3 that day).
 """
 
 import dataclasses
 import logging
+import threading
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from django.db import IntegrityError, transaction
+from conftest import Actor, FakeClock, blocked_on_lock, terminate_backends, wait_for
+from django.db import IntegrityError, OperationalError, connection, transaction
+from django.db.backends.utils import CursorWrapper
+from django.test import RequestFactory
 
 from powermon.alerts import ops, outbox, texts
 from powermon.alerts.models import OpsIncident, OutboxMessage
-from powermon.engine import lapse, transitions
-from powermon.engine.models import PowerInterval, SystemState
+from powermon.engine import lapse, timeline, transitions
+from powermon.engine.models import LocationState, PowerInterval, SystemState
+from powermon.web.views import HeartbeatView
 from powermon.worker import detection
 
 Interval = tuple[str, datetime, datetime | None, datetime | None]
@@ -112,6 +126,24 @@ def _subscriber_rows(location: Any = None) -> list[OutboxMessage]:
 
 def _gap_payload(start: datetime, end: datetime) -> dict[str, int]:
     return {"start_us": ops.instant_us(start), "end_us": ops.instant_us(end)}
+
+
+def _gap(start: datetime, end: datetime) -> tuple[str, None, datetime, datetime]:
+    """A closed monitoring_gap incident as ``_incidents()`` lists it."""
+    return (lapse.KIND_MONITORING_GAP, None, start, end)
+
+
+def _spy_on_decisions(monkeypatch: pytest.MonkeyPatch) -> list[datetime]:
+    """Record the ``now`` of every decisions step (``detection.run_cycle``), then run it."""
+    calls: list[datetime] = []
+    real = detection.run_cycle
+
+    def spy(now: datetime, tick: Callable[[], None] | None = None) -> int:
+        calls.append(now)
+        return real(now, tick=tick)
+
+    monkeypatch.setattr(detection, "run_cycle", spy)
+    return calls
 
 
 # INV-10 #1: the whole stack down 10:00-10:10
@@ -436,3 +468,353 @@ def test_ops_incident_allows_one_open_incident_per_kind_and_location(
 
     assert OpsIncident.objects.filter(ended_at__isnull=True).count() == 4
     assert str(OpsIncident.objects.get(location=first)).startswith("ops incident ")
+
+
+# The cycle tracker: what the previous cycle saw (D-04 triggers, D-15 clock step)
+
+
+def test_cycle_tracker_measures_the_clock_step_against_the_monotonic_clock() -> None:
+    tracker = lapse.CycleTracker()
+    assert (tracker.generation, tracker.pid, tracker.db_failed) == (0, None, False)
+    # The first cycle has nothing to compare with.
+    assert tracker.clock_step(_at(10, 0), 100.0) is None
+
+    tracker.db_failed = True
+    tracker.remember(3, 4242, _at(10, 0), 100.0)
+
+    assert (tracker.generation, tracker.pid, tracker.db_failed) == (3, 4242, False)
+    assert tracker.clock_step(_at(10, 0, 5), 105.0) == 0.0
+    assert tracker.clock_step(_at(10, 0, 13), 105.0) == 8.0
+    assert tracker.clock_step(_at(9, 0, 5), 105.0) == -3600.0
+
+
+# INV-10 #3 and #4: a stalled detection loop
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV10_detection_stall_is_not_monitored_one_notice(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    _system(cursor=None)
+    clock = FakeClock(_at(10, 0))
+    tracker = lapse.CycleTracker()
+    locations = [location_factory(name=f"Location {n}") for n in range(3)]
+
+    def beat_on_the_minute() -> None:
+        if clock.now().second == 0:
+            for location in locations:
+                transitions.record_heartbeat(location.pk, clock.now())
+
+    while clock.now() <= _at(10, 10):
+        beat_on_the_minute()
+        assert detection.run_detection(clock, 1, tracker) == 0
+        clock.advance(seconds=5)
+    # The detection loop stalls 10:10-10:14; the web app keeps accepting heartbeats.
+    while clock.now() < _at(10, 14):
+        beat_on_the_minute()
+        clock.advance(seconds=5)
+    beat_on_the_minute()
+
+    assert detection.run_detection(clock, 1, tracker) == 0
+
+    for location in locations:
+        assert _intervals(location) == [
+            ("on", _at(10, 0), _at(10, 10), None),
+            ("not_monitored", _at(10, 10), _at(10, 14), None),
+            ("on", _at(10, 14), None, None),
+        ]
+    assert _subscriber_rows() == []
+    assert _incidents() == [_gap(_at(10, 10), _at(10, 14))]
+    assert [n.payload for n in _ops_rows()] == [_gap_payload(_at(10, 10), _at(10, 14))]
+    assert _anchors() == (_at(10, 14), _at(10, 14))
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV10_stall_with_heartbeat_inside_timeline_split(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    _system(cursor=None)
+    clock = FakeClock(_at(10, 0))
+    tracker = lapse.CycleTracker()
+    location = location_factory()
+    transitions.record_heartbeat(location.pk, _at(10, 0))
+    while clock.now() <= _at(10, 1):
+        detection.run_detection(clock, 1, tracker)
+        clock.advance(seconds=5)
+    # Cycles stall from 10:01:00; the next heartbeat arrives at 10:01:35.
+    clock.advance(seconds=30)
+    assert transitions.record_heartbeat(location.pk, clock.now()) == "plain"
+    clock.advance(seconds=5)
+
+    assert detection.run_detection(clock, 1, tracker) == 0
+
+    assert _intervals(location) == [
+        ("on", _at(10, 0), _at(10, 1), None),
+        ("not_monitored", _at(10, 1), _at(10, 1, 40), None),
+        ("on", _at(10, 1, 40), None, None),
+    ]
+    assert _subscriber_rows() == []
+    assert _incidents() == [_gap(_at(10, 1), _at(10, 1, 40))]
+    assert len(_ops_rows()) == 1
+
+
+# The forced triggers (D-04): new generation, re-established connection, failed cycle
+
+
+@pytest.mark.django_db(transaction=True)
+def test_MON05_new_lease_generation_forces_a_carve_whatever_the_gap(
+    location_factory: Callable[..., Any], ops_settings: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _system(cursor=None)
+    location = location_factory()
+    transitions.record_heartbeat(location.pk, _at(9, 0))
+    clock = FakeClock(_at(10, 0))
+    tracker = lapse.CycleTracker()
+    detection.run_detection(clock, 1, tracker)
+    seen_at_decisions: list[tuple[datetime | None, datetime | None]] = []
+    real = detection.run_cycle
+
+    def decisions(now: datetime, tick: Callable[[], None] | None = None) -> int:
+        # The carve's cursor transaction committed before any timeout decision (D-04).
+        seen_at_decisions.append(_anchors())
+        return real(now, tick=tick)
+
+    monkeypatch.setattr(detection, "run_cycle", decisions)
+    clock.advance(seconds=5)
+
+    # The lease was lost and reacquired: generation 2, a 5 s gap.
+    detection.run_detection(clock, 2, tracker)
+
+    assert _incidents() == [_gap(_at(10, 0), _at(10, 0, 5))]
+    assert len(_ops_rows()) == 1
+    assert _intervals(location) == [
+        ("on", _at(9, 0), _at(10, 0), None),
+        ("not_monitored", _at(10, 0), _at(10, 0, 5), None),
+        ("on", _at(10, 0, 5), None, None),
+    ]
+    assert seen_at_decisions == [(_at(10, 0, 5), _at(10, 0, 5))]
+    assert tracker.generation == 2
+
+
+@pytest.mark.django_db(transaction=True)
+def test_MON05_two_normal_cycles_with_the_same_connection_do_not_carve(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    # Pitfall 3: a recycled connection would look like a reconnect and carve every cycle.
+    _system(cursor=None)
+    location = location_factory()
+    transitions.record_heartbeat(location.pk, _at(9, 0))
+    clock = FakeClock(_at(10, 0))
+    tracker = lapse.CycleTracker()
+    detection.run_detection(clock, 1, tracker)
+    pid = tracker.pid
+    clock.advance(seconds=5)
+
+    detection.run_detection(clock, 1, tracker)
+
+    assert pid is not None
+    assert tracker.pid == pid == connection.connection.info.backend_pid
+    assert (_incidents(), _ops_rows()) == ([], [])
+    assert _anchors() == (_at(10, 0, 5), _at(10, 0))
+    assert _intervals(location) == [("on", _at(9, 0), None, None)]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_MON05_failed_cycle_forces_a_carve_on_the_next_success(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    _system(cursor=None)
+    location = location_factory()
+    transitions.record_heartbeat(location.pk, _at(9, 0))
+    clock = FakeClock(_at(10, 0))
+    tracker = lapse.CycleTracker()
+    detection.run_detection(clock, 1, tracker)
+    # The detection loop saw the connection drop in the previous cycle.
+    tracker.db_failed = True
+    clock.advance(seconds=5)
+
+    detection.run_detection(clock, 1, tracker)
+
+    assert _incidents() == [_gap(_at(10, 0), _at(10, 0, 5))]
+    assert tracker.db_failed is False
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    "error",
+    [RuntimeError("a bug"), OperationalError("canceling statement due to statement timeout")],
+    ids=["bug", "statement-timeout"],
+)
+def test_MON05_a_failing_decisions_step_forces_no_further_carve(
+    location_factory: Callable[..., Any],
+    ops_settings: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+) -> None:
+    # Plan-check advisory 1: the lapse check commits before the decisions, so a decisions
+    # step that raises on every cycle neither keeps the generation trigger armed nor lets
+    # the cursor fall behind the 15 s threshold: at most one gap notice in total.
+    location = location_factory()
+    transitions.record_heartbeat(location.pk, _at(9, 0))
+    _system(cursor=_at(9, 59, 55), resumed=_at(9, 0))
+    clock = FakeClock(_at(10, 0))
+    tracker = lapse.CycleTracker()
+
+    def failing(now: datetime, tick: Callable[[], None] | None = None) -> int:
+        raise error
+
+    monkeypatch.setattr(detection, "run_cycle", failing)
+
+    for _ in range(8):  # 40 s of failing cycles, 5 s apart
+        with pytest.raises(type(error)):
+            detection.run_detection(clock, 1, tracker)
+        clock.advance(seconds=5)
+
+    # Only the generation's first cycle carved; the cursor kept up with every cycle.
+    assert _incidents() == [_gap(_at(9, 59, 55), _at(10, 0))]
+    assert len(_ops_rows()) == 1
+    assert _anchors() == (_at(10, 0, 35), _at(10, 0))
+    assert tracker.generation == 1
+
+
+# D-15: a wall-clock step skips the cycle's decisions
+
+
+@pytest.mark.django_db(transaction=True)
+def test_MON05_forward_clock_step_records_lapse_skips_decisions(
+    location_factory: Callable[..., Any], ops_settings: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _system(cursor=None)
+    location = location_factory()
+    transitions.record_heartbeat(location.pk, _at(9, 0))
+    clock = FakeClock(_at(10, 0))
+    tracker = lapse.CycleTracker()
+    detection.run_detection(clock, 1, tracker)
+    decisions = _spy_on_decisions(monkeypatch)
+    clock.advance(seconds=5)
+    # The wall clock jumps 8 s ahead of the monotonic clock (Δwall 13 s, Δmono 5 s).
+    clock.set(clock.now() + timedelta(seconds=8))
+
+    assert detection.run_detection(clock, 1, tracker) == 0
+
+    assert decisions == []
+    assert _incidents() == [_gap(_at(10, 0), _at(10, 0, 13))]
+    assert len(_ops_rows()) == 1
+    assert _anchors() == (_at(10, 0, 13), _at(10, 0, 13))
+
+    clock.advance(seconds=5)
+    detection.run_detection(clock, 1, tracker)
+    assert decisions == [_at(10, 0, 18)]
+    assert len(_incidents()) == 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_MON05_backward_clock_step_no_carve_no_off(
+    location_factory: Callable[..., Any],
+    ops_settings: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _system(cursor=None)
+    location = location_factory()
+    transitions.record_heartbeat(location.pk, _at(10, 0))
+    clock = FakeClock(_at(10, 0))
+    tracker = lapse.CycleTracker()
+    detection.run_detection(clock, 1, tracker)
+    decisions = _spy_on_decisions(monkeypatch)
+    caplog.set_level(logging.WARNING, logger=detection.__name__)
+    clock.advance(seconds=5)
+    # The wall clock steps an hour back (Δwall -3595 s, Δmono 5 s: a step of -3600 s).
+    clock.set(clock.now() - timedelta(hours=1))
+
+    assert detection.run_detection(clock, 1, tracker) == 0
+
+    assert decisions == []
+    assert (_incidents(), _ops_rows()) == ([], [])
+    # The cursor never moves backwards and history before it is never rewritten.
+    assert _anchors() == (_at(10, 0), _at(10, 0))
+    assert _intervals(location) == [("on", _at(10, 0), None, None)]
+    warnings = [(r.levelno, r.getMessage()) for r in caplog.records if r.name == detection.__name__]
+    assert warnings == [
+        (logging.WARNING, "wall clock stepped back 3600 s; skipping this cycle's decisions")
+    ]
+
+    # Later cycles decide again, and the stored anchors (now in the future) give no OFF.
+    for _ in range(3):
+        clock.advance(seconds=5)
+        assert detection.run_detection(clock, 1, tracker) == 0
+    assert len(decisions) == 3
+    assert _subscriber_rows() == []
+    assert LocationState.objects.get(pk=location.pk).status == "on"
+    assert len([r for r in caplog.records if r.name == detection.__name__]) == 1
+
+
+# Pitfall 5: a heartbeat that waited on the carve's row lock
+
+
+def _beat(location: Any, clock: FakeClock) -> int:
+    """One device request to /hb with the location's Bearer key; the response status code."""
+    request = RequestFactory().get(
+        "/hb", headers={"authorization": f"Bearer {location.device_key}"}
+    )
+    response = HeartbeatView.as_view(clock=clock)(request)
+    return int(response.status_code)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV10_heartbeat_during_carve_clamps_no_500(
+    location_factory: Callable[..., Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _system(cursor=None, resumed=_at(7, 0))
+    location = location_factory()
+    assert transitions.record_heartbeat(location.pk, _at(8, 0)) == "started"
+    assert transitions.record_heartbeat(location.pk, _at(9, 0)) == "plain"
+    assert detection.run_cycle(_at(9, 1, 31)) == 1  # off since 09:00
+    _system(cursor=_at(10, 0), resumed=_at(7, 0))
+    inside, release = threading.Event(), threading.Event()
+    real = timeline.overwrite
+
+    def paused(
+        cur: CursorWrapper, location_id: int, a: datetime, b: datetime, state: str = "not_monitored"
+    ) -> int:
+        changed = real(cur, location_id, a, b, state)
+        # Still inside the carve's transaction, holding the location's row lock.
+        inside.set()
+        if not release.wait(5):
+            raise AssertionError("the race hook was never released")
+        return changed
+
+    monkeypatch.setattr(timeline, "overwrite", paused)
+    carve = Actor(lambda: lapse.carve_window(_at(10, 0), _at(10, 10)))
+    # The device's request is received at 10:09:59, before the carve's end.
+    beat = Actor(lambda: _beat(location, FakeClock(_at(10, 9, 59))))
+    try:
+        carve.start()
+        assert inside.wait(5)
+        beat.start()
+        assert wait_for(lambda: beat.pid is not None and blocked_on_lock(beat.pid))
+        release.set()
+        carve.join(5)
+        beat.join(5)
+    finally:
+        release.set()
+        for actor in (carve, beat):
+            if actor.ident is not None:
+                actor.join(5)
+        if carve.is_alive() or beat.is_alive():
+            terminate_backends(Actor.APPLICATION_NAME)
+
+    assert carve.exc is None, carve.exc
+    assert beat.exc is None, beat.exc  # never an IntegrityError (power_interval_end_after_start)
+    assert (carve.result, beat.result) == (1, 200)
+    state = LocationState.objects.get(pk=location.pk)
+    assert (state.status, state.on_since) == ("on", _at(10, 10))
+    [_off, on] = _subscriber_rows(location)
+    assert (on.kind, on.event_at) == (outbox.KIND_POWER_ON, _at(10, 10))
+    assert on.payload == {"was_off_us": 70 * 60 * 1_000_000}
+    assert _intervals(location) == [
+        ("on", _at(8, 0), _at(9, 0), None),
+        ("off", _at(9, 0), _at(10, 0), _at(9, 0)),
+        ("not_monitored", _at(10, 0), _at(10, 10), None),
+        ("on", _at(10, 10), None, None),
+    ]
