@@ -1,0 +1,444 @@
+"""Mock generator for the Power Monitor weekly chart (rebuild; design reference only).
+
+NOT production code. Saved as .py.txt on purpose, so that GSD does not treat the
+new repository as an existing codebase.
+
+It renders docs/assets/chart-mock-*.svg/png from the hard-coded sample week in
+TIMELINE (also listed in docs/chart-spec.md section 10) so the chart spec has
+reference pictures. The real renderer must follow docs/chart-spec.md; this file
+only shows one way to hit the numbers.
+
+Run (macOS; registers the fonts with CoreText so cairo's Quartz backend finds them):
+    INTER_DIR=/path/to/Inter-4.1/extras/ttf \
+    DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib python mock_generator.py.txt OUT_DIR [uk en ru]
+Needs: cairosvg, Pillow, Inter 4.1 static TTFs (github.com/rsms/inter, OFL-1.1).
+On Linux, drop register_fonts_macos() and install the TTFs where fontconfig sees them.
+"""
+from __future__ import annotations
+
+import ctypes
+import ctypes.util
+import glob
+import os
+import sys
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
+from xml.sax.saxutils import escape
+
+from PIL import ImageFont
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+FONT_DIR = os.environ.get("INTER_DIR", os.path.join(HERE, "fonts", "extras", "ttf"))
+
+# ---------------------------------------------------------------- tokens
+W = 1280
+PAD_X = 48
+SURFACE = "#FCFCFB"
+INK_1 = "#1A1A19"      # primary text, now marker
+INK_2 = "#52514E"      # secondary text
+INK_3 = "#777570"      # muted text (axis, dimmed rows, headers)
+GRID = "#E3E2DC"       # 3-hour gridlines
+TODAY_BAND = "#F4F3EF" # today row highlight
+
+ON = "#62C28A"
+OFF = "#CC3434"
+TRACK = "#E5E4DE"      # no data (empty track)
+NM_BASE = "#E2E0DA"    # not monitored: base
+NM_INK = "#A09D94"     # not monitored: 45deg stripes
+DIM_T = 0.6            # dimmed = colour mixed 60 % with 40 % surface
+
+
+def mix(c: str, t: float, bg: str = SURFACE) -> str:
+    a = [int(c[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(bg[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#%02X%02X%02X" % tuple(round(t * x + (1 - t) * y) for x, y in zip(a, b))
+
+
+DIM = {
+    "on": mix(ON, DIM_T), "off": mix(OFF, DIM_T), "track": TRACK,
+    "nm_base": mix(NM_BASE, DIM_T), "nm_ink": mix(NM_INK, DIM_T),
+}
+CUR = {"on": ON, "off": OFF, "track": TRACK, "nm_base": NM_BASE, "nm_ink": NM_INK}
+
+# ---------------------------------------------------------------- fonts
+FONT_FILES = {
+    "Inter-Regular": "Inter-Regular.ttf",
+    "Inter-Medium": "Inter-Medium.ttf",
+    "Inter-SemiBold": "Inter-SemiBold.ttf",
+}
+
+
+def register_fonts_macos() -> None:
+    """Make Inter visible to cairo's Quartz backend for this process only."""
+    ct = ctypes.cdll.LoadLibrary(ctypes.util.find_library("CoreText"))
+    cf = ctypes.cdll.LoadLibrary(ctypes.util.find_library("CoreFoundation"))
+    cf.CFURLCreateFromFileSystemRepresentation.restype = ctypes.c_void_p
+    cf.CFURLCreateFromFileSystemRepresentation.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_bool]
+    ct.CTFontManagerRegisterFontsForURL.restype = ctypes.c_bool
+    ct.CTFontManagerRegisterFontsForURL.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
+    for fn in FONT_FILES.values():
+        p = os.path.join(FONT_DIR, fn).encode()
+        url = cf.CFURLCreateFromFileSystemRepresentation(None, p, len(p), False)
+        ct.CTFontManagerRegisterFontsForURL(url, 1, None)
+
+
+_font_cache: dict[tuple[str, int], ImageFont.FreeTypeFont] = {}
+
+
+def text_w(s: str, face: str, size: int) -> float:
+    key = (face, size)
+    if key not in _font_cache:
+        _font_cache[key] = ImageFont.truetype(os.path.join(FONT_DIR, FONT_FILES[face]), size)
+    return _font_cache[key].getlength(s)
+
+
+# ---------------------------------------------------------------- i18n
+I18N = {
+    "uk": {
+        "title": "Відключення світла",
+        "wd": ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"],
+        "months": ["січня", "лютого", "березня", "квітня", "травня", "червня", "липня",
+                   "серпня", "вересня", "жовтня", "листопада", "грудня"],
+        "legend": ["Світло є", "Світла немає", "Не відстежувалось", "Немає даних"],
+        "h": "год", "m": "хв", "lt1": "<1 хв",
+        "none": "без відключень",
+        "last_week": "минулого тижня",
+        "col_head": "без світла · разів",
+    },
+    "en": {
+        "title": "Power outages",
+        "wd": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+        "months": ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep",
+                   "Oct", "Nov", "Dec"],
+        "legend": ["Power on", "Power off", "Not monitored", "No data"],
+        "h": "h", "m": "m", "lt1": "<1m",
+        "none": "no outages",
+        "last_week": "last week",
+        "col_head": "off time · outages",
+    },
+    "ru": {
+        "title": "Отключения света",
+        "wd": ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"],
+        "months": ["января", "февраля", "марта", "апреля", "мая", "июня", "июля",
+                   "августа", "сентября", "октября", "ноября", "декабря"],
+        "legend": ["Свет есть", "Света нет", "Не отслеживалось", "Нет данных"],
+        "h": "ч", "m": "мин", "lt1": "<1 мин",
+        "none": "без отключений",
+        "last_week": "прошлой недели",
+        "col_head": "без света · раз",
+    },
+}
+
+
+def fmt_duration(seconds: float, lang: str) -> str:
+    t = I18N[lang]
+    minutes = int(seconds // 60 + (1 if seconds % 60 >= 30 else 0))
+    if seconds > 0 and minutes == 0:
+        return t["lt1"]
+    h, m = divmod(minutes, 60)
+    if lang == "en":
+        parts = ([f"{h}h"] if h else []) + ([f"{m}m"] if m or not h else [])
+    else:
+        parts = ([f"{h} {t['h']}"] if h else []) + ([f"{m} {t['m']}"] if m or not h else [])
+    return " ".join(parts)
+
+
+def fmt_range(d0: date, d1: date, lang: str) -> str:
+    mo = I18N[lang]["months"]
+    if lang == "en":
+        return f"{d0.day} {mo[d0.month - 1]} – {d1.day} {mo[d1.month - 1]} {d1.year}"
+    return f"{d0.day} {mo[d0.month - 1]} – {d1.day} {mo[d1.month - 1]} {d1.year}"
+
+
+# ---------------------------------------------------------------- sample data
+# Stored timeline intervals in local wall-clock time (the mock has no DST day).
+# state: on / off / nm (not monitored). Anything not covered = no data.
+def dt(d: str, hm: str) -> datetime:
+    return datetime.fromisoformat(f"{d}T{hm}")
+
+
+NOW = dt("2026-10-01", "14:37")
+TIMELINE = [
+    # last week (shown dimmed in Fri..Sun rows). Monitoring starts Fri 10:42.
+    ("on", dt("2026-09-25", "10:42"), dt("2026-09-25", "14:00")),
+    ("off", dt("2026-09-25", "14:00"), dt("2026-09-25", "17:55")),
+    ("on", dt("2026-09-25", "17:55"), dt("2026-09-26", "04:00")),
+    ("off", dt("2026-09-26", "04:00"), dt("2026-09-26", "08:00")),
+    ("on", dt("2026-09-26", "08:00"), dt("2026-09-26", "11:00")),
+    ("nm", dt("2026-09-26", "11:00"), dt("2026-09-26", "12:30")),   # maintenance
+    ("on", dt("2026-09-26", "12:30"), dt("2026-09-26", "19:00")),
+    ("off", dt("2026-09-26", "19:00"), dt("2026-09-26", "22:40")),
+    ("on", dt("2026-09-26", "22:40"), dt("2026-09-28", "08:00")),    # Sun: no outages
+    # this week
+    ("off", dt("2026-09-28", "08:00"), dt("2026-09-28", "12:05")),
+    ("on", dt("2026-09-28", "12:05"), dt("2026-09-28", "18:00")),
+    ("off", dt("2026-09-28", "18:00"), dt("2026-09-28", "21:30")),
+    ("on", dt("2026-09-28", "21:30"), dt("2026-09-29", "12:02")),
+    ("off", dt("2026-09-29", "12:02"), dt("2026-09-29", "15:58")),
+    ("on", dt("2026-09-29", "15:58"), dt("2026-09-29", "21:40")),
+    ("off", dt("2026-09-29", "21:40"), dt("2026-09-30", "01:15")),   # crosses midnight
+    ("on", dt("2026-09-30", "01:15"), dt("2026-09-30", "03:10")),
+    ("nm", dt("2026-09-30", "03:10"), dt("2026-09-30", "03:52")),   # server downtime
+    ("on", dt("2026-09-30", "03:52"), dt("2026-09-30", "10:30")),
+    ("off", dt("2026-09-30", "10:30"), dt("2026-09-30", "10:50")),   # 20-min outage
+    ("on", dt("2026-09-30", "10:50"), dt("2026-09-30", "16:05")),
+    ("off", dt("2026-09-30", "16:05"), dt("2026-09-30", "19:35")),
+    ("on", dt("2026-09-30", "19:35"), dt("2026-10-01", "05:57")),
+    ("off", dt("2026-10-01", "05:57"), dt("2026-10-01", "09:03")),
+    ("on", dt("2026-10-01", "09:03"), dt("2026-10-01", "11:58")),
+    ("off", dt("2026-10-01", "11:58"), dt("2026-10-01", "13:02")),
+    ("on", dt("2026-10-01", "13:02"), NOW),                          # open interval, clipped at now
+]
+
+
+@dataclass
+class Seg:
+    state: str
+    h0: float  # hours since local midnight
+    h1: float
+
+
+def day_segments(day: date, now: datetime) -> list[Seg]:
+    d0 = datetime.combine(day, time(0))
+    d1 = d0 + timedelta(days=1)
+    out = []
+    for state, a, b in TIMELINE:
+        a2, b2 = max(a, d0), min(b, d1, now)
+        if b2 > a2:
+            out.append(Seg(state, (a2 - d0).total_seconds() / 3600, (b2 - d0).total_seconds() / 3600))
+    return out
+
+
+def day_totals(segs: list[Seg]) -> tuple[float, int, bool]:
+    off = [s for s in segs if s.state == "off"]
+    monitored = any(s.state in ("on", "off") for s in segs)
+    return sum((s.h1 - s.h0) * 3600 for s in off), len(off), monitored
+
+
+# ---------------------------------------------------------------- layout
+TITLE_SIZE = 48
+SUB_SIZE = 30
+LEGEND_SIZE = 30
+LABEL_SIZE = 34
+TOTAL_SIZE = 32
+AXIS_SIZE = 30
+HEAD_SIZE = 27
+NOW_SIZE = 28
+
+GAP_L = 24                 # label column -> bar
+GAP_R = 24
+ROW_PITCH = 82
+BAR_H = 44
+BAR_R = 8
+NOW_EXTRA = 38             # extra space above today's row for the time pill
+DIVIDER_H = 56             # "last week" divider zone before the first dimmed row
+MIN_OFF_PX = 8             # an OFF interval is never drawn narrower than this
+H = 1000                   # fixed canvas height (layout below always fits)
+Y_TITLE = 82               # baselines
+Y_SUB = 128
+Y_LEGEND = 186
+Y_COLHEAD = 236
+Y_PLOT = 254               # top of the first row
+
+BAR_X0 = 0.0               # set per language in render()
+BAR_X1 = 0.0               # set per language in render()
+BAR_W = 0.0
+
+
+def hx(h: float) -> float:
+    return BAR_X0 + h / 24 * BAR_W
+
+
+WEIGHT = {"Inter-Regular": 400, "Inter-Medium": 500, "Inter-SemiBold": 600}
+
+
+def t(x, y, s, face, size, fill, anchor="start"):
+    # PostScript name first (cairo/Quartz picks the exact static face), then the
+    # family + weight so a browser with Inter installed renders the same design.
+    return (f'<text x="{x:.1f}" y="{y:.1f}" font-family="{face}, Inter, sans-serif" '
+            f'font-weight="{WEIGHT[face]}" font-size="{size}" fill="{fill}" '
+            f'text-anchor="{anchor}">{escape(s)}</text>')
+
+
+def render(lang: str, location: str) -> tuple[str, int]:
+    global BAR_X0, BAR_X1, BAR_W
+    tr = I18N[lang]
+    wd_w = max(text_w(w, "Inter-SemiBold", LABEL_SIZE) for w in tr["wd"])
+    date_x = PAD_X + wd_w + 14
+    label_col = wd_w + 14 + text_w("00.00", "Inter-SemiBold", LABEL_SIZE)
+    BAR_X0 = PAD_X + label_col + GAP_L
+    # totals column: widest of "no outages" and a worst-case "23 h 59 m · 12", measured
+    worst = fmt_duration(23 * 3600 + 59 * 60, lang) + " · 12"
+    total_col = max(text_w(tr["none"], "Inter-Medium", TOTAL_SIZE),
+                    text_w(worst, "Inter-SemiBold", TOTAL_SIZE),
+                    text_w(tr["col_head"], "Inter-Medium", HEAD_SIZE))
+    BAR_X1 = W - PAD_X - total_col - GAP_R
+    BAR_W = BAR_X1 - BAR_X0
+    today = NOW.date()
+    monday = today - timedelta(days=today.weekday())
+    els: list[str] = []
+    defs = []
+    for key, pal in (("cur", CUR), ("dim", DIM)):
+        defs.append(
+            f'<pattern id="nm-{key}" patternUnits="userSpaceOnUse" width="14" height="14" '
+            f'patternTransform="rotate(45)"><rect width="14" height="14" fill="{pal["nm_base"]}"/>'
+            f'<rect width="6" height="14" fill="{pal["nm_ink"]}"/></pattern>')
+
+    # header ---------------------------------------------------------------
+    els.append(t(PAD_X, Y_TITLE, tr["title"], "Inter-SemiBold", TITLE_SIZE, INK_1))
+    y2 = Y_SUB
+    sub = f"{location} · {fmt_range(monday, monday + timedelta(days=6), lang)}"
+    els.append(t(PAD_X, y2, sub, "Inter-Regular", SUB_SIZE, INK_2))
+
+    # legend ----------------------------------------------------------------
+    ly = Y_LEGEND
+    x = PAD_X
+    sw, sh = 38, 24
+    for i, label in enumerate(tr["legend"]):
+        fill = [ON, OFF, "url(#nm-cur)", TRACK][i]
+        els.append(f'<rect x="{x}" y="{ly - sh + 3}" width="{sw}" height="{sh}" rx="5" fill="{fill}"/>')
+        els.append(t(x + sw + 12, ly, label, "Inter-Regular", LEGEND_SIZE, INK_2))
+        x += sw + 12 + text_w(label, "Inter-Regular", LEGEND_SIZE) + 34
+
+    # column header over totals ------------------------------------------------
+    els.append(t(W - PAD_X, Y_COLHEAD, tr["col_head"], "Inter-Medium", HEAD_SIZE, INK_3, "end"))
+    row_y = Y_PLOT
+
+    rows = []
+    for i in range(7):
+        cur_day = monday + timedelta(days=i)
+        is_future = cur_day > today
+        shown = cur_day - timedelta(days=7) if is_future else cur_day
+        rows.append((i, shown, is_future, cur_day == today))
+
+    grid_top = row_y
+    bar_rows = []
+    first_dim_done = False
+    for i, shown, dim, is_today in rows:
+        if is_today:
+            row_y += NOW_EXTRA
+        if dim and not first_dim_done:
+            first_dim_done = True
+            # divider with "last week" caption, centred in its own zone
+            mid = row_y + DIVIDER_H / 2 + 4
+            els.append(t(PAD_X, mid + HEAD_SIZE * 0.36, tr["last_week"], "Inter-Medium", HEAD_SIZE, INK_3))
+            cw = text_w(tr["last_week"], "Inter-Medium", HEAD_SIZE)
+            els.append(f'<rect x="{PAD_X + cw + 16:.1f}" y="{mid - 0.75:.1f}" '
+                       f'width="{W - 2 * PAD_X - cw - 16:.1f}" height="1.5" fill="{GRID}"/>')
+            row_y += DIVIDER_H
+        bar_y = row_y + (ROW_PITCH - BAR_H) / 2
+        bar_rows.append((i, shown, dim, is_today, bar_y))
+        row_y += ROW_PITCH
+    grid_bottom = row_y
+
+    # today band (behind everything in that row)
+    for i, shown, dim, is_today, bar_y in bar_rows:
+        if is_today:
+            els.append(f'<rect x="{PAD_X - 18}" y="{bar_y - 14}" width="{W - 2 * PAD_X + 36}" '
+                       f'height="{BAR_H + 28}" rx="12" fill="{TODAY_BAND}"/>')
+
+    # 3-hour gridlines through the whole plot (drawn under bars)
+    for h in range(0, 25, 3):
+        els.append(f'<rect x="{hx(h) - 0.75:.2f}" y="{grid_top}" width="1.5" '
+                   f'height="{grid_bottom - grid_top}" fill="{GRID}"/>')
+
+    for i, shown, dim, is_today, bar_y in bar_rows:
+        pal = DIM if dim else CUR
+        segs = day_segments(shown, NOW)
+        # label
+        wd = tr["wd"][shown.weekday()]
+        date_s = shown.strftime("%d.%m")
+        ty = bar_y + BAR_H / 2 + LABEL_SIZE * 0.36
+        c1 = INK_3 if dim else INK_1
+        c2 = INK_3 if dim else INK_2
+        face = "Inter-SemiBold" if is_today else "Inter-Medium"
+        els.append(t(PAD_X, ty, wd, face, LABEL_SIZE, c1))
+        els.append(t(date_x, ty, date_s, "Inter-SemiBold" if is_today else "Inter-Regular",
+                     LABEL_SIZE, INK_1 if is_today else c2))
+        # track + segments clipped to rounded bar
+        cid = f"clip{i}"
+        defs.append(f'<clipPath id="{cid}"><rect x="{BAR_X0}" y="{bar_y}" width="{BAR_W}" '
+                    f'height="{BAR_H}" rx="{BAR_R}"/></clipPath>')
+        g = [f'<rect x="{BAR_X0}" y="{bar_y}" width="{BAR_W}" height="{BAR_H}" fill="{pal["track"]}"/>']
+        z = {"on": 0, "nm": 1, "off": 2}  # OFF on top so a widened short outage stays visible
+        for s in sorted(segs, key=lambda seg: z[seg.state]):
+            x0, x1 = hx(s.h0), hx(s.h1)
+            if s.state == "off" and x1 - x0 < MIN_OFF_PX:
+                mid = (x0 + x1) / 2
+                x0 = min(max(mid - MIN_OFF_PX / 2, BAR_X0), BAR_X1 - MIN_OFF_PX)
+                x1 = x0 + MIN_OFF_PX
+            fill = {"on": pal["on"], "off": pal["off"], "nm": f"url(#nm-{'dim' if dim else 'cur'})"}[s.state]
+            g.append(f'<rect x="{x0:.2f}" y="{bar_y}" width="{x1 - x0:.2f}" height="{BAR_H}" fill="{fill}"/>')
+        # hour separators (surface-coloured hairlines = hour cells)
+        for h in range(1, 24):
+            g.append(f'<rect x="{hx(h) - 1:.2f}" y="{bar_y}" width="2" height="{BAR_H}" '
+                     f'fill="{SURFACE}" fill-opacity="{0.9 if h % 3 == 0 else 0.55}"/>')
+        els.append(f'<g clip-path="url(#{cid})">' + "".join(g) + "</g>")
+        # totals
+        off_s, n, monitored = day_totals(segs)
+        if not monitored:
+            tot, tc = "—", INK_3
+        elif n == 0:
+            tot, tc = tr["none"], (INK_3 if dim else INK_2)
+        else:
+            tot, tc = fmt_duration(off_s, lang), (INK_3 if dim else INK_1)
+        face = "Inter-SemiBold" if is_today else "Inter-Medium"
+        right = W - PAD_X
+        if monitored and n:
+            cnt = f" · {n}"
+            els.append(t(right, ty - 1, cnt, face, TOTAL_SIZE, INK_3, "end"))
+            right -= text_w(cnt, face, TOTAL_SIZE)
+        els.append(t(right, ty - 1, tot, face, TOTAL_SIZE, tc, "end"))
+        # now marker
+        if is_today:
+            nh = NOW.hour + NOW.minute / 60
+            nx = hx(nh)
+            els.append(f'<rect x="{nx - 1.5:.2f}" y="{bar_y - 8}" width="3" height="{BAR_H + 16}" '
+                       f'rx="1.5" fill="{INK_1}"/>')
+            label = NOW.strftime("%H:%M")
+            pw = text_w(label, "Inter-SemiBold", NOW_SIZE) + 22
+            ph = 36
+            px = min(max(nx - pw / 2, BAR_X0 - 8), BAR_X1 + 8 - pw)
+            py = bar_y - 8 - ph - 2
+            els.append(f'<rect x="{px:.2f}" y="{py:.2f}" width="{pw:.2f}" height="{ph}" rx="{ph / 2}" fill="{INK_1}"/>')
+            els.append(t(px + pw / 2, py + ph / 2 + NOW_SIZE * 0.36, label, "Inter-SemiBold", NOW_SIZE,
+                         SURFACE, "middle"))
+
+    # axis ------------------------------------------------------------------
+    ay = grid_bottom + 30
+    for h in range(0, 25, 3):
+        els.append(t(hx(h), ay, f"{h:02d}", "Inter-Medium", AXIS_SIZE, INK_3, "middle"))
+    assert ay + 40 <= H, ay
+    height = H
+
+    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{height}" '
+           f'viewBox="0 0 {W} {height}"><defs>{"".join(defs)}</defs>'
+           f'<rect width="{W}" height="{height}" fill="{SURFACE}"/>' + "".join(els) + "</svg>")
+    return svg, height
+
+
+def main() -> None:
+    out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "out")
+    os.makedirs(out, exist_ok=True)
+    register_fonts_macos()
+    import cairosvg  # after font registration
+
+    locs = {"uk": "Дім, Оболонь", "en": "Home, Obolon", "ru": "Дом, Оболонь"}
+    for lang in sys.argv[2:] or ["uk", "en", "ru"]:
+        svg, h = render(lang, locs[lang])
+        with open(os.path.join(out, f"chart-mock-{lang}.svg"), "w", encoding="utf-8") as f:
+            f.write(svg)
+        png = os.path.join(out, f"chart-mock-{lang}.png")
+        cairosvg.svg2png(bytestring=svg.encode(), write_to=png)
+        print(f"{lang}: {W}x{h} bars x {BAR_X0:.0f}..{BAR_X1:.0f} ({BAR_W / 24:.1f} px/h)")
+        if lang == "uk":  # phone-size preview: Telegram shows the photo ~400 px wide
+            from PIL import Image
+            im = Image.open(png)
+            im.resize((400, round(h * 400 / W)), Image.LANCZOS).save(
+                os.path.join(out, "chart-mock-uk-phone.png"))
+
+
+if __name__ == "__main__":
+    main()
