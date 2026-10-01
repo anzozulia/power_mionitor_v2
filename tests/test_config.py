@@ -1,8 +1,13 @@
-"""Fail-closed configuration (SEC-01, INV-21 #1).
+"""Fail-closed configuration (SEC-01, INV-21 #1; OPS-01, ALRT-03, D-07, D-09, D-16).
 
 Production refuses to start when a secret, DOMAIN or ACME_EMAIL is missing, empty or still
 the .env.example value, when DEBUG is on, or when DISPLAY_TZ does not resolve; the error
 names the variable, and the real process exits non-zero.
+
+The admin ops chat (OPS_BOT_TOKEN + OPS_CHAT_ID) is optional: both unset means "not
+configured"; one of them alone, or a malformed value, is refused in every mode, and the
+error never holds the token. ALERT_MAX_AGE_HOURS (1-48, default 6) and LOG_LEVEL (default
+INFO) are refused when malformed. Build mode reads none of them.
 
 Every production case starts from one complete valid production env and changes only the
 variable under test, so each error names exactly that variable whatever order ``load()``
@@ -22,6 +27,8 @@ from powermon.config import EXAMPLE_VALUES, ConfigError, load
 ENV_EXAMPLE = Path(settings.BASE_DIR) / ".env.example"
 SECRETS = ("SECRET_KEY", "ADMIN_PASSWORD", "POSTGRES_PASSWORD")
 DOMAIN = "power.example.org"
+OPS_TOKEN = "555555555:" + "C" * 35
+OPS_CHAT_ID = "-1005555555555"
 # One complete production env: every .env.example key, none with its example value.
 VALID_PRODUCTION: dict[str, str] = {
     "APP_ENV": "production",
@@ -38,6 +45,10 @@ VALID_PRODUCTION: dict[str, str] = {
     "ACME_EMAIL": "ops@example.org",
     "DISPLAY_TZ": "Europe/Kyiv",
     "PUBLIC_BASE_URL": "http://localhost:8000",
+    "OPS_BOT_TOKEN": OPS_TOKEN,
+    "OPS_CHAT_ID": OPS_CHAT_ID,
+    "ALERT_MAX_AGE_HOURS": "6",
+    "LOG_LEVEL": "INFO",
 }
 # How a required value can be wrong; None means the variable is not set at all.
 BAD_VALUES = ("missing", "empty", "blank", "example")
@@ -99,6 +110,11 @@ def test_valid_production_env_loads() -> None:
     assert cfg.allowed_hosts == (DOMAIN, "127.0.0.1")
     assert cfg.public_base_url == f"https://{DOMAIN}"
     assert cfg.secret_key == VALID_PRODUCTION["SECRET_KEY"]
+    assert cfg.ops_configured
+    assert cfg.ops_bot_token == OPS_TOKEN
+    assert cfg.ops_chat_id == -1005555555555
+    assert cfg.alert_max_age_hours == 6
+    assert cfg.log_level == "INFO"
     # The base env covers every key a deploy sets, so a later key cannot be forgotten here.
     assert set(VALID_PRODUCTION) == set(_env_example())
 
@@ -211,12 +227,155 @@ def test_postgres_port_and_default_load(value: str | None, port: int) -> None:
     assert load(_env(POSTGRES_PORT=value)).db_port == port
 
 
+# The admin ops chat (D-09, OPS-01, INV-20)
+
+
+@pytest.mark.parametrize("app_env", ["production", "local"])
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_ops_chat_unset_is_allowed(app_env: str, value: str | None) -> None:
+    cfg = load(_env(APP_ENV=app_env, OPS_BOT_TOKEN=value, OPS_CHAT_ID=value))
+
+    assert not cfg.ops_configured
+    assert cfg.ops_bot_token == ""
+    assert cfg.ops_chat_id is None
+
+
+def test_ops_chat_values_are_trimmed() -> None:
+    cfg = load(_env(OPS_BOT_TOKEN=f"  {OPS_TOKEN}\n", OPS_CHAT_ID=" 12345 "))
+
+    assert cfg.ops_configured
+    assert cfg.ops_bot_token == OPS_TOKEN
+    assert cfg.ops_chat_id == 12345
+
+
+@pytest.mark.parametrize("app_env", ["production", "local"])
+@pytest.mark.parametrize("unset", [None, "", "  "])
+def test_ops_chat_half_configured_refused(app_env: str, unset: str | None) -> None:
+    with pytest.raises(ConfigError, match=r"^OPS_CHAT_ID") as only_token:
+        load(_env(APP_ENV=app_env, OPS_CHAT_ID=unset))
+    with pytest.raises(ConfigError, match=r"^OPS_BOT_TOKEN") as only_chat:
+        load(_env(APP_ENV=app_env, OPS_BOT_TOKEN=unset))
+
+    assert OPS_TOKEN not in str(only_token.value)
+    assert OPS_CHAT_ID not in str(only_chat.value)
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "abc",
+        "12345:short",
+        "123456789:" + "A" * 29,
+        "123456789:" + "A" * 20 + "/" + "A" * 20,
+        "123456789:" + "A" * 20 + "?" + "A" * 20,
+        "١٢٣٤٥٦٧٨٩:" + "A" * 35,
+        "123456789:" + "A" * 246,
+    ],
+    ids=["abc", "short", "29-chars", "slash", "question-mark", "arabic-indic", "256-chars"],
+)
+@pytest.mark.parametrize("app_env", ["production", "local"])
+def test_bad_ops_bot_token_refused_without_echo(app_env: str, token: str) -> None:
+    with pytest.raises(ConfigError) as excinfo:
+        load(_env(APP_ENV=app_env, OPS_BOT_TOKEN=token))
+
+    message = str(excinfo.value)
+    secret = token.partition(":")[2]
+    assert message.startswith("OPS_BOT_TOKEN")
+    assert token not in message
+    assert not secret or secret not in message
+
+
+def test_a_255_character_ops_bot_token_loads() -> None:
+    token = "123456789:" + "A" * 245
+
+    assert load(_env(OPS_BOT_TOKEN=token)).ops_bot_token == token
+
+
+@pytest.mark.parametrize(
+    "chat_id",
+    [
+        "@ops_channel",
+        "abc",
+        "1_000",
+        "+100",
+        "1" * 20,
+        "-9223372036854775809",
+        "１２３４５",
+    ],
+    ids=["username", "abc", "underscore", "plus", "20-digits", "below-int64", "full-width"],
+)
+def test_bad_ops_chat_id_refused(chat_id: str) -> None:
+    with pytest.raises(ConfigError, match=r"^OPS_CHAT_ID") as excinfo:
+        load(_env(OPS_CHAT_ID=chat_id))
+
+    assert OPS_TOKEN not in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "chat_id", ["-9223372036854775808", "9223372036854775807", "-1001234567890", "42"]
+)
+def test_int64_ops_chat_ids_load(chat_id: str) -> None:
+    assert load(_env(OPS_CHAT_ID=chat_id)).ops_chat_id == int(chat_id)
+
+
+# Alert maximum age (D-07, ALRT-03) and log level (D-16)
+
+
+@pytest.mark.parametrize(
+    ("value", "hours"),
+    [(None, 6), ("", 6), ("  ", 6), ("1", 1), ("48", 48), (" 7 ", 7), ("06", 6)],
+)
+def test_alert_max_age_hours_default_and_range(value: str | None, hours: int) -> None:
+    assert load(_env(ALERT_MAX_AGE_HOURS=value)).alert_max_age_hours == hours
+
+
+@pytest.mark.parametrize("value", ["0", "49", "-1", "6.5", "1_0", "100", "６", "6h"])
+def test_alert_max_age_hours_outside_1_to_48_refused(value: str) -> None:
+    with pytest.raises(ConfigError, match=r"^ALERT_MAX_AGE_HOURS .*1 to 48"):
+        load(_env(ALERT_MAX_AGE_HOURS=value))
+
+
+@pytest.mark.parametrize(
+    ("value", "level"),
+    [
+        (None, "INFO"),
+        ("", "INFO"),
+        ("debug", "DEBUG"),
+        (" Warning ", "WARNING"),
+        ("ERROR", "ERROR"),
+        ("info", "INFO"),
+    ],
+)
+def test_log_level_default_and_values(value: str | None, level: str) -> None:
+    assert load(_env(LOG_LEVEL=value)).log_level == level
+
+
+@pytest.mark.parametrize("value", ["TRACE", "VERBOSE", "CRITICAL", "20", "ınfo"])
+def test_bad_log_level_refused(value: str) -> None:
+    with pytest.raises(ConfigError, match=r"^LOG_LEVEL"):
+        load(_env(LOG_LEVEL=value))
+
+
 def test_build_mode_skips_secrets() -> None:
-    cfg = load({"APP_BUILD": "1", "DEBUG": "1"})
+    cfg = load(
+        {
+            "APP_BUILD": "1",
+            "DEBUG": "1",
+            "OPS_BOT_TOKEN": "not-a-token",
+            "ALERT_MAX_AGE_HOURS": "0",
+            "LOG_LEVEL": "TRACE",
+        }
+    )
 
     assert cfg.build
     assert not cfg.debug
     assert cfg.production
+    # Build mode reads no secret and no runtime setting.
+    assert not cfg.ops_configured
+    assert cfg.ops_bot_token == ""
+    assert cfg.ops_chat_id is None
+    assert cfg.alert_max_age_hours == 6
+    assert cfg.log_level == "INFO"
 
 
 @pytest.mark.parametrize("value", ["0", "true", "yes"])
@@ -251,3 +410,13 @@ def test_production_process_starts_with_a_valid_env() -> None:
     result = _run_django_setup(VALID_PRODUCTION)
 
     assert result.returncode == 0, result.stderr
+
+
+def test_bad_ops_bot_token_stops_the_process_without_echo() -> None:
+    secret = "B" * 20 + "/" + "B" * 20
+
+    result = _run_django_setup(_env(OPS_BOT_TOKEN=f"123456789:{secret}"))
+
+    assert result.returncode != 0
+    assert "ImproperlyConfigured: OPS_BOT_TOKEN" in result.stderr
+    assert secret not in result.stderr + result.stdout

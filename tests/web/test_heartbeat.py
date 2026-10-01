@@ -3,6 +3,10 @@
 Time-dependent tests serve HeartbeatView through RequestFactory with an injected FakeClock.
 Routing, status-code and middleware tests go through the Django test client, so the
 whole middleware stack (CSRF, login-required, CSP, slash handling) is part of the check.
+
+While the database fails, /hb answers 503 ``db unavailable``; the log gets one WARNING per
+outage per process (class name only) and one line when the database answers again, not a
+traceback or a django.request line per heartbeat (D-16, OPS-08).
 """
 
 import logging
@@ -12,15 +16,19 @@ from typing import Any
 
 import pytest
 from conftest import FakeClock
+from django.db import DatabaseError, OperationalError
 from django.http import HttpResponse
 from django.test import Client, RequestFactory
 
 from powermon.engine import transitions
 from powermon.engine.models import LocationState
 from powermon.locations.keys import generate_device_key
+from powermon.locations.models import Location
 from powermon.web import views
 
 CHALLENGE = 'Bearer realm="heartbeat"'
+DB_DOWN = "heartbeat: database unavailable ({}); answering 503 until it is back"
+DB_BACK = "heartbeat: database reachable again"
 
 
 def _bearer(key: str) -> dict[str, str]:
@@ -59,6 +67,37 @@ def _assert_unauthorized(response: Any) -> None:
     assert response.content == b"unauthorized"
     assert response["Content-Type"] == "text/plain"
     assert response["WWW-Authenticate"] == CHALLENGE
+
+
+def _assert_db_unavailable(response: Any) -> None:
+    assert response.status_code == 503
+    assert response.content == b"db unavailable"
+    assert response["Content-Type"] == "text/plain"
+
+
+def _db_down(*args: Any, **kwargs: Any) -> Any:
+    # A psycopg message can carry the host, the user and more; none of it may be logged.
+    raise OperationalError("connection to server at db failed: password=hunter2")
+
+
+def _view_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == views.__name__ and r.levelno >= logging.WARNING
+    ]
+
+
+def _request_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == "django.request"]
+
+
+@pytest.fixture
+def outage_log(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """A fresh per-process outage flag, so no test sees another test's outage."""
+    fresh = views._DbOutageLog()
+    monkeypatch.setattr(views, "_HEARTBEAT_DB", fresh)
+    return fresh
 
 
 # Accepted heartbeats (HB-01, MON-01)
@@ -424,3 +463,128 @@ def test_heartbeat_logs_never_contain_the_key(
     assert (accepted.status_code, rejected.status_code) == (200, 401)
     assert location.device_key not in caplog.text
     assert unknown not in caplog.text
+
+
+# Database outage: 503 and one log line per outage (D-16, OPS-08, T-02-07, T-02-08)
+
+
+@pytest.mark.django_db
+def test_heartbeat_answers_503_while_the_database_fails(
+    client: Client,
+    location_factory: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    outage_log: Any,
+) -> None:
+    location = location_factory()
+    monkeypatch.setattr(transitions, "record_heartbeat", _db_down)
+    caplog.set_level(logging.DEBUG)
+
+    first = client.get("/hb", headers=_bearer(location.device_key))
+    second = client.post(f"/hb?key={location.device_key}")
+
+    _assert_db_unavailable(first)
+    _assert_db_unavailable(second)
+    assert _view_warnings(caplog) == [DB_DOWN.format("OperationalError")]
+    # No "Service Unavailable: /hb" line per heartbeat, and no traceback.
+    assert _request_records(caplog) == []
+    assert "Traceback" not in caplog.text
+    assert "hunter2" not in caplog.text
+    assert location.device_key not in caplog.text
+
+
+@pytest.mark.django_db
+def test_heartbeat_logs_once_when_the_database_is_back(
+    client: Client,
+    location_factory: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    outage_log: Any,
+) -> None:
+    location = location_factory()
+    real = transitions.record_heartbeat
+    monkeypatch.setattr(transitions, "record_heartbeat", _db_down)
+    caplog.set_level(logging.DEBUG)
+    for _ in range(2):
+        _assert_db_unavailable(client.get("/hb", headers=_bearer(location.device_key)))
+    monkeypatch.setattr(transitions, "record_heartbeat", real)
+    caplog.clear()
+
+    back = client.get("/hb", headers=_bearer(location.device_key))
+    back_warnings = _view_warnings(caplog)
+    caplog.clear()
+    again = client.get("/hb", headers=_bearer(location.device_key))
+
+    assert (back.status_code, back.content) == (200, b"ok")
+    assert (again.status_code, again.content) == (200, b"ok")
+    assert back_warnings == [DB_BACK]
+    assert _view_warnings(caplog) == []
+    assert _state(location).status == "on"
+
+
+@pytest.mark.django_db
+def test_heartbeat_warns_again_on_a_second_outage(
+    client: Client,
+    location_factory: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    outage_log: Any,
+) -> None:
+    location = location_factory()
+    real = transitions.record_heartbeat
+    caplog.set_level(logging.DEBUG)
+
+    for record in (_db_down, real, _db_down, _db_down):
+        monkeypatch.setattr(transitions, "record_heartbeat", record)
+        client.get("/hb", headers=_bearer(location.device_key))
+
+    assert _view_warnings(caplog) == [
+        DB_DOWN.format("OperationalError"),
+        DB_BACK,
+        DB_DOWN.format("OperationalError"),
+    ]
+
+
+@pytest.mark.django_db
+def test_heartbeat_503_when_the_key_lookup_fails(
+    client: Client,
+    location_factory: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    outage_log: Any,
+) -> None:
+    location = location_factory()
+
+    def unreachable(*args: Any, **kwargs: Any) -> Any:
+        raise DatabaseError("could not connect to server: password=hunter2")
+
+    monkeypatch.setattr(Location.objects, "filter", unreachable)
+    caplog.set_level(logging.DEBUG)
+
+    by_header = client.get("/hb", headers=_bearer(location.device_key))
+    by_query = client.get("/hb", {"key": location.device_key})
+
+    _assert_db_unavailable(by_header)
+    _assert_db_unavailable(by_query)
+    assert _view_warnings(caplog) == [DB_DOWN.format("DatabaseError")]
+    assert _request_records(caplog) == []
+    assert "hunter2" not in caplog.text
+
+
+@pytest.mark.django_db
+def test_rejected_keys_keep_their_401_while_the_database_fails(
+    client: Client,
+    location_factory: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    outage_log: Any,
+) -> None:
+    location_factory()
+    monkeypatch.setattr(transitions, "record_heartbeat", _db_down)
+    caplog.set_level(logging.DEBUG)
+
+    # A malformed key costs no query, so it never meets the outage.
+    response = client.get("/hb", {"key": "too-short"})
+
+    _assert_unauthorized(response)
+    assert _view_warnings(caplog) == []

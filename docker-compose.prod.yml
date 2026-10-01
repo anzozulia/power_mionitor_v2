@@ -126,6 +126,10 @@ services:
       POSTGRES_PORT: ""
       DISPLAY_TZ: ""
       PUBLIC_BASE_URL: ""
+      OPS_BOT_TOKEN: ""
+      OPS_CHAT_ID: ""
+      ALERT_MAX_AGE_HOURS: ""
+      LOG_LEVEL: ""
     volumes:
       - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
       # Certificates and ACME account: persisted so a redeploy never re-issues (D-04).
