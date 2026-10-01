@@ -53,9 +53,9 @@ def _intervals(location: Any) -> list[Interval]:
 
 def _ids(location: Any) -> list[int]:
     return list(
-        PowerInterval.objects.filter(location=location).order_by("start_at").values_list(
-            "pk", flat=True
-        )
+        PowerInterval.objects.filter(location=location)
+        .order_by("start_at")
+        .values_list("pk", flat=True)
     )
 
 
@@ -64,9 +64,7 @@ def _overwrite(
 ) -> int:
     """``timeline.overwrite`` as the carve calls it: row lock first, one transaction."""
     with transaction.atomic(), connection.cursor() as cur:
-        cur.execute(
-            "SELECT 1 FROM location_state WHERE location_id = %s FOR UPDATE", [location.pk]
-        )
+        cur.execute("SELECT 1 FROM location_state WHERE location_id = %s FOR UPDATE", [location.pk])
         return timeline.overwrite(cur, location.pk, a, b, state)
 
 
