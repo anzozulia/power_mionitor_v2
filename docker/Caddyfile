@@ -1,0 +1,25 @@
+# TLS proxy for the production stack (docker-compose.prod.yml).
+# HTTPS only (D-05): Caddy's automatic HTTP->HTTPS redirect covers port 80, and there is
+# no plain-HTTP site. HSTS comes from Django, not from here.
+# No access log in the site block, so heartbeat keys (?key=) never reach a proxy log.
+# No acme_ca line: it would replace the default issuers and drop the ZeroSSL fallback.
+# Caddy overwrites client-sent X-Forwarded-* headers, which is what lets Django trust
+# X-Forwarded-Proto (SECURE_PROXY_SSL_HEADER).
+{
+	email {$ACME_EMAIL}
+	servers {
+		# 443/udp is not published, so no HTTP/3.
+		protocols h1 h2
+	}
+	log default {
+		# Drops the admin API lines the container healthcheck produces.
+		exclude admin.api
+	}
+}
+
+{$DOMAIN} {
+	reverse_proxy web:8000 {
+		# Buffers request bodies so slow clients cannot hold gunicorn threads (INV-22 #2).
+		request_buffers 64KB
+	}
+}
