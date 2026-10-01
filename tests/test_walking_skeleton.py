@@ -1,6 +1,5 @@
-"""Walking-skeleton stack tests: /healthz, CSP, the clock, redacting logs, the test harness.
-
-01-11 appends the in-process OFF/ON walking-skeleton test.
+"""Walking-skeleton stack tests: /healthz, CSP, the clock, redacting logs, the test harness,
+and the whole alert path in process (DoD 1: heartbeat -> OFF -> ON -> Telegram).
 """
 
 import logging
@@ -12,13 +11,20 @@ from zoneinfo import ZoneInfo
 
 import pytest
 import requests
-from conftest import DEFAULT_BOT_TOKEN, TELEGRAM_API, FakeClock
+from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, TELEGRAM_API, FakeClock
 from django.db import DatabaseError
+from django.http import HttpResponse
+from django.test import RequestFactory
 from pytest_socket import SocketConnectBlockedError
 
+from powermon.alerts.models import OutboxMessage
 from powermon.clock import SystemClock
+from powermon.engine.models import SystemState
 from powermon.logging_setup import RedactingFormatter
 from powermon.web import views
+from powermon.web.views import HeartbeatView
+from powermon.worker.detection import run_cycle
+from powermon.worker.io_loop import RelayState, run_iteration
 
 # UI-SPEC, Security-Bound UI Rules, rule 5.
 CSP = (
@@ -234,3 +240,62 @@ def test_network_guard_blocks_real_outbound_connections() -> None:
 def test_display_tz_is_canonical(settings: Any) -> None:
     assert settings.TIME_ZONE == "Europe/Kyiv"
     assert ZoneInfo(settings.TIME_ZONE).key == "Europe/Kyiv"
+
+
+# The whole alert path in process (DoD 1 in-process; ALRT-01, ALRT-02, MON-02, MON-03)
+
+
+def _at(hour: int, minute: int, second: int = 0) -> datetime:
+    """An aware UTC instant on the fixed test day (2026-10-01)."""
+    return datetime(2026, 10, 1, hour, minute, second, tzinfo=UTC)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_walking_skeleton_off_and_on_alerts_reach_telegram(
+    location_factory: Any, fake_telegram: Any, rf: RequestFactory
+) -> None:
+    # The worker started at 09:00, long before the device's first heartbeat.
+    SystemState.objects.update_or_create(
+        pk=1, defaults={"detection_resumed_at": _at(9, 0), "web_started_at": None}
+    )
+    location = location_factory(language="uk")
+    fake_telegram.accept(DEFAULT_BOT_TOKEN)
+
+    def beat(at: datetime) -> HttpResponse:
+        request = rf.get("/hb", headers={"authorization": f"Bearer {location.device_key}"})
+        response: HttpResponse = HeartbeatView.as_view(clock=FakeClock(at))(request)
+        return response
+
+    for minute in range(6):  # 10:00:00 ... 10:05:00, then the power goes
+        response = beat(_at(10, minute))
+        assert (response.status_code, response.content) == (200, b"ok")
+    state = RelayState()
+
+    # 10:06:31 is past period + grace (90 s) after the last heartbeat: OFF at 10:05:00.
+    assert run_cycle(_at(10, 6, 31)) == 1
+    assert run_iteration(_at(10, 6, 32), state) is True
+
+    off = {
+        "chat_id": -1001234567890,
+        "text": "🔴 <b>СВІТЛО ЗНИКЛО</b>\n⚡ Світло було: <b>5 хв</b>",
+        "parse_mode": "HTML",
+    }
+    assert fake_telegram.sent == [off]
+
+    # Power is back: the first heartbeat restores the location at 11:00:00.
+    response = beat(_at(11, 0))
+    assert (response.status_code, response.content) == (200, b"ok")
+    assert run_iteration(_at(11, 0, 1), state) is True
+
+    on = {
+        "chat_id": DEFAULT_CHAT_ID,
+        "text": "🟢 <b>СВІТЛО ПОВЕРНУЛОСЯ</b>\n⚡ Світла не було: <b>55 хв</b>",
+        "parse_mode": "HTML",
+    }
+    assert fake_telegram.sent == [off, on]
+    assert len(fake_telegram.calls) == 2
+    rows = OutboxMessage.objects.order_by("id").values_list("kind", "status")
+    assert list(rows) == [("power_off", "sent"), ("power_on", "sent")]
+    # Nothing else is due: no third message.
+    assert run_cycle(_at(11, 0, 2)) == 0
+    assert run_iteration(_at(11, 0, 3), state) is False

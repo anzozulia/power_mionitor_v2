@@ -43,6 +43,8 @@ INSTALLED_APPS = [
     "django.contrib.postgres",
     "powermon",
     "powermon.web",
+    # Hosts the run_worker management command (no models, no apps.py).
+    "powermon.worker",
 ]
 
 MIDDLEWARE = [
