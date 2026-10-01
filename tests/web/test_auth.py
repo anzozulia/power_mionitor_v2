@@ -1,22 +1,26 @@
-"""The env-defined single admin account (LOC-01, INV-21 #3) and the ``release`` command (D-02).
+"""The env-defined single admin account (LOC-01, INV-21 #3), the ``release`` command (D-02),
+and signing in and out (D-09 surface 1, UI-SPEC screen 1).
 
 ``release`` runs in the one-shot migrate service on every deploy: it applies migrations and
-then syncs the one admin account from ADMIN_USERNAME / ADMIN_PASSWORD.
-
-01-07 adds the sign-in and sign-out tests to this file.
+then syncs the one admin account from ADMIN_USERNAME / ADMIN_PASSWORD. The admin then signs
+in at /login/ with exactly that account and signs out with a POST to /logout/.
 """
 
+import re
 from io import StringIO
 from typing import Any
 
 import pytest
 from django.conf import settings
-from django.contrib.auth import authenticate, get_user_model
+from django.contrib.auth import authenticate, get_user, get_user_model
 from django.core.management import call_command
+from django.test import Client
 
 from powermon.web.admin_sync import sync_admin
 
 User = get_user_model()
+
+SIGN_IN_ERROR = "Wrong username or password. Check both and try again."
 
 
 def _snapshot() -> list[tuple[Any, ...]]:
@@ -140,3 +144,177 @@ def test_release_command_migrates_and_syncs() -> None:
     assert "Operations to perform" in out.getvalue()
     assert f"admin account synced: {settings.CFG.admin_username}" in out.getvalue()
     assert settings.CFG.admin_password not in out.getvalue() + err.getvalue()
+
+
+# sign in / sign out (UI-SPEC screen 1)
+
+
+def _input_tag(html: str, name: str) -> str:
+    """The rendered ``<input ...>`` tag whose name attribute is ``name``."""
+    match = re.search(rf'<input\b[^>]*\bname="{re.escape(name)}"[^>]*>', html)
+    assert match is not None, f"no input named {name!r} in the page"
+    return match.group(0)
+
+
+def _role_text(html: str, role: str) -> list[str]:
+    """The text directly inside each element that carries ``role="<role>"``."""
+    return [t.strip() for t in re.findall(rf'role="{role}"[^>]*>([^<]*)<', html)]
+
+
+def _sign_in(client: Client, username: str, password: str, **extra: str) -> Any:
+    return client.post("/login/", {"username": username, "password": password, **extra})
+
+
+def _signed_in(client: Client) -> bool:
+    return bool(get_user(client).is_authenticated)  # type: ignore[arg-type]
+
+
+@pytest.mark.django_db
+def test_LOC01_sign_in_page_renders_fields(client: Client) -> None:
+    response = client.get("/login/")
+
+    assert response.status_code == 200
+    html = response.content.decode()
+    assert "<title>Sign in · Power Monitor</title>" in html
+    username = _input_tag(html, "username")
+    assert 'autocomplete="username"' in username
+    assert "autofocus" in username
+    password = _input_tag(html, "password")
+    assert 'type="password"' in password
+    assert 'autocomplete="current-password"' in password
+    assert 'name="csrfmiddlewaretoken"' in html
+    assert "placeholder" not in html
+    assert "<script" not in html
+
+
+@pytest.mark.django_db
+def test_LOC01_env_admin_signs_in(client: Client) -> None:
+    sync_admin("admin", "pw-one")
+
+    response = _sign_in(client, "admin", "pw-one")
+
+    assert response.status_code == 302
+    assert response.url == "/"
+    user = get_user(client)  # type: ignore[arg-type]
+    assert user.is_authenticated
+    assert user.username == "admin"
+
+
+@pytest.mark.django_db
+def test_wrong_password_shows_generic_error_and_clears_password(client: Client) -> None:
+    sync_admin("admin", "pw-one")
+
+    response = _sign_in(client, "admin", "wrong-pw-xyz")
+
+    assert response.status_code == 200
+    html = response.content.decode()
+    assert _role_text(html, "alert") == [SIGN_IN_ERROR]
+    assert 'value="admin"' in _input_tag(html, "username")
+    assert "wrong-pw-xyz" not in html
+    assert "value=" not in _input_tag(html, "password")
+    assert not _signed_in(client)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("username", "password"),
+    [("", "pw-one"), ("admin", ""), ("", ""), ("   ", "pw-one")],
+    ids=["blank-username", "blank-password", "both-blank", "whitespace-username"],
+)
+def test_blank_fields_show_the_same_error(client: Client, username: str, password: str) -> None:
+    sync_admin("admin", "pw-one")
+
+    response = _sign_in(client, username, password)
+
+    assert response.status_code == 200
+    html = response.content.decode()
+    assert _role_text(html, "alert") == [SIGN_IN_ERROR]
+    assert "This field is required." not in html
+    assert "pw-one" not in html
+    if username == "admin":
+        assert 'value="admin"' in _input_tag(html, "username")
+    assert not _signed_in(client)
+
+
+@pytest.mark.django_db
+def test_INV21_old_password_rejected_after_env_change(client: Client) -> None:
+    sync_admin("admin", "pw-one")
+    sync_admin("admin", "pw-two")
+
+    old = _sign_in(client, "admin", "pw-one")
+
+    assert old.status_code == 200
+    assert _role_text(old.content.decode(), "alert") == [SIGN_IN_ERROR]
+    assert not _signed_in(client)
+
+    new = _sign_in(client, "admin", "pw-two")
+
+    assert new.status_code == 302
+    assert new.url == "/"
+    assert _signed_in(client)
+
+
+@pytest.mark.django_db
+def test_next_same_host_is_honoured(client: Client) -> None:
+    sync_admin("admin", "pw-one")
+    form = client.get("/login/", {"next": "/locations/new/"}).content.decode()
+    # The form carries the validated target in its hidden next field.
+    assert 'value="/locations/new/"' in _input_tag(form, "next")
+
+    response = _sign_in(client, "admin", "pw-one", next="/locations/new/")
+
+    assert response.status_code == 302
+    assert response.url == "/locations/new/"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("target", ["https://evil.example/", "//evil.example/", "/\\evil.example"])
+def test_next_off_host_is_ignored(client: Client, target: str) -> None:
+    sync_admin("admin", "pw-one")
+    form = client.get("/login/", {"next": target}).content.decode()
+    assert "evil.example" not in form
+
+    response = _sign_in(client, "admin", "pw-one", next=target)
+
+    assert response.status_code == 302
+    assert response.url == "/"
+
+
+@pytest.mark.django_db
+def test_sign_out_is_post_only_and_flashes(client: Client) -> None:
+    sync_admin("admin", "pw-one")
+    client.force_login(User.objects.get())
+
+    assert client.get("/logout/").status_code == 405
+    assert _signed_in(client)
+
+    response = client.post("/logout/")
+
+    assert response.status_code == 302
+    assert response.url == "/login/"
+    assert not _signed_in(client)
+    page = client.get("/login/").content.decode()
+    assert _role_text(page, "status") == ["You are signed out."]
+    # A flash is shown once.
+    assert _role_text(client.get("/login/").content.decode(), "status") == []
+
+
+@pytest.mark.django_db
+def test_sign_out_when_already_signed_out_lands_on_login(client: Client) -> None:
+    # P-23: the logout view is login-exempt, so a stale tab's Sign out does not bounce
+    # through /login/?next=/logout/ (a GET of /logout/ after sign-in would be a 405).
+    response = client.post("/logout/")
+
+    assert response.status_code == 302
+    assert response.url == "/login/"
+
+
+@pytest.mark.django_db
+def test_signed_in_user_visiting_login_is_redirected(client: Client) -> None:
+    sync_admin("admin", "pw-one")
+    client.force_login(User.objects.get())
+
+    response = client.get("/login/")
+
+    assert response.status_code == 302
+    assert response.url == "/"
