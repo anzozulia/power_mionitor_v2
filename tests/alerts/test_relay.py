@@ -1124,6 +1124,83 @@ def test_WR04_ops_pre_send_error_returns_to_pending(
     assert not OutboxMessage.objects.filter(status="uncertain").exists()
 
 
+# B1 (wave 2 audit): a failing admin chat never delays a subscriber alert, even when the
+# admin reuses a location's bot as OPS_BOT_TOKEN (INV-20 #2, ALRT-06)
+
+
+def _shared_bot(fake: Any, token: str, ops_answers: list[tuple[int, Any]]) -> list[int]:
+    """One bot for a location and the admin chat, faked per chat.
+
+    The admin chat gets ``ops_answers`` (status, JSON body) in turn, then ok; every other
+    chat is accepted. Returns the chat id of every request, in order.
+    """
+    chats: list[int] = []
+
+    def callback(request: PreparedRequest) -> tuple[int, dict[str, str], str]:
+        body = json.loads(request.body or b"{}")
+        chats.append(body["chat_id"])
+        if body["chat_id"] == OPS_CHAT_ID and ops_answers:
+            status, answer = ops_answers.pop(0)
+            return status, {}, json.dumps(answer)
+        fake.sent.append(body)
+        return 200, {}, json.dumps({"ok": True, "result": {"message_id": len(fake.sent)}})
+
+    fake.rsps.add_callback(
+        responses.POST,
+        f"{fake.API}/bot{token}/sendMessage",
+        callback=callback,
+        content_type="application/json",
+    )
+    return chats
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("status", "answer", "ops_wait"),
+    [
+        (
+            403,
+            {"ok": False, "error_code": 403, "description": "Forbidden: bot is not a member"},
+            timedelta(minutes=15),
+        ),
+        (429, _too_many_requests(30), timedelta(seconds=30)),
+        (502, {"ok": False, "error_code": 502}, timedelta(seconds=2)),
+    ],
+    ids=["403", "429", "502"],
+)
+def test_B1_an_admin_chat_failure_on_a_shared_bot_never_delays_the_location(
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    settings: Any,
+    status: int,
+    answer: Any,
+    ops_wait: timedelta,
+) -> None:
+    settings.CFG = dataclasses.replace(settings.CFG, ops_bot_token=TOKEN_A, ops_chat_id=OPS_CHAT_ID)
+    location = location_factory(bot_token=TOKEN_A)
+    notice = _gap_notice(T0 - timedelta(minutes=10), T0)
+    chats = _shared_bot(fake_telegram, TOKEN_A, [(status, answer)])
+    state = io_loop.RelayState()
+
+    # Only the admin chat fails.
+    assert io_loop.run_iteration(FakeClock(T0), state) is True
+    assert chats == [OPS_CHAT_ID]
+    assert (_row(notice).status, _row(notice).next_attempt_at) == ("pending", T0 + ops_wait)
+
+    # The location's OFF, queued a second later, goes out at once on the same bot.
+    off = _queue(location, at=T0 + _seconds(1))
+    assert io_loop.run_iteration(FakeClock(T0 + _seconds(1)), state) is True
+    assert (_row(off).status, _row(off).sent_at) == ("sent", T0 + _seconds(1))
+    assert chats == [OPS_CHAT_ID, DEFAULT_CHAT_ID]
+
+    # The admin chat still waits out its own backoff, and only then gets the notice.
+    due = T0 + ops_wait
+    assert io_loop.run_iteration(FakeClock(due - _seconds(1)), state) is False
+    assert io_loop.run_iteration(FakeClock(due), state) is True
+    assert (_row(notice).status, _row(notice).sent_at) == ("sent", due)
+    assert chats == [OPS_CHAT_ID, DEFAULT_CHAT_ID, OPS_CHAT_ID]
+
+
 # INV-14 #1: a 429 on one bot never delays another (ALRT-06, D-14)
 
 

@@ -309,7 +309,7 @@ def test_ops_bot_backoff_is_its_own(
     assert io_loop.run_iteration(FakeClock(T0), state) is True
 
     # Only the ops bot waits; the location's bot has no backoff at all.
-    assert state.not_before == {io_loop.bot_key(OPS_BOT_TOKEN): T0 + _seconds(30)}
+    assert state.not_before == {io_loop.ops_key(OPS_BOT_TOKEN): T0 + _seconds(30)}
     waiting = _row(notice)
     assert (waiting.status, waiting.last_error) == ("pending", "429")
     assert waiting.next_attempt_at == T0 + _seconds(30)
@@ -771,7 +771,7 @@ def test_INV20_broken_admin_chat_never_delays_subscribers(
     # The ops row backs off on its own: 2 s, 4 s, then 15 min after the 403.
     assert waits == [_seconds(2), _seconds(4), timedelta(minutes=15)]
     assert _row(notice).next_attempt_at == T0 + _seconds(6) + timedelta(minutes=15)
-    assert set(state.not_before) == {io_loop.bot_key(OPS_BOT_TOKEN)}
+    assert set(state.not_before) == {io_loop.ops_key(OPS_BOT_TOKEN)}
     assert _bots(fake_telegram).count("ops") == 3
     assert len(fake_telegram.sent) == len(alerts) == 7
     assert [r.getMessage() for r in caplog.records if r.name == RELAY_LOGGER] == [
