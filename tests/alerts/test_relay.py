@@ -1340,6 +1340,83 @@ def test_D1_the_db_down_notice_waits_only_for_a_bot_wide_backoff(
     assert state.db_down_notified is True
 
 
+# CR-01 (code review): two locations may share one bot. A 400/401/403 for one location's
+# channel concerns that channel only, so the other location's alerts go out on time and
+# never expire behind it. A bot-wide outcome (429, 5xx, a refused connection) still holds
+# every location on the bot (D-14).
+
+
+@pytest.mark.django_db(transaction=True)
+def test_CR01_a_refused_channel_never_holds_another_location_on_its_bot(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    # The refused location has the lower id, so every pass reaches its row first.
+    refused_location = location_factory(bot_token=TOKEN_A)
+    healthy = location_factory(bot_token=TOKEN_A, chat_id=CHAT_B)
+    assert refused_location.pk < healthy.pk
+    refused = _queue(refused_location)
+    sent = [_queue(healthy)]
+    chats = _shared_bot(fake_telegram, TOKEN_A, [(403, KICKED)] * 50, DEFAULT_CHAT_ID)
+    state = io_loop.RelayState()
+
+    # The refused channel backs off 15 min (D-14); the healthy one is sent in the same pass.
+    assert io_loop.run_iteration(FakeClock(T0), state) is True
+    assert chats == [DEFAULT_CHAT_ID, CHAT_B]
+    assert (_row(refused).status, _row(refused).next_attempt_at) == (
+        "pending",
+        T0 + timedelta(minutes=15),
+    )
+    assert (_row(sent[0]).status, _row(sent[0]).sent_at) == ("sent", T0)
+
+    # For 6 h the refused row comes due again every 15 min, at the very instant the healthy
+    # location records its next alert: each one still goes out in that pass.
+    for n in range(1, 24):
+        at = T0 + timedelta(minutes=15 * n)
+        row = _queue(healthy, ("power_on", "power_off")[(n - 1) % 2], at=at)
+        assert io_loop.run_iteration(FakeClock(at), state) is True
+        assert (_row(row).status, _row(row).sent_at) == ("sent", at)
+        sent.append(row)
+    assert chats == [DEFAULT_CHAT_ID, CHAT_B] * 24
+
+    # Only the refused alert reaches its maximum age; no healthy alert ever expired.
+    assert io_loop.run_iteration(FakeClock(T0 + timedelta(hours=6)), state) is False
+    assert _row(refused).status == "expired"
+    assert [_row(row).status for row in sent] == ["sent"] * 24
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("answer", "bot_wait"),
+    [
+        ((429, _too_many_requests(30)), _seconds(30)),
+        ((502, {"ok": False, "error_code": 502}), _seconds(2)),
+        (_refused(TOKEN_A), _seconds(2)),
+    ],
+    ids=["429", "502", "refused"],
+)
+def test_CR01_a_bot_wide_failure_still_holds_every_location_on_the_bot(
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    answer: Any,
+    bot_wait: timedelta,
+) -> None:
+    first = _queue(location_factory(bot_token=TOKEN_A))
+    second = _queue(location_factory(bot_token=TOKEN_A, chat_id=CHAT_B))
+    chats = _shared_bot(fake_telegram, TOKEN_A, [answer], DEFAULT_CHAT_ID)
+    state = io_loop.RelayState()
+
+    # The whole bot is limited or unreachable: the other location waits with it (D-14).
+    assert io_loop.run_iteration(FakeClock(T0), state) is True
+    assert chats == [DEFAULT_CHAT_ID]
+    assert (_row(second).status, _row(second).attempts) == ("pending", 0)
+
+    due = T0 + bot_wait
+    assert io_loop.run_iteration(FakeClock(due - _seconds(1)), state) is False
+    assert io_loop.run_iteration(FakeClock(due), state) is True
+    assert (_row(first).sent_at, _row(second).sent_at) == (due, due)
+    assert chats == [DEFAULT_CHAT_ID, DEFAULT_CHAT_ID, CHAT_B]
+
+
 # B2 (wave 2 audit): one ops notice that cannot be rendered never blocks later notices
 
 
