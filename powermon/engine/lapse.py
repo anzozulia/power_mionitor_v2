@@ -97,6 +97,41 @@ class Gap:
     end: datetime
 
 
+@dataclass
+class CycleTracker:
+    """What the detection loop's previous lapse check saw (one per worker process).
+
+    The forced carve triggers of D-04 compare against it: a new lease ``generation``, a
+    new backend ``pid`` of the detection connection (a re-established session), and
+    ``db_failed`` (the loop lost its connection since). ``wall``/``mono`` are the previous
+    cycle's wall-clock and monotonic times, for the clock-step check (D-15).
+    """
+
+    # 0: no lease generation seen yet in this process, so the first one forces a carve.
+    generation: int = 0
+    pid: int | None = None
+    db_failed: bool = False
+    wall: datetime | None = None
+    mono: float | None = None
+
+    def clock_step(self, now: datetime, mono: float) -> float | None:
+        """Seconds the wall clock moved beyond the monotonic clock since the last cycle.
+
+        Positive for a forward step, negative for a backward one; None on the first cycle.
+        """
+        if self.wall is None or self.mono is None:
+            return None
+        return (now - self.wall).total_seconds() - (mono - self.mono)
+
+    def remember(self, generation: int, pid: int, now: datetime, mono: float) -> None:
+        """Record a completed lapse check; the failure flag is cleared with it."""
+        self.generation = generation
+        self.pid = pid
+        self.wall = now
+        self.mono = mono
+        self.db_failed = False
+
+
 def read_cursor() -> datetime | None:
     """``system_state.last_cycle_completed_at``; the singleton is recreated if missing."""
     system, _created = SystemState.objects.get_or_create(pk=1)
