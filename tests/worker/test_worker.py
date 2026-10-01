@@ -34,6 +34,8 @@ from powermon.worker.lease import LOCK_KEY, Lease
 from powermon.worker.management.commands import run_worker
 
 T0 = datetime(2026, 10, 1, 10, 6, 31, tzinfo=UTC)
+OTHER_BOT_TOKEN = "987654321:" + "B" * 35
+OTHER_CHAT_ID = -1009876543210
 LOOP_NAMES = {"detection", "telegram-io"}
 FAST = {"standby_poll": 0.05, "check_interval": 0.05, "detection_interval": 0.05}
 WORKER_LOGGER = run_worker.__name__
@@ -362,6 +364,27 @@ def test_loops_survive_a_failing_iteration(
     assert not any(t.is_alive() for t in threads)
     assert "detection cycle failed" in caplog.text
     assert "telegram I/O iteration failed" in caplog.text
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV15_io_thread_starts_no_new_send_after_sigterm(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    # SIGTERM lands while the first location's alert is in flight: the thread finishes that
+    # send, records it, claims nothing more and returns. The other alert stays pending for
+    # the next worker instead of being cut off mid-send at exit.
+    first = _queue_off(location_factory())
+    second = _queue_off(location_factory(bot_token=OTHER_BOT_TOKEN, chat_id=OTHER_CHAT_ID))
+    stop = threading.Event()
+    fake_telegram.answer(DEFAULT_BOT_TOKEN, stop.set)
+    fake_telegram.accept(OTHER_BOT_TOKEN)
+
+    run_worker.io_thread(stop, FakeClock(T0 + timedelta(minutes=1)), 0.01)
+
+    assert OutboxMessage.objects.get(pk=first.pk).status == "sent"
+    row = OutboxMessage.objects.get(pk=second.pk)
+    assert (row.status, row.attempts) == ("pending", 0)
+    assert len(fake_telegram.calls) == 1
 
 
 # The command

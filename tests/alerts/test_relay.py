@@ -19,6 +19,7 @@ Telegram is faked at the HTTP boundary (``fake_telegram``).
 import hashlib
 import logging
 import re
+import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -427,6 +428,49 @@ def test_a_row_that_falls_due_during_a_slow_pass_goes_out_in_that_pass(
 
     assert fake_telegram.sent == [_body(OFF_EN), _body(OFF_EN, CHAT_B)]
     assert (_row(row_b).status, _row(row_b).sent_at) == ("sent", T0 + _seconds(10))
+
+
+# Shutdown: no new send after a stop request (INV-15)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV15_a_stop_mid_pass_claims_no_further_row(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    # SIGTERM arrives while A's alert is in flight. A's send finishes and its outcome is
+    # written, but B's alert is not claimed: it stays pending for the next worker. Claimed
+    # and cut off by the exit, it would be left "sending", and activation would turn it
+    # into an "uncertain" row that is never sent.
+    a = location_factory(bot_token=TOKEN_A)
+    b = location_factory(bot_token=TOKEN_B, chat_id=CHAT_B)
+    row_a = _queue(a)
+    row_b = _queue(b)
+    stop = threading.Event()
+    fake_telegram.answer(TOKEN_A, stop.set)
+    fake_telegram.accept(TOKEN_B)
+
+    assert io_loop.run_iteration(FakeClock(T0), io_loop.RelayState(), stop) is True
+
+    assert fake_telegram.sent == [_body(OFF_EN)]
+    assert _row(row_a).status == "sent"
+    assert (_row(row_b).status, _row(row_b).attempts) == ("pending", 0)
+    assert _calls_to(fake_telegram, TOKEN_B) == 0
+    assert not OutboxMessage.objects.filter(status__in=("sending", "uncertain")).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a_pass_after_a_stop_request_claims_nothing(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    row = _queue(location_factory())
+    fake_telegram.accept(TOKEN_A)
+    stop = threading.Event()
+    stop.set()
+
+    assert io_loop.run_iteration(FakeClock(T0), io_loop.RelayState(), stop) is False
+
+    assert len(fake_telegram.calls) == 0
+    assert (_row(row).status, _row(row).attempts) == ("pending", 0)
 
 
 @pytest.mark.django_db(transaction=True)

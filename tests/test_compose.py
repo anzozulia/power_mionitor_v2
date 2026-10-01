@@ -16,6 +16,9 @@ import pytest
 import yaml
 from django.conf import settings
 
+from powermon.telegram.client import DEFAULT_TIMEOUT
+from powermon.worker.management.commands.run_worker import JOIN_TIMEOUT_S
+
 BASE_DIR = Path(settings.BASE_DIR)
 COMPOSE_FILES = {"local": "docker-compose.local.yml", "prod": "docker-compose.prod.yml"}
 ENVS = sorted(COMPOSE_FILES)
@@ -222,6 +225,24 @@ def test_local_runs_the_same_release_and_worker_as_prod() -> None:
     # Above the joins' 15 s budget, so a stop never SIGKILLs a send mid-write.
     assert local["worker"]["stop_grace_period"] == prod["worker"]["stop_grace_period"] == "30s"
     assert "ports" not in local["worker"]
+
+
+def _duration_s(value: str) -> int:
+    match = re.fullmatch(r"([0-9]+)s", value)
+    assert match, f"{value!r} is not a whole number of seconds"
+    return int(match.group(1))
+
+
+@pytest.mark.parametrize("env", ENVS)
+def test_worker_join_budget_covers_one_send_and_fits_the_grace_period(env: str) -> None:
+    # On SIGTERM the relay starts no new send; the one in flight must end, and its outcome
+    # be written, before serve stops waiting for the thread. Cut off earlier, a row that
+    # never left the client stays "sending" and the next start makes it "uncertain".
+    # Docker sends SIGKILL when stop_grace_period runs out, so the joins end before it.
+    connect, read = DEFAULT_TIMEOUT
+    grace = _duration_s(_services(env)["worker"]["stop_grace_period"])
+
+    assert connect + read < JOIN_TIMEOUT_S < grace
 
 
 # Images, env files and data (D-03, D-04)
