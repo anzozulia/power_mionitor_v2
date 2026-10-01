@@ -309,7 +309,7 @@ def test_ops_bot_backoff_is_its_own(
     assert io_loop.run_iteration(FakeClock(T0), state) is True
 
     # Only the ops bot waits; the location's bot has no backoff at all.
-    assert state.not_before == {io_loop.bot_key(OPS_BOT_TOKEN): T0 + _seconds(30)}
+    assert state.not_before == {io_loop.ops_key(OPS_BOT_TOKEN): T0 + _seconds(30)}
     waiting = _row(notice)
     assert (waiting.status, waiting.last_error) == ("pending", "429")
     assert waiting.next_attempt_at == T0 + _seconds(30)
@@ -400,7 +400,7 @@ def test_a_stop_request_skips_the_ops_queue(
 
 
 @pytest.mark.django_db(transaction=True)
-def test_an_ops_notice_that_cannot_be_rendered_backs_off_alone(
+def test_an_ops_notice_that_cannot_be_rendered_is_dropped_alone(
     location_factory: Callable[..., Any],
     fake_telegram: Any,
     ops_settings: Any,
@@ -421,14 +421,16 @@ def test_an_ops_notice_that_cannot_be_rendered_backs_off_alone(
     assert io_loop.run_iteration(FakeClock(T0), state) is True
 
     row = _row(broken)
-    assert (row.status, row.attempts, row.last_error) == ("pending", 0, "render_error")
-    assert row.next_attempt_at == T0 + io_loop.PERMANENT_BACKOFF
+    assert (row.status, row.attempts, row.last_error) == ("dropped", 0, "render_error")
+    assert row.sent_at is None
     assert _row(alert).status == "sent"
     assert _bots(fake_telegram) == ["A"]
     # The ops bot itself is fine, so it is not backed off.
-    assert io_loop.bot_key(OPS_BOT_TOKEN) not in state.not_before
+    assert state.not_before == {}
     lines = [r.getMessage() for r in caplog.records if r.name == RELAY_LOGGER]
-    assert lines == [f"relay: cannot render ops notice {broken.pk}"]
+    assert lines == [
+        f"relay: ops notice {broken.pk} (ops_uncertain) cannot be rendered; it is dropped"
+    ]
 
 
 @pytest.mark.django_db(transaction=True)
@@ -476,7 +478,7 @@ def test_enqueue_ops_queues_a_due_ops_row() -> None:
         "pending",
     )
     assert (stored.event_at, stored.recorded_at, stored.next_attempt_at) == (T0, T0, T0)
-    assert stored.expires_at == T0 + outbox.MAX_AGE
+    assert stored.expires_at == T0 + timedelta(hours=6)
     assert stored.payload == {"start_us": 1, "end_us": 2}
     assert outbox.CHANNEL_OPS == "ops"
     assert set(outbox.OPS_KINDS) == {
@@ -771,7 +773,7 @@ def test_INV20_broken_admin_chat_never_delays_subscribers(
     # The ops row backs off on its own: 2 s, 4 s, then 15 min after the 403.
     assert waits == [_seconds(2), _seconds(4), timedelta(minutes=15)]
     assert _row(notice).next_attempt_at == T0 + _seconds(6) + timedelta(minutes=15)
-    assert set(state.not_before) == {io_loop.bot_key(OPS_BOT_TOKEN)}
+    assert set(state.not_before) == {io_loop.ops_key(OPS_BOT_TOKEN)}
     assert _bots(fake_telegram).count("ops") == 3
     assert len(fake_telegram.sent) == len(alerts) == 7
     assert [r.getMessage() for r in caplog.records if r.name == RELAY_LOGGER] == [
