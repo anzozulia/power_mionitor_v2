@@ -3,9 +3,12 @@
 {% comment %}
 UI-SPEC screen 2 (D-09): read-only, no live refresh. Times go through display_time only
 (P-3: Django's date filter loses the zone name in the repeated DST hour).
+Phase 2 D-09 (INV-20): while the ops chat is not configured, a warning shows on the empty
+state and on the table.
 {% endcomment %}
 {% block title %}Locations{% endblock %}
 {% block content %}
+{% if not ops_configured %}<p class="callout"><strong>Warning:</strong> The ops chat is not configured. Set OPS_BOT_TOKEN and OPS_CHAT_ID in the env file and run the deploy command; until then, ops notices (monitoring gaps, all-silent, expired or unconfirmed alerts, database outages) go to the worker log only.</p>{% endif %}
 {% if rows %}
 <div class="page-head">
   <h1>Locations</h1>

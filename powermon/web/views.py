@@ -7,6 +7,7 @@ Every admin page relies on LoginRequiredMiddleware; only sign-in, sign-out, ``/h
 
 import logging
 import re
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -96,7 +97,8 @@ class LocationListView(View):
     """``/``: every location that is not deleted, sorted by name (UI-SPEC screen 2, D-09).
 
     Read-only, one server-rendered response with no live refresh: the admin reloads to
-    see a new status. There is no pagination (at most about 20 locations).
+    see a new status. There is no pagination (at most about 20 locations). While the ops
+    chat is not configured, the page says so (Phase 2 D-09, INV-20).
     """
 
     template_name = "web/location_list.html"
@@ -120,7 +122,8 @@ class LocationListView(View):
                     language_label=LANGUAGE_LABELS[location.language],
                 )
             )
-        return render(request, self.template_name, {"rows": rows})
+        context = {"rows": rows, "ops_configured": settings.CFG.ops_configured}
+        return render(request, self.template_name, context)
 
 
 def _create_location(data: dict[str, Any], now: datetime) -> Location:
@@ -230,6 +233,50 @@ def _extract_key(request: HttpRequest) -> str | None:
     return key if KEY_RE.fullmatch(key) else None
 
 
+class _DbOutageLog:
+    """One WARNING when heartbeats start failing on the database, one when it answers again.
+
+    Per process (D-16): a device beats every few seconds, so a WARNING or a traceback per
+    failed heartbeat would flood the log during an outage. gunicorn's gthread workers
+    serve heartbeats on several threads, hence the lock.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._failing = False
+
+    def failed(self, exc: DatabaseError) -> None:
+        with self._lock:
+            first = not self._failing
+            self._failing = True
+        if first:
+            # The class name only: a driver message can carry the host, the user and
+            # more (OPS-08).
+            log.warning(
+                "heartbeat: database unavailable (%s); answering 503 until it is back",
+                type(exc).__name__,
+            )
+
+    def ok(self) -> None:
+        with self._lock:
+            recovered = self._failing
+            self._failing = False
+        if recovered:
+            log.warning("heartbeat: database reachable again")
+
+
+_HEARTBEAT_DB = _DbOutageLog()
+
+
+def _db_unavailable() -> HttpResponse:
+    """503 ``db unavailable``; the device simply retries on its next period."""
+    response = HttpResponse("db unavailable", status=503, content_type="text/plain")
+    # Django's log_response skips a response with this flag. Without it, django.request
+    # writes one "Service Unavailable: /hb" ERROR line per heartbeat, the flood D-16 removes.
+    response._has_been_logged = True  # type: ignore[attr-defined]
+    return response
+
+
 @method_decorator([login_not_required, csrf_exempt, no_append_slash], name="dispatch")
 class HeartbeatView(View):
     """``/hb``: a device reports that mains power (and internet) is up (HB-01, HB-02, D-06).
@@ -237,6 +284,8 @@ class HeartbeatView(View):
     GET and POST behave the same: 200 ``ok`` for a valid key, 401 for a missing, malformed
     or unknown key, 405 for any other method, never a redirect. The key is looked up before
     any write, a malformed key costs no query, and the request does no network I/O (KD2).
+    While the database fails, the answer is 503 ``db unavailable`` with one WARNING per
+    outage per process (D-16).
     """
 
     # Everything else, HEAD and OPTIONS included, gets 405.
@@ -254,20 +303,27 @@ class HeartbeatView(View):
         # The server receive time is the only timestamp; device clocks never matter.
         now = self.clock.now()
         key = _extract_key(request)
-        location_id = (
-            None
-            if key is None
-            else Location.objects.filter(device_key=key, deleted_at__isnull=True)
-            .values_list("id", flat=True)
-            .first()
-        )
+        try:
+            location_id = (
+                None
+                if key is None
+                else Location.objects.filter(device_key=key, deleted_at__isnull=True)
+                .values_list("id", flat=True)
+                .first()
+            )
+            result = None if location_id is None else transitions.record_heartbeat(location_id, now)
+        except DatabaseError as exc:
+            # No exception text and never the key: driver errors can carry connection
+            # details (OPS-08).
+            _HEARTBEAT_DB.failed(exc)
+            return _db_unavailable()
         if location_id is None:
             # Nothing is written for a rejected request (HB-02). Never log the key.
             log.debug("heartbeat rejected: missing, malformed or unknown key")
             response = HttpResponse("unauthorized", status=401, content_type="text/plain")
             response["WWW-Authenticate"] = 'Bearer realm="heartbeat"'
             return response
-        result = transitions.record_heartbeat(location_id, now)
+        _HEARTBEAT_DB.ok()
         log.debug("heartbeat: location %s %s", location_id, result)
         return HttpResponse("ok", content_type="text/plain")
 
