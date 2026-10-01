@@ -24,7 +24,12 @@ Cycle order (D-04, D-15, RESEARCH Pattern 3):
    never a new gap notice on every cycle (plan-check advisory 1);
 6. the decisions (``run_cycle``), skipped on a cycle whose clock stepped by more than
    5 s either way. A backward step records nothing, only one WARNING;
-7. (02-08) the all-silent check, after the decisions.
+7. the all-silent check (``all_silent.evaluate``, OPS-04, INV-12), after the decisions and
+   skipped together with them on a clock step. It only informs the admin and never holds
+   a subscriber alert (D-01), so it runs after the OFFs of the cycle are recorded. An
+   error in it never stops detection: a connectivity error on a connection that is gone
+   reaches the loop (one WARNING per outage, and the next cycle carves), any other error
+   is logged with its traceback.
 
 ``run_cycle`` is the decisions step on its own (Phase 1 shape, INV-13):
 - each location in its own ``try``, so one failing location never stops the others. The
@@ -46,7 +51,7 @@ from django.db.models import Value
 from django.db.models.functions import Greatest
 
 from powermon.clock import Clock
-from powermon.engine import lapse, rules, transitions
+from powermon.engine import all_silent, lapse, rules, transitions
 from powermon.engine.models import SystemState
 
 log = logging.getLogger(__name__)
@@ -58,7 +63,7 @@ def run_detection(
     tracker: lapse.CycleTracker,
     tick: Callable[[], None] | None = None,
 ) -> int:
-    """One cycle for lease ``generation``: lapse check, then decisions; the OFFs recorded.
+    """One cycle for lease ``generation``: lapse check, decisions, all-silent; the OFFs recorded.
 
     ``tracker`` carries what the previous cycle of this process saw. A database error is
     raised to the detection loop, which marks ``tracker.db_failed`` when the connection
@@ -90,7 +95,21 @@ def run_detection(
     tracker.remember(generation, pid, now, mono)
     if step is not None and abs(step) > lapse.CLOCK_STEP_LIMIT_S:
         return 0
-    return run_cycle(now, tick=tick)
+    recorded = run_cycle(now, tick=tick)
+    _check_all_silent(now)
+    return recorded
+
+
+def _check_all_silent(now: datetime) -> None:
+    """Run the all-silent check; only a lost connection's error leaves this function."""
+    try:
+        all_silent.evaluate(now)
+    except OperationalError, InterfaceError:
+        if connection_lost():
+            raise
+        log.exception("all-silent evaluation failed")
+    except Exception:
+        log.exception("all-silent evaluation failed")
 
 
 def connection_lost() -> bool:
