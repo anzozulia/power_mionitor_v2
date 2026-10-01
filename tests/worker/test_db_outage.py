@@ -16,6 +16,10 @@ only a worker that held the lease when the database went away sends it, and the 
 notice follows through the outbox once the database is back. "Unreachable" is the lease
 pointed at 127.0.0.1:1 on a mutable settings copy after its session was terminated.
 
+C1 (wave 3 audit): a worker whose lease session is gone claims and sends no outbox row, of
+either channel, even while its last published status still says HELD and another worker
+holds the lock; it sends again only after it holds the lock itself.
+
 Timing rule. The ``FakeClock`` is shared by everything in ``serve``: ``advance`` also
 moves the monotonic time that the watchdog's 60 s detection limit and the 15 s lapse
 rule read. One large advance would therefore make the next cycle carve a gap by itself
@@ -68,11 +72,11 @@ from conftest import (
     terminate_backends,
     wait_for,
 )
-from django.db import IntegrityError, OperationalError, connection
+from django.db import IntegrityError, OperationalError, connection, transaction
 from requests import PreparedRequest
 from urllib3.exceptions import MaxRetryError, NewConnectionError
 
-from powermon.alerts import outbox, texts
+from powermon.alerts import ops, outbox, texts
 from powermon.alerts.models import OpsIncident, OutboxMessage
 from powermon.engine import lapse, timeline, transitions
 from powermon.engine.models import PowerInterval, SystemState
@@ -1130,3 +1134,128 @@ def test_io_thread_sends_the_db_down_notice(
     assert fake_telegram.sent == [
         {"chat_id": OPS_CHAT_ID, "text": _db_down_text("13:00:00"), "parse_mode": "HTML"}
     ]
+
+
+# C1 (wave 3 audit): no claim after the lease session is lost (INV-02 #2, INV-15)
+
+OFF_WAS_ON_US = 300_000_000
+
+
+def _queue_off(location: Any) -> OutboxMessage:
+    with transaction.atomic():
+        return outbox.enqueue(
+            outbox.KIND_POWER_OFF,
+            location.pk,
+            event_at=T0,
+            recorded_at=T0,
+            payload={"was_on_us": OFF_WAS_ON_US},
+        )
+
+
+def _claim_state(row: OutboxMessage) -> tuple[str, int]:
+    row.refresh_from_db()
+    return row.status, row.attempts
+
+
+def _io_stamps(seen: _Seen) -> int:
+    return seen.mark().stamps.get("telegram-io", 0)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_C1_a_pass_claims_only_while_its_lease_session_holds_the_lock(
+    leases: Callable[[FakeClock], Lease],
+    location_factory: Callable[..., Any],
+    ops_settings: Any,
+    fake_telegram: Any,
+) -> None:
+    location = location_factory()
+    fake_telegram.accept(DEFAULT_BOT_TOKEN)
+    fake_telegram.accept(OPS_BOT_TOKEN)
+    clock = FakeClock(T0)
+    old, new = leases(clock), leases(clock)
+    assert old.ensure_held().state == "held"
+    lost_pid = old.current().pid
+    off = _queue_off(location)
+    with transaction.atomic():
+        notice = outbox.enqueue_ops(
+            outbox.KIND_OPS_GAP,
+            payload={"start_us": ops.instant_us(T0 - _seconds(10)), "end_us": ops.instant_us(T0)},
+            recorded_at=T0,
+        )
+
+    # The old session is gone and a second worker holds the lock: a pass that still names
+    # the old session claims nothing, on either channel.
+    assert _terminate(LEASE) == 1
+    assert new.ensure_held().state == "held"
+    state = io_loop.RelayState()
+    for _ in range(3):
+        assert io_loop.run_iteration(clock, state, lease_pid=lost_pid) is False
+    assert len(fake_telegram.calls) == 0
+    assert (_claim_state(off), _claim_state(notice)) == (("pending", 0), ("pending", 0))
+
+    # The holder's session: the subscriber head, then the ops row, in one pass.
+    assert io_loop.run_iteration(clock, state, lease_pid=new.current().pid) is True
+    assert [m["chat_id"] for m in fake_telegram.sent] == [DEFAULT_CHAT_ID, OPS_CHAT_ID]
+    assert (_claim_state(off), _claim_state(notice)) == (("sent", 1), ("sent", 1))
+
+
+@pytest.mark.django_db(transaction=True)
+def test_C1_old_holder_never_sends_after_losing_the_lock(
+    leases: Callable[[FakeClock], Lease],
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    seen: _Seen,
+    tmp_path: Path,
+) -> None:
+    # The audit's reproduction: right after a cycle the old holder's lease session is
+    # terminated and a second worker takes the lock, then an OFF is queued. The old
+    # holder's detection loop is held before it asks the lease again, so its published
+    # status still says HELD (the window C1 is about).
+    _system(cursor=None)
+    location = location_factory()
+    fake_telegram.accept(DEFAULT_BOT_TOKEN)
+    clock = FakeClock(T0)
+    old, new = leases(clock), leases(clock)
+    serving = _Serve(old, clock, tmp_path)
+    try:
+        assert wait_for(lambda: old.current().generation == 1, WAIT_S)
+        start = seen.mark()
+        assert wait_for(lambda: seen.cycled_since(start) and seen.stamped_since(start), WAIT_S)
+        seen.hold()
+        try:
+            assert _terminate(LEASE) == 1  # the second worker has no session yet
+            assert new.ensure_held().state == "held"
+            assert old.current().state == "held"  # stale: the old holder has not looked
+            off = _queue_off(location)
+            passes = _io_stamps(seen)
+            # Ten passes or more of the old holder's I/O thread (three stamps a pass).
+            assert wait_for(lambda: _io_stamps(seen) >= passes + 30, WAIT_S)
+            assert fake_telegram.sent == []
+            assert _claim_state(off) == ("pending", 0)
+        finally:
+            seen.release()
+
+        # The old holder looks again: its session is gone and the lock is taken.
+        assert wait_for(lambda: old.current().state == "standby", WAIT_S)
+        passes = _io_stamps(seen)
+        assert wait_for(lambda: _io_stamps(seen) >= passes + 10, WAIT_S)
+        assert fake_telegram.sent == []
+
+        # The second worker goes away: the old process holds the lock again (generation
+        # 2) and sends the OFF, once.
+        new.close()
+        assert wait_for(lambda: old.current().generation == 2, WAIT_S)
+        assert wait_for(lambda: len(fake_telegram.sent) == 1, WAIT_S)
+    finally:
+        code = serving.finish()
+
+    assert code == 0
+    assert serving.stalls == []
+    assert fake_telegram.sent == [
+        {
+            "chat_id": DEFAULT_CHAT_ID,
+            "text": texts.render_alert(outbox.KIND_POWER_OFF, "en", OFF_WAS_ON_US),
+            "parse_mode": "HTML",
+        }
+    ]
+    assert _claim_state(off) == ("sent", 1)

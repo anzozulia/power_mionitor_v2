@@ -3,6 +3,10 @@
 KD2 and D-14: alerts leave only through ``outbox_message``, which the worker relay drains
 (01-11). The row holds integer durations only; the text is rendered at send time, and the
 bot token and chat are read from the location then (T-01-45).
+
+C1 (wave 3 audit): the worker's claim names its lease session, and the claim succeeds
+only while that session holds the worker lock, so a worker that lost the lock claims
+nothing even before it notices.
 """
 
 from collections.abc import Callable
@@ -16,6 +20,7 @@ from django.db import IntegrityError, connection, transaction
 from powermon import config
 from powermon.alerts import outbox
 from powermon.alerts.models import OutboxMessage
+from powermon.worker.lease import Lease
 
 EVENT_AT = datetime(2026, 10, 1, 10, 5, tzinfo=UTC)
 RECORDED_AT = datetime(2026, 10, 1, 10, 6, 31, tzinfo=UTC)
@@ -127,3 +132,68 @@ def test_open_rows_index_is_partial() -> None:
     assert "WHERE ((status)::text = ANY" in indexdef
     assert "'pending'" in indexdef
     assert "'sending'" in indexdef
+
+
+# C1 (wave 3 audit): the worker claims a row only while its lease session holds the lock
+
+
+def _claim_state(row: OutboxMessage) -> tuple[str, int]:
+    row.refresh_from_db()
+    return row.status, row.attempts
+
+
+def _my_backend_pid() -> int:
+    with connection.cursor() as cur:
+        cur.execute("SELECT pg_backend_pid()")
+        (pid,) = cur.fetchone()
+    return int(pid)
+
+
+def _end_session(pid: int) -> None:
+    """End one backend and wait until it is gone, so its locks are released."""
+    with connection.cursor() as cur:
+        cur.execute("SELECT pg_terminate_backend(%s, 5000)", [pid])
+        assert cur.fetchone() == (True,)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_C1_a_fenced_claim_needs_the_lease_session_to_hold_the_lock(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = location_factory()
+    row = _enqueue(location)
+    holder = Lease(connection.settings_dict)
+    standby = Lease(connection.settings_dict)
+    try:
+        assert holder.ensure_held().state == "held"
+        assert standby.ensure_held().state == "standby"
+        assert holder.pid is not None
+        assert standby.pid is not None
+
+        # A session that does not hold the worker lock claims nothing: another worker's
+        # lease session, or this Django session itself.
+        assert outbox.claim(row.pk, lease_pid=standby.pid) is False
+        assert outbox.claim(row.pk, lease_pid=_my_backend_pid()) is False
+        assert _claim_state(row) == ("pending", 0)
+
+        # The holder's lease session claims the row, once.
+        assert outbox.claim(row.pk, lease_pid=holder.pid) is True
+        assert _claim_state(row) == ("sending", 1)
+        assert outbox.claim(row.pk, lease_pid=holder.pid) is False
+
+        # Once the holder's session is gone, its pid claims nothing more, even before the
+        # next worker took the lock.
+        later = _enqueue(location)
+        lost_pid = holder.pid
+        _end_session(lost_pid)
+        assert outbox.claim(later.pk, lease_pid=lost_pid) is False
+        assert _claim_state(later) == ("pending", 0)
+        assert standby.ensure_held().state == "held"
+        assert outbox.claim(later.pk, lease_pid=standby.pid) is True
+    finally:
+        holder.close()
+        standby.close()
+
+    # Without a lease pid (a direct call, as in the relay tests) the claim is unfenced.
+    third = _enqueue(location)
+    assert outbox.claim(third.pk) is True
