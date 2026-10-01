@@ -178,7 +178,7 @@ def _classify(resp: requests.Response) -> SendResult:
     """Classify an HTTP answer by its status and JSON body. The body is untrusted input."""
     try:
         payload: Any = resp.json()
-    except ValueError:  # not JSON: an HTML error page, an empty body
+    except Exception:  # not JSON (an HTML error page, an empty body) or too deep to parse
         payload = None
     data: dict[Any, Any] = payload if isinstance(payload, dict) else {}
     if resp.status_code == 200 and data.get("ok") is True:
