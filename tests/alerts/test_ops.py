@@ -11,6 +11,10 @@ Scenarios:
   OPS_BOT_TOKEN. With no ops chat configured no Telegram request is made for an ops row.
 - OPS-08 / D-10: an ops payload holds integers only. The text and the location name are
   read and rendered at send time, and the name is HTML-escaped.
+- B3 (wave 2 audit): with no ops chat, a database error while a notice is rendered is
+  never swallowed. It reaches the caller, so ``mark_uncertain`` and activation fail and are
+  retried instead of committing nothing while reporting success. Any other render error
+  is still one WARNING, and the caller's transaction commits.
 
 Relay cases call ``io_loop.run_iteration``, which calls ``close_old_connections()``, so
 they are ``django_db(transaction=True)``. Time comes only from the ``FakeClock`` passed in;
@@ -30,8 +34,15 @@ from typing import Any
 
 import pytest
 import requests
-from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, OPS_BOT_TOKEN, OPS_CHAT_ID, FakeClock
-from django.db import transaction
+from conftest import (
+    DEFAULT_BOT_TOKEN,
+    DEFAULT_CHAT_ID,
+    OPS_BOT_TOKEN,
+    OPS_CHAT_ID,
+    Actor,
+    FakeClock,
+)
+from django.db import DatabaseError, InterfaceError, OperationalError, connection, transaction
 from urllib3.exceptions import MaxRetryError, NewConnectionError
 
 import powermon
@@ -724,6 +735,225 @@ def test_io_activation_turns_interrupted_sends_into_one_notice(
     [line] = _ops_lines(caplog)
     assert line.startswith("ops notice (ops chat not configured): ❓ OFF alert for Test location")
     assert "(the worker stopped while sending it)" in line
+
+
+# A database error is never hidden from the caller (wave 2 audit B3)
+
+# The connectivity errors the worker loops count as a DB outage, and their base class.
+DB_ERRORS = [OperationalError, InterfaceError, DatabaseError]
+
+
+def _drop_this_session() -> None:
+    """End this thread's DB session from another one, as a DB restart would.
+
+    Called inside a transaction: the next statement on this connection fails, and so does
+    the rollback to any savepoint.
+    """
+    with connection.cursor() as cur:
+        cur.execute("SELECT pg_backend_pid()")
+        row = cur.fetchone()
+    assert row is not None
+    pid = row[0]
+
+    def terminate() -> bool:
+        with connection.cursor() as cur:
+            cur.execute("SELECT pg_terminate_backend(%s, 5000)", [pid])
+            found = cur.fetchone()
+        return bool(found and found[0])
+
+    killer = Actor(terminate)
+    killer.start()
+    killer.join(10)
+    assert killer.exc is None
+    assert killer.result is True
+
+
+def _claimed(location: Any) -> OutboxMessage:
+    """An OFF alert claimed for sending, as the relay leaves it before the HTTP call."""
+    off = _queue(location)
+    assert outbox.claim(off.pk) is True
+    return off
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("error", DB_ERRORS, ids=lambda error: error.__name__)
+def test_B3_a_db_error_while_rendering_a_logged_notice_propagates(
+    location_factory: Callable[..., Any],
+    no_ops_chat: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error: type[DatabaseError],
+) -> None:
+    location = location_factory()
+    off = _claimed(location)
+
+    def render(*args: Any, **kwargs: Any) -> str:
+        raise error("the database went away while the notice was rendered")
+
+    monkeypatch.setattr(ops, "render_text", render)
+    caplog.set_level(logging.WARNING, logger=OPS_LOGGER)
+
+    with pytest.raises(error), transaction.atomic():
+        ops.notify(
+            outbox.KIND_OPS_UNCERTAIN,
+            payload={"message_id": off.pk},
+            recorded_at=T0,
+            location_id=location.pk,
+        )
+    with pytest.raises(error):
+        ops.mark_uncertain(off.pk, "read_timeout", T0)
+
+    # Not reported as marked: the row still holds its location's queue, for the relay's
+    # error handling or activation to settle, and nothing was logged as if handled.
+    assert (_row(off).status, _row(off).last_error) == ("sending", "")
+    assert _ops_rows() == []
+    assert _ops_lines(caplog) == []
+
+
+@pytest.mark.django_db
+def test_B3_a_malformed_payload_still_logs_one_warning_and_does_not_raise(
+    location_factory: Callable[..., Any], no_ops_chat: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    location = location_factory()
+    caplog.set_level(logging.WARNING, logger=OPS_LOGGER)
+
+    with transaction.atomic():
+        # Integers, so the payload check passes, but far outside datetime's range: the
+        # render raises ValueError.
+        ops.notify(
+            outbox.KIND_OPS_GAP, payload={"start_us": 10**20, "end_us": 10**20}, recorded_at=T0
+        )
+        # The caller's transaction is still usable and commits.
+        alert = outbox.enqueue(
+            outbox.KIND_POWER_OFF,
+            location.pk,
+            event_at=T0,
+            recorded_at=T0,
+            payload={"was_on_us": 1},
+        )
+
+    assert OutboxMessage.objects.filter(pk=alert.pk).exists()
+    assert _ops_lines(caplog) == [
+        "ops notice ops_gap (ops chat not configured) could not be rendered: ValueError"
+    ]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_B3_a_non_db_render_error_keeps_mark_uncertain_committed(
+    location_factory: Callable[..., Any],
+    no_ops_chat: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    off = _claimed(location_factory())
+
+    def render(*args: Any, **kwargs: Any) -> str:
+        raise ValueError("malformed payload")
+
+    monkeypatch.setattr(ops, "render_text", render)
+    caplog.set_level(logging.WARNING, logger=OPS_LOGGER)
+
+    assert ops.mark_uncertain(off.pk, "read_timeout", T0) is True
+
+    assert (_row(off).status, _row(off).last_error) == ("uncertain", "read_timeout")
+    assert _ops_lines(caplog) == [
+        "ops notice ops_uncertain (ops chat not configured) could not be rendered: ValueError"
+    ]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_B3_a_dropped_connection_inside_render_fails_mark_uncertain(
+    location_factory: Callable[..., Any],
+    no_ops_chat: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    off = _claimed(location_factory())
+    real_render = ops.render_text
+
+    def render(*args: Any, **kwargs: Any) -> str:
+        _drop_this_session()
+        return real_render(*args, **kwargs)
+
+    monkeypatch.setattr(ops, "render_text", render)
+    caplog.set_level(logging.WARNING, logger=OPS_LOGGER)
+
+    try:
+        # The relay's _apply and its DatabaseError handling see the outage.
+        with pytest.raises((OperationalError, InterfaceError)):
+            ops.mark_uncertain(off.pk, "read_timeout", T0)
+    finally:
+        # Never leave this thread's dead session to the teardown flush.
+        connection.close()
+
+    assert (_row(off).status, _row(off).last_error) == ("sending", "")
+    assert _ops_lines(caplog) == []
+
+
+@pytest.mark.django_db(transaction=True)
+def test_B3_a_dropped_connection_inside_render_fails_activation_so_it_is_retried(
+    location_factory: Callable[..., Any],
+    no_ops_chat: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    off = _queue(location_factory())
+    OutboxMessage.objects.filter(pk=off.pk).update(status="sending", attempts=1)
+    real_render = ops.render_text
+    dropped: list[bool] = []
+
+    def render(*args: Any, **kwargs: Any) -> str:
+        if not dropped:
+            dropped.append(True)
+            _drop_this_session()
+        return real_render(*args, **kwargs)
+
+    monkeypatch.setattr(ops, "render_text", render)
+    caplog.set_level(logging.WARNING, logger=OPS_LOGGER)
+    state = io_loop.RelayState()
+    clock = FakeClock(T0 + timedelta(hours=1))
+
+    try:
+        # The I/O thread keeps this generation unactivated and calls activate again.
+        with pytest.raises((OperationalError, InterfaceError)):
+            io_loop.activate(state, clock)
+        assert _ops_lines(caplog) == []
+        assert io_loop.activate(state, clock) == 1
+    finally:
+        connection.close()
+
+    assert (_row(off).status, _row(off).last_error) == ("uncertain", "interrupted")
+    # Exactly one notice, from the activation that committed.
+    [line] = _ops_lines(caplog)
+    assert line.startswith("ops notice (ops chat not configured): ❓ OFF alert for Test location")
+
+
+@pytest.mark.django_db(transaction=True)
+def test_B3_a_render_error_after_the_connection_dropped_is_not_swallowed(
+    location_factory: Callable[..., Any],
+    no_ops_chat: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The savepoint cannot be rolled back on a dead connection, so Django marks the caller's
+    # whole transaction for rollback: swallowing the error would commit nothing silently.
+    off = _claimed(location_factory())
+
+    def render(*args: Any, **kwargs: Any) -> str:
+        _drop_this_session()
+        raise ValueError("malformed payload")
+
+    monkeypatch.setattr(ops, "render_text", render)
+    caplog.set_level(logging.WARNING, logger=OPS_LOGGER)
+
+    try:
+        with pytest.raises(DatabaseError):
+            ops.mark_uncertain(off.pk, "read_timeout", T0)
+    finally:
+        connection.close()
+
+    assert (_row(off).status, _row(off).last_error) == ("sending", "")
+    assert _ops_lines(caplog) == []
 
 
 # A broken admin chat never delays subscribers (INV-20 #2, ALRT-06)
