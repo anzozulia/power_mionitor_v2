@@ -113,8 +113,9 @@ docker compose -f docker-compose.prod.yml up -d --build --wait
 ```
 
 It builds the image, starts PostgreSQL, runs the one-shot `migrate` service (apply
-migrations, then sync the admin account from the env file), and starts `web`, `worker`
-and `caddy` only after `migrate` succeeded. Check the result:
+migrations, then sync the admin account from the env file), and starts `web` and
+`worker` only after `migrate` succeeded. `caddy` does not wait for `migrate`: it starts
+on its own and keeps running if a migration fails (section 8). Check the result:
 
 ```sh
 docker compose -f docker-compose.prod.yml ps
