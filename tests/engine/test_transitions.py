@@ -1,9 +1,14 @@
-"""The stored power timeline (KD1, MON-01; K-1 timeline part, PITFALLS 15).
+"""Heartbeat gates and the stored power timeline (KD1, MON-01, MON-03; K-1, K-3, PITFALLS 15).
 
 Heartbeats write the timeline in the same transaction as the state change, and
 PostgreSQL itself rejects overlapping, zero-length, second-open and inconsistent
-intervals, so no code path can corrupt the one source of truth. 01-08 adds K-1's
-"no alert" assertion and K-3 to this file.
+intervals, so no code path can corrupt the one source of truth. The first heartbeat is
+silent (K-1); the first heartbeat after an outage turns the location ON and queues
+exactly one ON alert in the same transaction (K-3, D-14).
+
+Tests that reach OFF through ``detection.run_cycle`` are ``django_db(transaction=True)``:
+the cycle calls ``close_old_connections()``, which would close the connection inside
+pytest-django's per-test transaction.
 """
 
 from collections.abc import Callable
@@ -13,8 +18,11 @@ from typing import Any
 import pytest
 from django.db import IntegrityError, connection, transaction
 
+from powermon.alerts import texts
+from powermon.alerts.models import OutboxMessage
 from powermon.engine import timeline, transitions
 from powermon.engine.models import LocationState, PowerInterval, SystemState
+from powermon.worker import detection
 
 Interval = tuple[str, datetime, datetime | None, datetime | None]
 
@@ -49,6 +57,23 @@ def _assert_rejected(constraint: str, location: Any, *args: Any, **extra: Any) -
         _insert(location, *args, **extra)
 
 
+def _kinds() -> list[str]:
+    """The kinds of all outbox rows, oldest first."""
+    return list(OutboxMessage.objects.order_by("id").values_list("kind", flat=True))
+
+
+def _off_since_1005(location_factory: Callable[..., Any], **overrides: Any) -> Any:
+    """K-2: heartbeats every 60 s from 10:00:00 to 10:05:00, OFF at the cycle at 10:06:31."""
+    SystemState.objects.update_or_create(
+        pk=1, defaults={"detection_resumed_at": _at(9, 0), "web_started_at": None}
+    )
+    location = location_factory(**overrides)
+    for minute in range(6):
+        transitions.record_heartbeat(location.pk, _at(10, minute))
+    assert detection.run_cycle(_at(10, 6, 31)) == 1
+    return location
+
+
 # The first heartbeat opens the timeline (K-1, MON-01)
 
 
@@ -65,6 +90,93 @@ def test_K1_first_heartbeat_opens_one_on_interval(
     assert _intervals(location) == [("on", _at(8, 0), None, None)]
     # No data before the first heartbeat: nothing starts before 08:00:00.
     assert not PowerInterval.objects.filter(location=location, start_at__lt=fixed_now).exists()
+
+
+@pytest.mark.django_db
+def test_K1_first_heartbeat_queues_no_alert(
+    location_factory: Callable[..., Any], fixed_now: datetime
+) -> None:
+    location = location_factory()
+
+    assert transitions.record_heartbeat(location.pk, fixed_now) == "started"
+    assert transitions.record_heartbeat(location.pk, _at(8, 1)) == "plain"
+
+    # Monitoring starts silently (MON-01): no alert for the first heartbeat or the next.
+    assert _kinds() == []
+
+
+# Power returns: ON at the first heartbeat after the outage, one ON alert (K-3, MON-03)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_K3_restore_queues_on_alert_was_off_55m(location_factory: Callable[..., Any]) -> None:
+    location = _off_since_1005(location_factory)
+
+    assert transitions.record_heartbeat(location.pk, _at(11, 0)) == "restored"
+
+    state = LocationState.objects.get(pk=location.pk)
+    assert (state.status, state.on_since, state.last_heartbeat_at) == ("on", _at(11, 0), _at(11, 0))
+    off, on = OutboxMessage.objects.order_by("id")
+    assert (off.kind, on.kind) == ("power_off", "power_on")
+    assert (on.channel, on.status, on.location_id) == ("subscriber", "pending", location.pk)
+    assert (on.event_at, on.recorded_at) == (_at(11, 0), _at(11, 0))
+    # "Was OFF for" = restore time - outage start = 11:00:00 - 10:05:00, in integer µs.
+    assert on.payload == {"was_off_us": 3_300_000_000}
+    assert texts.render_alert(on.kind, location.language, on.payload["was_off_us"]) == (
+        "🟢 <b>POWER ON</b>\n⚡ Power was OFF for: <b>55m</b>"
+    )
+    assert _intervals(location) == [
+        ("on", _at(10, 0), _at(10, 5), None),
+        ("off", _at(10, 5), _at(11, 0), _at(10, 5)),
+        ("on", _at(11, 0), None, None),
+    ]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_restore_with_alerts_off_queues_nothing(location_factory: Callable[..., Any]) -> None:
+    location = _off_since_1005(location_factory, alerts_enabled=False)
+
+    assert transitions.record_heartbeat(location.pk, _at(11, 0)) == "restored"
+
+    # Alerts off suppresses the alert only: the state and the timeline still change.
+    assert LocationState.objects.get(pk=location.pk).status == "on"
+    assert _kinds() == []
+    assert _intervals(location)[-2:] == [
+        ("off", _at(10, 5), _at(11, 0), _at(10, 5)),
+        ("on", _at(11, 0), None, None),
+    ]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_heartbeat_after_restore_is_plain(location_factory: Callable[..., Any]) -> None:
+    location = _off_since_1005(location_factory)
+    assert transitions.record_heartbeat(location.pk, _at(11, 0)) == "restored"
+
+    assert transitions.record_heartbeat(location.pk, _at(11, 1)) == "plain"
+
+    state = LocationState.objects.get(pk=location.pk)
+    assert (state.status, state.on_since, state.last_heartbeat_at) == ("on", _at(11, 0), _at(11, 1))
+    assert _kinds() == ["power_off", "power_on"]
+    assert _intervals(location)[-1] == ("on", _at(11, 0), None, None)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_restore_dated_before_the_outage_start_writes_nothing(
+    location_factory: Callable[..., Any],
+) -> None:
+    # INV-01: a restore stamped before the recorded outage start would give a negative
+    # "was OFF for" and close the off interval before it starts. The timeline CHECK
+    # rejects it and the whole transition rolls back: no half-written state, no alert.
+    location = _off_since_1005(location_factory)
+    before = LocationState.objects.filter(pk=location.pk).values().get()
+    stored = _intervals(location)
+
+    with pytest.raises(IntegrityError, match="power_interval_end_after_start"):
+        transitions.record_heartbeat(location.pk, _at(10, 4))
+
+    assert LocationState.objects.filter(pk=location.pk).values().get() == before
+    assert _intervals(location) == stored
+    assert _kinds() == ["power_off"]
 
 
 @pytest.mark.django_db
