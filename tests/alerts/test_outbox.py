@@ -10,8 +10,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+from django.conf import settings
 from django.db import IntegrityError, connection, transaction
 
+from powermon import config
 from powermon.alerts import outbox
 from powermon.alerts.models import OutboxMessage
 
@@ -45,10 +47,11 @@ def test_enqueue_writes_a_pending_subscriber_row(location_factory: Callable[...,
     assert (row.event_at, row.recorded_at) == (EVENT_AT, RECORDED_AT)
     assert row.payload == {"was_on_us": 300_000_000}
     assert (row.status, row.attempts, row.last_error, row.sent_at) == ("pending", 0, "", None)
-    # Due at once; expiry is written now and enforced in Phase 2 (ALRT-03).
+    # Due at once; it expires ALERT_MAX_AGE_HOURS after it was recorded (ALRT-03, D-07),
+    # 6 h under the default config.
     assert row.next_attempt_at == RECORDED_AT
+    assert settings.CFG.alert_max_age_hours == config.DEFAULT_ALERT_MAX_AGE_HOURS == 6
     assert row.expires_at == RECORDED_AT + timedelta(hours=6)
-    assert outbox.MAX_AGE == timedelta(hours=6)
     assert (outbox.KIND_POWER_OFF, outbox.KIND_POWER_ON) == ("power_off", "power_on")
 
 

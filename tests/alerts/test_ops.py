@@ -476,7 +476,7 @@ def test_enqueue_ops_queues_a_due_ops_row() -> None:
         "pending",
     )
     assert (stored.event_at, stored.recorded_at, stored.next_attempt_at) == (T0, T0, T0)
-    assert stored.expires_at == T0 + outbox.MAX_AGE
+    assert stored.expires_at == T0 + timedelta(hours=6)
     assert stored.payload == {"start_us": 1, "end_us": 2}
     assert outbox.CHANNEL_OPS == "ops"
     assert set(outbox.OPS_KINDS) == {
