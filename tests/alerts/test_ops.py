@@ -81,7 +81,7 @@ def _queue(location: Any, *, at: datetime = T0) -> OutboxMessage:
 
 
 def _uncertain_notice(location: Any, *, at: datetime = T0) -> OutboxMessage:
-    """An uncertain subscriber row and its queued ops notice, as ``ops.mark_uncertain`` leaves them."""
+    """An uncertain subscriber row and its queued ops notice, as ops.mark_uncertain leaves them."""
     with transaction.atomic():
         alert = outbox.enqueue(
             outbox.KIND_POWER_OFF,
@@ -503,4 +503,4 @@ def test_render_text_refuses_an_unknown_kind_and_a_missing_row() -> None:
     with pytest.raises(KeyError):
         ops.render_text(outbox.KIND_OPS_UNCERTAIN, {}, None, now=T0)
     with pytest.raises(TypeError):
-        ops.render_text(outbox.KIND_OPS_UNCERTAIN, [1], None, now=T0)  # type: ignore[arg-type]
+        ops.render_text(outbox.KIND_OPS_UNCERTAIN, [1], None, now=T0)

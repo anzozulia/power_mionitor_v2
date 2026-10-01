@@ -1,18 +1,27 @@
 """The alert outbox: queueing alerts and the relay's row transitions (KD2, D-14).
 
-``enqueue`` writes through the ORM on the caller's connection, inside the caller's
-``transaction.atomic()`` block: the alert row commits together with the transition that
-caused it, or not at all. It does no network I/O.
+``enqueue`` (subscriber alerts) and ``enqueue_ops`` (admin ops notices, D-09) write through
+the ORM on the caller's connection, inside the caller's ``transaction.atomic()`` block: the
+row commits together with the transition that caused it, or not at all. They do no
+network I/O, and a payload holds integers only, so no text or secret is ever stored
+(OPS-08).
 
-The worker relay (``powermon.worker.io_loop``) moves a row through its statuses with the
-functions below. Each is one conditional UPDATE in Django's autocommit mode, so it is
-committed before the relay makes its HTTP call and no transaction is open during it:
+Two channels share the table. "subscriber" rows are drained per location, oldest first
+(``subscriber_heads``). "ops" rows form one queue for the env-configured admin chat
+(``ops_head``), drained after the subscriber heads of each pass (INV-20 #2).
+
+The worker relay (``powermon.worker.io_loop``) moves a row of either channel through its
+statuses with the functions below. Each is one conditional UPDATE in Django's autocommit
+mode, so it is committed before the relay makes its HTTP call and no transaction is open
+during it:
 
     pending --claim--> sending --mark_sent--> sent
        ^                  |----mark_uncertain--> uncertain (never resent, INV-16)
        '---mark_retry-----'
     sending --recover_interrupted (worker activation)--> uncertain
 
+A subscriber row that becomes uncertain queues one ``ops_uncertain`` notice in the same
+transaction (``powermon.alerts.ops``, D-11 #5); an uncertain ops row is only logged.
 ``last_error`` is always a short code (at most 64 characters), never a URL or a token.
 """
 
@@ -26,6 +35,20 @@ KIND_POWER_OFF = "power_off"
 KIND_POWER_ON = "power_on"
 KINDS = (KIND_POWER_OFF, KIND_POWER_ON)
 CHANNEL_SUBSCRIBER = "subscriber"
+CHANNEL_OPS = "ops"
+# Ops notice kinds (D-11) and their integer payloads; the text is rendered at send time.
+KIND_OPS_GAP = "ops_gap"  # {start_us, end_us}
+KIND_OPS_ALL_SILENT_START = "ops_all_silent_start"  # {since_us, count}
+KIND_OPS_ALL_SILENT_END = "ops_all_silent_end"  # {since_us, first_us}; location = first
+KIND_OPS_EXPIRED = "ops_expired"  # {message_id}; location = the alert's
+KIND_OPS_UNCERTAIN = "ops_uncertain"  # {message_id}; location = the alert's
+OPS_KINDS = (
+    KIND_OPS_GAP,
+    KIND_OPS_ALL_SILENT_START,
+    KIND_OPS_ALL_SILENT_END,
+    KIND_OPS_EXPIRED,
+    KIND_OPS_UNCERTAIN,
+)
 # Written into expires_at now; enforced in Phase 2 (ALRT-03, default maximum age 6 h).
 MAX_AGE = timedelta(hours=6)
 # The database column is varchar(64).
@@ -48,15 +71,47 @@ def enqueue(
     """
     if kind not in KINDS:
         raise ValueError(f"unknown alert kind: {kind!r}")
-    for key, value in payload.items():
-        # bool is an int subclass, but True is not a duration.
-        if not isinstance(value, int) or isinstance(value, bool):
-            raise TypeError(f"payload {key!r} must be integer microseconds")
+    _check_payload(payload, "must be integer microseconds")
     return OutboxMessage.objects.create(
         channel=CHANNEL_SUBSCRIBER,
         location_id=location_id,
         kind=kind,
         event_at=event_at,
+        recorded_at=recorded_at,
+        payload=dict(payload),
+        status="pending",
+        next_attempt_at=recorded_at,
+        expires_at=recorded_at + MAX_AGE,
+    )
+
+
+def check_ops_notice(kind: str, payload: dict[str, int]) -> None:
+    """ValueError for a kind outside OPS_KINDS, TypeError for a non-integer payload value."""
+    if kind not in OPS_KINDS:
+        raise ValueError(f"unknown ops notice kind: {kind!r}")
+    _check_payload(payload, "must be an integer")
+
+
+def enqueue_ops(
+    kind: str,
+    *,
+    payload: dict[str, int],
+    recorded_at: datetime,
+    location_id: int | None = None,
+) -> OutboxMessage:
+    """Queue one ops notice for the admin chat, due at once, in the caller's transaction.
+
+    Use ``powermon.alerts.ops.notify``, which decides whether the notice is queued or,
+    with no ops chat configured, logged (D-09). ``payload`` holds integers only (epoch
+    microseconds, a count, a message id); names and texts are read at send time (OPS-08).
+    The kind and payload are checked before any write.
+    """
+    check_ops_notice(kind, payload)
+    return OutboxMessage.objects.create(
+        channel=CHANNEL_OPS,
+        location_id=location_id,
+        kind=kind,
+        event_at=recorded_at,
         recorded_at=recorded_at,
         payload=dict(payload),
         status="pending",
@@ -78,6 +133,19 @@ def subscriber_heads() -> list[OutboxMessage]:
         .select_related("location")
         .order_by("location_id", "id")
         .distinct("location_id")
+    )
+
+
+def ops_head() -> OutboxMessage | None:
+    """The oldest open ops row, or None: the ops queue is one line, oldest first.
+
+    Like a subscriber head, an ops row left in "sending" holds the line until worker
+    activation turns it into "uncertain".
+    """
+    return (
+        OutboxMessage.objects.filter(channel=CHANNEL_OPS, status__in=OPEN_STATUSES)
+        .order_by("id")
+        .first()
     )
 
 
@@ -122,6 +190,13 @@ def recover_interrupted() -> int:
     return OutboxMessage.objects.filter(status="sending").update(
         status="uncertain", last_error="interrupted"
     )
+
+
+def _check_payload(payload: dict[str, int], rule: str) -> None:
+    for key, value in payload.items():
+        # bool is an int subclass, but True is neither a duration nor an id.
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"payload {key!r} {rule}")
 
 
 def _short(code: str) -> str:
