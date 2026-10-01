@@ -351,7 +351,7 @@ def test_MON05_backward_clock_step_never_carves(
 
 
 @pytest.mark.django_db(transaction=True)
-def test_MON05_waiting_and_deleted_locations_get_no_piece(
+def test_MON05_waiting_deleted_and_maintenance_locations_get_no_piece(
     location_factory: Callable[..., Any], ops_settings: Any
 ) -> None:
     _system(cursor=_at(10, 0), resumed=_at(9, 0))
@@ -359,12 +359,18 @@ def test_MON05_waiting_and_deleted_locations_get_no_piece(
     deleted = location_factory(name="Deleted")
     transitions.record_heartbeat(deleted.pk, _at(9, 0))
     type(deleted).objects.filter(pk=deleted.pk).update(deleted_at=_at(9, 30))
+    maintenance = location_factory(name="In maintenance", maintenance=True)
+    transitions.record_heartbeat(maintenance.pk, _at(9, 0))
+    ticks: list[int] = []
 
-    assert lapse.carve_window(_at(10, 0), _at(10, 10)) == 0
+    assert lapse.carve_window(_at(10, 0), _at(10, 10), tick=lambda: ticks.append(1)) == 0
 
     # No data stays no data (K-1), and a deleted location's history is not rewritten.
     assert _intervals(waiting) == []
     assert _intervals(deleted) == [("on", _at(9, 0), None, None)]
+    # Maintenance is already not monitored: visited (one tick) but not changed.
+    assert _intervals(maintenance) == [("not_monitored", _at(9, 0), None, None)]
+    assert ticks == [1]
 
 
 # Crash safety and exactly one notice (D-04, ARCHITECTURE Pattern 4)
@@ -414,6 +420,25 @@ def test_INV10_crash_mid_carve_reruns_idempotently_one_notice(
         ("on", later, None, None),
     ]
     assert _anchors() == (later, later)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV10_a_second_carver_with_a_stale_cursor_records_nothing(
+    location_factory: Callable[..., Any], ops_settings: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _system(cursor=_at(10, 0), resumed=_at(9, 0))
+    location = location_factory()
+    transitions.record_heartbeat(location.pk, _at(9, 0))
+    assert lapse.carve_if_needed(_at(10, 10), force=True) == lapse.Gap(_at(10, 0), _at(10, 10))
+    rows = _intervals(location)
+    # A second carver that read the cursor before the first one committed.
+    monkeypatch.setattr(lapse, "read_cursor", lambda: _at(10, 0))
+
+    assert lapse.carve_if_needed(_at(10, 10), force=True) is None
+
+    assert _intervals(location) == rows
+    assert _incidents() == [_gap(_at(10, 0), _at(10, 10))]
+    assert len(_ops_rows()) == 1
 
 
 @pytest.mark.django_db(transaction=True)

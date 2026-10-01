@@ -408,12 +408,14 @@ def _heartbeating(location_factory: Callable[..., Any]) -> Any:
 def test_INV13_lease_session_terminated_reacquires_and_carves(
     leases: Callable[[FakeClock], Lease],
     location_factory: Callable[..., Any],
+    fake_telegram: Any,
     worker_sessions: None,
     seen: _Seen,
     tmp_path: Path,
 ) -> None:
     _system(cursor=None)
     location = _heartbeating(location_factory)
+    fake_telegram.accept(DEFAULT_BOT_TOKEN)  # the OFF at the end is delivered, offline
     clock = FakeClock(T0)
     lease = leases(clock)
 
