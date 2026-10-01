@@ -31,8 +31,8 @@ exactly one ``location_state`` row, and takes that lock first. That covers heart
 ``system_state``, ``ops_incident`` and ``outbox_message``, never ``location_state``.
 
 An error while carving one location is logged with its id, and the carve of the others and
-the cursor commit go on (INV-13 #4). Only a database error that shows the connection is
-gone aborts the carve; the next cycle then re-runs it, before the cursor ever moved.
+the cursor commit go on (INV-13 #4). Only a database connectivity error aborts the carve;
+the cursor has not moved then, so the next cycle re-runs the whole carve.
 
 Time comes only from the arguments: nothing here reads a clock (the injected Clock
 belongs to the caller, ``powermon.worker.detection.run_detection``). SQL constants use
@@ -152,10 +152,14 @@ def carve_window(a: datetime, b: datetime, tick: Callable[[], None] | None = Non
     """Record ``[a, b)`` as not monitored for every monitored location; return how many changed.
 
     Each location in its own transaction, which locks its ``location_state`` row first.
-    ``tick`` (the watchdog's progress stamp) runs after each location. A database error on
-    a connection that is no longer usable is raised (the cursor must not move past a carve
-    that did not happen); any other error is logged with the location id and the carve goes
-    on with the next location (INV-13 #4).
+    ``tick`` (the watchdog's progress stamp) runs after each location. A database
+    connectivity error (OperationalError, InterfaceError: a lost session, the database
+    down, a lock or statement timeout) is raised, so the cursor never moves past a carve
+    that did not happen and the next cycle re-runs it. Checking the connection is not
+    enough: when a session dies inside a transaction, Django opens a new connection as
+    the transaction exits, so the connection looks usable while this location was never
+    carved. Any other error is logged with the location id, and the carve goes on with
+    the next location (INV-13 #4).
     """
     with connection.cursor() as cur:
         cur.execute(CARVE_LOCATIONS_SQL)
@@ -166,9 +170,7 @@ def carve_window(a: datetime, b: datetime, tick: Callable[[], None] | None = Non
             if _carve_one(location_id, a, b):
                 changed += 1
         except OperationalError, InterfaceError:
-            if not connection.is_usable():
-                raise
-            log.exception("lapse carve failed for location %s", location_id)
+            raise
         except Exception:
             log.exception("lapse carve failed for location %s", location_id)
         finally:
