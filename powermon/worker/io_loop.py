@@ -90,7 +90,7 @@ uncertain one. Both channels go through one helper, ``_send``:
 - an exception after the claim and before the HTTP call (building the client): the
   request provably never left, so the row goes back to "pending" ("pre_send_error");
 - the outcome write raises a database error after Telegram answered: the known outcome
-  (``Unapplied``: the row, attempts, result, answer time and bot key) is kept.
+  (``Unapplied``: the row, attempts, result, answer time and backoff keys) is kept.
 
 Kept outcomes are written by ``_flush_unapplied`` at the start of the next pass, right
 after the connection step and before any new claim, and at activation before leftover
@@ -99,6 +99,15 @@ A database error stops the flush and propagates: the pass (or the activation) en
 retried on a replaced connection. Only database errors are kept: any other error is a bug,
 logged by class name, and the row waits for activation as before. The flush runs before
 any head, so a head with a kept outcome is never seen by the same process.
+
+WR-01: a kept outcome is written only onto this worker's own claim, so another worker's
+send of the row is never reset and repeated. Every reset to "pending" names the attempt
+count its claim gave the row, which another worker's later claim raises. A "no request
+made" reset also runs only while the pass's lease session holds the lock (the claim's
+fence, C1), and a new lease generation drops such resets unwritten: the claim's own
+commit is unknown, and a worker that held the lock in between may have claimed the row
+with the same count. A row it leaves "sending" is declared uncertain by the next holder's
+activation, never sent twice.
 
 The database-down notice (D-11 #2, INV-13 #2, OPS-02) is the one notice that cannot go
 through the outbox, because the outbox lives in the database. ``notify_db_down`` runs on
@@ -245,9 +254,12 @@ def activate(state: RelayState, clock: Clock) -> int:
     session on every attempt (D-16). Then this process's own kept outcomes are written
     (WR-04), so a send it knows went through becomes "sent" and is not declared uncertain
     by the recovery. A database error there propagates, and the recovery waits for the
-    next attempt.
+    next attempt. Kept "no request made" resets are dropped first (WR-01): from an earlier
+    term, one cannot tell this worker's own claim from a claim another worker made while
+    it held the lock, so a row such a reset concerns is left to the recovery.
     """
     close_old_connections()
+    state.unapplied = {pk: kept for pk, kept in state.unapplied.items() if kept.result is not None}
     _flush_unapplied(state)
     recovered = ops.recover_interrupted(clock.now())
     log.info("relay activated: %d interrupted send(s) marked uncertain", recovered)
@@ -495,9 +507,23 @@ def _flush_unapplied(state: RelayState) -> None:
 
 
 def _record(outcome: Unapplied, state: RelayState) -> None:
-    """Write one outcome on its claimed row: back to pending if nothing was sent."""
+    """Write one outcome on its claimed row: back to pending if nothing was sent.
+
+    Every reset names the attempt count of the claim it is about, so it never reaches a
+    later claim of the row by another worker (WR-01). A "no request made" reset also
+    needs this pass's lease session to still hold the lock: the claim's own commit may be
+    unknown, and a worker that held the lock since could have claimed the row with the
+    same count. A reset the fence refuses is not kept either: that session never holds
+    the lock again, and the next holder's activation makes a row left "sending" uncertain.
+    """
     if outcome.result is None:
-        outbox.mark_retry(outcome.row.pk, outcome.answered_at, "pre_send_error")
+        outbox.mark_retry(
+            outcome.row.pk,
+            outcome.answered_at,
+            "pre_send_error",
+            attempts=outcome.attempts,
+            lease_pid=state.lease_pid,
+        )
         return
     _apply(
         outcome.row,
@@ -571,4 +597,6 @@ def _apply(
         # it waits, and so does a shared admin chat (D1). A 400/401/403 stays with this
         # channel (CR-01).
         state.not_before[bot_wide] = next_attempt_at
-    outbox.mark_retry(row.pk, next_attempt_at, result.code or result.kind)
+    # Only this claim's attempt: a kept outcome may be written after another worker claimed
+    # the row again (WR-01).
+    outbox.mark_retry(row.pk, next_attempt_at, result.code or result.kind, attempts=attempts)

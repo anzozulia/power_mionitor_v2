@@ -35,6 +35,11 @@ lock. A send claimed just before the loss is the one in flight: the next holder'
 activation turns it into "uncertain". Without ``lease_pid`` (a direct call, as in tests)
 the claim is unfenced.
 
+The relay's reset of a row it claimed (``mark_retry`` with ``attempts``) is fenced too
+(WR-01): it moves the row only while it still carries the attempt count that claim gave
+it, so it never reaches a later claim of the row by another worker, which counts one
+more. With ``lease_pid`` it also needs that session to hold the worker lock, as the claim.
+
 An ops notice whose text cannot be built from its integer payload (a referenced row gone,
 an end before its start after a backward clock step) never will be: it is dropped at
 once, so it never holds the one-line ops queue (B2). Expiry leaves dropped rows alone.
@@ -97,6 +102,19 @@ RETURNING id, channel, location_id
 CLAIM_HELD_SQL = """
 UPDATE outbox_message SET status = 'sending', attempts = attempts + 1
  WHERE id = %(id)s AND status = 'pending'
+   AND EXISTS (
+       SELECT 1 FROM pg_locks
+        WHERE locktype = 'advisory' AND granted AND pid = %(pid)s
+          AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+          AND classid = %(classid)s::oid AND objid = %(objid)s::oid AND objsubid = 1
+   )
+"""
+# The relay's reset of its own claim (WR-01): only the attempt that claim counted, and only
+# while the lease session holds the worker lock (the same pg_locks check as the claim's).
+RETRY_HELD_SQL = """
+UPDATE outbox_message
+   SET status = 'pending', next_attempt_at = %(next_attempt_at)s, last_error = %(code)s
+ WHERE id = %(id)s AND status IN ('pending', 'sending') AND attempts = %(attempts)s
    AND EXISTS (
        SELECT 1 FROM pg_locks
         WHERE locktype = 'advisory' AND granted AND pid = %(pid)s
@@ -258,9 +276,40 @@ def mark_dropped(message_id: int, code: str) -> bool:
     return updated == 1
 
 
-def mark_retry(message_id: int, next_attempt_at: datetime, code: str) -> bool:
-    """Put an open row back to "pending", due again at ``next_attempt_at``."""
-    updated = OutboxMessage.objects.filter(pk=message_id, status__in=OPEN_STATUSES).update(
+def mark_retry(
+    message_id: int,
+    next_attempt_at: datetime,
+    code: str,
+    *,
+    attempts: int | None = None,
+    lease_pid: int | None = None,
+) -> bool:
+    """Put an open row back to "pending", due again at ``next_attempt_at``.
+
+    With ``attempts`` (the count the relay's claim gave the row) only while the row still
+    carries it, so the reset never reaches another worker's later claim (WR-01). With
+    ``lease_pid`` also only while that session holds the worker lock, as ``claim``; that
+    fenced reset needs ``attempts`` too and moves nothing without it.
+    """
+    if lease_pid is not None:
+        with connection.cursor() as cur:
+            cur.execute(
+                RETRY_HELD_SQL,
+                {
+                    "id": message_id,
+                    "next_attempt_at": next_attempt_at,
+                    "code": _short(code),
+                    "attempts": attempts,
+                    "pid": lease_pid,
+                    "classid": _LOCK_CLASSID,
+                    "objid": _LOCK_OBJID,
+                },
+            )
+            return cur.rowcount == 1
+    rows = OutboxMessage.objects.filter(pk=message_id, status__in=OPEN_STATUSES)
+    if attempts is not None:
+        rows = rows.filter(attempts=attempts)
+    updated = rows.update(
         status="pending", next_attempt_at=next_attempt_at, last_error=_short(code)
     )
     return updated == 1

@@ -7,6 +7,9 @@ bot token and chat are read from the location then (T-01-45).
 C1 (wave 3 audit): the worker's claim names its lease session, and the claim succeeds
 only while that session holds the worker lock, so a worker that lost the lock claims
 nothing even before it notices.
+
+WR-01 (code review): the relay's reset of a row it claimed names that claim's attempt
+count (and, fenced, its lease session), so it never moves another worker's later claim.
 """
 
 from collections.abc import Callable
@@ -197,3 +200,44 @@ def test_C1_a_fenced_claim_needs_the_lease_session_to_hold_the_lock(
     # Without a lease pid (a direct call, as in the relay tests) the claim is unfenced.
     third = _enqueue(location)
     assert outbox.claim(third.pk) is True
+
+
+# WR-01 (code review): the relay's reset of its own claim never reaches another claim
+
+
+@pytest.mark.django_db(transaction=True)
+def test_WR01_a_relay_reset_moves_only_the_attempt_of_its_claim(
+    location_factory: Callable[..., Any],
+) -> None:
+    row = _enqueue(location_factory())
+    due = RECORDED_AT + timedelta(seconds=5)
+    holder = Lease(connection.settings_dict)
+    standby = Lease(connection.settings_dict)
+    try:
+        assert holder.ensure_held().state == "held"
+        assert standby.ensure_held().state == "standby"
+        assert outbox.claim(row.pk, lease_pid=holder.pid) is True
+
+        # Another attempt count, or a session that does not hold the lock: nothing moves.
+        assert outbox.mark_retry(row.pk, due, "x", attempts=2) is False
+        assert outbox.mark_retry(row.pk, due, "x", attempts=2, lease_pid=holder.pid) is False
+        assert outbox.mark_retry(row.pk, due, "x", attempts=1, lease_pid=standby.pid) is False
+        assert outbox.mark_retry(row.pk, due, "x", lease_pid=holder.pid) is False
+        assert _claim_state(row) == ("sending", 1)
+
+        # The claim's own attempt, by the holder's session: back to pending.
+        assert outbox.mark_retry(row.pk, due, "x", attempts=1, lease_pid=holder.pid) is True
+        assert (_claim_state(row), row.next_attempt_at, row.last_error) == (
+            ("pending", 1),
+            due,
+            "x",
+        )
+    finally:
+        holder.close()
+        standby.close()
+
+    # Without a lease session only the attempt count is checked.
+    assert outbox.claim(row.pk) is True
+    assert outbox.mark_retry(row.pk, due, "y", attempts=1) is False
+    assert outbox.mark_retry(row.pk, due, "y", attempts=2) is True
+    assert _claim_state(row) == ("pending", 2)
