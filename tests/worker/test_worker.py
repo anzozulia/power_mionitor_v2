@@ -14,7 +14,6 @@ thread is stopped, in a ``finally`` block, or pytest-django cannot drop the test
 
 import logging
 import os
-import re
 import signal
 import threading
 import time
@@ -24,15 +23,14 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, FakeClock
+from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, FakeClock, terminate_backends
 from django.core.management import CommandError, call_command
 from django.db import connection, transaction
 
 from powermon.alerts import outbox
 from powermon.alerts.models import OutboxMessage
 from powermon.engine.models import SystemState
-from powermon.worker import lease as lease_module
-from powermon.worker.lease import LOCK_KEY, Lease
+from powermon.worker.lease import Lease
 from powermon.worker.management.commands import run_worker
 
 T0 = datetime(2026, 10, 1, 10, 6, 31, tzinfo=UTC)
@@ -41,8 +39,6 @@ OTHER_CHAT_ID = -1009876543210
 LOOP_NAMES = {"detection", "telegram-io"}
 FAST = {"standby_poll": 0.05, "check_interval": 0.05, "detection_interval": 0.05}
 WORKER_LOGGER = run_worker.__name__
-LEASE_LOGGER = lease_module.__name__
-UNREACHABLE = re.compile(r"worker lock: database unreachable or session lost \(\w+\); retrying")
 
 
 def _wait_for(predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
@@ -79,19 +75,6 @@ def _queue_off(location: Any, at: datetime = T0) -> OutboxMessage:
         )
 
 
-def _terminate_lease_backend() -> None:
-    """Kill the worker's lock session from outside, as a DB restart or network drop would."""
-    with connection.cursor() as cur:
-        cur.execute(
-            "SELECT pid FROM pg_stat_activity "
-            "WHERE application_name = 'powermon-worker-lease' AND datname = current_database()"
-        )
-        rows = cur.fetchall()
-        assert len(rows) == 1, rows
-        cur.execute("SELECT pg_terminate_backend(%s, 5000)", [rows[0][0]])
-        assert cur.fetchone() == (True,)
-
-
 class _Serve:
     """``run_worker.serve`` in a thread, with fast intervals, its exit code kept."""
 
@@ -125,111 +108,6 @@ def leases() -> Iterator[Callable[[], Lease]]:
     yield new
     for lease in made:
         lease.close()
-
-
-# The lease (Pitfall 2, D-18)
-
-
-@pytest.mark.django_db(transaction=True)
-def test_lease_is_exclusive_and_never_blocks(leases: Callable[[], Lease]) -> None:
-    a = leases()
-    b = leases()
-
-    assert a.try_acquire() is True
-
-    started = time.monotonic()
-    assert b.try_acquire() is False
-    assert time.monotonic() - started < 1.0
-    assert a.alive() is True
-    assert isinstance(a.pid, int)
-    assert a.pid != b.pid
-    # The repr names the session only: no connection details, no password.
-    assert repr(a) == f"Lease(pid={a.pid})"
-    assert connection.settings_dict["PASSWORD"] not in repr(a)
-    a.close()
-    assert a.pid is None
-    assert a.alive() is False
-    assert b.try_acquire() is True
-    assert LOCK_KEY == 0x504F5745524D4F4E < 2**63
-
-
-@pytest.mark.django_db(transaction=True)
-def test_lease_not_alive_after_its_backend_is_terminated(leases: Callable[[], Lease]) -> None:
-    a = leases()
-    assert a.try_acquire() is True
-
-    _terminate_lease_backend()
-
-    assert a.alive() is False
-    # The dead session released the lock: another worker can take it now.
-    b = leases()
-    assert b.try_acquire() is True
-    # A try on the dead connection fails quietly and drops it; the next try reconnects.
-    assert a.try_acquire() is False
-    assert a.pid is None
-    b.close()
-    assert a.try_acquire() is True
-
-
-def test_lease_try_acquire_returns_false_when_the_database_is_unreachable() -> None:
-    # Nothing listens on port 1: the connect fails, nothing raises, the standby keeps polling.
-    lease = Lease({**connection.settings_dict, "HOST": "127.0.0.1", "PORT": 1})
-    try:
-        assert lease.try_acquire() is False
-        assert lease.pid is None
-        assert lease.alive() is False
-    finally:
-        lease.close()
-
-
-def _lease_lines(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
-    return [r for r in caplog.records if r.name == LEASE_LOGGER]
-
-
-def test_lease_warns_once_while_the_database_stays_unreachable(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    # Without this line the standby line would be the only output, and README section 10
-    # reads it as "a second worker". The class name only: a psycopg error message can
-    # carry the host, the port and the user.
-    lease = Lease({**connection.settings_dict, "HOST": "127.0.0.1", "PORT": 1})
-    caplog.set_level(logging.DEBUG, logger=LEASE_LOGGER)
-    try:
-        for _ in range(3):
-            assert lease.try_acquire() is False
-    finally:
-        lease.close()
-
-    lines = _lease_lines(caplog)
-    assert [r.getMessage() for r in lines] == [
-        "worker lock: database unreachable or session lost (OperationalError); retrying"
-    ]
-    assert (lines[0].levelno, lines[0].exc_info) == (logging.WARNING, None)
-    assert connection.settings_dict["PASSWORD"] not in caplog.text
-
-
-@pytest.mark.django_db(transaction=True)
-def test_lease_warns_again_after_the_database_answered(
-    leases: Callable[[], Lease], caplog: pytest.LogCaptureFixture
-) -> None:
-    caplog.set_level(logging.DEBUG, logger=LEASE_LOGGER)
-    a = leases()
-    b = leases()
-    # Taking the lock, or finding it held by another worker, is not a database problem.
-    assert a.try_acquire() is True
-    assert b.try_acquire() is False
-    b.close()
-    assert _lease_lines(caplog) == []
-
-    _terminate_lease_backend()  # a database restart drops the lock session
-    assert a.try_acquire() is False
-    assert a.try_acquire() is True  # the database answers again: that run of errors ends
-    _terminate_lease_backend()
-    assert a.try_acquire() is False
-
-    messages = [r.getMessage() for r in _lease_lines(caplog)]
-    assert len(messages) == 2
-    assert all(UNREACHABLE.fullmatch(m) for m in messages), messages
 
 
 # Activation (D-14)
@@ -343,7 +221,7 @@ def test_lease_loss_exits_with_code_3(
         assert _wait_for(lambda: _resumed_at() == clock.now())
         assert _wait_for(lambda: _loop_threads() == LOOP_NAMES)
 
-        _terminate_lease_backend()
+        assert terminate_backends("powermon-worker-lease") == 1
 
         serving.thread.join(2.0)
         assert not serving.thread.is_alive()
