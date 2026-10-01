@@ -14,9 +14,11 @@ from typing import Any
 import pytest
 from django.contrib.auth import get_user_model
 from django.contrib.staticfiles.storage import staticfiles_storage
+from django.db import DatabaseError
 from django.test import Client
 
 from powermon.engine.models import LocationState
+from powermon.locations.models import Location
 
 User = get_user_model()
 
@@ -148,6 +150,52 @@ def test_list_location_without_state_row_shows_waiting(
     html = admin.get("/").content.decode()
 
     assert _table_rows(html) == [["Orphan", "Waiting for first heartbeat", "Never", "English"]]
+
+
+@pytest.mark.django_db
+def test_list_shows_twenty_locations_on_one_page(
+    admin: Client, location_factory: Callable[..., Any]
+) -> None:
+    for n in range(20):
+        location_factory(name=f"Location {n:02d}")
+
+    html = admin.get("/").content.decode()
+
+    rows = _table_rows(html)
+    assert [row[0] for row in rows] == [f"Location {n:02d}" for n in range(20)]
+    # No pagination and no count in the heading, whatever the number of rows.
+    assert "<h1>Locations</h1>" in html
+    assert "page=" not in html
+    assert "20" not in _text(html.split("<tbody>")[0])
+
+
+def test_list_has_no_live_refresh(admin: Client) -> None:
+    html = admin.get("/").content.decode()
+
+    assert "http-equiv" not in html
+    assert "<script" not in html
+
+
+@pytest.mark.django_db
+def test_list_database_failure_renders_500_without_a_table(
+    admin: Client, location_factory: Callable[..., Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    location_factory(name="Office")
+
+    def unreachable(*args: Any, **kwargs: Any) -> None:
+        raise DatabaseError("could not connect to server")
+
+    monkeypatch.setattr(Location.objects, "filter", unreachable)
+    admin.raise_request_exception = False
+
+    response = admin.get("/")
+
+    assert response.status_code == 500
+    html = response.content.decode()
+    assert "<h1>Something went wrong</h1>" in html
+    assert "<table" not in html
+    assert "Office" not in html
+    assert "could not connect" not in html
 
 
 def test_anonymous_list_redirects_to_sign_in(client: Client, db: None) -> None:
