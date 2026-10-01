@@ -290,6 +290,14 @@ def test_result_code_never_contains_token(
     assert all(secret not in str(record.args) for record in caplog.records)
 
 
+def test_client_repr_hides_token() -> None:
+    # A client that ends up in a log line or a traceback must not print its URL.
+    text = repr(TelegramClient(TOKEN))
+
+    assert TOKEN.split(":", 1)[1] not in text
+    assert "sendMessage" not in text
+
+
 def test_send_result_defaults() -> None:
     result = SendResult("ok")
 
