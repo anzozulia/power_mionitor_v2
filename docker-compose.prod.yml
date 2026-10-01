@@ -89,10 +89,12 @@ services:
     restart: unless-stopped
     stop_grace_period: 30s
 
-  # Detection and alert delivery; one active instance at a time (advisory lock). Exits
-  # with code 3 when it loses the lock and the restart policy brings it back (D-18). Its
-  # health-file healthcheck arrives with OPS-05 in Phase 2; until then `up --wait` waits
-  # for it to be running.
+  # Detection and alert delivery. One instance is active at a time (database advisory
+  # lock); a second one stands by, is healthy and takes over when the lock is free. The
+  # healthcheck needs the health file to be under 30 s old, so the worker shows unhealthy
+  # while the database is down and recovers by itself when it is back (a lost lock is
+  # reacquired in process). If a loop hangs, the worker exits 70 and the restart policy
+  # restarts it (D-15).
   worker:
     <<: *app
     command: ["python", "manage.py", "run_worker"]
