@@ -1,6 +1,7 @@
 # Local stack. One command (D-03):
 #   docker compose -f docker-compose.local.yml up -d --build --wait
-# Only web publishes a port, bound to 127.0.0.1. The worker service is added in 01-11.
+# Same services as production minus caddy: db, the one-shot migrate (release), web and
+# worker. Only web publishes a port, bound to 127.0.0.1.
 name: powermon-local
 
 x-logging: &logging
@@ -35,10 +36,11 @@ services:
     restart: unless-stopped
     logging: *logging
 
-  # One-shot: runs on every `up`, before web starts. A failed migration stops the deploy.
+  # One-shot on every `up`: apply migrations, then sync the env admin account. web and
+  # worker start only after it exits 0, so a failed migration stops the stack (D-02).
   migrate:
     <<: *app
-    command: ["python", "manage.py", "migrate", "--noinput"]
+    command: ["python", "manage.py", "release"]
     depends_on:
       db:
         condition: service_healthy
@@ -79,5 +81,20 @@ services:
       timeout: 5s
       retries: 6
       start_period: 20s
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  # Detection and alert delivery; one active instance at a time (advisory lock). Exits
+  # with code 3 when it loses the lock and the restart policy brings it back (D-18). Its
+  # health-file healthcheck arrives with OPS-05 in Phase 2; until then `up --wait` waits
+  # for it to be running.
+  worker:
+    <<: *app
+    command: ["python", "manage.py", "run_worker"]
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
     stop_grace_period: 30s

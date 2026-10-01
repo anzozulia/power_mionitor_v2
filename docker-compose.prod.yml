@@ -87,8 +87,10 @@ services:
     restart: unless-stopped
     stop_grace_period: 30s
 
-  # The run_worker command lands in 01-11. Its health-file healthcheck arrives with OPS-05
-  # in Phase 2; until then `up --wait` waits for it to be running.
+  # Detection and alert delivery; one active instance at a time (advisory lock). Exits
+  # with code 3 when it loses the lock and the restart policy brings it back (D-18). Its
+  # health-file healthcheck arrives with OPS-05 in Phase 2; until then `up --wait` waits
+  # for it to be running.
   worker:
     <<: *app
     command: ["python", "manage.py", "run_worker"]
