@@ -14,6 +14,7 @@ thread is stopped, in a ``finally`` block, or pytest-django cannot drop the test
 
 import logging
 import os
+import re
 import signal
 import threading
 import time
@@ -30,6 +31,7 @@ from django.db import connection, transaction
 from powermon.alerts import outbox
 from powermon.alerts.models import OutboxMessage
 from powermon.engine.models import SystemState
+from powermon.worker import lease as lease_module
 from powermon.worker.lease import LOCK_KEY, Lease
 from powermon.worker.management.commands import run_worker
 
@@ -39,6 +41,8 @@ OTHER_CHAT_ID = -1009876543210
 LOOP_NAMES = {"detection", "telegram-io"}
 FAST = {"standby_poll": 0.05, "check_interval": 0.05, "detection_interval": 0.05}
 WORKER_LOGGER = run_worker.__name__
+LEASE_LOGGER = lease_module.__name__
+UNREACHABLE = re.compile(r"worker lock: database unreachable or session lost \(\w+\); retrying")
 
 
 def _wait_for(predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
@@ -176,6 +180,56 @@ def test_lease_try_acquire_returns_false_when_the_database_is_unreachable() -> N
         assert lease.alive() is False
     finally:
         lease.close()
+
+
+def _lease_lines(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == LEASE_LOGGER]
+
+
+def test_lease_warns_once_while_the_database_stays_unreachable(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Without this line the standby line would be the only output, and README section 10
+    # reads it as "a second worker". The class name only: a psycopg error message can
+    # carry the host, the port and the user.
+    lease = Lease({**connection.settings_dict, "HOST": "127.0.0.1", "PORT": 1})
+    caplog.set_level(logging.DEBUG, logger=LEASE_LOGGER)
+    try:
+        for _ in range(3):
+            assert lease.try_acquire() is False
+    finally:
+        lease.close()
+
+    lines = _lease_lines(caplog)
+    assert [r.getMessage() for r in lines] == [
+        "worker lock: database unreachable or session lost (OperationalError); retrying"
+    ]
+    assert (lines[0].levelno, lines[0].exc_info) == (logging.WARNING, None)
+    assert connection.settings_dict["PASSWORD"] not in caplog.text
+
+
+@pytest.mark.django_db(transaction=True)
+def test_lease_warns_again_after_the_database_answered(
+    leases: Callable[[], Lease], caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG, logger=LEASE_LOGGER)
+    a = leases()
+    b = leases()
+    # Taking the lock, or finding it held by another worker, is not a database problem.
+    assert a.try_acquire() is True
+    assert b.try_acquire() is False
+    b.close()
+    assert _lease_lines(caplog) == []
+
+    _terminate_lease_backend()  # a database restart drops the lock session
+    assert a.try_acquire() is False
+    assert a.try_acquire() is True  # the database answers again: that run of errors ends
+    _terminate_lease_backend()
+    assert a.try_acquire() is False
+
+    messages = [r.getMessage() for r in _lease_lines(caplog)]
+    assert len(messages) == 2
+    assert all(UNREACHABLE.fullmatch(m) for m in messages), messages
 
 
 # Activation (D-14)
