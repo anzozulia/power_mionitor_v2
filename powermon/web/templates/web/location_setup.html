@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% load display_time %}
+{% comment %}
+UI-SPEC screen 4 (LOC-05, D-06, D-11). The full device key is in the page only when
+"revealed" is true, which only the reveal POST response sets. Every command in a code
+block is a string from powermon.locations.examples (the generator the INV-24 #3 test runs
+verbatim); none is written here. The bot token is shown only as its masked form.
+{% endcomment %}
+{% block title %}{{ location.name }} · Device setup{% endblock %}
+{% block content %}
+<h1 class="name">{{ location.name }}</h1>
+<p class="meta"><span class="status status--{{ status }}">{{ status_label }}</span> · Last heartbeat: <span class="num">{{ last_heartbeat_at|display_time }}</span></p>
+
+<h2>Before you start</h2>
+<p>Use a device that loses power in a blackout: plugged into mains, with no UPS, power bank or battery. A device on backup power keeps reporting and hides the outage.</p>
+<p>A heartbeat needs both power and internet at the device. If the router or the provider's network is down, this location is reported OFF too.</p>
+<p>The device must send a heartbeat at least every {{ period_s }} s. Power is reported OFF after {{ off_after_s }} s without one.</p>
+
+<h2>Heartbeat URL</h2>
+<p>Send a GET or POST request to this URL. Put the key in the Authorization header; use ?key= in the URL only for devices that cannot set headers.</p>
+<pre class="copy" id="heartbeat-url"><code>{{ heartbeat_url }}</code></pre>
+
+<h2>Device key</h2>
+{% if revealed %}
+<div class="inline">
+  <pre class="copy" id="device-key"><code>{{ shown_key }}</code></pre>
+  <a class="btn btn--secondary" href="{% url 'location-setup' location.pk %}">Hide key</a>
+</div>
+<p>Anyone with this key can send heartbeats for this location. Keep it private.</p>
+<p>The key is hidden again the next time you open this page.</p>
+{% else %}
+<div class="inline">
+  <code id="device-key" aria-hidden="true">{{ shown_key }}</code>
+  <span class="visually-hidden">Hidden key ending in {{ key_tail }}</span>
+  <form method="post" action="{% url 'location-setup' location.pk %}">
+    {% csrf_token %}
+    <button class="btn btn--primary" type="submit">Reveal key</button>
+  </form>
+</div>
+<p>Anyone with this key can send heartbeats for this location. Keep it private.</p>
+{% endif %}
+
+<h2>Examples</h2>
+{% if not revealed %}
+<p class="callout"><strong>Note:</strong> Reveal the key above to fill it into these examples.</p>
+{% endif %}
+<div class="example">
+  <h3>curl, key in a header (recommended)</h3>
+  <pre class="copy" id="example-curl"><code>{{ curl_example }}</code></pre>
+</div>
+<div class="example">
+  <h3>Cron (router or Linux)</h3>
+  <pre class="copy" id="example-cron"><code>{{ cron_example }}</code></pre>
+  <p class="help">Each line is one crontab entry; add them with <code>crontab -e</code>. Together they send a heartbeat at least every {{ period_s }} s. No curl on the device? Put one of the wget commands below in place of the curl command.</p>
+</div>
+<div class="example">
+  <h3>wget, key in the URL (GNU wget)</h3>
+  <pre class="copy" id="example-wget-gnu"><code>{{ wget_gnu_example }}</code></pre>
+</div>
+<div class="example">
+  <h3>BusyBox wget or OpenWrt uclient-fetch, key in the URL</h3>
+  <pre class="copy" id="example-wget-busybox"><code>{{ wget_busybox_example }}</code></pre>
+  <p class="help">These do not accept <code>--max-redirect</code>. The heartbeat URL never redirects.</p>
+</div>
+<p class="callout"><strong>Warning:</strong> Do not paste a URL that contains the key into Telegram or any other chat. Chat apps open links to build previews, and every opening counts as a heartbeat: it can mark this location ON while the power is off.</p>
+<p>A working heartbeat gets HTTP 200 with the body ok. HTTP 401 means the key is missing or wrong, and nothing is recorded. After the first heartbeat this location shows On; the first heartbeat sends no alert.</p>
+
+<h2>Location settings</h2>
+{% comment %}"name" adds overflow-wrap: anywhere, which the values inherit (UI-SPEC E7).{% endcomment %}
+<dl class="panel settings name">
+  <dt>Language</dt>
+  <dd>{{ language_label }}</dd>
+  <dt>Heartbeat period</dt>
+  <dd>{{ period_s }} s</dd>
+  <dt>Grace period</dt>
+  <dd>{{ grace_s }} s</dd>
+  <dt>Reported OFF after</dt>
+  <dd>{{ off_after_s }} s without a heartbeat</dd>
+  <dt>Channel chat ID</dt>
+  <dd>{{ location.chat_id }}</dd>
+  <dt>Bot token</dt>
+  <dd>{{ masked_token }}</dd>
+</dl>
+<p class="help">Settings cannot be changed yet. To fix a mistake, add a new location; an unused one stays in Waiting for first heartbeat and sends nothing.</p>
+{% endblock %}

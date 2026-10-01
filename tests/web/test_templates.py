@@ -132,8 +132,22 @@ def test_list_last_heartbeat_uses_display_time(
 
     html = admin.get("/").content.decode()
 
-    assert _table_rows(html) == [["Office", "On", "2026-10-25 03:30:00 EET", "Ukrainian"]]
+    # The factory's default language is English.
+    assert _table_rows(html) == [["Office", "On", "2026-10-25 03:30:00 EET", "English"]]
     assert '<td class="num">2026-10-25 03:30:00 EET</td>' in html
+
+
+@pytest.mark.django_db
+def test_list_location_without_state_row_shows_waiting(
+    admin: Client, location_factory: Callable[..., Any]
+) -> None:
+    # Locations are always created with their state row; a missing one must not crash.
+    location = location_factory(name="Orphan")
+    LocationState.objects.filter(location=location).delete()
+
+    html = admin.get("/").content.decode()
+
+    assert _table_rows(html) == [["Orphan", "Waiting for first heartbeat", "Never", "English"]]
 
 
 def test_anonymous_list_redirects_to_sign_in(client: Client, db: None) -> None:

@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% load display_time %}
+{% comment %}
+UI-SPEC screen 2 (D-09): read-only, no live refresh. Times go through display_time only
+(P-3: Django's date filter loses the zone name in the repeated DST hour).
+{% endcomment %}
+{% block title %}Locations{% endblock %}
+{% block content %}
+{% if rows %}
+<div class="page-head">
+  <h1>Locations</h1>
+  <a class="btn btn--primary" href="{% url 'location-create' %}">Add location</a>
+</div>
+<div class="table-wrap">
+<table>
+  <thead>
+    <tr>
+      <th scope="col">Name</th>
+      <th scope="col">Status</th>
+      <th scope="col">Last heartbeat</th>
+      <th scope="col">Language</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in rows %}
+    <tr>
+      <td><a class="name" href="{% url 'location-setup' row.pk %}">{{ row.name }}</a></td>
+      <td><span class="status status--{{ row.status }}">{{ row.status_label }}</span></td>
+      <td class="num">{{ row.last_heartbeat_at|display_time }}</td>
+      <td>{{ row.language_label }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<h1>Locations</h1>
+<div class="panel panel--empty flow">
+  <h2>No locations yet</h2>
+  <p>Add a location to get its heartbeat URL, device key and setup examples.</p>
+  <p><a class="btn btn--primary" href="{% url 'location-create' %}">Add location</a></p>
+</div>
+{% endif %}
+{% endblock %}
