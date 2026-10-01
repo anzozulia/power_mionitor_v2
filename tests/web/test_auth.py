@@ -182,6 +182,9 @@ def test_LOC01_sign_in_page_renders_fields(client: Client) -> None:
     password = _input_tag(html, "password")
     assert 'type="password"' in password
     assert 'autocomplete="current-password"' in password
+    # First load (UI-SPEC E1 empty state): both fields start empty.
+    assert "value=" not in username
+    assert "value=" not in password
     assert 'name="csrfmiddlewaretoken"' in html
     assert "placeholder" not in html
     assert "<script" not in html
