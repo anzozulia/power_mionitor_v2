@@ -238,6 +238,9 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
 - **Worker restarts:** only one worker is active at a time (a database lock). If its lock
   connection drops (for example on a database restart), it exits with code 3 and Docker
   restarts it; a second worker started by mistake logs
-  `standby: waiting for the worker lock` and does nothing.
+  `standby: waiting for the worker lock` and does nothing. When that line follows
+  `worker lock: database unreachable or session lost (...)`, the worker is waiting for
+  the database instead (expected during a database restart or a host reboot); it takes
+  the lock by itself once the database answers.
 - **Data:** everything lives in `docker_data/prod/` (PostgreSQL data and Caddy
   certificates). Nightly backups are not part of this release yet.

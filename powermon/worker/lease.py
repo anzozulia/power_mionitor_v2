@@ -13,15 +13,20 @@ backend). ``alive`` notices that, and the Phase 1 worker then exits with code 3 
 Docker restarts it (D-18); Phase 2 replaces that with in-process reacquisition.
 
 Like ``SendResult`` in the Telegram client, nothing here raises across its boundary:
-``try_acquire`` and ``alive`` return False on any database error.
+``try_acquire`` and ``alive`` return False on any database error. ``try_acquire`` logs
+the first error of each run of errors as a warning, so a worker that waits for the
+database does not look like a standby that waits for another worker.
 """
 
 import contextlib
+import logging
 from collections.abc import Mapping
 from typing import Any
 
 import psycopg
 from psycopg.rows import TupleRow
+
+log = logging.getLogger(__name__)
 
 # "POWERMON" in ASCII = 5786940001439534926, below 2**63 (a PostgreSQL bigint).
 LOCK_KEY = 0x504F5745524D4F4E
@@ -34,6 +39,8 @@ class Lease:
         # Django's DATABASES["default"]; tests pass the test database's dict.
         self._settings = settings_dict
         self._conn: psycopg.Connection[TupleRow] | None = None
+        # True from a failed try until a try reaches the database again.
+        self._failing = False
 
     def __repr__(self) -> str:
         return f"Lease(pid={self.pid})"
@@ -48,11 +55,19 @@ class Lease:
             if self._conn is None:
                 self._conn = self._connect()
             row = self._conn.execute("SELECT pg_try_advisory_lock(%s)", (LOCK_KEY,)).fetchone()
-        except psycopg.Error:
+        except psycopg.Error as exc:
             # The database is unreachable or this session died: drop it and reconnect on
-            # the next try.
+            # the next try. Once per run of errors, and the class name only: a psycopg
+            # message can carry the host, the port and the user (OPS-08).
+            if not self._failing:
+                log.warning(
+                    "worker lock: database unreachable or session lost (%s); retrying",
+                    type(exc).__name__,
+                )
+                self._failing = True
             self.close()
             return False
+        self._failing = False
         return bool(row and row[0])
 
     def alive(self) -> bool:
