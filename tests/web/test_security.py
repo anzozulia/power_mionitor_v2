@@ -99,6 +99,18 @@ def _server_error() -> Any:
     return server_error(RequestFactory().get("/"))
 
 
+def _page(client: Client, page: str) -> Any:
+    """One response of each page kind the admin surface can show a signed-out browser."""
+    if page == "login":
+        return client.get("/login/")
+    if page == "404":
+        return client.get("/no-such-page-xyz")
+    if page == "csrf-403":
+        return _csrf_failure("/login/")
+    assert page == "500", page
+    return _server_error()
+
+
 # Secure cookies and HSTS (INV-22 #3)
 
 
@@ -168,11 +180,7 @@ def test_INV22_production_env_builds_these_security_settings(production_settings
 @pytest.mark.django_db
 @pytest.mark.parametrize("page", ["login", "404", "csrf-403"])
 def test_admin_pages_security_headers(client: Client, page: str) -> None:
-    response = {
-        "login": lambda: client.get("/login/"),
-        "404": lambda: client.get("/no-such-page-xyz"),
-        "csrf-403": lambda: _csrf_failure("/login/"),
-    }[page]()
+    response = _page(client, page)
 
     assert response["Content-Security-Policy"] == CSP
     assert response["X-Frame-Options"] == "DENY"
@@ -264,13 +272,7 @@ def test_500_page_renders_without_request_context() -> None:
 @pytest.mark.django_db
 @pytest.mark.parametrize("page", ["login", "404", "csrf-403", "500"])
 def test_pages_load_only_same_origin_assets(client: Client, page: str) -> None:
-    response = {
-        "login": lambda: client.get("/login/"),
-        "404": lambda: client.get("/no-such-page-xyz"),
-        "csrf-403": lambda: _csrf_failure("/login/"),
-        "500": _server_error,
-    }[page]()
-    html = response.content.decode()
+    html = _page(client, page).content.decode()
 
     assert "<script" not in html
     assert "http://" not in html
