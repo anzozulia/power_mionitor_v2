@@ -15,6 +15,9 @@ straight to the admin chat with the ops bot, because the outbox lives in the dat
 only a worker that held the lease when the database went away sends it, and the gap
 notice follows through the outbox once the database is back. "Unreachable" is the lease
 pointed at 127.0.0.1:1 on a mutable settings copy after its session was terminated.
+WR-02 (code review): that worker may be restarted during the outage (the watchdog's
+exit 70 on a frozen database); its container's held marker lets the new process send the
+notice once, and a standby or a stale marker sends nothing.
 
 C1 (wave 3 audit): a worker whose lease session is gone claims and sends no outbox row, of
 either channel, even while its last published status still says HELD and another worker
@@ -87,6 +90,7 @@ from powermon.alerts.models import OpsIncident, OutboxMessage
 from powermon.engine import lapse, timeline, transitions
 from powermon.engine.models import PowerInterval, SystemState
 from powermon.worker import detection, io_loop, supervision
+from powermon.worker import lease as lease_module
 from powermon.worker.lease import Lease, LeaseState, LeaseStatus
 from powermon.worker.management.commands import run_worker
 
@@ -915,8 +919,9 @@ def test_INV13_db_down_over_5_min_one_direct_notice_then_gap_notice(
 def test_db_down_notice_only_from_a_worker_that_held_the_lease(
     ops_settings: Any, fake_telegram: Any
 ) -> None:
-    # A standby, or a worker restarted during the outage: it never held the lease, so it
-    # has no down timer and never reports the outage, however long it lasts (D-11 #2).
+    # A process that never held the lease and has no record that its container did (a
+    # standby): it has no down timer and never reports the outage, however long it lasts
+    # (D-11 #2). A restarted worker that held it is WR-02, below.
     settings_dict = dict(connection.settings_dict)
     _point_away(settings_dict)
     clock = FakeClock(T0)
@@ -937,6 +942,79 @@ def test_db_down_notice_only_from_a_worker_that_held_the_lease(
 
     assert len(fake_telegram.calls) == 0
     assert state.db_down_notified is False
+
+
+# WR-02 (code review): the worker that held the lease may be restarted during the outage:
+# the watchdog's exit 70 on a frozen database, an OOM kill, a container restart. Its new
+# process never held the lease, but a container-local marker (``lease.HELD_MARKER``)
+# records when the container last did, and a recent one starts the down timer from then.
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("before", "restart_after_s", "notified"),
+    [("held", 70, True), ("nothing", 70, False), ("standby", 70, False), ("held", 301, False)],
+    ids=["held", "no-marker", "standby", "stale-marker"],
+)
+def test_WR02_a_restarted_worker_that_held_the_lease_sends_the_notice_once(
+    leases: Callable[[FakeClock], Lease],
+    ops_settings: Any,
+    kyiv: Any,
+    fake_telegram: Any,
+    tmp_path: Path,
+    before: str,
+    restart_after_s: int,
+    notified: bool,
+) -> None:
+    fake_telegram.accept(OPS_BOT_TOKEN)
+    marker = tmp_path / "powermon-worker.held"
+    clock = FakeClock(T0)
+    if before in ("held", "standby"):
+        # This container's previous process held the lock in a cycle at T0, then ended
+        # without noticing the outage (it hung on the frozen database).
+        previous = Lease(dict(connection.settings_dict), clock, held_marker=marker)
+        try:
+            assert previous.ensure_held().state == "held"
+        finally:
+            previous.close()
+    if before == "standby":
+        # Then another worker took the lock, and this container waited as a standby.
+        assert leases(clock).ensure_held().state == "held"
+        standby = Lease(dict(connection.settings_dict), clock, held_marker=marker)
+        try:
+            assert standby.ensure_held().state == "standby"
+        finally:
+            standby.close()
+
+    # Docker restarts the process; the database is still unreachable.
+    clock.advance(seconds=restart_after_s)
+    settings_dict = dict(connection.settings_dict)
+    _point_away(settings_dict)
+    restarted = Lease(settings_dict, clock, held_marker=marker)
+    state = io_loop.RelayState()
+    sent_at = []
+    try:
+        status = restarted.ensure_held()
+        assert (status.state, status.generation) == ("db_down", 0)
+        assert status.down_since == (T0 if notified else None)
+        # Ten minutes of the outage, one I/O-thread iteration every 10 s.
+        for _ in range(60):
+            if io_loop.notify_db_down(restarted.ensure_held(), clock, state):
+                sent_at.append(clock.now())
+            clock.advance(seconds=10)
+    finally:
+        restarted.close()
+
+    if notified:
+        # Once, as soon as the database has been unreachable for over 5 min since T0.
+        assert sent_at == [T0 + _seconds(310)]
+        assert fake_telegram.sent == [
+            {"chat_id": OPS_CHAT_ID, "text": _db_down_text("13:00:00"), "parse_mode": "HTML"}
+        ]
+    else:
+        assert (sent_at, len(fake_telegram.calls)) == ([], 0)
+    # Within that age the worker that held the lock cannot have sent the notice itself.
+    assert lease_module.HELD_MARKER_MAX_AGE_S == io_loop.DB_DOWN_NOTICE_AFTER_S
 
 
 def test_db_down_notice_logged_when_the_ops_chat_is_not_configured(

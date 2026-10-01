@@ -54,6 +54,7 @@ from powermon.alerts.models import OutboxMessage
 from powermon.engine import transitions
 from powermon.engine.models import LocationState, SystemState
 from powermon.worker import detection, io_loop, supervision
+from powermon.worker import lease as lease_module
 from powermon.worker.lease import Lease
 from powermon.worker.management.commands import run_worker
 
@@ -898,6 +899,10 @@ def test_run_worker_stops_on_sigterm_and_exits_0(
     assert set(handlers) == {signal.SIGTERM, signal.SIGINT}
     assert seen["stopped"] is True
     assert isinstance(seen["lease"], Lease)
+    # The container-local record of the last held cycle (WR-02): /tmp survives a restart
+    # of the worker container and is never shared with another container.
+    assert seen["lease"].held_marker == lease_module.HELD_MARKER
+    assert lease_module.HELD_MARKER == Path("/tmp/powermon-worker.held")  # noqa: S108
     # The worker's session settings are in place before serve opens any connection.
     assert seen["max_age"] is None
     assert seen["options"]["options"] == django_settings.WORKER_PG_OPTIONS

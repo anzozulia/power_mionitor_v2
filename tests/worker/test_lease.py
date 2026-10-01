@@ -8,7 +8,9 @@ PostgreSQL:
 - a held session is never locked again: session locks stack, so one unlock must free it;
 - a terminated lease session is replaced in the same call, with a new generation and no
   exception, as a database restart needs (MON-06; D-15 replaces Phase 1's exit 3);
-- the DB-down timer starts only when this process loses a lease it held (D-11 #2);
+- the DB-down timer starts only when this process loses a lease it held (D-11 #2), or,
+  in a process restarted during the outage, at the last held cycle its container's
+  marker records, when that is under 5 min old (WR-02);
 - one WARNING per run of database errors, one when the database answers again (D-16);
 - the session carries the server-side keepalive GUCs that make PostgreSQL drop a
   partitioned zombie holder in about 11 s (RESEARCH Pitfall 1);
@@ -28,6 +30,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import psycopg
@@ -48,11 +51,18 @@ MakeLease = Callable[..., Lease]
 
 @pytest.fixture
 def leases() -> Iterator[MakeLease]:
-    """``new(settings_dict=None, clock=None) -> Lease``; every lease is closed afterwards."""
+    """``new(settings_dict=None, clock=None, **kwargs) -> Lease``; every lease is closed after.
+
+    ``kwargs`` go to ``Lease`` (``held_marker``).
+    """
     made: list[Lease] = []
 
-    def new(settings_dict: Mapping[str, Any] | None = None, clock: Any = None) -> Lease:
-        lease = Lease(connection.settings_dict if settings_dict is None else settings_dict, clock)
+    def new(
+        settings_dict: Mapping[str, Any] | None = None, clock: Any = None, **kwargs: Any
+    ) -> Lease:
+        lease = Lease(
+            connection.settings_dict if settings_dict is None else settings_dict, clock, **kwargs
+        )
         made.append(lease)
         return lease
 
@@ -376,3 +386,56 @@ def test_lease_repr_shows_only_the_pid(leases: MakeLease) -> None:
     assert repr(lease) == f"Lease(pid={lease.pid})"
     for detail in (s["HOST"], s["USER"], s["PASSWORD"], s["NAME"]):
         assert str(detail) not in repr(lease)
+
+
+# WR-02 (code review): a container-local marker of when this container last held the lock
+
+
+@pytest.mark.django_db(transaction=True)
+def test_WR02_the_held_marker_records_the_last_held_cycle(
+    leases: MakeLease, tmp_path: Path
+) -> None:
+    marker = tmp_path / "held"
+    clock = FakeClock(T0)
+    lease = leases(clock=clock, held_marker=marker)
+    assert lease.held_marker == marker
+    assert lease.ensure_held().state == "held"
+    clock.advance(seconds=5)
+    assert lease.ensure_held().state == "held"
+    lease.close()
+
+    # A process started 60 s later finds the database unreachable: its down timer starts
+    # at the container's last held cycle, in wall-clock and in monotonic time.
+    clock.advance(seconds=60)
+    status = leases(_unreachable(), clock, held_marker=marker).ensure_held()
+    assert (status.state, status.generation) == ("db_down", 0)
+    assert (status.down_since, status.down_since_mono) == (T0 + timedelta(seconds=5), 5.0)
+
+    # A standby result removes the marker: this container is no longer the active worker.
+    assert leases().ensure_held().state == "held"
+    assert leases(clock=clock, held_marker=marker).ensure_held().state == "standby"
+    assert not marker.exists()
+    later = leases(_unreachable(), clock, held_marker=marker).ensure_held()
+    assert (later.state, later.down_since, later.down_since_mono) == ("db_down", None, None)
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("marker_state", ["unwritable", "garbage", "naive", "future"])
+def test_WR02_an_unusable_held_marker_never_raises_and_starts_no_timer(
+    leases: MakeLease, tmp_path: Path, marker_state: str
+) -> None:
+    marker = tmp_path / "held"
+    clock = FakeClock(T0)
+    if marker_state == "unwritable":
+        marker = tmp_path / "missing-directory" / "held"
+        assert leases(clock=clock, held_marker=marker).ensure_held().state == "held"
+    elif marker_state == "future":
+        # Written by a clock an hour ahead (a later backward step): not a recent hold.
+        ahead = FakeClock(T0 + timedelta(hours=1))
+        assert leases(clock=ahead, held_marker=marker).ensure_held().state == "held"
+    else:
+        marker.write_text("not a time" if marker_state == "garbage" else "2026-10-01T10:06:31")
+
+    clock.advance(seconds=10)
+    status = leases(_unreachable(), clock, held_marker=marker).ensure_held()
+    assert (status.state, status.down_since, status.down_since_mono) == ("db_down", None, None)
