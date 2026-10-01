@@ -6,7 +6,10 @@ expiry (ALRT-03), the subscriber heads, then at most one ops row. For each locat
 looks only at the oldest open row (``outbox.subscriber_heads``), so OFF always goes before
 ON. A due row is rendered at send time in the location's current language, claimed with
 one conditional UPDATE (committed at once, Django autocommit), and sent with no
-transaction open.
+transaction open. In the worker the claim also names the lease session of the HELD
+status the pass runs under (``RelayState.lease_pid``) and succeeds only while that
+session holds the worker lock: a worker that lost its session claims nothing, even
+before its detection loop notices and while another worker holds the lock (C1).
 
 After every subscriber head of the pass, and only when an ops chat is configured, the
 pass sends at most one ops notice: the oldest open row of the ops queue
@@ -91,6 +94,20 @@ A database error stops the flush and propagates: the pass (or the activation) en
 retried on a replaced connection. Only database errors are kept: any other error is a bug,
 logged by class name, and the row waits for activation as before. The flush runs before
 any head, so a head with a kept outcome is never seen by the same process.
+
+The database-down notice (D-11 #2, INV-13 #2, OPS-02) is the one notice that cannot go
+through the outbox, because the outbox lives in the database. ``notify_db_down`` runs on
+every iteration of the I/O thread with the lease status the detection loop published.
+Once the database has been unreachable for more than DB_DOWN_NOTICE_AFTER_S (300 s,
+strict) since this process lost a lease it held (``LeaseStatus.down_since_mono``, set
+only then), it sends one notice straight to the admin chat with the ops bot, or logs it
+once at WARNING when no ops chat is configured (D-09). A process that never held the
+lease (a standby, a worker restarted during the outage) has no down timer and stays
+silent. A refused, 5xx or 429 send backs off under the admin chat's key (``ops_key``) and
+is tried again; an accepted, ambiguous (never resent, INV-16) or permanently refused one
+ends it for this outage. The flag resets as soon as the lease is HELD or STANDBY again,
+when the database answers; the monitoring-gap notice then reports the outage through the
+outbox. Nothing in this path touches the database.
 """
 
 import hashlib
@@ -103,12 +120,13 @@ from datetime import datetime, timedelta
 from django.conf import settings
 from django.db import Error, close_old_connections, transaction
 
-from powermon.alerts import ops, outbox
+from powermon.alerts import ops, ops_texts, outbox
 from powermon.alerts.models import OutboxMessage
 from powermon.alerts.texts import render_alert
 from powermon.clock import Clock
 from powermon.i18n import times
 from powermon.telegram.client import DEFAULT_RETRY_AFTER_S, SendResult, TelegramClient
+from powermon.worker.lease import LeaseState, LeaseStatus
 
 log = logging.getLogger(__name__)
 
@@ -120,6 +138,9 @@ PERMANENT_BACKOFF = timedelta(minutes=15)
 MAX_RETRY_AFTER_S = 3600
 # An alert sent later than this after it was recorded states its event time (D-07).
 LATE_AFTER = timedelta(seconds=120)
+# The direct database-down notice goes out once the database has been unreachable for
+# longer than this, in monotonic seconds since the lease was lost (D-11 #2).
+DB_DOWN_NOTICE_AFTER_S = 300
 # Which payload value holds the previous state's duration for each alert kind.
 _DURATION_KEYS = {outbox.KIND_POWER_OFF: "was_on_us", outbox.KIND_POWER_ON: "was_off_us"}
 
@@ -146,10 +167,17 @@ class RelayState:
 
     ``not_before``: when each bot may be called again. ``unapplied``: outcomes kept after
     a database error, by row id, written before the next claim (WR-04).
+    ``db_down_notified``: this database outage's direct notice is done (D-11 #2).
+    ``lease_pid``: the lease session of the HELD status the next pass runs under, set by
+    the I/O thread before every pass; every claim requires that session to hold the
+    worker lock, so a worker whose session is gone claims nothing (C1). None (a direct
+    call, as in tests) claims unfenced.
     """
 
     not_before: dict[str, datetime] = field(default_factory=dict)
     unapplied: dict[int, Unapplied] = field(default_factory=dict)
+    db_down_notified: bool = False
+    lease_pid: int | None = None
 
 
 def bot_key(token: str) -> str:
@@ -201,7 +229,8 @@ def run_iteration(
     watchdog's progress stamp) runs after every subscriber head, whether it was sent,
     skipped or failed, and after the ops step, so a long pass still shows progress. A
     database error in the flush or in expiry ends the pass before any claim and
-    propagates to the caller.
+    propagates to the caller. Every claim of the pass names ``state.lease_pid`` when it
+    is set (C1).
     """
     close_old_connections()
     # Outcomes kept after a DB error are written before any new claim (WR-04).
@@ -230,6 +259,54 @@ def run_iteration(
         if tick is not None:
             tick()
     return attempted
+
+
+def notify_db_down(status: LeaseStatus, clock: Clock, state: RelayState) -> bool:
+    """Tell the admin, once per outage, that the database is unreachable (D-11 #2).
+
+    Called on every I/O-thread iteration with the published lease status; True when a
+    send was attempted. Any status but DB_DOWN means the database answered, so the next
+    outage gets its own notice. Sent only when this process lost a lease it held more
+    than DB_DOWN_NOTICE_AFTER_S ago (strict), with the ops bot to the ops chat only, or
+    logged once at WARNING without an ops chat (D-09). Uses no database: the outbox is
+    out of reach, and the text comes from the lease's down time alone (OPS-08).
+    """
+    if status.state is not LeaseState.DB_DOWN:
+        state.db_down_notified = False
+        return False
+    if state.db_down_notified or status.down_since is None or status.down_since_mono is None:
+        return False
+    if clock.monotonic() - status.down_since_mono <= DB_DOWN_NOTICE_AFTER_S:
+        return False
+    now = clock.now()
+    text = ops_texts.db_down(status.down_since, now, settings.CFG.display_tz)
+    token = settings.CFG.ops_bot_token
+    chat_id = settings.CFG.ops_chat_id
+    if not token or chat_id is None:
+        log.warning("ops notice (ops chat not configured): %s", text)
+        state.db_down_notified = True
+        return False
+    key = ops_key(token)
+    # The admin chat's own backoff, or the bot's when a location shares it (B1).
+    if max(state.not_before.get(key, now), state.not_before.get(bot_key(token), now)) > now:
+        return False
+    result = TelegramClient(token).send_message(chat_id, text)
+    if result.kind in ("ok", "maybe_delivered"):
+        # An ambiguous send may have reached the admin: never repeated (INV-16).
+        state.db_down_notified = True
+    elif result.kind == "permanent":
+        log.warning(
+            "relay: permanent error %s for the ops chat; the database-down notice is not resent",
+            result.code,
+        )
+        state.db_down_notified = True
+    else:  # not_sent, transient or rate_limited: nothing was delivered, try again later
+        wait = BACKOFF_CAP_S
+        if result.kind == "rate_limited":
+            wait = min(result.retry_after or DEFAULT_RETRY_AFTER_S, MAX_RETRY_AFTER_S)
+        # The send may have blocked for seconds: the wait counts from its answer.
+        state.not_before[key] = clock.now() + timedelta(seconds=wait)
+    return True
 
 
 def _expire(now: datetime) -> int:
@@ -317,13 +394,16 @@ def _send(
 ) -> bool:
     """Claim, send and record one row of either channel; True if the request was made.
 
-    From the claim on, no error leaves the row "sending" for good (WR-04, D-13): a
-    database error keeps what is known in ``state.unapplied``, and an error before the
-    HTTP call puts the row back to "pending".
+    The claim names ``state.lease_pid`` when it is set: it fails, and nothing is sent,
+    once that lease session no longer holds the worker lock (C1). From the claim on, no
+    error leaves the row "sending" for good (WR-04, D-13): a database error keeps what is
+    known in ``state.unapplied``, and an error before the HTTP call puts the row back to
+    "pending".
     """
     attempts = row.attempts + 1
+    lease_pid = state.lease_pid
     try:
-        claimed = outbox.claim(row.pk)
+        claimed = outbox.claim(row.pk) if lease_pid is None else outbox.claim(row.pk, lease_pid)
     except Error as exc:
         # The claim may or may not have committed; either way no request was made.
         state.unapplied[row.pk] = Unapplied(row, attempts, None, clock.now(), key)

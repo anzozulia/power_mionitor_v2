@@ -11,7 +11,10 @@ PostgreSQL:
 - the DB-down timer starts only when this process loses a lease it held (D-11 #2);
 - one WARNING per run of database errors, one when the database answers again (D-16);
 - the session carries the server-side keepalive GUCs that make PostgreSQL drop a
-  partitioned zombie holder in about 11 s (RESEARCH Pitfall 1).
+  partitioned zombie holder in about 11 s (RESEARCH Pitfall 1);
+- C1 (wave 3 audit): a HELD status names the lease session's backend pid, which the
+  relay's claim requires to hold the lock, and a lost session is published as DB_DOWN
+  before the reconnect, so no loop acts on HELD while the lease reconnects.
 
 Every test that reaches the database is ``django_db(transaction=True)``: the lease's own
 connection must see locks outside any test transaction, and the test database's name is
@@ -24,7 +27,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import psycopg
@@ -310,6 +313,58 @@ def test_current_publishes_without_io(leases: MakeLease, monkeypatch: pytest.Mon
 
     assert not caller.is_alive()
     assert other.current().state == "db_down"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_C1_a_held_status_names_the_lease_session(leases: MakeLease) -> None:
+    holder = leases()
+    standby = leases()
+
+    held = holder.ensure_held()
+    assert isinstance(held.pid, int)
+    assert held.pid == holder.pid
+    assert holder.current().pid == holder.pid
+    # Only a session that holds the lock is named: the relay's claim requires it (C1).
+    assert standby.ensure_held().pid is None
+    assert leases(_unreachable()).ensure_held().pid is None
+    holder.close()
+    assert holder.current().pid is None
+
+
+@pytest.mark.django_db(transaction=True)
+def test_C1_a_lost_session_is_published_before_the_reconnect(
+    leases: MakeLease, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock(T0)
+    lease = leases(clock=clock)
+    assert lease.ensure_held().state == "held"
+    assert terminate_backends(LEASE_APPLICATION_NAME) == 1
+    clock.advance(seconds=5)
+
+    # The reconnect waits for its connect_timeout (up to 5 s) and the try after it.
+    entered, release = threading.Event(), threading.Event()
+
+    def blocked_connect() -> psycopg.Connection[Any]:
+        entered.set()
+        release.wait(10)
+        raise psycopg.OperationalError("simulated connect timeout")
+
+    monkeypatch.setattr(lease, "_connect", blocked_connect)
+    caller = threading.Thread(target=lease.ensure_held, name="lease-caller")
+    caller.start()
+    try:
+        assert entered.wait(5)
+        # Meanwhile the I/O thread must not see HELD: another worker may hold the lock now.
+        meanwhile = lease.current()
+        assert (meanwhile.state, meanwhile.generation) == ("db_down", 1)
+        assert (meanwhile.down_since, meanwhile.down_since_mono) == (T0 + timedelta(seconds=5), 5.0)
+        assert meanwhile.pid is None
+    finally:
+        release.set()
+        caller.join(5)
+
+    assert not caller.is_alive()
+    assert lease.current().state == "db_down"
 
 
 @pytest.mark.django_db(transaction=True)

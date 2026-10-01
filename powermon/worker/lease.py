@@ -38,6 +38,18 @@ can carry the host, the port and the user, OPS-08): one when the session is lost
 run of connect errors, and one when the database answers again (D-16). ``current()``
 returns the last published status without I/O and without the lease's mutex, so the I/O
 thread can read it while a reconnect waits for its connect_timeout.
+
+A published status can be stale: the session may die between two ``ensure_held()``
+calls, and another worker may take the lock before this process looks again (C1). Two
+things keep a stale HELD from acting:
+
+- a HELD status names its session's backend ``pid``, and the relay's claim
+  (``powermon.alerts.outbox.claim``) succeeds only while that very session holds the lock
+  in ``pg_locks``. A worker whose session is gone claims nothing, whatever its status
+  says, so it cannot send an ON before another worker's OFF (INV-15) or make the admin
+  get a false "may not have been delivered" notice;
+- a lost session is published as DB_DOWN at once, before the reconnect, so the loops stop
+  for the whole reconnect (connect_timeout and the try after it).
 """
 
 import contextlib
@@ -87,6 +99,9 @@ class LeaseStatus:
     # Set only on a HELD -> DB_DOWN loss in this process; cleared once the DB answers.
     down_since: datetime | None
     down_since_mono: float | None
+    # HELD only: the lock session's backend pid. Every claim of the relay requires this
+    # session to hold the lock (C1); None in any other state.
+    pid: int | None = None
 
 
 class Lease:
@@ -177,14 +192,20 @@ class Lease:
         return self._status(LeaseState.STANDBY)
 
     def _lose(self, exc: psycopg.Error) -> None:
-        """The held session is gone: drop it and start the down timer (D-11 #2)."""
+        """The held session is gone: drop it and start the down timer (D-11 #2).
+
+        Published at once (C1): during the reconnect that follows, the loops must not act
+        on the HELD status, because another worker may already hold the lock.
+        """
         self._drop()
         self._down_since = self._clock.now()
         self._down_since_mono = self._clock.monotonic()
+        self._published = self._status(LeaseState.DB_DOWN)
         log.warning("worker lock: lease session lost (%s)", type(exc).__name__)
 
     def _status(self, state: LeaseState) -> LeaseStatus:
-        return LeaseStatus(state, self._generation, self._down_since, self._down_since_mono)
+        pid = self.pid if state is LeaseState.HELD else None
+        return LeaseStatus(state, self._generation, self._down_since, self._down_since_mono, pid)
 
     def _drop(self) -> None:
         conn, self._conn = self._conn, None

@@ -18,6 +18,15 @@ resent, and queues exactly one "may not have been delivered" notice in the same
 transaction. An ops row in the same situation is only logged, so a broken admin chat
 cannot loop (the D-08 rule).
 
+``open_incident`` and ``close_incident`` make "exactly one notice per incident" a database
+fact, not a code convention (D-11, ARCHITECTURE Pattern 10). Opening is
+``INSERT ... ON CONFLICT DO NOTHING RETURNING id`` against the partial unique index
+``ops_incident_one_open`` (one open incident per kind and location, a NULL location
+counted as one value): a second opener gets no row back. Closing is an UPDATE conditional
+on the incident still being open: only the closer whose row count is 1 may send the
+recovery notice. The caller sends the notice in the same transaction, so a concurrent or
+repeated evaluation can neither add a second notice nor lose one.
+
 Every function runs inside the caller's transaction or opens its own. Nothing here does
 network I/O, and nothing here hides a database error: it reaches the caller, whose
 transaction then fails where its error handling can see it.
@@ -37,6 +46,16 @@ log = logging.getLogger(__name__)
 
 EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _ONE_US = timedelta(microseconds=1)
+
+# A second open incident of the same kind and location conflicts with the partial unique
+# index ops_incident_one_open, and then no row comes back (RESEARCH spike 8).
+OPEN_INCIDENT_SQL = """
+INSERT INTO ops_incident (kind, location_id, started_at, ended_at, details)
+VALUES (%s, %s, %s, NULL, '{}'::jsonb)
+ON CONFLICT DO NOTHING RETURNING id
+"""
+# Only an open incident closes: a second close changes no row.
+CLOSE_INCIDENT_SQL = "UPDATE ops_incident SET ended_at = %s WHERE id = %s AND ended_at IS NULL"
 
 
 def instant_us(dt: datetime) -> int:
@@ -208,6 +227,30 @@ def recover_interrupted(now: datetime) -> int:
             else:
                 log.warning("ops notice %s was interrupted while sending; it is not resent", ref.id)
     return len(rows)
+
+
+def open_incident(kind: str, started_at: datetime, *, location_id: int | None = None) -> int | None:
+    """Open an incident ``[started_at, open)``; its id, or None if one is already open.
+
+    Runs on the caller's connection, inside its transaction: send the start notice in the
+    same transaction, and only when an id came back. A concurrent opener of the same kind
+    and location waits for this transaction and then gets None (D-11).
+    """
+    with connection.cursor() as cur:
+        cur.execute(OPEN_INCIDENT_SQL, [kind, location_id, started_at])
+        row = cur.fetchone()
+    return None if row is None else int(row[0])
+
+
+def close_incident(incident_id: int, ended_at: datetime) -> bool:
+    """Close an open incident at ``ended_at``; False if it was already closed (or is gone).
+
+    Runs on the caller's connection, inside its transaction: send the recovery notice in
+    the same transaction, and only when this returned True (D-11).
+    """
+    with connection.cursor() as cur:
+        cur.execute(CLOSE_INCIDENT_SQL, [ended_at, incident_id])
+        return cur.rowcount == 1
 
 
 def _int(payload: object, key: str) -> int:

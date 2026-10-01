@@ -9,13 +9,20 @@ One process, three threads, all started at once and always running:
 - ``telegram-io``: reads the status the detection loop last published
   (``lease.current()``). While HELD it drains the outbox (``io_loop.run_iteration``) back
   to back while there is work, waiting IO_IDLE_WAIT_S seconds after a pass that sent
-  nothing; otherwise it idles.
+  nothing; otherwise it idles. On every iteration it also hands the status to
+  ``io_loop.notify_db_down``: once the database has been unreachable for over 5 min
+  since this process lost a lease it held, the admin gets one notice straight from the
+  ops bot, because the outbox lives in the database (D-11 #2, INV-13 #2).
 - main: the watchdog (below), until SIGTERM or SIGINT.
 
 The lease is HELD, STANDBY or DB_DOWN, with a generation counter that rises on every
 successful acquisition (``powermon.worker.lease``). A lost lease session is reacquired in
 process on a fresh connection, and a standby never blocks, never exits and never writes
 or sends (MON-04). This replaces Phase 1's exit with code 3 (D-15 replaces Phase 1 D-18).
+The status the I/O thread reads can be up to one detection interval old, so its passes
+name the lease session of that HELD status (``LeaseStatus.pid``) and every claim requires
+that session to hold the lock: a worker whose session was lost sends nothing more, even
+while another worker already holds the lock (C1).
 
 Every gap in monitoring is recorded once (D-04, MON-05, OPS-02). The detection loop keeps
 one ``CycleTracker`` and passes it, with the lease generation, to every cycle. Each cycle
@@ -193,10 +200,16 @@ def io_thread(
             busy = False
             try:
                 status = lease.current()
+                # D-11 #2: the direct notice while the database stays unreachable; it
+                # resets itself when the lease is HELD or STANDBY again.
+                busy = io_loop.notify_db_down(status, clock, state)
                 if status.state is LeaseState.HELD:
                     if status.generation != activated:
                         io_loop.activate(state, clock)
                         activated = status.generation
+                    # Every claim names the lease session: once it is gone, nothing more
+                    # is claimed, even before the detection loop notices (C1).
+                    state.lease_pid = status.pid
                     busy = io_loop.run_iteration(clock, state, stop, tick=tick)
                     outage.ok()
             except _DB_ERRORS as exc:
