@@ -169,6 +169,9 @@ def test_commands_are_exec_form_and_gunicorn_flags(env: str) -> None:
     web = services["web"]["command"]
 
     assert web[0] == "gunicorn"
+    # Redacted UTC gunicorn.error lines and the once-per-container web start (D-16, MON-05).
+    assert _flag_value(web, "powermon.wsgi") == "--config"
+    assert _flag_value(web, "--config") == "python:powermon.web.gunicorn_conf"
     assert "--no-control-socket" in web
     # gunicorn's worker heartbeat dir on tmpfs (a flag value, not a temp file we write).
     assert _flag_value(web, "--worker-tmp-dir") == "/dev/shm"  # noqa: S108

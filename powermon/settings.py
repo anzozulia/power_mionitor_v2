@@ -81,6 +81,13 @@ TEMPLATES = [
     },
 ]
 
+# D-16: every session is bounded, so a partitioned or slow database surfaces as an error,
+# never as a silent hang. Without tcp_user_timeout a query with unacknowledged data waits
+# for ~15 min of kernel retransmits; with it plus keepalives 10/5/3 the spike saw the error
+# after 10.45 s (RESEARCH Pattern 11, Pitfall 2). Web statements stop at 5 s. The OPTIONS
+# keys go straight to psycopg.connect. `manage.py release` lifts the statement cap for
+# migrations (Pitfall 7).
+#
 # Build mode (collectstatic in the Dockerfile) has no database at all.
 DATABASES: dict[str, dict[str, Any]] = (
     {}
@@ -98,13 +105,20 @@ DATABASES: dict[str, dict[str, Any]] = (
             "OPTIONS": {
                 "connect_timeout": 5,
                 "keepalives": 1,
-                "keepalives_idle": 30,
-                "keepalives_interval": 10,
+                "keepalives_idle": 10,
+                "keepalives_interval": 5,
                 "keepalives_count": 3,
-                "options": "-c idle_in_transaction_session_timeout=60000",
+                "tcp_user_timeout": 10000,
+                "options": "-c statement_timeout=5000 -c idle_in_transaction_session_timeout=60000",
             },
         }
     }
+)
+
+# The worker's session options (D-16). run_worker puts them into OPTIONS["options"], with
+# CONN_MAX_AGE None, before any worker connection opens (02-05).
+WORKER_PG_OPTIONS = (
+    "-c statement_timeout=10000 -c lock_timeout=5000 -c idle_in_transaction_session_timeout=60000"
 )
 
 # Security. Caddy terminates TLS and overwrites X-Forwarded-* from clients; the web
@@ -135,5 +149,6 @@ LOGOUT_REDIRECT_URL = "login"
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
-# stdout only, through the redacting formatter; urllib3 and django.db.backends at WARNING.
-LOGGING = logging_setup.LOGGING
+# stdout only, through the redacting formatter, with UTC ISO 8601 timestamps (IN-03).
+# LOG_LEVEL sets root and django; urllib3 and django.db.backends stay at WARNING (D-16).
+LOGGING = logging_setup.build_logging(CFG.log_level)
