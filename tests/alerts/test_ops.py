@@ -38,7 +38,6 @@ import powermon
 from powermon.alerts import ops, outbox
 from powermon.alerts.models import OutboxMessage
 from powermon.worker import io_loop
-from powermon.worker.management.commands import run_worker
 
 TOKEN_A = DEFAULT_BOT_TOKEN
 TOKEN_B = "987654321:" + "B" * 35
@@ -54,7 +53,6 @@ UNCERTAIN_OFF = (
 )
 OPS_LOGGER = "powermon.alerts.ops"
 RELAY_LOGGER = "powermon.worker.io_loop"
-WORKER_LOGGER = "powermon.worker.management.commands.run_worker"
 GAP_SAMPLE = "⏸ Monitoring gap 01.10 10:00:12 – 10:10:40 (10m 28s)"
 
 
@@ -709,23 +707,21 @@ def test_recover_interrupted_notifies_once_per_subscriber_row(
 
 
 @pytest.mark.django_db(transaction=True)
-def test_run_worker_activation_turns_interrupted_sends_into_one_notice(
+def test_io_activation_turns_interrupted_sends_into_one_notice(
     location_factory: Callable[..., Any], no_ops_chat: Any, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # 02-05 moves this recovery into io_loop.activate and ports this test there.
+    # The I/O thread runs this once per lease generation (02-05).
     off = _queue(location_factory())
     OutboxMessage.objects.filter(pk=off.pk).update(status="sending", attempts=1)
     caplog.set_level(logging.INFO)
 
-    run_worker.activate(T0 + timedelta(hours=1))
+    assert io_loop.activate(io_loop.RelayState(), FakeClock(T0 + timedelta(hours=1))) == 1
 
     assert (_row(off).status, _row(off).last_error) == ("uncertain", "interrupted")
     assert _ops_rows() == []
     [line] = _ops_lines(caplog)
     assert line.startswith("ops notice (ops chat not configured): ❓ OFF alert for Test location")
     assert "(the worker stopped while sending it)" in line
-    worker = [r.getMessage() for r in caplog.records if r.name == WORKER_LOGGER]
-    assert any("1 interrupted send(s) marked uncertain" in m for m in worker)
 
 
 # A broken admin chat never delays subscribers (INV-20 #2, ALRT-06)
