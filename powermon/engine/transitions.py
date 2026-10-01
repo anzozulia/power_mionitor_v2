@@ -22,6 +22,17 @@ from django.db.backends.utils import CursorWrapper
 from powermon.alerts import outbox
 from powermon.engine import rules, timeline
 
+# off -> on: the first heartbeat after an outage (MON-03). RETURNING gives the stored
+# outage start for "was OFF for"; the UPDATE must not clear it, or RETURNING sees NULL.
+RESTORE_SQL = """
+UPDATE location_state
+   SET status = 'on', on_since = %(now)s,
+       last_heartbeat_at = GREATEST(last_heartbeat_at, %(now)s),
+       state_version = state_version + 1
+ WHERE location_id = %(id)s AND status = 'off'
+RETURNING outage_started_at
+"""
+
 # waiting -> on: the first heartbeat starts monitoring, silently (MON-01).
 FIRST_SQL = """
 UPDATE location_state
@@ -81,11 +92,33 @@ def _config_row(cur: CursorWrapper, location_id: int) -> tuple[bool, bool]:
 def record_heartbeat(location_id: int, now: datetime) -> str:
     """Apply one accepted heartbeat that the server received at ``now``.
 
-    Returns "started" (waiting -> on), "plain" (already on) or "ignored" (no state row in
-    a status this function handles yet).
+    The gates run in the order RESTORE, FIRST, PLAIN, each a conditional UPDATE, all in
+    one transaction with no network I/O (INV-01). Returns "restored" (off -> on, with one
+    power_on alert queued when alerts are on), "started" (waiting -> on, silent), "plain"
+    (already on) or "ignored" (no state row for this location).
     """
     params: dict[str, int | datetime] = {"id": location_id, "now": now}
     with transaction.atomic(), connection.cursor() as cur:
+        cur.execute(RESTORE_SQL, params)
+        restored = cur.fetchone()
+        if restored is not None:
+            (outage_started_at,) = restored
+            maintenance, alerts_enabled = _config_row(cur, location_id)
+            # Closes the off interval at ``now``. A restore dated before the outage start
+            # would close it before its start: the CHECK rejects that and the whole
+            # transaction rolls back, so nothing is half-written.
+            timeline.set_open_state(
+                cur, location_id, now, rules.desired_open_state("on", maintenance)
+            )
+            if alerts_enabled:
+                outbox.enqueue(
+                    outbox.KIND_POWER_ON,
+                    location_id,
+                    event_at=now,
+                    recorded_at=now,
+                    payload={"was_off_us": _us(now - outage_started_at)},
+                )
+            return "restored"
         cur.execute(FIRST_SQL, params)
         if cur.rowcount == 1:
             # MON-01 stays silent: the timeline opens, no outbox row is written.
