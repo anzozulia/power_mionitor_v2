@@ -64,7 +64,8 @@ def _unreachable() -> dict[str, Any]:
 
 
 def _reachable_again(settings_dict: dict[str, Any]) -> None:
-    settings_dict.update(HOST=connection.settings_dict["HOST"], PORT=connection.settings_dict["PORT"])
+    real = connection.settings_dict
+    settings_dict.update(HOST=real["HOST"], PORT=real["PORT"])
 
 
 def _session(lease: Lease) -> psycopg.Connection[Any]:
