@@ -30,6 +30,7 @@ deterministic, never a ``time.sleep`` race (RESEARCH Pitfall 8):
 All times are fixed aware datetimes on 2026-10-01 UTC.
 """
 
+import logging
 import threading
 import time
 from collections.abc import Callable
@@ -195,9 +196,12 @@ def test_MON04_WR01_heartbeat_during_off_cas_restores(
 
 @pytest.mark.django_db(transaction=True)
 def test_INV01_restore_racing_a_detection_cycle_one_on(
-    monkeypatch: pytest.MonkeyPatch, location_factory: Callable[..., Any]
+    monkeypatch: pytest.MonkeyPatch,
+    location_factory: Callable[..., Any],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     # Off since 10:01:00 with its OFF alert queued (on since 09:00, last heartbeat 10:01).
+    caplog.set_level(logging.ERROR, logger=detection.__name__)
     _resume_detection(_at(8, 0))
     location = location_factory()
     assert transitions.record_heartbeat(location.pk, _at(9, 0)) == "started"
@@ -223,7 +227,9 @@ def test_INV01_restore_racing_a_detection_cycle_one_on(
     assert restore.exc is None, restore.exc
     assert cycle.exc is None, cycle.exc
     assert (restore.result, cycle.result) == ("restored", 0)
-    assert _state(location).status == "on"
+    # The status, the transition time and the heartbeat time are written together (INV-01).
+    state = _state(location)
+    assert (state.status, state.on_since, state.last_heartbeat_at) == ("on", _at(13, 0), _at(13, 0))
     assert _kinds() == ["power_off", "power_on"]
     on_row = _outbox()[-1]
     assert texts.render_alert(on_row.kind, "en", on_row.payload["was_off_us"]) == (
@@ -232,6 +238,8 @@ def test_INV01_restore_racing_a_detection_cycle_one_on(
     # The next cycle sees a location that is on with a fresh heartbeat: nothing more.
     assert detection.run_cycle(_at(13, 0, 2)) == 0
     assert _kinds() == ["power_off", "power_on"]
+    # No cycle hit an error inside (run_cycle logs and skips a failing location).
+    assert [r.getMessage() for r in caplog.records if r.name == detection.__name__] == []
 
 
 # INV-02 #1: two restoring heartbeats in parallel
