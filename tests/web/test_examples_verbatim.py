@@ -20,6 +20,13 @@ from typing import Any
 import pytest
 
 from powermon.engine.models import LocationState
+from powermon.locations.examples import (
+    cron_lines,
+    curl_cmd,
+    heartbeat_url,
+    wget_busybox,
+    wget_gnu,
+)
 
 KEY = "Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4z"
 URL = "https://power.example.org/hb"
@@ -81,14 +88,6 @@ def _base_url(live_server: Any) -> str:
 def test_INV24_examples_run_verbatim(
     period_s: int, live_server: Any, location_factory: Any, tmp_path: Path
 ) -> None:
-    from powermon.locations.examples import (
-        cron_lines,
-        curl_cmd,
-        heartbeat_url,
-        wget_busybox,
-        wget_gnu,
-    )
-
     location = location_factory(period_s=period_s)
     url = heartbeat_url(_base_url(live_server))
     key = location.device_key
@@ -117,8 +116,6 @@ def test_busybox_rejects_max_redirect(
     live_server: Any, location_factory: Any, tmp_path: Path
 ) -> None:
     # Why example d exists: the GNU line, run on BusyBox, fails before sending anything.
-    from powermon.locations.examples import heartbeat_url, wget_gnu
-
     location = location_factory()
     url = heartbeat_url(_base_url(live_server))
     bb_dir = _busybox_wget(tmp_path)
@@ -137,8 +134,6 @@ def test_busybox_rejects_max_redirect(
 
 
 def test_heartbeat_url_from_base_url() -> None:
-    from powermon.locations.examples import heartbeat_url
-
     assert heartbeat_url("https://power.example.org") == URL
     assert heartbeat_url("https://power.example.org/") == URL
     assert heartbeat_url("http://localhost:8000") == "http://localhost:8000/hb"
@@ -150,15 +145,11 @@ def test_heartbeat_url_from_base_url() -> None:
     ids=["empty", "no-scheme", "path-only", "ftp"],
 )
 def test_heartbeat_url_rejects_a_base_url_that_is_not_absolute_http(base_url: str) -> None:
-    from powermon.locations.examples import heartbeat_url
-
     with pytest.raises(ValueError, match="http"):
         heartbeat_url(base_url)
 
 
 def test_curl_cmd_shapes() -> None:
-    from powermon.locations.examples import curl_cmd
-
     assert curl_cmd(URL, KEY) == CURL
     assert curl_cmd(URL, KEY, multiline=True).split("\n") == [
         "curl -fsS -m 10 -o /dev/null \\",
@@ -170,8 +161,6 @@ def test_curl_cmd_shapes() -> None:
 
 
 def test_wget_shapes() -> None:
-    from powermon.locations.examples import wget_busybox, wget_gnu
-
     assert wget_gnu(URL, KEY) == f'wget -q -O /dev/null --max-redirect=0 "{URL}?key={KEY}"'
     assert wget_busybox(URL, KEY) == f'wget -q -O /dev/null "{URL}?key={KEY}"'
 
@@ -193,23 +182,17 @@ def test_wget_shapes() -> None:
     ],
 )
 def test_cron_lines_rules(period_s: int, expected: list[str]) -> None:
-    from powermon.locations.examples import cron_lines
-
     assert cron_lines(URL, KEY, period_s) == expected
 
 
 @pytest.mark.parametrize("period_s", [9, 3601, 0, -60])
 def test_cron_lines_rejects_period_outside_10_3600(period_s: int) -> None:
-    from powermon.locations.examples import cron_lines
-
     with pytest.raises(ValueError, match="10-3600"):
         cron_lines(URL, KEY, period_s)
 
 
 @pytest.mark.parametrize("period_s", PERIODS)
 def test_key_transport_per_example(period_s: int) -> None:
-    from powermon.locations.examples import cron_lines, curl_cmd, wget_busybox, wget_gnu
-
     header_examples = [
         curl_cmd(URL, KEY),
         curl_cmd(URL, KEY, multiline=True),
