@@ -19,14 +19,15 @@ transaction. An ops row in the same situation is only logged, so a broken admin 
 cannot loop (the D-08 rule).
 
 Every function runs inside the caller's transaction or opens its own. Nothing here does
-network I/O.
+network I/O, and nothing here hides a database error: it reaches the caller, whose
+transaction then fails where its error handling can see it.
 """
 
 import logging
 from datetime import UTC, datetime, timedelta
 
 from django.conf import settings
-from django.db import transaction
+from django.db import DatabaseError, InterfaceError, connection, transaction
 
 from powermon.alerts import ops_texts, outbox
 from powermon.alerts.models import OutboxMessage
@@ -66,19 +67,34 @@ def notify(
 
     Call it inside the caller's ``transaction.atomic()``: the notice commits with the
     change it reports, or not at all. The kind and payload are checked in both modes. With
-    no ops chat configured the plain-text notice is logged at WARNING; a notice that cannot
-    be rendered is logged by its error class and never raised, because a notice must not
-    abort the caller's transition.
+    no ops chat configured the plain-text notice is logged at WARNING. A notice that cannot
+    be rendered (a missing row, a malformed payload) is logged by its error class and not
+    raised, because a broken notice must not abort the caller's transition.
+
+    A database error is never swallowed: it propagates, so the caller's transaction fails
+    loudly and is retried instead of committing nothing while the caller believes it
+    succeeded. If the render's savepoint could not be rolled back (the connection is gone),
+    Django has already doomed the caller's transaction; any render error then propagates
+    as a DatabaseError (TransactionManagementError) as well.
     """
     if settings.CFG.ops_configured:
         outbox.enqueue_ops(kind, payload=payload, recorded_at=recorded_at, location_id=location_id)
         return
     outbox.check_ops_notice(kind, payload)
     try:
-        # A savepoint, so a failed read cannot break the caller's transaction.
+        # A savepoint, so a render error leaves the caller's transaction usable.
         with transaction.atomic():
             text = render_text(kind, payload, location_id, now=recorded_at, escape=False)
+    except DatabaseError, InterfaceError:
+        # Every django.db error: the caller's own error handling must run (B3).
+        raise
     except Exception as exc:
+        if connection.needs_rollback:
+            # The rollback to the savepoint failed, so Django marked the caller's whole
+            # transaction for rollback: returning would make it commit nothing silently.
+            raise transaction.TransactionManagementError(
+                "an ops notice could not be rendered and its savepoint could not be rolled back"
+            ) from exc
         log.warning(
             "ops notice %s (ops chat not configured) could not be rendered: %s",
             kind,
