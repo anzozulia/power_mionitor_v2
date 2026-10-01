@@ -93,6 +93,20 @@ def _caddy_blocks(text: str) -> dict[str, list[str]]:
     return blocks
 
 
+def _nested_block(lines: list[str], opener: str) -> list[str]:
+    """The lines inside the one nested block that opens with the line ``opener``."""
+    assert lines.count(opener) == 1, f"expected exactly one {opener!r} line"
+    inner: list[str] = []
+    depth = 1
+    for line in lines[lines.index(opener) + 1 :]:
+        bare = _PLACEHOLDER_RE.sub("ENV", line)
+        depth += bare.count("{") - bare.count("}")
+        if depth <= 0:
+            return inner
+        inner.append(line)
+    raise AssertionError(f"{opener!r} has no closing brace")
+
+
 # Exposure (SEC-02, INV-22 #1)
 
 
@@ -299,3 +313,28 @@ def test_caddyfile_https_only_proxy() -> None:
     assert "request_buffers 64KB" in site
     # No access log: device keys in ?key= never reach a proxy log.
     assert not [line for line in site if line.split()[0] == "log"]
+
+
+def test_INV23_caddy_logs_cut_the_query_out_of_request_uris() -> None:
+    # No access log is not enough: Caddy's error logger (http.log.error) writes the request
+    # URI of every 5xx, e.g. a 502 while web restarts during a deploy, so a heartbeat key
+    # sent as ?key= would reach the proxy log (INV-23, OPS-08; Wave 3 audit F3). Caddy has
+    # one logger, it takes every log name, and it cuts the query out of request>uri.
+    global_options = _caddy_blocks(_caddyfile())[""]
+
+    default_logger = _nested_block(global_options, "log default {")
+    log_filter = _nested_block(default_logger, "format filter {")
+
+    assert [line for line in global_options if line.split()[0] == "log"] == ["log default {"]
+    assert not [line for line in default_logger if line.split()[0] == "include"]
+    uri_filters = [line.split() for line in log_filter if line.split()[0] == "request>uri"]
+    assert len(uri_filters) == 1, "request>uri needs exactly one filter"
+    assert len(uri_filters[0]) == 4, "expected: request>uri regexp <pattern> <replacement>"
+    _, kind, pattern, replacement = uri_filters[0]
+    # A regexp on the raw string: Caddy's query filter parses the URI and writes it
+    # unchanged when parsing fails, and leaves anything after a '#' alone.
+    assert kind == "regexp"
+    for uri in ("/hb?key=SECRETKEY123", "/hb?x=1&key=SECRETKEY123", "/hb#?key=SECRETKEY123"):
+        logged = re.sub(pattern, replacement, uri)
+        assert "SECRETKEY123" not in logged, uri
+        assert logged.startswith(uri.partition("?")[0]), uri  # the path stays readable
