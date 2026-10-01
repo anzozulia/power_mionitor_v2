@@ -16,6 +16,8 @@ from conftest import DEFAULT_BOT_TOKEN, TELEGRAM_API, FakeClock
 from django.db import DatabaseError
 from pytest_socket import SocketConnectBlockedError
 
+from powermon.clock import SystemClock
+from powermon.logging_setup import RedactingFormatter
 from powermon.web import views
 
 # UI-SPEC, Security-Bound UI Rules, rule 5.
@@ -98,8 +100,6 @@ def test_csp_covers_responses_that_other_middleware_build(client: Any) -> None:
 
 
 def test_system_clock_is_aware_utc() -> None:
-    from powermon.clock import SystemClock
-
     clock = SystemClock()
 
     assert clock.now().tzinfo is UTC
@@ -125,8 +125,6 @@ def test_fake_clock_refuses_naive_datetimes(fixed_now: datetime) -> None:
 
 
 def test_logging_routes_through_redacting_formatter(settings: Any) -> None:
-    from powermon.logging_setup import RedactingFormatter
-
     config = settings.LOGGING
     handler = config.get("handlers", {}).get("stdout", {})
     assert handler.get("stream") == "ext://sys.stdout"
@@ -147,8 +145,6 @@ def test_logging_routes_through_redacting_formatter(settings: Any) -> None:
 
 
 def _format(msg: str, *args: object, exc_info: Any = None) -> str:
-    from powermon.logging_setup import RedactingFormatter
-
     record = logging.LogRecord("t", logging.ERROR, __file__, 1, msg, args, exc_info)
     return RedactingFormatter("%(levelname)s %(message)s").format(record)
 
