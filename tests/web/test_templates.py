@@ -1,0 +1,214 @@
+"""The location pages through the signed-in shell (D-09 surfaces 2-4, UI-SPEC screens 2-4).
+
+The list is read-only: one row per location, sorted by name without regard to case, with
+the status label, the last heartbeat in the display TZ (``display_time``, P-3) and the
+language label. With no locations it shows the empty-state panel instead of the table.
+Every page escapes the user-typed location name (UI-SPEC security rule 1).
+"""
+
+import re
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import pytest
+from django.contrib.auth import get_user_model
+from django.contrib.staticfiles.storage import staticfiles_storage
+from django.test import Client
+
+from powermon.engine.models import LocationState
+
+User = get_user_model()
+
+XSS_NAME = "<script>alert(1)</script>"
+ESCAPED_XSS_NAME = "&lt;script&gt;alert(1)&lt;/script&gt;"
+
+
+@pytest.fixture
+def admin(client: Client, db: None) -> Client:
+    """A client signed in as the single admin."""
+    client.force_login(User.objects.create_user("admin", password="not-used-here"))
+    return client
+
+
+@pytest.fixture
+def kyiv(settings: Any) -> Any:
+    """Pin the display TZ, so the expected times do not depend on the env file."""
+    settings.TIME_ZONE = "Europe/Kyiv"
+    return settings
+
+
+def _set_state(location: Any, **fields: Any) -> None:
+    LocationState.objects.filter(location=location).update(**fields)
+
+
+def _text(fragment: str) -> str:
+    """The visible text of an HTML fragment: tags dropped, whitespace collapsed."""
+    return " ".join(re.sub(r"<[^>]+>", " ", fragment).split())
+
+
+def _table_rows(html: str) -> list[list[str]]:
+    """The text of every body cell, row by row."""
+    body = re.search(r"<tbody>(.*?)</tbody>", html, re.S)
+    assert body is not None, "no table body in the page"
+    rows = re.findall(r"<tr>(.*?)</tr>", body.group(1), re.S)
+    return [
+        [_text(cell) for cell in re.findall(r"<td\b[^>]*>(.*?)</td>", row, re.S)] for row in rows
+    ]
+
+
+# Location list
+
+
+def test_list_empty_state(admin: Client) -> None:
+    response = admin.get("/")
+
+    assert response.status_code == 200
+    html = response.content.decode()
+    assert "<title>Locations · Power Monitor</title>" in html
+    assert "<h1>Locations</h1>" in html
+    assert "<h2>No locations yet</h2>" in html
+    assert "Add a location to get its heartbeat URL, device key and setup examples." in html
+    # One accent button only: the panel's, not the heading row's.
+    assert html.count(">Add location</a>") == 1
+    assert html.count("btn--primary") == 1
+    assert 'href="/locations/new/"' in html
+    assert "<table" not in html
+
+
+@pytest.mark.django_db
+def test_list_rows_sorted_with_labels(
+    admin: Client, kyiv: Any, location_factory: Callable[..., Any], fixed_now: datetime
+) -> None:
+    beta = location_factory(name="beta", language="uk")
+    alpha = location_factory(name="Alpha", language="en")
+    gamma = location_factory(name="gamma", language="ru")
+    delta = location_factory(name="Delta", language="en")
+    _set_state(alpha, status="on", last_heartbeat_at=fixed_now, on_since=fixed_now)
+    gone = fixed_now - timedelta(minutes=2)
+    _set_state(gamma, status="off", last_heartbeat_at=gone, outage_started_at=gone)
+
+    html = admin.get("/").content.decode()
+
+    # Case-insensitive: a plain code-point sort would put "Delta" before "beta".
+    assert _table_rows(html) == [
+        ["Alpha", "On", "2026-10-01 11:00:00 EEST", "English"],
+        ["beta", "Waiting for first heartbeat", "Never", "Ukrainian"],
+        ["Delta", "Waiting for first heartbeat", "Never", "English"],
+        ["gamma", "Off", "2026-10-01 10:58:00 EEST", "Russian"],
+    ]
+    for location in (alpha, beta, gamma, delta):
+        assert f'href="/locations/{location.pk}/setup/"' in html
+    for heading in ("Name", "Status", "Last heartbeat", "Language"):
+        assert f'<th scope="col">{heading}</th>' in html
+    assert '<span class="status status--on">On</span>' in html
+    assert '<span class="status status--off">Off</span>' in html
+    assert '<span class="status status--waiting">Waiting for first heartbeat</span>' in html
+    # The table scrolls inside its wrapper on narrow screens; the heading row has the button.
+    assert re.search(r'<div class="table-wrap">\s*<table>', html)
+    assert html.count(">Add location</a>") == 1
+    assert "No locations yet" not in html
+
+
+@pytest.mark.django_db
+def test_list_hides_deleted_locations(admin: Client, location_factory: Callable[..., Any]) -> None:
+    location_factory(name="kept")
+    location_factory(name="tombstoned", deleted_at=datetime(2026, 9, 1, tzinfo=UTC))
+
+    html = admin.get("/").content.decode()
+
+    assert [row[0] for row in _table_rows(html)] == ["kept"]
+    assert "tombstoned" not in html
+
+
+@pytest.mark.django_db
+def test_list_last_heartbeat_uses_display_time(
+    admin: Client, kyiv: Any, location_factory: Callable[..., Any]
+) -> None:
+    location = location_factory(name="Office")
+    # 01:30 UTC on the fall-back day is the second 03:30 in Kyiv (P-3).
+    beat = datetime(2026, 10, 25, 1, 30, tzinfo=UTC)
+    _set_state(location, status="on", last_heartbeat_at=beat, on_since=beat)
+
+    html = admin.get("/").content.decode()
+
+    assert _table_rows(html) == [["Office", "On", "2026-10-25 03:30:00 EET", "Ukrainian"]]
+    assert '<td class="num">2026-10-25 03:30:00 EET</td>' in html
+
+
+def test_anonymous_list_redirects_to_sign_in(client: Client, db: None) -> None:
+    response = client.get("/")
+
+    assert response.status_code == 302
+    assert response.url == "/login/?next=/"
+
+
+# Page shell
+
+
+def test_signed_in_header_renders_nav_and_sign_out(admin: Client) -> None:
+    html = admin.get("/").content.decode()
+
+    nav = re.search(r'<nav class="site-nav" aria-label="Main">(.*?)</nav>', html, re.S)
+    assert nav is not None
+    assert '<a href="/" aria-current="page">Locations</a>' in nav.group(1)
+    sign_out = re.search(r'<form class="site-header__signout"[^>]*>(.*?)</form>', html, re.S)
+    assert sign_out is not None
+    assert 'method="post" action="/logout/"' in sign_out.group(0)
+    assert 'name="csrfmiddlewaretoken"' in sign_out.group(1)
+    assert ">Sign out</button>" in sign_out.group(1)
+
+
+def test_nav_marks_the_list_only_on_the_list_page(admin: Client) -> None:
+    html = admin.get("/locations/new/").content.decode()
+
+    assert '<a href="/">Locations</a>' in html
+    assert "aria-current" not in html
+
+
+# Escaping and wrapping of the user-typed name
+
+
+@pytest.mark.django_db
+def test_xss_name_is_escaped_everywhere(
+    admin: Client, location_factory: Callable[..., Any]
+) -> None:
+    location = location_factory(name=XSS_NAME)
+
+    listing = admin.get("/").content.decode()
+    setup = admin.get(f"/locations/{location.pk}/setup/").content.decode()
+
+    assert _table_rows(listing)[0][0] == ESCAPED_XSS_NAME
+    assert f">{ESCAPED_XSS_NAME}</a>" in listing
+    assert f'<h1 class="name">{ESCAPED_XSS_NAME}</h1>' in setup
+    assert f"<title>{ESCAPED_XSS_NAME} · Device setup · Power Monitor</title>" in setup
+    for html in (listing, setup):
+        assert "<script" not in html
+
+
+@pytest.mark.django_db
+def test_long_name_has_the_wrapping_class(
+    admin: Client, location_factory: Callable[..., Any]
+) -> None:
+    name = "x" * 100
+    location = location_factory(name=name)
+
+    listing = admin.get("/").content.decode()
+    setup = admin.get(f"/locations/{location.pk}/setup/").content.decode()
+
+    assert f'<a class="name" href="/locations/{location.pk}/setup/">{name}</a>' in listing
+    assert f'<h1 class="name">{name}</h1>' in setup
+
+
+# Static assets
+
+
+def test_app_css_is_in_the_manifest() -> None:
+    stored = staticfiles_storage.stored_name("web/app.css")
+
+    assert re.fullmatch(r"web/app\.[0-9a-f]{12}\.css", stored)
+
+
+def test_unknown_static_file_is_not_in_the_manifest() -> None:
+    with pytest.raises(ValueError, match="Missing staticfiles manifest entry"):
+        staticfiles_storage.stored_name("web/missing.css")
