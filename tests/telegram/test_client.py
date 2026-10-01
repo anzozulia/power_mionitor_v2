@@ -239,6 +239,26 @@ def test_unexpected_error_bodies_are_permanent_and_safe(fake_telegram: Any, body
     assert _send() == SendResult("permanent", code="http_400")
 
 
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (200, SendResult("permanent", code="http_200")),
+        (429, SendResult("rate_limited", retry_after=30, code="429")),
+        (502, SendResult("transient", code="http_502")),
+    ],
+    ids=["200", "429", "502"],
+)
+def test_deeply_nested_body_never_raises(
+    fake_telegram: Any, status: int, expected: SendResult
+) -> None:
+    # The body is untrusted: json.loads raises RecursionError (not ValueError) on deep
+    # nesting. The answer arrived, so it is classified like any unparseable body (audit F2).
+    depth = 500_000
+    fake_telegram.rsps.add(responses.POST, SEND_URL, status=status, body="[" * depth + "]" * depth)
+
+    assert _send() == expected
+
+
 def test_ok_false_on_200_is_not_success(fake_telegram: Any) -> None:
     fake_telegram.fail(TOKEN, status=200, json_body={"ok": False})
 
