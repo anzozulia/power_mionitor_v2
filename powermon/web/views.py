@@ -1,14 +1,24 @@
-"""Web views: admin sign-in and sign-out, the device heartbeat endpoint and the health check."""
+"""Web views: admin sign-in and sign-out, the location pages, the device heartbeat
+endpoint and the health check.
+
+Every admin page relies on LoginRequiredMiddleware; only sign-in, sign-out, ``/hb`` and
+``/healthz`` are login-exempt.
+"""
 
 import logging
 import re
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
+from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_not_required
 from django.contrib.auth.views import LoginView, LogoutView
-from django.db import DatabaseError, connection
+from django.db import DatabaseError, connection, transaction
+from django.db.models.functions import Lower
 from django.http import HttpRequest, HttpResponse
+from django.shortcuts import get_object_or_404, redirect, render
 from django.utils.decorators import method_decorator
 from django.views import View
 from django.views.decorators.cache import never_cache
@@ -18,12 +28,21 @@ from django.views.decorators.http import require_GET
 
 from powermon.clock import Clock, SystemClock
 from powermon.engine import transitions
-from powermon.locations.models import Location
-from powermon.web.forms import SignInForm
+from powermon.engine.models import LocationState
+from powermon.locations import examples, keys, validators
+from powermon.locations.models import LANGUAGE_CHOICES, Location
+from powermon.web.forms import LocationForm, SignInForm
 
 log = logging.getLogger(__name__)
 
 SIGNED_OUT_MESSAGE = "You are signed out."
+LOCATION_CREATED_MESSAGE = (
+    "Location created. Reveal the key below, then copy an example to the device."
+)
+STATUS_LABELS = {"waiting": "Waiting for first heartbeat", "on": "On", "off": "Off"}
+LANGUAGE_LABELS = dict(LANGUAGE_CHOICES)
+# Before the engine has written anything, a location waits for its first heartbeat.
+WAITING = "waiting"
 
 
 class SignInView(LoginView):
@@ -51,6 +70,152 @@ class SignOutView(LogoutView):
         # storage keeps a short message in its own cookie, so the flash survives.
         messages.info(request, SIGNED_OUT_MESSAGE)
         return response
+
+
+@dataclass(frozen=True)
+class LocationRow:
+    """One row of the location list."""
+
+    pk: int
+    name: str
+    status: str
+    status_label: str
+    last_heartbeat_at: datetime | None
+    language_label: str
+
+
+def _state_of(location: Location) -> tuple[str, datetime | None]:
+    """The status and last heartbeat time; a location with no state row counts as waiting."""
+    state: LocationState | None = getattr(location, "state", None)
+    if state is None:
+        return WAITING, None
+    return state.status, state.last_heartbeat_at
+
+
+class LocationListView(View):
+    """``/``: every location that is not deleted, sorted by name (UI-SPEC screen 2, D-09).
+
+    Read-only, one server-rendered response with no live refresh: the admin reloads to
+    see a new status. There is no pagination (at most about 20 locations).
+    """
+
+    template_name = "web/location_list.html"
+
+    def get(self, request: HttpRequest) -> HttpResponse:
+        locations = (
+            Location.objects.filter(deleted_at__isnull=True)
+            .select_related("state")
+            .order_by(Lower("name"), "pk")
+        )
+        rows = []
+        for location in locations:
+            status, last_heartbeat_at = _state_of(location)
+            rows.append(
+                LocationRow(
+                    pk=location.pk,
+                    name=location.name,
+                    status=status,
+                    status_label=STATUS_LABELS[status],
+                    last_heartbeat_at=last_heartbeat_at,
+                    language_label=LANGUAGE_LABELS[location.language],
+                )
+            )
+        return render(request, self.template_name, {"rows": rows})
+
+
+def _create_location(data: dict[str, Any], now: datetime) -> Location:
+    """The location and its waiting state in one transaction: both rows or neither.
+
+    No network I/O: nothing is sent to Telegram on save (D-12).
+    """
+    with transaction.atomic():
+        location = Location.objects.create(
+            name=data["name"],
+            period_s=data["period_s"],
+            grace_s=data["grace_s"],
+            bot_token=data["bot_token"],
+            chat_id=data["chat_id"],
+            language=data["language"],
+            device_key=keys.generate_device_key(),
+            created_at=now,
+        )
+        LocationState.objects.create(location=location, status=WAITING)
+    return location
+
+
+class LocationCreateView(View):
+    """``/locations/new/``: the add-location form (UI-SPEC screen 3; LOC-02, D-10, D-12).
+
+    A valid POST creates the location and redirects to its setup page with the success
+    flash (POST, redirect, GET). An invalid POST re-renders the form with its errors; the
+    bot token input comes back empty. A double submit creates a second location, which
+    stays waiting and sends nothing.
+    """
+
+    template_name = "web/location_form.html"
+    # Tests inject a FakeClock with LocationCreateView.as_view(clock=...).
+    clock: Clock = SystemClock()
+
+    def get(self, request: HttpRequest) -> HttpResponse:
+        return render(request, self.template_name, {"form": LocationForm()})
+
+    def post(self, request: HttpRequest) -> HttpResponse:
+        form = LocationForm(request.POST)
+        if not form.is_valid():
+            return render(request, self.template_name, {"form": form})
+        location = _create_location(form.cleaned_data, self.clock.now())
+        messages.success(request, LOCATION_CREATED_MESSAGE)
+        return redirect("location-setup", pk=location.pk)
+
+
+@method_decorator(never_cache, name="dispatch")
+class LocationSetupView(View):
+    """``/locations/<pk>/setup/``: device setup (UI-SPEC screen 4; LOC-05, HB-01, D-11).
+
+    GET shows the device key masked. POST (CSRF) is the explicit reveal, answered with the
+    revealed page itself (200, no redirect): the only response that ever carries the full
+    key. Every response is ``Cache-Control: no-store``, so neither the Back button nor a
+    cache shows a revealed key again. The examples are the exact strings the 01-09
+    generators return, the ones the INV-24 #3 test runs verbatim against ``/hb``.
+    """
+
+    template_name = "web/location_setup.html"
+
+    def get(self, request: HttpRequest, pk: int) -> HttpResponse:
+        return self._render(request, pk, revealed=False)
+
+    def post(self, request: HttpRequest, pk: int) -> HttpResponse:
+        return self._render(request, pk, revealed=True)
+
+    def _render(self, request: HttpRequest, pk: int, *, revealed: bool) -> HttpResponse:
+        location = get_object_or_404(
+            Location.objects.select_related("state"), pk=pk, deleted_at__isnull=True
+        )
+        status, last_heartbeat_at = _state_of(location)
+        key = location.device_key
+        shown_key = key if revealed else keys.mask_key(key)
+        # The configured base URL only, never the request's Host header.
+        url = examples.heartbeat_url(settings.PUBLIC_BASE_URL)
+        context = {
+            "location": location,
+            "status": status,
+            "status_label": STATUS_LABELS[status],
+            "last_heartbeat_at": last_heartbeat_at,
+            "language_label": LANGUAGE_LABELS[location.language],
+            "revealed": revealed,
+            "shown_key": shown_key,
+            "key_tail": key[-keys.MASK_VISIBLE :],
+            "heartbeat_url": url,
+            "curl_example": examples.curl_cmd(url, shown_key, multiline=True),
+            "cron_example": "\n".join(examples.cron_lines(url, shown_key, location.period_s)),
+            "wget_gnu_example": examples.wget_gnu(url, shown_key),
+            "wget_busybox_example": examples.wget_busybox(url, shown_key),
+            "period_s": location.period_s,
+            "grace_s": location.grace_s,
+            "off_after_s": location.period_s + location.grace_s,
+            "masked_token": validators.mask_token(location.bot_token),
+        }
+        return render(request, self.template_name, context)
 
 
 # D-07: exactly 32 characters from [A-Za-z0-9]. Explicit ASCII classes with fullmatch:
