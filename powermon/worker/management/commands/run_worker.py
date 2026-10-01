@@ -4,7 +4,8 @@ One process, three threads, all started at once and always running:
 
 - ``detection``: every DETECTION_INTERVAL_S seconds (on the monotonic clock) it asks the
   lease ``ensure_held()``. Only this loop polls the lock. HELD runs a detection cycle
-  (``detection.run_cycle``); STANDBY and DB_DOWN are idle iterations.
+  (``detection.run_detection``: the lapse check, then the timeout decisions); STANDBY and
+  DB_DOWN are idle iterations.
 - ``telegram-io``: reads the status the detection loop last published
   (``lease.current()``). While HELD it drains the outbox (``io_loop.run_iteration``) back
   to back while there is work, waiting IO_IDLE_WAIT_S seconds after a pass that sent
@@ -12,16 +13,26 @@ One process, three threads, all started at once and always running:
 - main: the watchdog (below), until SIGTERM or SIGINT.
 
 The lease is HELD, STANDBY or DB_DOWN, with a generation counter that rises on every
-successful acquisition (``powermon.worker.lease``). Each loop activates once per new
-generation and marks it seen only after its activation returned, so a database error
-retries it: the detection loop opens a fresh detection window (``activate_detection``;
-02-06 replaces it with the lapse carve), and the I/O loop turns sends left in "sending"
-into "uncertain" (``io_loop.activate``, INV-16). A lost lease session is reacquired in
+successful acquisition (``powermon.worker.lease``). A lost lease session is reacquired in
 process on a fresh connection, and a standby never blocks, never exits and never writes
 or sends (MON-04). This replaces Phase 1's exit with code 3 (D-15 replaces Phase 1 D-18).
 
-Every worker DB entry point (``activate_detection``, ``detection.run_cycle``,
-``io_loop.activate``, ``io_loop.run_iteration``) starts with ``close_old_connections()``.
+Every gap in monitoring is recorded once (D-04, MON-05, OPS-02). The detection loop keeps
+one ``CycleTracker`` and passes it, with the lease generation, to every cycle. Each cycle
+first checks for a lapse (``powermon.engine.lapse``) and carves ``[cursor, now)`` as not
+monitored for every location, with one gap notice, whatever the gap's length, after the
+first activation in a process, after a new lease generation, after the detection
+connection was re-established (a new backend pid) and after a cycle lost its connection
+(``tracker.db_failed``, set here on a connectivity error only when the connection is
+gone); otherwise when more than 15 s passed since the last completed cycle (a stall, a
+clock step). The carve also opens a fresh detection window. The first cycle ever starts
+fresh at its own time instead (no gap, no notice). The I/O loop activates once per new
+generation and marks it seen only after its activation returned, so a database error
+retries it: it turns sends left in "sending" into "uncertain" (``io_loop.activate``,
+INV-16).
+
+Every worker DB entry point (``detection.run_detection``, ``io_loop.activate``,
+``io_loop.run_iteration``) starts with ``close_old_connections()``.
 Django health-checks a connection, and so replaces one the database dropped, only after
 that call, so either thread's next activation or pass replaces a terminated session
 before its first statement instead of failing on it forever while its progress stamps
@@ -57,22 +68,15 @@ import signal
 import sys
 import threading
 from collections.abc import Callable
-from datetime import datetime
 from types import FrameType
 from typing import Any
 
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
-from django.db import (
-    InterfaceError,
-    OperationalError,
-    close_old_connections,
-    connection,
-    connections,
-)
+from django.db import InterfaceError, OperationalError, connection, connections
 
 from powermon.clock import Clock, SystemClock
-from powermon.engine.models import SystemState
+from powermon.engine.lapse import CycleTracker
 from powermon.worker import detection, io_loop
 from powermon.worker.lease import Lease, LeaseState
 from powermon.worker.supervision import (
@@ -119,14 +123,6 @@ def apply_worker_db_settings(settings_dict: dict[str, Any]) -> None:
     }
 
 
-def activate_detection(now: datetime, generation: int) -> None:
-    """Open a fresh detection window at ``now`` for a new lease generation."""
-    close_old_connections()
-    # update_or_create: a missing singleton row must not stop the worker.
-    SystemState.objects.update_or_create(pk=1, defaults={"detection_resumed_at": now})
-    log.info("worker active since %s (generation %d)", now.isoformat(), generation)
-
-
 def detection_loop(
     stop: threading.Event,
     clock: Clock,
@@ -137,7 +133,9 @@ def detection_loop(
 ) -> None:
     """Keep the lease and run a detection cycle every ``interval`` s until ``stop`` is set."""
     outage = DbOutageLog(log, "detection", clock)
-    activated = 0  # the last generation this loop activated
+    # What the previous cycle of this process saw: the lapse carve's forced triggers.
+    tracker = CycleTracker()
+    announced = 0  # the last generation logged as active
 
     def tick() -> None:
         progress.stamp("detection")
@@ -149,15 +147,23 @@ def detection_loop(
             try:
                 status = lease.ensure_held()
                 if status.state is LeaseState.HELD:
-                    if status.generation != activated:
-                        activate_detection(clock.now(), status.generation)
-                        activated = status.generation
-                    detection.run_cycle(clock.now(), tick=tick)
+                    if status.generation != announced:
+                        log.info(
+                            "worker active since %s (generation %d)",
+                            clock.now().isoformat(),
+                            status.generation,
+                        )
+                        announced = status.generation
+                    detection.run_detection(clock, status.generation, tracker, tick=tick)
                     health.touch()
                     outage.ok()
                 elif status.state is LeaseState.STANDBY:
                     health.touch()
             except _DB_ERRORS as exc:
+                # Only a lost connection forces the next carve; an error on a connection
+                # that still works (a statement timeout) is not a gap by itself.
+                if detection.connection_lost():
+                    tracker.db_failed = True
                 outage.failed(exc)
             except Exception:
                 log.exception("detection cycle failed")

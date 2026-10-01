@@ -1,14 +1,32 @@
-"""One detection cycle of the worker: mark silent locations OFF (MON-02, KD2).
+"""One detection cycle of the worker: record lapses, then mark silent locations OFF.
 
-The worker's detection thread calls ``run_cycle`` every few seconds while it holds the
-lease. A cycle only reads and writes the database: no Telegram call, no sleep (INV-14).
-The OFF alert goes into the outbox inside the transition's own transaction, and the relay
-sends it. 02-06 adds ``run_detection`` around this function (reconnect and clock-step
-checks, the lapse carve, the cursor); it calls the module-level ``run_cycle``.
+The worker's detection thread calls ``run_detection`` every few seconds while it holds
+the lease (MON-02, MON-05, KD2). A cycle only reads and writes the database: no Telegram
+call, no sleep (INV-14). An OFF alert or a gap notice goes into the outbox inside its own
+transaction, and the relay sends it.
 
-Loop-body pattern (INV-13 shape), copied by the relay loop:
-- ``close_old_connections()`` first, so a connection the database dropped is replaced
-  before the first statement instead of failing every cycle (D-16, MON-06);
+Cycle order (D-04, D-15, RESEARCH Pattern 3):
+
+1. connections: ``close_old_connections()``, then a cursor, so a connection the database
+   dropped is replaced before the first statement (D-16, MON-06);
+2. the backend pid of the detection connection (it changes only when the session was
+   re-established, because the worker's connections are persistent, CONN_MAX_AGE None);
+3. the clock-step check: wall-clock against monotonic time since the previous cycle;
+4. the lapse carve (``lapse.carve_if_needed``), forced by a new lease generation, a new
+   backend pid, a lost connection since the previous cycle or a forward clock step over
+   5 s, otherwise run when the gap since the last completed cycle is over 15 s. It commits
+   before any timeout decision, and a carve moves ``detection_resumed_at`` to now, so no
+   OFF can follow from the gap itself;
+5. the cursor: ``last_cycle_completed_at`` moves to now with GREATEST (never backwards)
+   and the tracker remembers this cycle. Both happen once the lapse check committed and
+   before the decisions, so a decisions step that keeps failing neither keeps a forced
+   trigger armed nor lets the cursor fall behind the threshold: it is logged by the loop,
+   never a new gap notice on every cycle (plan-check advisory 1);
+6. the decisions (``run_cycle``), skipped on a cycle whose clock stepped by more than
+   5 s either way. A backward step records nothing, only one WARNING;
+7. (02-08) the all-silent check, after the decisions.
+
+``run_cycle`` is the decisions step on its own (Phase 1 shape, INV-13):
 - each location in its own ``try``, so one failing location never stops the others. The
   log line names only the location id: no token, key or URL (OPS-08);
 - a database connectivity error raised while the connection is no longer usable aborts
@@ -24,11 +42,64 @@ from collections.abc import Callable
 from datetime import datetime
 
 from django.db import InterfaceError, OperationalError, close_old_connections, connection
+from django.db.models import Value
+from django.db.models.functions import Greatest
 
-from powermon.engine import rules, transitions
+from powermon.clock import Clock
+from powermon.engine import lapse, rules, transitions
 from powermon.engine.models import SystemState
 
 log = logging.getLogger(__name__)
+
+
+def run_detection(
+    clock: Clock,
+    generation: int,
+    tracker: lapse.CycleTracker,
+    tick: Callable[[], None] | None = None,
+) -> int:
+    """One cycle for lease ``generation``: lapse check, then decisions; the OFFs recorded.
+
+    ``tracker`` carries what the previous cycle of this process saw. A database error is
+    raised to the detection loop, which marks ``tracker.db_failed`` when the connection
+    was lost, so the next cycle carves the failed window.
+    """
+    close_old_connections()
+    # The health check and, for a dropped session, the reconnect happen here.
+    with connection.cursor():
+        pass
+    pid: int = connection.connection.info.backend_pid
+    now, mono = clock.now(), clock.monotonic()
+    step = tracker.clock_step(now, mono)
+    force = (
+        generation != tracker.generation
+        or (tracker.pid is not None and pid != tracker.pid)
+        or tracker.db_failed
+        or (step is not None and step > lapse.CLOCK_STEP_LIMIT_S)
+    )
+    if step is not None and step > lapse.CLOCK_STEP_LIMIT_S:
+        # The carve below records the gap (and logs it); the decisions wait a cycle.
+        log.warning("wall clock stepped forward %d s; skipping this cycle's decisions", round(step))
+    elif step is not None and step < -lapse.CLOCK_STEP_LIMIT_S:
+        # Nothing is recorded (the window before the cursor is history): one line only.
+        log.warning("wall clock stepped back %d s; skipping this cycle's decisions", round(-step))
+    lapse.carve_if_needed(now, force=force, tick=tick)
+    SystemState.objects.filter(pk=1).update(
+        last_cycle_completed_at=Greatest("last_cycle_completed_at", Value(now))
+    )
+    tracker.remember(generation, pid, now, mono)
+    if step is not None and abs(step) > lapse.CLOCK_STEP_LIMIT_S:
+        return 0
+    return run_cycle(now, tick=tick)
+
+
+def connection_lost() -> bool:
+    """True when this thread's database connection is gone (closed or no longer usable).
+
+    The detection loop asks after a connectivity error: only a lost connection forces the
+    next cycle's carve, not an error on a connection that still works.
+    """
+    return connection.connection is None or not connection.is_usable()
 
 
 def run_cycle(now: datetime, tick: Callable[[], None] | None = None) -> int:
