@@ -13,6 +13,23 @@ the conditional flag UPDATE on the location row, then the timeline through
 Phase 4 writer uses, so the toggle cannot deadlock with a heartbeat or ``mark_off``. Nothing
 here does network I/O, and time always comes from the caller (``now``), never from SQL
 ``now()``. Parameters go in as ``%(name)s`` placeholders, never formatted into the SQL.
+
+Maintenance has exactly one effect: OFF is not detected (INV-05). The detector's snapshot
+and its OFF CAS skip a location in maintenance, so no OFF and no OFF alert is recorded while
+it is on. Everything else carries on:
+
+- Heartbeats are still recorded. A restore during maintenance takes ``record_heartbeat``'s
+  usual path and queues the ON alert (when alerts are on), "was OFF for" counted from the
+  original outage start (D-01); the open piece stays ``not_monitored`` until the exit.
+- Leaving maintenance with the location on writes ``window_start_at`` = the exit, a fresh
+  detection window (INV-04 #2). Leaving it with the location off reopens ``off`` with the
+  locked ``outage_started_at``: one outage, no second OFF alert, and its off time excludes
+  the maintenance span (INV-11).
+- A location still waiting for its first heartbeat only gets the flag (D-02).
+
+Every toggle that moves the timeline bumps ``state_version``, so a detector snapshot read
+before the click loses its OFF CAS. There is no ``maintenance_changed_at`` column and no
+reconcile step in the worker: the toggle is applied at the click (D-02).
 """
 
 import logging
@@ -41,6 +58,15 @@ UPDATE location_state
  WHERE location_id = %(id)s
 """
 
+# Leaving maintenance with the location on: the bump plus a fresh detection window from the
+# exit (INV-04 #2). rules.anchor already counts window_start_at, so no OFF is decided before
+# exit + timeout, and an outage then starts at the exit, not at the last heartbeat before it.
+EXIT_ON_SQL = """
+UPDATE location_state
+   SET state_version = state_version + 1, window_start_at = %(at)s
+ WHERE location_id = %(id)s
+"""
+
 
 def set_maintenance(location_id: int, on: bool, now: datetime) -> bool:
     """Turn maintenance ``on`` or off for the location at ``now``; True if the flag changed.
@@ -54,6 +80,8 @@ def set_maintenance(location_id: int, on: bool, now: datetime) -> bool:
       opens from it: ``not_monitored`` when turning on; the stored status when turning off,
       an off piece keeping the locked ``outage_started_at`` so an outage in progress stays
       one outage (INV-11). The status itself never changes, and ``state_version`` is bumped.
+    - turning off with status "on" also sets ``window_start_at`` to the click: the fresh
+      detection window (INV-04 #2).
 
     The click is clamped to ``max(now, open start)`` under the lock (Pitfall 2): the web
     reads ``now`` before it gets the lock, and a lapse carve committed meanwhile can have
@@ -83,7 +111,8 @@ def set_maintenance(location_id: int, on: bool, now: datetime) -> bool:
                 state,
                 outage_start_at=outage_started_at if state == "off" else None,
             )
-            cur.execute(BUMP_SQL, {"id": location_id})
+            exit_on = not on and status == "on"
+            cur.execute(EXIT_ON_SQL if exit_on else BUMP_SQL, {"id": location_id, "at": at})
     # Ids and times only: never a key or a token.
     log.info(
         "maintenance %s for location %s at %s", "on" if on else "off", location_id, at.isoformat()
