@@ -31,8 +31,9 @@ channel's alerts. Only a bot-wide outcome of a chart call (``BOT_WIDE_KINDS``: a
 5xx, a refused connection, which concern the whole bot) also sets ``bot_wide_key``, with
 the hold an alert's outcome of that kind would give (D-06); the bot's alerts then wait
 for it as for their own. The chart step in turn skips a bot whose ``bot_wide_key``, or a
-channel whose ``chat_key``, is in the future, and keeps its own consecutive failures per
-step in ``RelayState.chart_failures``.
+channel whose ``chat_key``, is in the future (except the release of a moved or deleted
+location's old chart, which waits for its bot only, D-08), and keeps its own consecutive
+failures per step in ``RelayState.chart_failures``.
 
 The result decides the row's next status, for both channels (D-14 policy):
 
@@ -49,7 +50,9 @@ The result decides the row's next status, for both channels (D-14 policy):
 - permanent (400/401/403/404): retried after PERMANENT_BACKOFF, with one warning. For a
   subscriber row, in the same transaction, the location's delivery is marked failing: its
   ``delivery_failing`` incident opens with one ``ops_delivery_failing`` notice to the
-  admin (D-10); a refusal while the incident is open adds nothing (INV-20 #1).
+  admin (D-10). A refusal while the incident is open opens no incident and sends no
+  notice (INV-20 #1), but updates the open incident's details to that latest refusal
+  (its status and any ``migrate_to_chat_id``, W2-A2).
 
 Only those two outcomes of a subscriber send touch the incident: a 429, a 5xx, a refused
 connection, an ambiguous send, an ops row and every chart call leave it alone (D-10).
