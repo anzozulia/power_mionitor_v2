@@ -27,6 +27,11 @@ worker was down is simply due on the next pass.
   again (D-14).
 - Unpin: every older record still pinned is unpinned by its own message id in its own
   chat, oldest first, and nothing else is ever unpinned (D-04, INV-19).
+- Cleanup of older records never blocks and never loops (INV-19): a permanent error on a
+  final edit or an unpin marks the record finalized or unpinned anyway (best effort, one
+  WARNING); an older chart deleted in the channel ("not found") is retired with no
+  repost, or simply marked unpinned. Every record transition is a conditional UPDATE
+  decided by row count, so a repeated or concurrent outcome changes nothing twice.
 - Refresh: today's chart is due ``REFRESH_EVERY`` (15 min) after its last successful
   render (``last_rendered_at``, the answer time), and is edited in place in its recorded
   chat; "message is not modified" counts as rendered (D-05, CHRT-02). The state is in the
@@ -99,6 +104,8 @@ _RENDERED: tuple[Step, ...] = ("post", "refresh", "finalize")
 # Outcomes that end a step's tries for now with the fixed 15-min wait. "message to edit
 # not found" waits too until 03-09 retires the record.
 _PERMANENT_KINDS = ("permanent", "edit_target_missing")
+# The cleanup of older records (INV-19): a permanent outcome ends the step for good.
+_CLEANUP: tuple[Step, ...] = ("finalize", "unpin")
 
 LOCATIONS_SQL = """
 SELECT l.id, l.name, l.language, l.bot_token, l.chat_id
@@ -465,14 +472,68 @@ def _apply(
             )
         elif action.step == "unpin" and row is not None:
             ChartMessage.objects.filter(pk=row.id, pinned=True).update(pinned=False)
-        # The step is done: its failures and its spent key are forgotten.
-        state.chart_failures.pop(key, None)
-        state.not_before.pop(key, None)
+        _step_done(key, state)
+        return
+    if action.step in _CLEANUP and row is not None and result.kind in _PERMANENT_KINDS:
+        _end_cleanup(action, row, result, answered)
+        _step_done(key, state)
         return
     if result.kind == "permanent" and action.step == "pin" and row is not None:
         # The bot may not pin here: tried again after the next render, not before (D-07).
         ChartMessage.objects.filter(pk=row.id, pinned=False).update(pin_failed_at=answered)
     _fail(action, key, result, answered, state)
+
+
+def _step_done(key: str, state: io_loop.RelayState) -> None:
+    """The step is over: its failure count and its spent key are forgotten."""
+    state.chart_failures.pop(key, None)
+    state.not_before.pop(key, None)
+
+
+def _end_cleanup(action: Action, row: ChartRow, result: SendResult, answered: datetime) -> None:
+    """An older record's final edit or unpin that cannot succeed ends here (INV-19, D-06).
+
+    The message is gone ("message to edit / unpin not found"): a final edit retires the
+    record, with no repost, as it is not today's; an unpin marks it unpinned. Any other
+    permanent error is best effort: the record is marked finalized or unpinned, with one
+    WARNING, so cleanup never loops and never blocks the next step.
+    """
+    location_id = action.location.location_id
+    if action.step == "finalize" and result.kind == "edit_target_missing":
+        _retire(row, answered)
+        log.warning(
+            "chart finalize for location %s: record %s is gone from the chat; it is retired",
+            location_id,
+            row.id,
+        )
+    elif action.step == "finalize":
+        ChartMessage.objects.filter(pk=row.id, finalized_at__isnull=True).update(
+            finalized_at=answered
+        )
+        log.warning(
+            "chart finalize for location %s: permanent error %s for record %s; "
+            "it is marked finalized (best effort)",
+            location_id,
+            result.code,
+            row.id,
+        )
+    else:
+        ChartMessage.objects.filter(pk=row.id, pinned=True).update(pinned=False)
+        if result.kind == "permanent":
+            log.warning(
+                "chart unpin for location %s: permanent error %s for record %s; "
+                "it is marked unpinned (best effort)",
+                location_id,
+                result.code,
+                row.id,
+            )
+
+
+def _retire(row: ChartRow, answered: datetime) -> None:
+    """The record's message is gone: retired and unpinned, never called again (D-06)."""
+    ChartMessage.objects.filter(pk=row.id, retired_at__isnull=True).update(
+        retired_at=answered, pinned=False
+    )
 
 
 def _key(action: Action) -> str:
