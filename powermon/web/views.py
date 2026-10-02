@@ -15,6 +15,7 @@ from typing import Any
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_not_required
+from django.contrib.auth.forms import AuthenticationForm
 from django.contrib.auth.views import LoginView, LogoutView
 from django.db import (
     DatabaseError,
@@ -40,6 +41,7 @@ from powermon.engine import transitions
 from powermon.engine.models import LocationState
 from powermon.locations import examples, keys, validators
 from powermon.locations.models import LANGUAGE_CHOICES, Location
+from powermon.throttle import rules, store
 from powermon.web.forms import LocationForm, SignInForm
 
 log = logging.getLogger(__name__)
@@ -55,16 +57,75 @@ WAITING = "waiting"
 
 
 class SignInView(LoginView):
-    """``/login/``: the env-defined admin signs in (LOC-01, D-09).
+    """``/login/``: the env-defined admin signs in (LOC-01, D-09), throttled per IP (SEC-03).
 
     LoginView is already login-exempt and CSRF-protected. It honours ``next`` only when
     ``url_has_allowed_host_and_scheme`` accepts it (same host), else it goes to
     LOGIN_REDIRECT_URL. A signed-in admin who opens the page is sent there directly.
+
+    The login throttle (D-16, UI-D13): every failed sign-in POST is recorded against the
+    client IP (``throttle.rules.client_ip``). Five within 60 s start a 5-minute cool-down,
+    during which every sign-in POST from that IP answers 429 with the throttle message and
+    ``Retry-After: 300``, even one with the right password. The throttled page renders an
+    unbound form, so ``authenticate()`` never runs and the page cannot tell whether the
+    credentials were right (UI rule 6). Throttled POSTs are not recorded, so the cool-down
+    cannot be extended. A GET stays a normal page, and a successful sign-in clears its IP's
+    failures.
     """
 
     template_name = "web/login.html"
     authentication_form = SignInForm
     redirect_authenticated_user = True
+    # Tests inject a FakeClock with SignInView.as_view(clock=...).
+    clock: Clock = SystemClock()
+    # Set by post() for form_invalid() and form_valid(): one IP and one time per attempt.
+    _client_ip: str
+    _attempt_at: datetime
+
+    def post(self, request: HttpRequest, *args: Any, **kwargs: Any) -> HttpResponse:
+        self._client_ip = rules.client_ip(request.META)
+        self._attempt_at = self.clock.now()
+        if store.is_blocked(self._client_ip, self._attempt_at):
+            return self._throttled(request)
+        return super().post(request, *args, **kwargs)
+
+    def _throttled(self, request: HttpRequest) -> HttpResponse:
+        """The 429 page: the sign-in form, unbound, with only the throttle callout.
+
+        Unbound, so ``full_clean()`` and ``authenticate()`` never run: the credentials are
+        not checked and nothing is recorded. The username keeps its submitted value; the
+        password input is never rendered back.
+        """
+        form: AuthenticationForm = self.get_form_class()(
+            request, initial={"username": request.POST.get("username", "")[:150]}
+        )
+        response = self.render_to_response(
+            self.get_context_data(
+                form=form, throttled=True, throttle_message=rules.THROTTLE_MESSAGE
+            )
+        )
+        response.status_code = 429
+        response["Retry-After"] = rules.RETRY_AFTER
+        return response
+
+    def form_invalid(self, form: AuthenticationForm) -> HttpResponse:
+        # Blank, wrong and inactive credentials all count as one failed sign-in.
+        store.record_failure(self._client_ip, self._attempt_at)
+        if store.is_blocked(self._client_ip, self._attempt_at):
+            # The client IP only: never the username or the password.
+            log.warning(
+                "sign-in: %s failed sign-ins within %s s from %s; its sign-in POSTs get "
+                "429 for %s s",
+                rules.MAX_FAILURES,
+                int(rules.WINDOW.total_seconds()),
+                self._client_ip,
+                rules.RETRY_AFTER,
+            )
+        return super().form_invalid(form)
+
+    def form_valid(self, form: AuthenticationForm) -> HttpResponse:
+        store.clear(self._client_ip)
+        return super().form_valid(form)
 
 
 # P-23: login-exempt, so a signed-out tab's Sign out lands on /login/ and not on

@@ -216,8 +216,9 @@ class RelayState:
     (``powermon.chart.lifecycle.chart_key``), which set that step's growing backoff; kept
     in memory like ``not_before``, so a restart starts again from the first delay.
     ``chart_posted``: a chart photo Telegram accepted whose record could not be written
-    yet, by (location id, local date) -> (chat id, message id, answer time); the next
-    chart step writes it first, so it is never posted a second time (WR-04 analogue).
+    yet, by (location id, local date) -> (chat id, message id, answer time, bot key); the
+    bot key (``bot_key``) is that of the token that posted it (D-08). The next chart step
+    writes it first, so it is never posted a second time (WR-04 analogue).
     """
 
     not_before: dict[str, datetime] = field(default_factory=dict)
@@ -225,7 +226,9 @@ class RelayState:
     db_down_notified: bool = False
     lease_pid: int | None = None
     chart_failures: dict[str, int] = field(default_factory=dict)
-    chart_posted: dict[tuple[int, date], tuple[int, int, datetime]] = field(default_factory=dict)
+    chart_posted: dict[tuple[int, date], tuple[int, int, datetime, str]] = field(
+        default_factory=dict
+    )
 
 
 def bot_key(token: str) -> str:

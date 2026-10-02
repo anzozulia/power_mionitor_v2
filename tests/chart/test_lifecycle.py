@@ -264,6 +264,80 @@ def test_monitored_location_gets_todays_chart_posted_and_recorded(
     assert len(_rows()) == 1
 
 
+# The record names the bot that posted it (D-08, Phase 3 IN-02)
+
+
+def test_D08_record_stores_the_posting_bots_key(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    _monitored(location_factory)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+
+    assert _pass(FakeClock(NOON_05), io_loop.RelayState()) is True
+
+    [row] = _rows()
+    assert row.bot_key == io_loop.bot_key(DEFAULT_BOT_TOKEN)
+    assert len(row.bot_key) == 12
+    # OPS-08: no column of the record holds the token or its secret part.
+    with connection.cursor() as cur:
+        cur.execute("SELECT row_to_json(c)::text FROM chart_message c")
+        [(record,)] = cur.fetchall()
+    assert DEFAULT_BOT_TOKEN not in record
+    assert DEFAULT_BOT_TOKEN.split(":", 1)[1] not in record
+
+
+def test_kept_post_records_the_bot_that_posted_it(
+    location_factory: Callable[..., Any], fake_telegram: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    location = _monitored(location_factory)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    fake_telegram.accept_chart(TOKEN_B)
+    real = lifecycle._record_post
+    tries: list[int] = []
+
+    def refused_once(*args: Any, **kwargs: Any) -> Any:
+        tries.append(1)
+        if len(tries) == 1:
+            raise OperationalError("could not extend file: No space left on device")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(lifecycle, "_record_post", refused_once)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+    posting_bot = io_loop.bot_key(DEFAULT_BOT_TOKEN)
+
+    # Telegram accepted the photo; its record is kept with the bot that posted it.
+    assert _pass(clock, state) is True
+    assert state.chart_posted == {
+        (location.pk, TODAY): (DEFAULT_CHAT_ID, 1001, NOON_05, posting_bot)
+    }
+
+    # The admin changes the token before the kept post is written: the record still
+    # names the bot that posted the photo, not the location's current one.
+    Location.objects.filter(pk=location.pk).update(bot_token=TOKEN_B)
+    _pass(clock, state)
+
+    assert state.chart_posted == {}
+    [row] = _rows()
+    assert (row.message_id, row.chat_id, row.bot_key) == (1001, DEFAULT_CHAT_ID, posting_bot)
+    assert row.bot_key != io_loop.bot_key(TOKEN_B)
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "sendPhoto") == 1
+
+
+def test_record_without_a_bot_key_is_refused(location_factory: Callable[..., Any]) -> None:
+    location = _monitored(location_factory)
+
+    # NOT NULL: no writer can leave a record without the bot that posted it.
+    with pytest.raises(IntegrityError), transaction.atomic(), connection.cursor() as cur:
+        cur.execute(
+            "INSERT INTO chart_message (location_id, local_date, chat_id, message_id, pinned, "
+            "last_rendered_at, created_at) VALUES (%s, %s, %s, %s, false, %s, %s)",
+            [location.pk, TODAY, DEFAULT_CHAT_ID, 1001, NOON_05, NOON_05],
+        )
+
+    assert _rows() == []
+
+
 def test_without_the_charts_flag_no_chart_call_is_made(
     location_factory: Callable[..., Any], fake_telegram: Any
 ) -> None:

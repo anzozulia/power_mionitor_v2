@@ -6,7 +6,9 @@
 <h1>Sign in</h1>
 <form method="post" action="{% url 'login' %}">
   {% csrf_token %}
-  {% if form.errors %}
+  {% if throttled %}
+  <p class="callout callout--error" role="alert">{{ throttle_message }}</p>
+  {% elif form.errors %}
   <p class="callout callout--error" role="alert">{{ form.error_messages.invalid_login }}</p>
   {% endif %}
   <div class="field">

@@ -75,6 +75,8 @@ NO_PIN_RIGHTS = {
 }
 BAD_GATEWAY = {"ok": False, "error_code": 502, "description": "Bad Gateway"}
 DISK_FULL = "could not extend file: No space left on device"
+# The key of the bot that posted a kept chart photo (D-08): the default location's bot.
+BOT_A = io_loop.bot_key(DEFAULT_BOT_TOKEN)
 
 
 @pytest.fixture(autouse=True)
@@ -351,7 +353,7 @@ def test_post_kept_after_a_db_error_is_recorded_without_a_second_photo(
     assert _pass(clock, state) is True
 
     assert _today() == []
-    assert state.chart_posted == {(location.pk, TODAY): (DEFAULT_CHAT_ID, 1001, NOON_05)}
+    assert state.chart_posted == {(location.pk, TODAY): (DEFAULT_CHAT_ID, 1001, NOON_05, BOT_A)}
     # The post is known, not failed: no backoff, no failure count.
     assert state.not_before == {}
     assert state.chart_failures == {}
@@ -363,6 +365,7 @@ def test_post_kept_after_a_db_error_is_recorded_without_a_second_photo(
     assert state.chart_posted == {}
     [row] = _today()
     assert (row.message_id, row.chat_id, row.pinned) == (1001, DEFAULT_CHAT_ID, True)
+    assert row.bot_key == BOT_A
     assert (row.last_rendered_at, row.created_at) == (NOON_05, NOON_05)
     assert _chart(fake_telegram) == [("sendPhoto", None), ("pinChatMessage", 1001)]
     assert fake_telegram.count(DEFAULT_BOT_TOKEN, "sendPhoto") == 1
@@ -389,7 +392,7 @@ def test_kept_post_flush_error_makes_no_call(
     caplog.set_level(logging.WARNING)
     clock = FakeClock(NOON_05)
     state = io_loop.RelayState()
-    kept = {(location.pk, TODAY): (DEFAULT_CHAT_ID, 1001, NOON_05)}
+    kept = {(location.pk, TODAY): (DEFAULT_CHAT_ID, 1001, NOON_05, BOT_A)}
 
     assert _pass(clock, state) is True
     assert state.chart_posted == kept
@@ -427,7 +430,7 @@ def test_kept_post_of_an_earlier_day_is_recorded_for_that_day(
     clock = FakeClock(late)
     state = io_loop.RelayState()
     assert _pass(clock, state) is True
-    assert state.chart_posted == {(location.pk, YESTERDAY): (DEFAULT_CHAT_ID, 1001, late)}
+    assert state.chart_posted == {(location.pk, YESTERDAY): (DEFAULT_CHAT_ID, 1001, late, BOT_A)}
 
     # Midnight passes before the flush: the kept post is still yesterday's chart. It gets
     # its one unpin (INV-19) at once; its final edit waits until detection has settled
