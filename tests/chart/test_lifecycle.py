@@ -17,31 +17,46 @@ keeps to a handful of them. The display time zone is Europe/Kyiv (UTC+3 until
 
 import dataclasses
 import io
+import json
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import pytest
-from chart_fixtures import KYIV, kyiv, monitor
+from chart_fixtures import KYIV, insert_pieces, kyiv, local_pieces, monitor, set_status
 from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, ChartCall, FakeClock
+from django.db import IntegrityError, transaction
 from PIL import Image
 
-from powermon.chart import lifecycle
+from powermon.chart import lifecycle, render
+from powermon.chart.model import Piece, Week
 from powermon.chart.models import ChartMessage
+from powermon.engine import transitions
 from powermon.locations.models import Location
 from powermon.worker import io_loop
 
 pytestmark = pytest.mark.django_db(transaction=True)
 
 # Thu 2026-10-01 12:05 local (09:05 UTC); monitoring started at 08:00 local.
+TODAY = date(2026, 10, 1)
 NOON_05 = kyiv("2026-10-01 12:05")
 SINCE = kyiv("2026-10-01 08:00")
 OTHER_CHAT_ID = -1007777777777
+TOKEN_B = "987654321:" + "B" * 35
+CHAT_B = -1009876543210
 CHAT_NOT_FOUND = {"ok": False, "error_code": 400, "description": "Bad Request: chat not found"}
 NO_PIN_RIGHTS = {
     "ok": False,
     "error_code": 400,
     "description": "Bad Request: not enough rights to manage pinned messages in the chat",
+}
+NOT_MODIFIED = {
+    "ok": False,
+    "error_code": 400,
+    "description": (
+        "Bad Request: message is not modified: specified new message content and reply "
+        "markup are exactly the same as a current content and reply markup of the message"
+    ),
 }
 
 
@@ -74,6 +89,66 @@ def _png_size(png: bytes) -> tuple[int, int]:
     with Image.open(io.BytesIO(png)) as image:
         assert image.format == "PNG"
         return image.size
+
+
+def _seed(
+    location: Any,
+    *,
+    day: date = TODAY,
+    rendered: datetime = NOON_05,
+    message_id: int = 1001,
+    chat_id: int = DEFAULT_CHAT_ID,
+    pinned: bool = True,
+) -> ChartMessage:
+    """A record as an earlier post left it (pinned by default)."""
+    return ChartMessage.objects.create(
+        location=location,
+        local_date=day,
+        chat_id=chat_id,
+        message_id=message_id,
+        pinned=pinned,
+        last_rendered_at=rendered,
+        created_at=rendered,
+    )
+
+
+def _spy_renders(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    """Record the language and name of every render; the real renderer still runs."""
+    seen: list[tuple[str, str]] = []
+    real = render.render_png
+
+    def spy(week: Week, *, lang: str, name: str) -> bytes:
+        seen.append((lang, name))
+        return real(week, lang=lang, name=name)
+
+    monkeypatch.setattr(render, "render_png", spy)
+    return seen
+
+
+def _location(location_id: int, token: str = DEFAULT_BOT_TOKEN) -> lifecycle.ChartLocation:
+    return lifecycle.ChartLocation(location_id, f"L{location_id}", "en", token, DEFAULT_CHAT_ID)
+
+
+def _row(
+    row_id: int,
+    location_id: int,
+    *,
+    rendered: datetime,
+    day: date = TODAY,
+    pinned: bool = True,
+    pin_failed_at: datetime | None = None,
+) -> lifecycle.ChartRow:
+    return lifecycle.ChartRow(
+        id=row_id,
+        location_id=location_id,
+        local_date=day,
+        chat_id=DEFAULT_CHAT_ID,
+        message_id=1000 + row_id,
+        pinned=pinned,
+        pin_failed_at=pin_failed_at,
+        last_rendered_at=rendered,
+        finalized_at=None,
+    )
 
 
 # Post and record (D-01, D-02 steps 1-2, INV-17)
@@ -241,3 +316,283 @@ def test_permanent_pin_failure_waits_for_the_next_refresh(
         _pass(clock, state)
     assert fake_telegram.count(DEFAULT_BOT_TOKEN, "pinChatMessage") == 1
     assert ChartMessage.objects.get(location=location).pinned is False
+
+
+# Refresh every 15 min from DB state, catch-up, D-03, D-14, INV-05, INV-17 #2 (D-05)
+
+
+def test_CHRT02_refresh_is_due_15_minutes_after_the_last_render(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    _monitored(location_factory)
+    clock = FakeClock(NOON_05)
+    # The first edit takes 1 s: last_rendered_at is when Telegram answered.
+    fake_telegram.answer_method(
+        DEFAULT_BOT_TOKEN, "editMessageMedia", lambda: clock.advance(seconds=1)
+    )
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    state = io_loop.RelayState()
+    _pass(clock, state)
+    _pass(clock, state)
+    assert _rows()[0].pinned is True
+
+    clock.set(NOON_05 + timedelta(minutes=14, seconds=59))
+    assert _pass(clock, state) is False
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "editMessageMedia") == 0
+
+    clock.set(NOON_05 + timedelta(minutes=15))
+    assert _pass(clock, state) is True
+
+    [edit] = _chart_calls(fake_telegram, "editMessageMedia")
+    assert (edit.fields["chat_id"], edit.fields["message_id"]) == (str(DEFAULT_CHAT_ID), "1001")
+    assert json.loads(edit.fields["media"]) == {
+        "type": "photo",
+        "media": "attach://chart",
+        "caption": "No outages today\nUpdated 12:20",
+    }
+    assert _png_size(edit.files["chart"]) == (1280, 1000)
+    assert _rows()[0].last_rendered_at == NOON_05 + timedelta(minutes=15, seconds=1)
+
+
+def test_refresh_not_modified_counts_as_rendered(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    location = _monitored(location_factory)
+    _seed(location, rendered=NOON_05)
+    fake_telegram.fail_method(
+        DEFAULT_BOT_TOKEN, "editMessageMedia", status=400, json_body=NOT_MODIFIED
+    )
+    state = io_loop.RelayState()
+    at = NOON_05 + timedelta(minutes=15)
+
+    assert _pass(FakeClock(at), state) is True
+
+    assert _rows()[0].last_rendered_at == at
+    assert state.not_before == {}
+
+
+def test_refresh_catches_up_once_after_downtime(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    location = _monitored(location_factory)
+    _seed(location, rendered=NOON_05)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    clock = FakeClock(kyiv("2026-10-01 14:30"))
+    state = io_loop.RelayState()
+
+    # Down from 12:05 to 14:30: one refresh now, not one per missed 15-min slot (INV-18).
+    assert _pass(clock, state) is True
+    assert _pass(clock, state) is False
+    clock.advance(minutes=14)
+    assert _pass(clock, state) is False
+
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "editMessageMedia") == 1
+    assert _rows()[0].last_rendered_at == kyiv("2026-10-01 14:30")
+
+
+def test_D03_waiting_location_makes_no_chart_call_until_its_first_heartbeat(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    waiting = location_factory()
+    gone = _monitored(location_factory, bot_token=TOKEN_B, chat_id=CHAT_B)
+    Location.objects.filter(pk=gone.pk).update(deleted_at=SINCE)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    fake_telegram.accept_chart(TOKEN_B)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+
+    for _ in range(3):
+        assert _pass(clock, state) is False
+        clock.advance(minutes=20)
+    assert len(fake_telegram.calls) == 0
+
+    # The first heartbeat starts monitoring (MON-01); the next pass posts its chart.
+    assert transitions.record_heartbeat(waiting.pk, clock.now()) == "started"
+    assert _pass(clock, state) is True
+
+    [photo] = _chart_calls(fake_telegram, "sendPhoto")
+    assert photo.token == DEFAULT_BOT_TOKEN
+    assert [row.location_id for row in _rows()] == [waiting.pk]
+    assert fake_telegram.count(TOKEN_B, "sendPhoto") == 0
+
+
+def test_INV05_chart_ignores_alerts_enabled_and_maintenance(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    location = location_factory(alerts_enabled=False, maintenance=True)
+    # In maintenance the live piece is not monitored (INV-04); the status stays on.
+    set_status(location, "on", at=SINCE)
+    insert_pieces(location, [Piece("not_monitored", SINCE, None, None)])
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+
+    _pass(clock, state)
+    _pass(clock, state)
+    clock.advance(minutes=15)
+    _pass(clock, state)
+
+    assert [call.method for call in fake_telegram.chart_calls] == [
+        "sendPhoto",
+        "pinChatMessage",
+        "editMessageMedia",
+    ]
+    [row] = _rows()
+    assert (row.pinned, row.last_rendered_at) == (True, clock.now())
+
+
+def test_INV17_2_a_second_run_the_same_day_posts_nothing(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    location = _monitored(location_factory)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    clock = FakeClock(kyiv("2026-10-02 00:00:05"))
+    _pass(clock, io_loop.RelayState())
+    _pass(clock, io_loop.RelayState())
+    [row] = _rows()
+    assert (row.local_date, row.pinned) == (date(2026, 10, 2), True)
+
+    # A worker restart at 00:00:40: fresh relay state, the record is in the database.
+    clock.set(kyiv("2026-10-02 00:00:40"))
+    restarted = io_loop.RelayState()
+    for _ in range(3):
+        assert _pass(clock, restarted) is False
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "sendPhoto") == 1
+
+    # The database refuses a second active record for the day...
+    with pytest.raises(IntegrityError), transaction.atomic():
+        _seed(location, day=date(2026, 10, 2), message_id=2002)
+    # ...while a retired one does not block its replacement.
+    ChartMessage.objects.filter(pk=row.pk).update(retired_at=clock.now(), pinned=False)
+    _seed(location, day=date(2026, 10, 2), message_id=2002)
+    assert ChartMessage.objects.filter(location=location, retired_at__isnull=True).count() == 1
+
+
+def test_D14_refresh_uses_the_current_name_and_language(
+    location_factory: Callable[..., Any], fake_telegram: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    location = _monitored(location_factory)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    rendered = _spy_renders(monkeypatch)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+    _pass(clock, state)
+    _pass(clock, state)
+
+    Location.objects.filter(pk=location.pk).update(name="Дача", language="uk")
+    clock.advance(minutes=15)
+    _pass(clock, state)
+
+    [edit] = _chart_calls(fake_telegram, "editMessageMedia")
+    caption = json.loads(edit.fields["media"])["caption"]
+    assert caption == "Сьогодні відключень не було\nОновлено о 12:20"
+    assert rendered == [("en", "Test location"), ("uk", "Дача")]
+
+
+def test_INV03_1_caption_matches_the_outage(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    location = location_factory()
+    # Heartbeats until 10:00, the next one at 12:00: off 10:00-12:00 (INV-03 #1).
+    insert_pieces(
+        location,
+        local_pieces(
+            [
+                ("on", "2026-10-01 08:00", "2026-10-01 10:00"),
+                ("off", "2026-10-01 10:00", "2026-10-01 12:00"),
+                ("on", "2026-10-01 12:00", None),
+            ]
+        ),
+    )
+    set_status(location, "on", at=kyiv("2026-10-01 12:00"))
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+
+    _pass(FakeClock(NOON_05), io_loop.RelayState())
+
+    [photo] = _chart_calls(fake_telegram, "sendPhoto")
+    assert photo.fields["caption"] == "Today off: 2h · 1 outage\nUpdated 12:05"
+
+
+def test_refresh_order_oldest_first(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    low = _monitored(location_factory)
+    high = _monitored(location_factory, bot_token=TOKEN_B, chat_id=CHAT_B)
+    assert low.pk < high.pk
+    _seed(low, rendered=kyiv("2026-10-01 12:06"))
+    _seed(high, rendered=kyiv("2026-10-01 12:05"), message_id=2001, chat_id=CHAT_B)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    fake_telegram.accept_chart(TOKEN_B)
+    clock = FakeClock(kyiv("2026-10-01 12:30"))
+    state = io_loop.RelayState()
+
+    assert _pass(clock, state) is True
+    assert _pass(clock, state) is True
+    assert _pass(clock, state) is False
+
+    assert [call.token for call in _chart_calls(fake_telegram, "editMessageMedia")] == [
+        TOKEN_B,
+        DEFAULT_BOT_TOKEN,
+    ]
+
+
+def test_failed_pin_is_retried_after_the_next_refresh(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    _monitored(location_factory)
+    fake_telegram.fail_method(
+        DEFAULT_BOT_TOKEN, "pinChatMessage", status=400, json_body=NO_PIN_RIGHTS
+    )
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+    _pass(clock, state)
+    _pass(clock, state)
+    assert _rows()[0].pin_failed_at == NOON_05
+
+    for minutes in (5, 14):
+        clock.set(NOON_05 + timedelta(minutes=minutes))
+        assert _pass(clock, state) is False
+    # 12:20: the refresh comes first (the pin is not due before a new render)...
+    clock.set(NOON_05 + timedelta(minutes=15))
+    assert _pass(clock, state) is True
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "pinChatMessage") == 1
+    # ...and the next pass tries the pin again (D-07).
+    assert _pass(clock, state) is True
+
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "pinChatMessage") == 2
+    [row] = _rows()
+    assert (row.pinned, row.pin_failed_at) == (True, None)
+
+
+# Pure planner ordering (CHRT-02, D-02)
+
+
+def test_plan_equal_render_times_refresh_the_lower_location_id_first() -> None:
+    a = _location(1)
+    b = _location(2)
+    rows = [_row(10, 2, rendered=NOON_05), _row(11, 1, rendered=NOON_05)]
+    now = NOON_05 + timedelta(minutes=15)
+
+    action = lifecycle.plan([a, b], rows, today=TODAY, now=now, not_before={})
+
+    assert action == lifecycle.Action("refresh", a, rows[1])
+
+
+def test_plan_midnight_steps_beat_any_refresh() -> None:
+    # Location 1's refresh has waited longest; location 2 still has to post today.
+    a = _location(1)
+    b = _location(2)
+    rows = [_row(10, 1, rendered=NOON_05 - timedelta(hours=2))]
+
+    action = lifecycle.plan([a, b], rows, today=TODAY, now=NOON_05, not_before={})
+
+    assert action == lifecycle.Action("post", b)
+
+
+def test_plan_nothing_due() -> None:
+    a = _location(1)
+    rows = [_row(10, 1, rendered=NOON_05)]
+
+    assert lifecycle.plan([a], rows, today=TODAY, now=NOON_05, not_before={}) is None
+    assert lifecycle.plan([], [], today=TODAY, now=NOON_05, not_before={}) is None
