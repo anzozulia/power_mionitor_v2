@@ -36,6 +36,7 @@ from powermon.alerts import outbox
 from powermon.alerts.models import OpsIncident, OutboxMessage
 from powermon.chart import lifecycle, model
 from powermon.chart.models import ChartMessage
+from powermon.locations.models import Location
 from powermon.worker import io_loop
 
 pytestmark = pytest.mark.django_db(transaction=True)
@@ -48,7 +49,9 @@ SINCE = kyiv("2026-10-01 08:00")
 # The ops_incident kind of a refused pin (lifecycle.KIND_CHART_PIN_FAILED).
 PIN_INCIDENT = "chart_pin_failed"
 LIFECYCLE_LOGGER = lifecycle.__name__
-BOTS = {DEFAULT_BOT_TOKEN: "A", OPS_BOT_TOKEN: "ops"}
+TOKEN_B = "987654321:" + "B" * 35
+CHAT_B = -1009876543210
+BOTS = {DEFAULT_BOT_TOKEN: "A", TOKEN_B: "B", OPS_BOT_TOKEN: "ops"}
 EDIT_GONE = {
     "ok": False,
     "error_code": 400,
@@ -409,6 +412,50 @@ def test_kept_post_of_an_earlier_day_is_recorded_for_that_day(
         ("pinChatMessage", 1002),
         ("editMessageMedia", 1001),
     ]
+
+
+def test_kept_post_of_a_deleted_location_is_dropped(
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    gone = _monitored(location_factory)
+    other = _monitored(location_factory, bot_token=TOKEN_B, chat_id=CHAT_B)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    fake_telegram.accept_chart(TOKEN_B)
+    real = lifecycle._record_post
+    tries: list[int] = []
+
+    def refused_once(*args: Any, **kwargs: Any) -> Any:
+        tries.append(1)
+        if len(tries) == 1:
+            raise OperationalError(DISK_FULL)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(lifecycle, "_record_post", refused_once)
+    caplog.set_level(logging.WARNING, logger=LIFECYCLE_LOGGER)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+    assert _pass(clock, state) is True
+    assert list(state.chart_posted) == [(gone.pk, TODAY)]
+
+    # The location row is deleted before the kept post is written: its record can never
+    # be written, so the photo stays untracked and the other location's work goes on.
+    Location.objects.filter(pk=gone.pk).delete()
+    assert _pass(clock, state) is True
+
+    assert state.chart_posted == {}
+    assert [(row.location_id, row.message_id) for row in _today()] == [(other.pk, 1002)]
+    assert "1001" in _lines(caplog)[-1] and "untracked" in _lines(caplog)[-1]
+
+
+def test_pin_failure_notice_names_the_http_status() -> None:
+    assert lifecycle._http_status("http_400") == 400
+    assert lifecycle._http_status("http_403") == 403
+    # A code with no plausible status falls back to 400 (the notice needs 100..599).
+    for code in ("", "permanent", "http_", "http_99", "http_600", "http_4x0", "http_٤٠٠"):
+        assert lifecycle._http_status(code) == 400
 
 
 # INV-17 #1, D-07: the bot can post but not pin
