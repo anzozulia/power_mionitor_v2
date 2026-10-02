@@ -24,7 +24,7 @@ import subprocess
 import sys
 import threading
 from collections.abc import Callable
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -43,10 +43,10 @@ from urllib3.exceptions import MaxRetryError, NewConnectionError
 
 from powermon.alerts import ops, outbox
 from powermon.alerts.models import OutboxMessage
-from powermon.chart import lifecycle, render, source
+from powermon.chart import lifecycle, model, render, source
 from powermon.chart.model import Piece, Week
 from powermon.chart.models import ChartMessage
-from powermon.engine import transitions
+from powermon.engine import lapse, rules, transitions
 from powermon.locations.models import Location
 from powermon.worker import io_loop
 from powermon.worker.lease import Lease
@@ -192,8 +192,14 @@ def _spy_renders(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
     return seen
 
 
-def _location(location_id: int, token: str = DEFAULT_BOT_TOKEN) -> lifecycle.ChartLocation:
-    return lifecycle.ChartLocation(location_id, f"L{location_id}", "en", token, DEFAULT_CHAT_ID)
+def _location(
+    location_id: int, token: str = DEFAULT_BOT_TOKEN, *, router_grace: bool = False
+) -> lifecycle.ChartLocation:
+    """A monitored location as the planner sees it: period 60 s, grace 30 s."""
+    settle = lifecycle.settle_time(60, 30, router_grace)
+    return lifecycle.ChartLocation(
+        location_id, f"L{location_id}", "en", token, DEFAULT_CHAT_ID, settle
+    )
 
 
 def _row(
@@ -215,6 +221,7 @@ def _row(
         pin_failed_at=pin_failed_at,
         last_rendered_at=rendered,
         finalized_at=None,
+        unpinned_at=None,
     )
 
 
@@ -683,6 +690,111 @@ def test_plan_skips_a_bot_or_channel_that_is_backing_off() -> None:
     # At the key's own time the step is due again.
     assert lifecycle.plan([a], [], today=TODAY, now=later, not_before=channel) == (
         lifecycle.Action("post", a)
+    )
+
+
+# A finished day settles before its final edit (INV-03, INV-08; Wave 4 audit, fix 1)
+
+
+def test_settle_time_is_the_longest_timeout_plus_the_lapse_threshold() -> None:
+    # Period 60 s + grace 30 s, plus 15 s: detection moves its cursor before it decides.
+    assert lifecycle.settle_time(60, 30, False) == timedelta(seconds=105)
+    assert lifecycle.settle_time(60, 30, False) == (
+        rules.longest_timeout(60, 30, False) + lapse.LAPSE_THRESHOLD
+    )
+    # Router-reconnect grace may hold an OFF back by another 180 s.
+    assert lifecycle.settle_time(60, 30, True) == timedelta(seconds=285)
+    assert lifecycle.settle_time(3600, 3600, False) == timedelta(hours=2, seconds=15)
+
+
+def test_settled_records_wait_for_the_detection_cursor() -> None:
+    a = _location(1)
+    b = _location(2, TOKEN_B, router_grace=True)
+    yesterday = TODAY - timedelta(days=1)
+    older_a = _row(10, 1, rendered=NOON_05 - timedelta(days=1), day=yesterday)
+    older_b = _row(20, 2, rendered=NOON_05 - timedelta(days=1), day=yesterday)
+    rows = [older_a, older_b, _row(11, 1, rendered=NOON_05), _row(21, 2, rendered=NOON_05)]
+    # Yesterday ends at today's local midnight.
+    end = kyiv("2026-10-01 00:00")
+    assert model.next_midnight(yesterday, KYIV) == end
+
+    def settled(cursor: datetime | None) -> frozenset[int]:
+        return lifecycle.settled_records([a, b], rows, today=TODAY, detected_until=cursor, tz=KYIV)
+
+    # Detection has not run yet, or has not passed the day's end + the settle time.
+    assert settled(None) == frozenset()
+    assert settled(end) == frozenset()
+    assert settled(end + timedelta(seconds=105) - timedelta(microseconds=1)) == frozenset()
+    # Exactly at it, A's day has settled; B's waits 180 s more (router grace).
+    assert settled(end + timedelta(seconds=105)) == {10}
+    assert settled(end + timedelta(seconds=285)) == {10, 20}
+    # Today's records never settle; a finalized record or an unmonitored location's is out.
+    finalized = dataclasses.replace(older_a, finalized_at=end)
+    later = end + timedelta(hours=12)
+    assert lifecycle.settled_records(
+        [a, b], [finalized, older_b], today=TODAY, detected_until=later, tz=KYIV
+    ) == {20}
+    assert lifecycle.settled_records([b], rows, today=TODAY, detected_until=later, tz=KYIV) == {20}
+
+
+def test_settled_records_end_a_25_hour_day_at_its_local_midnight() -> None:
+    # 2026-10-25 lasts 25 h in Kyiv (INV-08): it ends at 2026-10-26 00:00 EET (22:00 UTC),
+    # not 24 h after it began.
+    a = _location(1)
+    dst_day = date(2026, 10, 25)
+    rows = [_row(10, 1, rendered=kyiv("2026-10-25 23:45"), day=dst_day)]
+    end = kyiv("2026-10-26 00:00")
+    assert end == datetime(2026, 10, 25, 22, 0, tzinfo=UTC)
+
+    def settled(cursor: datetime) -> frozenset[int]:
+        return lifecycle.settled_records(
+            [a], rows, today=date(2026, 10, 26), detected_until=cursor, tz=KYIV
+        )
+
+    assert settled(end + timedelta(seconds=105)) == {10}
+    assert settled(end + timedelta(seconds=104)) == frozenset()
+
+
+def test_INV19_plan_unpins_an_older_record_not_known_to_be_pinned() -> None:
+    # Its pin may have taken effect (an ambiguous answer, an unwritten outcome): an older
+    # record gets its one unpin whatever ``pinned`` says (Wave 4 audit, fix 2).
+    a = _location(1)
+    yesterday = TODAY - timedelta(days=1)
+    older = _row(10, 1, rendered=NOON_05 - timedelta(days=1), day=yesterday, pinned=False)
+    rows = [older, _row(11, 1, rendered=NOON_05)]
+
+    assert lifecycle.plan([a], rows, today=TODAY, now=NOON_05, not_before={}) == (
+        lifecycle.Action("unpin", a, older)
+    )
+    # Its own key still holds it, as for any step.
+    held = {lifecycle.chart_key(1, "unpin", 10): NOON_05 + timedelta(seconds=30)}
+    assert lifecycle.plan([a], rows, today=TODAY, now=NOON_05, not_before=held) is None
+    # Once its unpin was made, it gets no second one, pinned flag or not.
+    for pinned in (False, True):
+        done = dataclasses.replace(older, pinned=pinned, unpinned_at=NOON_05)
+        assert lifecycle.plan([a], [done, rows[1]], today=TODAY, now=NOON_05, not_before={}) is (
+            None
+        )
+
+
+def test_plan_final_edit_waits_for_its_day_and_never_holds_the_unpin() -> None:
+    a = _location(1)
+    older = _row(10, 1, rendered=NOON_05 - timedelta(days=1), day=TODAY - timedelta(days=1))
+    rows = [older, _row(11, 1, rendered=NOON_05)]
+
+    # Today's chart is posted and pinned; yesterday's has not settled: it is unpinned now.
+    assert lifecycle.plan([a], rows, today=TODAY, now=NOON_05, not_before={}) == (
+        lifecycle.Action("unpin", a, older)
+    )
+    # Once it has settled, its final edit goes first (D-02 order).
+    assert lifecycle.plan(
+        [a], rows, today=TODAY, now=NOON_05, not_before={}, settled={10}
+    ) == lifecycle.Action("finalize", a, older)
+    # A settled id of a record that is not older (today's) changes nothing.
+    done = dataclasses.replace(older, pinned=False, finalized_at=NOON_05, unpinned_at=NOON_05)
+    assert (
+        lifecycle.plan([a], [done, rows[1]], today=TODAY, now=NOON_05, not_before={}, settled={11})
+        is None
     )
 
 
