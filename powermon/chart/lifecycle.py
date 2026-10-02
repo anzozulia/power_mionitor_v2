@@ -92,8 +92,10 @@ worker was down is simply due on the next pass.
   (Pitfall 1): a post in the new chat while the old today-record is active would hit
   ``chart_message_one_active_per_day`` and leave an untracked photo on every pass. Once
   its stale records are retired, a moved location has no record for today, so today's
-  chart is posted and pinned in its new chat on the next passes. A change of only the name
-  or the language releases nothing: the next refresh shows it (D-14).
+  chart is posted and pinned in its new chat on the next passes. A deleted location stays
+  in the snapshot (``ChartLocation.deleted``) only until its records are retired, and gets
+  nothing but releases: no post, pin, refresh or final edit. A change of only the name or
+  the language releases nothing: the next refresh shows it (D-14).
 
 Each step is its own condition, checked on every pass (D-02): after downtime across one
 or more midnights the passes post and pin one chart for today and finalize and unpin
@@ -121,7 +123,9 @@ bot-wide outcome (429, 5xx, refused connection) also sets ``bot_wide_key``, for 
 hold the relay gives an alert's outcome of that kind. On top of that hold, the step waits
 ``step_delay(n)`` after its n-th consecutive failure (``RelayState.chart_failures``): 30 s,
 doubling, at most 15 min. So a failed step's key always outlives its bot's hold, and the
-location's other due steps go first (D-02); and an ambiguous post, which is posted again
+location's other due steps go first (D-02), except while it has a stale record: then a
+failed release holds every step of that location, and the location's next stale record,
+if any, goes first (Pitfall 1); and an ambiguous post, which is posted again
 (D-06), slows down to at most 4 untracked photos an hour. Permanent errors and render
 errors wait a fixed 15 min. A step whose call was made but whose record UPDATE raised a
 database error (refresh, pin, finalize, unpin: all idempotent) waits ``step_delay(n)``
@@ -136,7 +140,9 @@ first drops every ``chart:`` key that no longer guards a step, i.e. one of a loc
 that is not monitored, a post key once today's record exists, a refresh key while it
 does not, a pin key of a record that is pinned or no longer today's (an older record's
 pin is never retried: its one unpin follows instead), a finalize or unpin key of a record
-that is done or retired. The alert relay's keys are never touched.
+that is done or retired. A location with a stale record keeps only the keys of its
+releases, each until its record is retired; without them a transient release error
+would turn into a call per pass. The alert relay's keys are never touched.
 
 Each call logs one INFO line, ``chart <step> for location <id>: <kind> (<code>)
 render_ms=<n> call_ms=<n>``, with no token and no Telegram description (OPS-08).
@@ -200,11 +206,21 @@ _CLEANUP: tuple[Step, ...] = ("finalize", "unpin")
 # The steps on today's record: its message gone means today's chart is posted again.
 _TODAYS: tuple[Step, ...] = ("pin", "refresh")
 
+# The monitored locations (status on or off, not deleted), and the deleted ones that still
+# have an active record (ROWS_SQL's predicate): those only get their records released, and
+# leave the snapshot once every record is retired (D-09).
 LOCATIONS_SQL = """
-SELECT l.id, l.name, l.language, l.bot_token, l.chat_id, l.period_s, l.grace_s, l.router_grace
+SELECT l.id, l.name, l.language, l.bot_token, l.chat_id, l.period_s, l.grace_s, l.router_grace,
+       l.deleted_at IS NOT NULL
   FROM location l
   JOIN location_state s ON s.location_id = l.id
- WHERE s.status IN ('on', 'off') AND l.deleted_at IS NULL
+ WHERE (s.status IN ('on', 'off') AND l.deleted_at IS NULL)
+    OR (l.deleted_at IS NOT NULL
+        AND EXISTS (SELECT 1 FROM chart_message c
+                     WHERE c.location_id = l.id AND c.retired_at IS NULL
+                       AND (c.local_date = %(today)s
+                            OR (c.local_date < %(today)s
+                                AND (c.finalized_at IS NULL OR c.unpinned_at IS NULL)))))
  ORDER BY l.id
 """
 # Today's active records, and older ones that still need their final edit or their unpin
@@ -370,25 +386,33 @@ def settled_records(
     The cursor, not the wall clock: while detection stalls, or across a lapse, the final
     edit waits too (a lapse carve commits before the cursor moves). With no cursor
     (detection has not run yet) no day has settled. Only records not finalized yet, of
-    monitored locations.
+    monitored locations: a deleted location's record, or one whose chat or bot is no
+    longer its location's (``stale``), is released and never finalized (D-08, D-09).
     """
     if detected_until is None:
         return frozenset()
-    settle = {location.location_id: location.settle for location in locations}
+    by_id = {location.location_id: location for location in locations if not location.deleted}
     return frozenset(
         row.id
         for row in rows
         if row.local_date < today
         and row.finalized_at is None
-        and row.location_id in settle
-        and detected_until >= model.next_midnight(row.local_date, tz) + settle[row.location_id]
+        and row.location_id in by_id
+        and not stale(by_id[row.location_id], row)
+        and detected_until
+        >= model.next_midnight(row.local_date, tz) + by_id[row.location_id].settle
     )
 
 
 def read_snapshot(today: date) -> tuple[list[ChartLocation], list[ChartRow]]:
-    """The monitored locations by id, and the records ``plan`` may act on, oldest first."""
+    """The locations by id, and the records ``plan`` may act on, oldest first.
+
+    The locations are the monitored ones plus the deleted ones that still have an active
+    record, marked ``deleted``: a deleted location stays only until its records are
+    retired (D-09).
+    """
     with connection.cursor() as cur:
-        cur.execute(LOCATIONS_SQL)
+        cur.execute(LOCATIONS_SQL, {"today": today})
         locations = [
             ChartLocation(
                 location_id=r[0],
@@ -397,6 +421,7 @@ def read_snapshot(today: date) -> tuple[list[ChartLocation], list[ChartRow]]:
                 bot_token=r[3],
                 chat_id=r[4],
                 settle=settle_time(r[5], r[6], r[7]),
+                deleted=r[8],
             )
             for r in cur.fetchall()
         ]
@@ -1041,9 +1066,21 @@ def _prune(
 
 
 def _live_keys(locations: list[ChartLocation], rows: list[ChartRow], today: date) -> set[str]:
-    """Every key that can still guard a step: the steps the snapshot may still make."""
-    monitored = {location.location_id for location in locations}
+    """Every key that can still guard a step: the steps the snapshot may still make.
+
+    A location with a stale record (or a deleted one) makes only releases until every
+    stale record is retired (D-08, D-09): its live keys are those releases' keys, so a
+    release's backoff survives every pass and a transient error never turns into a call
+    per pass; none of its other keys is live.
+    """
+    monitored: set[int] = set()
     live: set[str] = set()
+    for location in locations:
+        stale_rows = _stale_rows(location, rows)
+        if stale_rows or location.deleted:
+            live.update(chart_key(location.location_id, "release", row.id) for row in stale_rows)
+        else:
+            monitored.add(location.location_id)
     for location_id in monitored:
         today_row = _today_row(rows, location_id, today)
         if today_row is None:
