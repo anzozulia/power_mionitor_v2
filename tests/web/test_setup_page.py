@@ -1,7 +1,9 @@
 """The device setup page (LOC-05, HB-01, D-06, D-11; INV-23 UI part, INV-24 #3 link).
 
 - The key is masked on GET and shown in full only in the reveal POST response (200, no
-  redirect). Every response of the view is ``Cache-Control: no-store``.
+  redirect) and, with the new key, in the Regenerate POST response (Phase 4 D-14). Every
+  response of the view is ``Cache-Control: no-store``. Both key states offer "Regenerate
+  key", a link to the confirmation page (UI-D5).
 - The heartbeat URL comes from ``PUBLIC_BASE_URL``, never from the request's Host header.
 - Every example block is exactly the string the 01-09 generator returns, the same string
   ``test_examples_verbatim`` runs against ``/hb``.
@@ -39,6 +41,7 @@ MASKED_TOKEN = "987654321:••••••••"
 REVEAL_NOTE = "Reveal the key above to fill it into these examples."
 HIDDEN_AGAIN = "The key is hidden again the next time you open this page."
 KEY_NOTE = "Anyone with this key can send heartbeats for this location. Keep it private."
+REGENERATE_NOTE = "If the key has leaked, regenerate it. The old key stops working at once."
 
 
 @pytest.fixture
@@ -160,21 +163,65 @@ def test_full_key_appears_in_no_other_response(admin: Client) -> None:
             "language": "en",
         },
     )
-    key = LocationState.objects.get().location.device_key
+    location = LocationState.objects.get().location
+    key = location.device_key
     setup = created.url
+    regenerate = f"{setup}regenerate/"
 
+    confirm = admin.get(regenerate)
     responses = [
         created,
         admin.get(setup),
         admin.get("/"),
         admin.get("/locations/new/"),
         admin.get("/locations/999999/setup/"),
+        admin.get(f"/locations/{location.pk}/"),
+        confirm,
+        admin.get("/locations/999999/setup/regenerate/"),
     ]
 
     for response in responses:
         assert key not in response.content.decode()
         assert key not in response.get("Location", "")
     assert key in admin.post(setup).content.decode()
+
+    # The only other response with the full key is the Regenerate POST, with the new one
+    # (SEC-04, D-14); the old key is gone from it, and the new key from every page after.
+    marker = re.search(r'name="marker" value="([^"]+)"', confirm.content.decode())
+    assert marker is not None
+    regenerated = admin.post(regenerate, {"marker": marker.group(1)})
+    new_key = Location.objects.get(pk=location.pk).device_key
+    assert new_key != key
+    assert new_key in regenerated.content.decode()
+    assert key not in regenerated.content.decode()
+    for response in (
+        admin.get(setup),
+        admin.get("/"),
+        admin.get(f"/locations/{location.pk}/"),
+        admin.get(regenerate),
+    ):
+        assert new_key not in response.content.decode()
+
+
+@pytest.mark.django_db
+def test_setup_page_offers_regenerate(admin: Client, location: Any) -> None:
+    masked = admin.get(_url(location)).content.decode()
+    revealed = admin.post(_url(location)).content.decode()
+
+    link = (
+        f'<a class="btn btn--secondary" href="/locations/{location.pk}/setup/regenerate/">'
+        "Regenerate key</a>"
+    )
+    for page, last_note in ((masked, KEY_NOTE), (revealed, HIDDEN_AGAIN)):
+        section = page[page.index("<h2>Device key") : page.index("<h2>Examples")]
+        assert f"<p>{REGENERATE_NOTE}</p>" in section
+        assert link in section
+        # After the key note (and the "hidden again" line when revealed), UI-SPEC screen E.
+        assert section.index(last_note) < section.index(REGENERATE_NOTE) < section.index(link)
+        # The entry point only opens the confirmation page (UI-D5): a link, not a form.
+        assert "btn--danger" not in page
+    # The masked state keeps "Reveal key" as its only primary button.
+    assert masked.count("btn--primary") == 1
 
 
 # The examples are the generator's strings
