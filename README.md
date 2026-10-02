@@ -356,11 +356,13 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
     heartbeat gets no chart.
   - At local midnight (`DISPLAY_TZ`) a new chart for the new day is posted silently and
     pinned silently, and the previous day's chart is unpinned. Two charts are pinned for
-    a few seconds at most. About two minutes later, once detection has settled past
-    midnight (the location's heartbeat timeout plus a short margin, so an outage that
-    began just before midnight is still counted), the previous day's chart gets its final
-    render (no now marker, the caption names its date, for example
-    `No outages on Thu 01.10`).
+    a few seconds at most. About two minutes later, once detection has run past
+    midnight by the location's heartbeat timeout plus a short margin, the previous day's
+    chart gets its final render (no now marker, the caption names its date, for example
+    `No outages on Thu 01.10`). An outage that began just before midnight is then
+    counted, unless detection's checks failed in every cycle of that short margin (for
+    example on database errors). Each such failure is logged, and the finished chart is
+    not redrawn.
   - Today's chart is edited in place every 15 minutes, so an outage shows on it within 15
     minutes of its OFF alert.
   - After the worker was down across one or more midnights, it posts exactly one chart
