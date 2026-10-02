@@ -78,6 +78,12 @@ UPDATE location_state
  WHERE location_id = %(id)s AND status = 'on'
 """
 
+# Is the location deleted? Read right after LOCK_SQL, under the state row lock: a delete
+# commits its tombstone in a transaction that holds the same lock (D-09), so a heartbeat
+# that looked up its key before the delete and waited on the lock sees it here (LOC-04).
+# No row (the location row is gone) counts as deleted.
+DELETED_SQL = "SELECT deleted_at IS NOT NULL FROM location WHERE id = %s"
+
 # Whether an alert is sent is decided when its transition is recorded, inside the
 # transition's own transaction (INV-05, D-06): a heartbeat gate reads the settings here,
 # under the row lock; the OFF transition reads alerts_enabled from its CAS row
@@ -125,6 +131,13 @@ def _config_row(cur: CursorWrapper, location_id: int) -> tuple[bool, bool]:
     return bool(row[0]), bool(row[1])
 
 
+def _deleted(cur: CursorWrapper, location_id: int) -> bool:
+    """True when the location is deleted or its row is gone, read on the gate's cursor."""
+    cur.execute(DELETED_SQL, [location_id])
+    row = cur.fetchone()
+    return row is None or bool(row[0])
+
+
 def _run_gate(cur: CursorWrapper, sql: str, params: dict[str, int | datetime]) -> None:
     """Run one heartbeat gate UPDATE; it must change exactly the locked row.
 
@@ -166,7 +179,12 @@ def record_heartbeat(location_id: int, now: datetime) -> str:
     that arrives while another writer of this location is mid-transaction waits for it
     and sees its result (WR-01). Returns "restored" (off -> on, with one power_on alert
     queued when alerts are on), "started" (waiting -> on, silent), "plain" (already on) or
-    "ignored" (only when this location has no state row; nothing is written).
+    "ignored" (this location has no state row, or it is deleted; nothing is written).
+
+    The deleted check runs right after the row lock and before any gate (D-09, LOC-04).
+    The heartbeat lookup already skips deleted locations, but a heartbeat that looked up
+    its key before a delete may wait on the lock the delete holds; once it gets the lock
+    it sees the tombstone and changes nothing: no restore, no interval, no ON alert.
 
     A restore is stamped at ``max(now, outage start, open interval start)`` (IN-01). After
     a backward clock step ``now`` can lie before the outage start, and a heartbeat that
@@ -181,7 +199,7 @@ def record_heartbeat(location_id: int, now: datetime) -> str:
     with transaction.atomic(), connection.cursor() as cur:
         cur.execute(LOCK_SQL, [location_id])
         locked = cur.fetchone()
-        if locked is None:
+        if locked is None or _deleted(cur, location_id):
             return "ignored"
         status, outage_started_at = locked
         if status == "off":
