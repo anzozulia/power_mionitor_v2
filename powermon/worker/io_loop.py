@@ -23,9 +23,15 @@ would hold the one-line queue and block every later notice (B2).
 
 The chart step (``powermon.chart.lifecycle.run_step``, D-05) is the last step of the pass
 and makes at most one Telegram call, so chart work delays an alert by at most one call
-(INV-14). It runs only when the caller passes ``charts=True``, which the worker does; it
-is off by default. A chart outcome never sets ``chat_key``: a chart's per-chat or
-permanent failure must not hold that channel's alerts.
+(INV-14). It runs only when the caller passes ``charts=True``; it is off by default, so a
+caller that does not ask for chart work makes no chart call. A chart outcome never sets
+``chat_key``: a chart's per-chat, permanent or render failure must not hold that
+channel's alerts. Only a bot-wide outcome of a chart call (``BOT_WIDE_KINDS``: a 429, a
+5xx, a refused connection, which concern the whole bot) also sets ``bot_wide_key``, with
+the hold an alert's outcome of that kind would give (D-06); the bot's alerts then wait
+for it as for their own. The chart step in turn skips a bot whose ``bot_wide_key``, or a
+channel whose ``chat_key``, is in the future, and keeps its own consecutive failures per
+step in ``RelayState.chart_failures``.
 
 The result decides the row's next status, for both channels (D-14 policy):
 
@@ -206,12 +212,16 @@ class RelayState:
     the I/O thread before every pass; every claim requires that session to hold the
     worker lock, so a worker whose session is gone claims nothing (C1). None (a direct
     call, as in tests) claims unfenced.
+    ``chart_failures``: consecutive failures per chart step key
+    (``powermon.chart.lifecycle.chart_key``), which set that step's growing backoff; kept
+    in memory like ``not_before``, so a restart starts again from the first delay.
     """
 
     not_before: dict[str, datetime] = field(default_factory=dict)
     unapplied: dict[int, Unapplied] = field(default_factory=dict)
     db_down_notified: bool = False
     lease_pid: int | None = None
+    chart_failures: dict[str, int] = field(default_factory=dict)
 
 
 def bot_key(token: str) -> str:

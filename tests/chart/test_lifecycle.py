@@ -43,7 +43,7 @@ from urllib3.exceptions import MaxRetryError, NewConnectionError
 
 from powermon.alerts import ops, outbox
 from powermon.alerts.models import OutboxMessage
-from powermon.chart import lifecycle, render
+from powermon.chart import lifecycle, render, source
 from powermon.chart.model import Piece, Week
 from powermon.chart.models import ChartMessage
 from powermon.engine import transitions
@@ -697,9 +697,7 @@ def test_INV14_one_chart_call_per_pass_after_alerts_and_ops(
     b = _monitored(location_factory, bot_token=TOKEN_B, chat_id=CHAT_B)
     _queue_alert(a)
     with transaction.atomic():
-        ops.notify(
-            outbox.KIND_OPS_PIN_RESTORED, payload={}, recorded_at=NOON_05, location_id=a.pk
-        )
+        ops.notify(outbox.KIND_OPS_PIN_RESTORED, payload={}, recorded_at=NOON_05, location_id=a.pk)
     fake_telegram.accept(DEFAULT_BOT_TOKEN)
     fake_telegram.accept(OPS_BOT_TOKEN)
     fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
@@ -719,6 +717,7 @@ def test_INV14_one_chart_call_per_pass_after_alerts_and_ops(
         [("B", "sendPhoto")],
         [("B", "pinChatMessage")],
     ]
+    assert [(row.location_id, row.pinned) for row in _rows()] == [(a.pk, True), (b.pk, True)]
 
 
 def test_chart_failure_never_holds_the_channels_alerts(
@@ -741,7 +740,9 @@ def test_chart_failure_never_holds_the_channels_alerts(
     }
     off = _queue_alert(a, at=clock.now())
     assert _pass(clock, state) is True
-    assert fake_telegram.sent == [{"chat_id": DEFAULT_CHAT_ID, "text": OFF_EN, "parse_mode": "HTML"}]
+    assert fake_telegram.sent == [
+        {"chat_id": DEFAULT_CHAT_ID, "text": OFF_EN, "parse_mode": "HTML"}
+    ]
     assert OutboxMessage.objects.get(pk=off.pk).status == "sent"
 
 
@@ -943,6 +944,26 @@ def test_stale_lease_makes_no_chart_call(
     assert len(_rows()) == 1
 
 
+def test_a_second_record_for_the_day_is_never_written(
+    location_factory: Callable[..., Any], fake_telegram: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    location = _monitored(location_factory)
+    # Another worker records its own post for today while this one's sendPhoto is in flight.
+    fake_telegram.answer_method(
+        DEFAULT_BOT_TOKEN, "sendPhoto", lambda: _seed(location, message_id=999, pinned=False)
+    )
+    caplog.set_level(logging.WARNING, logger=LIFECYCLE_LOGGER)
+    state = io_loop.RelayState()
+
+    assert _pass(FakeClock(NOON_05), state) is True
+
+    # ON CONFLICT DO NOTHING: one record for the day, the other worker's (CHRT-05).
+    assert [row.message_id for row in _rows()] == [999]
+    [line] = [r.getMessage() for r in caplog.records if r.name == LIFECYCLE_LOGGER]
+    assert "1001" in line and "untracked" in line
+    assert state.not_before == {}
+
+
 def test_render_error_backs_off_that_step_only(
     location_factory: Callable[..., Any],
     fake_telegram: Any,
@@ -982,6 +1003,91 @@ def test_render_error_backs_off_that_step_only(
     assert _requests(fake_telegram) == [("B", "sendPhoto")]
 
 
+def test_database_error_in_the_chart_step_is_logged_and_the_watchdog_ticks(
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _monitored(location_factory)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+
+    def unreachable(*args: Any, **kwargs: Any) -> Week:
+        raise OperationalError("server closed the connection unexpectedly")
+
+    # The week read fails: a database error, not a render error, so no 15-min backoff.
+    monkeypatch.setattr(source, "load_week", unreachable)
+    caplog.set_level(logging.WARNING)
+    ticks: list[str] = []
+    state = io_loop.RelayState()
+
+    attempted = io_loop.run_iteration(
+        FakeClock(NOON_05), state, tick=lambda: ticks.append("tick"), charts=True
+    )
+
+    assert attempted is False
+    assert len(fake_telegram.calls) == 0
+    assert state.not_before == {}
+    assert "chart step failed: OperationalError" in caplog.text
+    assert "server closed" not in caplog.text
+    # The ops step and the chart step each stamp the watchdog (no subscriber head).
+    assert ticks == ["tick", "tick"]
+
+
+def test_ambiguous_refresh_is_retried_after_the_step_delay(
+    location_factory: Callable[..., Any], fake_telegram: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    location = _monitored(location_factory)
+    _seed(location, rendered=NOON_05)
+    fake_telegram.fail_method(DEFAULT_BOT_TOKEN, "editMessageMedia", exc=requests.ReadTimeout())
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    caplog.set_level(logging.WARNING, logger=LIFECYCLE_LOGGER)
+    at = NOON_05 + timedelta(minutes=15)
+    clock = FakeClock(at)
+    state = io_loop.RelayState()
+    key = lifecycle.chart_key(location.pk, "refresh")
+
+    assert _pass(clock, state) is True
+
+    # An edit is idempotent: it is simply made again after the step's own wait.
+    assert state.not_before == {key: at + _seconds(30)}
+    assert state.chart_failures == {key: 1}
+    assert [r for r in caplog.records if r.name == LIFECYCLE_LOGGER] == []
+    assert _rows()[0].last_rendered_at == NOON_05
+    clock.set(at + _seconds(30))
+    assert _pass(clock, state) is True
+    assert _rows()[0].last_rendered_at == at + _seconds(30)
+    assert state.chart_failures == {}
+
+
+def test_chart_content_finished_day_caption(location_factory: Callable[..., Any]) -> None:
+    location = location_factory()
+    insert_pieces(
+        location,
+        local_pieces(
+            [
+                ("on", "2026-10-01 08:00", "2026-10-01 10:00"),
+                ("off", "2026-10-01 10:00", "2026-10-01 12:00"),
+                ("on", "2026-10-01 12:00", None),
+            ]
+        ),
+    )
+    quiet = location_factory()
+    end_of_day = kyiv("2026-10-02 00:00")
+
+    png, caption = lifecycle.chart_content(
+        _location(location.pk), TODAY, end_of_day, live=False, tz=KYIV
+    )
+    _, quiet_caption = lifecycle.chart_content(
+        _location(quiet.pk), TODAY, end_of_day, live=False, tz=KYIV
+    )
+
+    # A finished day: line 1 only, the weekday and date in place of "Today" (D-13).
+    assert caption == "Thu 01.10 off: 2h · 1 outage"
+    assert quiet_caption == "No outages on Thu 01.10"
+    assert _png_size(png) == (1280, 1000)
+
+
 def test_stop_set_makes_no_chart_call(
     location_factory: Callable[..., Any], fake_telegram: Any
 ) -> None:
@@ -990,7 +1096,9 @@ def test_stop_set_makes_no_chart_call(
     stop = threading.Event()
     stop.set()
 
-    assert io_loop.run_iteration(FakeClock(NOON_05), io_loop.RelayState(), stop, charts=True) is False
+    assert (
+        io_loop.run_iteration(FakeClock(NOON_05), io_loop.RelayState(), stop, charts=True) is False
+    )
 
     assert len(fake_telegram.calls) == 0
 

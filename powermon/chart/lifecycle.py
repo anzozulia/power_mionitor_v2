@@ -36,6 +36,19 @@ Before each call the worker checks that its lease session (``RelayState.lease_pi
 holds the worker lock, with the same ``pg_locks`` predicate as the outbox claim; a stale
 worker makes no chart call (C1).
 
+Backoff (D-02, D-06, INV-14). Chart calls share the alert relay's per-bot and per-chat
+backoff, read only: a bot whose ``bot_wide_key`` or a channel whose ``chat_key`` is in
+the future gets no chart call. A chart outcome writes its own step key
+(``chart_key``: ``chart:<location>:<step>[:<record>]``) and never ``chat_key``, so a
+chart's per-chat, permanent or render failure never holds the channel's alerts. Only a
+bot-wide outcome (429, 5xx, refused connection) also sets ``bot_wide_key``, for exactly the
+hold the relay gives an alert's outcome of that kind. On top of that hold, the step waits
+``step_delay(n)`` after its n-th consecutive failure (``RelayState.chart_failures``): 30 s,
+doubling, at most 15 min. So a failed step's key always outlives its bot's hold, and the
+location's other due steps go first (D-02); and an ambiguous post, which is posted again
+(D-06), slows down to at most 4 untracked photos an hour. Permanent errors and render
+errors wait a fixed 15 min. Nothing here sleeps.
+
 Each call logs one INFO line, ``chart <step> for location <id>: <kind> (<code>)
 render_ms=<n> call_ms=<n>``, with no token and no Telegram description (OPS-08).
 """
@@ -48,13 +61,13 @@ from datetime import date, datetime, timedelta
 from typing import Literal
 
 from django.conf import settings
-from django.db import connection
+from django.db import Error, connection
 
 from powermon.chart import model, source
 from powermon.chart.models import ChartMessage
 from powermon.clock import Clock
 from powermon.i18n import chart_texts, times
-from powermon.telegram.client import SendResult, TelegramClient
+from powermon.telegram.client import DEFAULT_RETRY_AFTER_S, SendResult, TelegramClient
 from powermon.worker import io_loop
 from powermon.worker.lease import LOCK_KEY
 
@@ -64,10 +77,17 @@ Step = Literal["post", "pin", "finalize", "unpin", "refresh"]
 
 # Today's chart is due for a refresh this long after its last successful render (D-05).
 REFRESH_EVERY = timedelta(minutes=15)
-# The first wait after a failed step.
+# A failed step's own wait: STEP_RETRY after its first consecutive failure, doubling with
+# each further one, at most STEP_RETRY_MAX (``step_delay``).
 STEP_RETRY = timedelta(seconds=io_loop.BACKOFF_CAP_S)
+STEP_RETRY_MAX = REFRESH_EVERY
+# Doublings after which STEP_RETRY is past STEP_RETRY_MAX (30 s * 2**5 = 16 min).
+_MAX_DOUBLINGS = 5
 # The steps that render a chart right before their call.
 _RENDERED: tuple[Step, ...] = ("post", "refresh")
+# Outcomes that end a step's tries for now with the fixed 15-min wait. "message to edit
+# not found" waits too until 03-09 retires the record.
+_PERMANENT_KINDS = ("permanent", "edit_target_missing")
 
 LOCATIONS_SQL = """
 SELECT l.id, l.name, l.language, l.bot_token, l.chat_id
@@ -147,6 +167,17 @@ def chart_key(location_id: int, step: Step, row_id: int | None = None) -> str:
     return key if row_id is None else f"{key}:{row_id}"
 
 
+def step_delay(failures: int) -> timedelta:
+    """A step's own wait after its ``failures``-th consecutive failure (D-02, D-06).
+
+    30 s after the first, doubling with each further one, at most 15 min: 30 s, 60 s, 2,
+    4, 8 min, then 15 min. ValueError for ``failures`` below 1.
+    """
+    if failures < 1:
+        raise ValueError(f"step_delay() needs at least 1 failure, not {failures}")
+    return min(STEP_RETRY * 2 ** min(failures - 1, _MAX_DOUBLINGS), STEP_RETRY_MAX)
+
+
 def read_snapshot(today: date) -> tuple[list[ChartLocation], list[ChartRow]]:
     """The monitored locations by id, and the records ``plan`` may act on, oldest first."""
     with connection.cursor() as cur:
@@ -188,7 +219,10 @@ def plan(
     it). Only when none is due anywhere, the refresh that has waited longest goes: today's
     record with the oldest ``last_rendered_at`` at least ``REFRESH_EVERY`` ago, ties to
     the lower location id (CHRT-02). A step whose own key in ``not_before`` is in the
-    future is skipped, so the next due step goes instead.
+    future is skipped, so the next due step goes instead (D-02). The alert relay's
+    backoff is respected, read only: a location whose bot waits (``bot_wide_key``) makes
+    no step, and a step whose channel waits (``chat_key`` of the chat it would call)
+    is skipped (D-06).
     """
 
     def waiting(key: str) -> bool:
@@ -196,6 +230,8 @@ def plan(
 
     due_refreshes: list[tuple[datetime, int, Action]] = []
     for location in locations:
+        if waiting(io_loop.bot_wide_key(location.bot_token)):
+            continue
         today_row = _today_row(rows, location.location_id, today)
         action = _midnight_step(location, today_row, waiting)
         if action is not None:
@@ -204,6 +240,7 @@ def plan(
             today_row is not None
             and now - today_row.last_rendered_at >= REFRESH_EVERY
             and not waiting(chart_key(location.location_id, "refresh"))
+            and not waiting(io_loop.chat_key(location.bot_token, today_row.chat_id))
         ):
             refresh = Action("refresh", location, today_row)
             due_refreshes.append((today_row.last_rendered_at, location.location_id, refresh))
@@ -225,10 +262,17 @@ def _midnight_step(
 ) -> Action | None:
     """The location's first due step of D-02 (post, pin), or None."""
     location_id = location.location_id
+    token = location.bot_token
     if today_row is None:
-        if not waiting(chart_key(location_id, "post")):
+        if not waiting(chart_key(location_id, "post")) and not waiting(
+            io_loop.chat_key(token, location.chat_id)
+        ):
             return Action("post", location)
-    elif _pin_due(today_row) and not waiting(chart_key(location_id, "pin", today_row.id)):
+    elif (
+        _pin_due(today_row)
+        and not waiting(chart_key(location_id, "pin", today_row.id))
+        and not waiting(io_loop.chat_key(token, today_row.chat_id))
+    ):
         return Action("pin", location, today_row)
     return None
 
@@ -265,7 +309,15 @@ def chart_content(
 
 
 def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | None = None) -> bool:
-    """Make the one chart call due now, if any; True if a Telegram call was made."""
+    """Make the one chart call due now, if any; True if a Telegram call was made.
+
+    ``now`` is read once: today's date, the render, its now pill and the caption's update
+    time all come from it (CHRT-04, Pitfall 8); the outcome counts from the answer time.
+    ``stop`` is checked before the render and again before the call. A render error backs
+    off that step only, for 15 min, and makes no call (INV-13 pattern). A database error
+    propagates, except one writing the outcome of a call that was made: that step then
+    waits ``step_delay``, so a write that keeps failing never turns into a call per pass.
+    """
     now = clock.now()
     tz = settings.CFG.display_tz
     today = model.local_today(now, tz)
@@ -274,19 +326,32 @@ def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | No
     if action is None or _stopped(stop):
         return False
     location = action.location
+    key = _key(action)
     content: tuple[bytes, str] | None = None
     started = clock.monotonic()
     if action.step in _RENDERED:
-        content = chart_content(location, today, now, live=True, tz=tz)
+        try:
+            content = chart_content(location, today, now, live=True, tz=tz)
+        except Error:
+            raise  # the database, not the chart: the pass ends and is retried (MON-06)
+        except Exception as exc:
+            # The class only: an exception's text could carry anything.
+            state.not_before[key] = now + io_loop.PERMANENT_BACKOFF
+            log.error(
+                "chart %s for location %s: render failed (%s); the step waits 15 min",
+                action.step,
+                location.location_id,
+                type(exc).__name__,
+            )
+            return False
     render_ms = _ms(clock.monotonic() - started)
-    if not _lease_holds(state.lease_pid):
+    if _stopped(stop) or not _lease_holds(state.lease_pid):
         return False
     client = TelegramClient(location.bot_token)
     called = clock.monotonic()
     result = _call(client, action, content)
     call_ms = _ms(clock.monotonic() - called)
     answered = clock.now()
-    _apply(action, result, today, answered, state)
     log.info(
         "chart %s for location %s: %s (%s) render_ms=%d call_ms=%d",
         action.step,
@@ -296,6 +361,10 @@ def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | No
         render_ms,
         call_ms,
     )
+    try:
+        _apply(action, key, result, today, answered, state)
+    except Error as exc:
+        _unwritten(action, key, result, answered, state, exc)
     return True
 
 
@@ -315,14 +384,17 @@ def _call(client: TelegramClient, action: Action, content: tuple[bytes, str] | N
 
 def _apply(
     action: Action,
+    key: str,
     result: SendResult,
     today: date,
     answered: datetime,
     state: io_loop.RelayState,
 ) -> None:
-    """Write the step's outcome: its record on success, else its own backoff key."""
-    key = _key(action)
+    """Write the step's outcome: its record on success, else its own backoff (``_fail``)."""
     row = action.row
+    if result.kind == "ok" and action.step == "post" and result.message_id is None:
+        # Cannot happen with the client (it answers no_message_id), and must not record.
+        result = SendResult("maybe_delivered", code="no_message_id")
     if result.kind == "ok":
         if action.step == "post" and result.message_id is not None:
             _record_post(action.location, today, result.message_id, answered)
@@ -335,12 +407,14 @@ def _apply(
             ChartMessage.objects.filter(pk=row.id, retired_at__isnull=True).update(
                 last_rendered_at=answered
             )
+        # The step is done: its failures and its spent key are forgotten.
+        state.chart_failures.pop(key, None)
         state.not_before.pop(key, None)
         return
     if result.kind == "permanent" and action.step == "pin" and row is not None:
         # The bot may not pin here: tried again after the next render, not before (D-07).
         ChartMessage.objects.filter(pk=row.id, pinned=False).update(pin_failed_at=answered)
-    _back_off(action, key, result, answered, state)
+    _fail(action, key, result, answered, state)
 
 
 def _key(action: Action) -> str:
@@ -389,17 +463,89 @@ def _record_post(location: ChartLocation, day: date, message_id: int, answered: 
         )
 
 
-def _back_off(
+def _fail(
     action: Action, key: str, result: SendResult, answered: datetime, state: io_loop.RelayState
 ) -> None:
-    """A failed step waits under its own key; it never writes the channel's ``chat_key``."""
-    if result.kind == "permanent":
+    """A failed step waits under its own key, counted from the answer (D-02, D-06).
+
+    With n = the step's consecutive failures, this one included:
+
+    - permanent (and, until 03-09, edit_target_missing): the fixed PERMANENT_BACKOFF;
+    - rate_limited, transient, not_sent (``BOT_WIDE_KINDS``): the bot is held as an
+      alert's outcome would hold it (retry_after capped at MAX_RETRY_AFTER_S, or
+      min(2**n, BACKOFF_CAP_S) s), and the step waits ``step_delay(n)`` longer, so the
+      location's other steps go first once the hold ends;
+    - maybe_delivered: ``step_delay(n)``. A post may exist but is never recorded, pinned
+      or edited, and is posted again after the wait (D-06); an edit or pin is idempotent.
+
+    It never writes ``chat_key``: a chart failure must not hold the channel's alerts.
+    """
+    failures = state.chart_failures.get(key, 0) + 1
+    state.chart_failures[key] = failures
+    location_id = action.location.location_id
+    if result.kind in _PERMANENT_KINDS:
         state.not_before[key] = answered + io_loop.PERMANENT_BACKOFF
         log.warning(
             "chart %s for location %s: permanent error %s; the step waits 15 min",
             action.step,
-            action.location.location_id,
+            location_id,
             result.code,
         )
         return
-    state.not_before[key] = answered + STEP_RETRY
+    hold = _bot_hold(result, failures)
+    if hold is not None:
+        state.not_before[io_loop.bot_wide_key(action.location.bot_token)] = answered + hold
+        state.not_before[key] = answered + hold + step_delay(failures)
+        return
+    delay = step_delay(failures)
+    state.not_before[key] = answered + delay
+    if action.step == "post":
+        log.warning(
+            "chart post for location %s may have been delivered (%s); it is not recorded "
+            "and is posted again in %d s (attempt %d)",
+            location_id,
+            result.code,
+            delay // timedelta(seconds=1),
+            failures,
+        )
+
+
+def _bot_hold(result: SendResult, failures: int) -> timedelta | None:
+    """How long a bot-wide outcome holds the whole bot (``io_loop._apply``), else None."""
+    if result.kind not in io_loop.BOT_WIDE_KINDS:
+        return None
+    if result.kind == "rate_limited":
+        wait = min(result.retry_after or DEFAULT_RETRY_AFTER_S, io_loop.MAX_RETRY_AFTER_S)
+        return timedelta(seconds=wait)
+    return timedelta(seconds=min(2**failures, io_loop.BACKOFF_CAP_S))
+
+
+def _unwritten(
+    action: Action,
+    key: str,
+    result: SendResult,
+    answered: datetime,
+    state: io_loop.RelayState,
+    exc: Error,
+) -> None:
+    """The call was made but its outcome could not be written: the step waits.
+
+    A posted photo then stays untracked (never pinned or edited), as after an ambiguous
+    post, and is posted again after ``step_delay``; so a record that keeps failing to be
+    written gives at most a few photos per hour, never one per pass (D-06).
+    """
+    failures = state.chart_failures.get(key, 0) + 1
+    state.chart_failures[key] = failures
+    delay = step_delay(failures)
+    state.not_before[key] = answered + delay
+    message_id = result.message_id if action.row is None else action.row.message_id
+    log.warning(
+        "chart %s for location %s: %s for message %s, but the outcome was not written (%s); "
+        "the step waits %d s",
+        action.step,
+        action.location.location_id,
+        result.kind,
+        message_id,
+        type(exc).__name__,
+        delay // timedelta(seconds=1),
+    )
