@@ -355,9 +355,12 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
     and the time before it is empty (no data). A location still waiting for its first
     heartbeat gets no chart.
   - At local midnight (`DISPLAY_TZ`) a new chart for the new day is posted silently and
-    pinned silently. The previous day's chart then gets its final render (no now marker,
-    the caption names its date, for example `No outages on Thu 01.10`) and is unpinned.
-    Two charts are pinned for a few seconds at most.
+    pinned silently, and the previous day's chart is unpinned. Two charts are pinned for
+    a few seconds at most. About two minutes later, once detection has settled past
+    midnight (the location's heartbeat timeout plus a short margin, so an outage that
+    began just before midnight is still counted), the previous day's chart gets its final
+    render (no now marker, the caption names its date, for example
+    `No outages on Thu 01.10`).
   - Today's chart is edited in place every 15 minutes, so an outage shows on it within 15
     minutes of its OFF alert.
   - After the worker was down across one or more midnights, it posts exactly one chart
@@ -612,8 +615,9 @@ whether the window was hatched on it.
 
 ### (e) INV-14 #3: the midnight chart job on the VPS
 
-At local midnight every location's chart is posted, pinned, given its final render and
-unpinned, beside detection. This check measures render time and worker memory on the
+At local midnight every location's new chart is posted and pinned and the previous one
+unpinned; about two minutes later the previous one gets its final render. All of it runs
+beside detection. This check measures render time and worker memory on the
 real VPS, and that detection did not pause.
 
 1. Before 23:55 local, start sampling the worker's CPU and memory into a file, in a
