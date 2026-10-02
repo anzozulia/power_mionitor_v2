@@ -48,6 +48,8 @@ BOTS = {DEFAULT_BOT_TOKEN: "A", TOKEN_B: "B"}
 LIFECYCLE_LOGGER = lifecycle.__name__
 # How long a step that failed unexpectedly waits (io_loop.PERMANENT_BACKOFF).
 WAIT = timedelta(minutes=15)
+# The key of the bot that posted a kept chart photo (D-08): the default location's bot.
+BOT_A = io_loop.bot_key(DEFAULT_BOT_TOKEN)
 
 
 @pytest.fixture(autouse=True)
@@ -159,7 +161,7 @@ def test_INV13_error_after_an_accepted_post_keeps_it_without_a_second_photo(
     # Telegram accepted the photo, so the pass made a call and the post is kept.
     assert _pass(clock, state) is True
     assert ChartMessage.objects.count() == 0
-    assert state.chart_posted == {(location.pk, TODAY): (DEFAULT_CHAT_ID, 1001, NOON_05)}
+    assert state.chart_posted == {(location.pk, TODAY): (DEFAULT_CHAT_ID, 1001, NOON_05, BOT_A)}
     [error] = _errors(caplog)
     assert error.exc_info is not None and "post" in error.getMessage()
 
@@ -169,6 +171,7 @@ def test_INV13_error_after_an_accepted_post_keeps_it_without_a_second_photo(
     assert state.not_before == {}
     [row] = ChartMessage.objects.all()
     assert (row.message_id, row.pinned, row.last_rendered_at) == (1001, True, NOON_05)
+    assert row.bot_key == BOT_A
     assert _requests(fake_telegram) == [("A", "sendPhoto"), ("A", "pinChatMessage")]
     assert len(_errors(caplog)) == 1
 
