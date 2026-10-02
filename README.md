@@ -8,7 +8,9 @@ heartbeat every minute or so. When the heartbeats stop for longer than the locat
 period plus grace, the location's Telegram channel gets an OFF alert; the first heartbeat
 after the outage brings an ON alert. Each channel also gets a pinned weekly chart of when
 power was on and off, with daily totals, that updates itself (section 10, Weekly chart).
-One admin manages the locations in a small web panel.
+One admin manages the locations in a small web panel: add, edit and delete them, pause
+them for maintenance, switch their alerts off, rotate a device key, send a test message,
+and see which locations cannot deliver alerts (section 10, Location page).
 
 The stack is Django (web panel and heartbeat endpoint), one worker process (outage
 detection and Telegram delivery), PostgreSQL and Caddy (TLS), run with Docker Compose.
@@ -185,7 +187,13 @@ its OFF within one detection window (period plus grace) after the restart.
 3. On the location's setup page, click **Reveal key** and copy the curl or cron example
    onto the device. The device must run on mains power only (no UPS): heartbeats measure
    power and internet at the device.
-4. The location list shows **Waiting for first heartbeat**, then **On** after the first
+4. Open the location's page (click its name in the location list) and click **Send test
+   message**. The bot posts one silent message in the channel
+   (`🔧 Power Monitor test message: the bot can post here.`, in the location's language),
+   and the page says whether it was sent. If not, the message on the page names the cause
+   (the bot is not in the chat, a wrong chat ID, a bad token) and what to fix (section 10,
+   "Location page"). This checks the bot token and the chat ID before the first alert.
+5. The location list shows **Waiting for first heartbeat**, then **On** after the first
    heartbeat. The first heartbeat sends no alert, but within a few seconds the channel
    gets its first weekly chart, posted and pinned silently (section 10). The chart starts
    at the first heartbeat: the time before it is empty (no data).
@@ -341,6 +349,14 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
     once when pinning starts failing and once when it works again:
     `📌 Can't pin today's chart for Office (Telegram: http_400). The chart is still posted and refreshed; pinning is retried every 15 min. Check that the bot may pin messages in the chat.`
     and `📌 Pinning works again for Office.`
+  - Telegram refuses a location's alerts for good (bot removed from the channel, wrong
+    chat ID, bad token), once when it starts and once when an alert or a test message
+    goes through again, however many alerts are queued ("Location page" below):
+    `🚫 Alerts for Office are failing (Telegram: http_403). They stay queued and are retried every 15 min until they expire after 6h. Check that the bot is an admin of the channel, then send a test message from the admin panel.`
+    and `✅ Alerts for Office are delivered again.` When Telegram reports that the group
+    became a supergroup, the first one ends with
+    `The group became a supergroup; its new chat ID is -100…. Update the location's chat ID.`
+  - All-silent with a location in maintenance: see "All-silent and maintenance" below.
 - **Late alerts:** an alert sent more than 2 minutes after its transition was recorded
   starts with the local time of its event (the outage start for OFF, the restore time for
   ON): `🔴 17:27 POWER OFF`, or `🔴 30.09 23:58 POWER OFF` when the event was on another
@@ -379,8 +395,96 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
     while it runs. Chart work runs in the worker's Telegram thread only, at most one chart
     call per delivery pass and after all due alerts, so it never delays detection or
     heartbeats and delays an alert by one call at most. Each chart call logs one INFO
-    line, `chart <post|pin|finalize|unpin|refresh> for location <id>: <result> (<code>)
-    render_ms=<n> call_ms=<n>`.
+    line, `chart <post|pin|finalize|unpin|refresh|release> for location <id>: <result>
+    (<code>) render_ms=<n> call_ms=<n>` (`release` unpins a chart after a chat or token
+    change or a delete; "Location page" below).
+- **Location page:** click a location's name in the location list. Every action on it
+  is a button; nothing changes on a page load, and a reload never repeats an action.
+  - **Status:** On, Off, Maintenance or Waiting for first heartbeat. Under maintenance
+    the page also shows the power state underneath. Then on since or outage since, the
+    last heartbeat and **Delivery**: `OK`, or
+    `Failing since 2026-10-01 14:05:00 EEST (http_403)` with the cause and what to do.
+    The list's Delivery column shows the same badge (`Failing since 14:05 (http_403)`,
+    with the date when it started before today).
+  - **Switches:** each changes exactly one thing, applies at the click and can be
+    switched back; a second click or an old page never flips it back.
+    - **Maintenance:** OFF is not detected, so no OFF alert is sent, and the chart shows
+      the time as not monitored (hatched). Heartbeats are still recorded: an outage that
+      was already in progress stays one outage and gets its ON alert as usual when power
+      returns ("was OFF for" includes the maintenance time). Turning maintenance off
+      starts a fresh detection window: silence during maintenance does not count, and
+      OFF can be reported at the earliest period + grace after the switch.
+    - **Alerts:** while off, subscribers get no new alerts, and none are saved for
+      later. Alerts already queued still go out. The chart, its 15-minute refresh and the
+      midnight re-pin carry on.
+    - **Router grace:** while on, OFF waits 180 s longer when the last heartbeat came
+      within 5 minutes after power returned, so a router that restarts after a blackout
+      is not reported as a second outage. It changes only decisions made after the
+      switch; outages already recorded and their totals stay as they are.
+  - **Send test message:** one silent message to the channel with the location's bot
+    and chat, to check the token and the chat ID. It is not an alert: it is sent even
+    while alerts are off or maintenance is on, never queued and never retried. Telegram
+    can take up to 15 s to answer. The page then says the result: sent; the bot is not
+    in the chat or the chat was not found (`http_400`, `http_403`); Telegram rejected
+    the token (`http_401`, `http_404`); no answer in time (it may have been sent: check
+    the channel before you try again); Telegram unreachable; or Telegram asks to wait N
+    seconds. Details go to the web log as a short code, never the token.
+  - **Delivery failing:** when Telegram refuses a subscriber alert for good (400, 401,
+    403, 404), the location shows `Failing since …` and the ops chat gets one notice. The
+    alerts stay queued and are retried every 15 minutes until they expire
+    (`ALERT_MAX_AGE_HOURS`). Fix the cause (make the bot an admin of the channel again,
+    or correct the token or the chat ID in Edit location), then click **Send test
+    message**. When it goes through, the badge clears, the ops chat gets one
+    `✅ Alerts for … are delivered again.`, and the queued alerts go out in the worker's
+    next pass, each with its event time (the late prefix above). A subscriber alert that
+    goes through clears it too. A failed test message never marks a location failing:
+    its cause is shown on the page only. If Telegram says the group became a supergroup,
+    the page and the notice show the new chat ID (`-100…`): put it in Edit location, then
+    send a test message. The chat ID is never changed automatically.
+  - **Edit location:** name, heartbeat period, grace, chat ID, language and, optionally,
+    a new bot token. The token field is always empty and the token is never shown again
+    (only `123456789:••••••••`); leave it empty to keep the current one. New period and
+    grace values apply from the next check and never change past days or their totals.
+    A lower value can report OFF at the next check if the device has already been silent
+    that long. A new chat ID or bot token moves the weekly chart: the worker posts and
+    pins a new one in the new chat, and the queued alerts go there. The old chart is
+    unpinned in the old chat only if this location's bot is an admin there with the
+    "Edit messages of others" right; otherwise the old pin stays (one WARNING in the
+    worker log), so unpin it by hand in Telegram. The switches are not part of the form,
+    so saving a form opened earlier never switches them back or changes the status.
+  - **Delete location:** a confirmation page, then the delete. There is no undo. The
+    location's alerts stop at once and the queued ones are dropped (never sent), its
+    device key gets HTTP 401, its open problems (such as failing delivery) close without
+    a recovery notice, and it disappears from the admin panel. The worker unpins its
+    weekly chart where the bot still can; otherwise unpin it by hand (the posted messages
+    stay in the channel). Its history stays in the database but is never shown. To
+    monitor the place again, add a new location (a new key and an empty history). To
+    pause a location instead, turn maintenance on or alerts off.
+- **Device key rotation:** if a key has leaked, open the device setup page, click
+  **Regenerate key** and confirm. The old key stops working at once (HTTP 401) and the
+  history is kept. The page then shows the new key and the examples with it; a reload or
+  a double click never replaces it a second time. Turn maintenance on first, update the
+  device, then turn maintenance off. Without maintenance, an OFF can be recorded period +
+  grace after the device's last heartbeat with the old key, and subscribers then get an
+  OFF alert if alerts are on.
+- **Sign-in throttle:** 5 failed sign-ins within a minute from one IP lock sign-in for
+  that IP for 5 minutes: every sign-in from it then gets HTTP 429 and "Too many failed
+  sign-ins. Try again in 5 minutes.", even with the right password. The IP is the one
+  Caddy reports in `X-Forwarded-For` (locally, the direct client address).
+- **All-silent and maintenance (Pitfall 7):** an all-silent incident starts only when at
+  least 2 active locations (monitored, not in maintenance) are all silent, and its start
+  is the moment the last of them fell quiet. It ends at the first heartbeat after that
+  start from a location that has been active since before the start. A heartbeat from a
+  location in maintenance, or from one that left maintenance or came back on after the
+  start, counts only if it arrives after the incident was opened (detected, when the
+  start notice is queued): a device that beat in between proves nothing about the server
+  or the network. So during an area outage, a powered device in maintenance that keeps
+  beating ends the incident at its first beat after the start notice, and the admin gets
+  the start and the end notice at most about one heartbeat period apart, the end naming
+  that location. A silence that was already reported opens no second incident (one start and
+  one end notice per silence), and putting locations into maintenance or deleting them
+  never ends an incident by itself. The maintainer confirms this behaviour in section 13
+  (d).
 - **Data:** everything lives in `docker_data/prod/` (PostgreSQL data and Caddy
   certificates). Nightly backups are not part of this release yet.
 
@@ -656,3 +760,105 @@ budget (about 110 MB steady, plus about 35 MB while a chart renders).
 
 Record: the largest `render_ms` and `call_ms`, the worker's peak memory in
 `~/worker-stats-midnight.txt`, and the result.
+
+## 13. Location management checks (Phase 4 verification)
+
+These four checks cover what the tests cannot: what real Telegram does with the test
+message, a bot really removed from a channel and added back, a second bot taking over a
+channel, and one behaviour the maintainer decides on. Everything else in the location
+pages (switches, edit, delete, key rotation, sign-in throttle, the delivery badge, and
+that no page shows a token or a key) is covered by automated tests. No harness starts,
+stops or restarts containers for these checks. Run (a) to (c) on the production VPS while
+alerts still go to the private test channel (section 1), with the ops chat configured
+(section 4). For each check, record the result (times, messages, a screenshot where it
+helps) in the phase verification file.
+
+### (a) A real test message
+
+1. Open a location's page and click **Send test message**.
+2. Look at the private test channel on a phone.
+
+Expected: within about 15 seconds the page shows "Test message sent. Check that it
+arrived in the channel." The channel has exactly one new message,
+`🔧 Power Monitor test message: the bot can post here.` (or its uk or ru text, in the
+location's language), and the phone makes no sound for it (Telegram's silent message).
+The ops chat gets nothing.
+
+Record: the time, the message on the page, and whether the message arrived silently.
+Record the result in the phase verification file.
+
+### (b) Bot removed, then added back: failing, test message, recovery
+
+1. In the test channel's settings, remove the location's bot from the administrators.
+2. Unplug the device and wait for its OFF (heartbeat period plus grace). The OFF alert is
+   refused.
+3. Check the admin panel and the ops chat. Expected: the location list shows
+   `Failing since HH:MM (http_403)` in the Delivery column, the location page shows the
+   same with "The bot cannot post in the channel: …", and the ops chat has exactly one
+   `🚫 Alerts for … are failing (Telegram: http_403). …`.
+4. Plug the device back in, so an ON alert is queued behind the OFF. Wait 20 minutes:
+   no second failing notice comes, and nothing reaches the channel.
+5. Add the bot back as an administrator with the "Post messages" and "Edit messages of
+   others" rights.
+6. On the location page, click **Send test message**.
+
+Expected: the page shows "Test message sent. Delivery is marked OK again, and any queued
+alerts go out next." and the Delivery row shows `OK`, as does the list. The ops chat gets
+exactly one `✅ Alerts for … are delivered again.` Within a few seconds the channel gets
+the OFF and then the ON, each starting with the local time of its event (for example
+`🔴 14:05 POWER OFF`), because they go out late. No alert arrives twice.
+
+Record: the time of each step, the notices and the alerts as they arrived. Record the
+result in the phase verification file.
+
+### (c) A new bot takes over the channel
+
+Telegram's documentation says that a channel administrator with the "Edit messages of
+others" right can unpin any message, including one another bot posted. This has not been
+tried yet.
+
+1. Create a second bot with @BotFather. Make it an administrator of the test channel with
+   the "Post messages" and "Edit messages of others" rights. Keep the first bot there.
+2. Note the pinned weekly chart in the channel (posted by the first bot).
+3. On the location's **Edit location** page, paste the second bot's token into "New bot
+   token" and save.
+4. Watch the channel for a few minutes (the worker makes one chart call per delivery
+   pass), then read the worker's chart lines:
+
+   ```sh
+   docker compose -f docker-compose.prod.yml logs --since 15m worker | grep 'chart '
+   ```
+
+Expected: the old chart is unpinned (its message stays in the channel), and a new chart,
+posted by the second bot, is posted and pinned. The log has a
+`chart release for location <id>: ok` line, then `post` and `pin` lines. If the release
+was refused, the log has one WARNING
+`chart release for location <id>: permanent error …` and the old pin stays; that is the
+accepted risk in section 10 ("Edit location"): unpin it by hand.
+
+Record: whether the second bot unpinned the first bot's chart, and the log lines. Record
+the result in the phase verification file. Afterwards, put the first bot's token back if
+the second bot is not to be kept.
+
+### (d) All-silent with a location in maintenance (Pitfall 7)
+
+Section 10 ("All-silent and maintenance") describes what the admin gets when an area
+outage hits while a location in maintenance keeps beating: the all-silent start notice,
+then its end notice about one heartbeat period later, naming the location in
+maintenance; and only one such pair per silence. This follows the decision taken for
+Phase 4 (an all-silent incident may end by a heartbeat from a location in maintenance,
+but only one received after the incident was opened). The automated tests cover it. The
+maintainer confirms that this is the wanted behaviour.
+
+1. Read section 10, "All-silent and maintenance".
+2. Optional, on the real stack with at least 3 locations: put one location in
+   maintenance and keep its device powered, then cut the internet of two active
+   devices' routers (not their power) for about 5 minutes, and watch the ops chat.
+
+Expected (optional run): one `⚠️ All … active locations silent since …` notice, then one
+`✅ Heartbeats are back (first: <the location in maintenance>, …)` at most about one
+heartbeat period later, and no further all-silent notice while the two devices stay cut
+off. The subscribers of the two cut-off locations get their OFF alerts as usual.
+
+Record: "accepted", or the change wanted. Record the result in the phase verification
+file.

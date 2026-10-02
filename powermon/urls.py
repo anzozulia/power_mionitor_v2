@@ -10,6 +10,7 @@ from powermon.web.location_views import (
     MaintenanceSwitchView,
     RegenerateKeyView,
     RouterGraceSwitchView,
+    SendTestMessageView,
 )
 from powermon.web.views import (
     HeartbeatView,
@@ -37,6 +38,11 @@ urlpatterns = [
         "locations/<int:pk>/router-grace/",
         RouterGraceSwitchView.as_view(),
         name="location-router-grace",
+    ),
+    path(
+        "locations/<int:pk>/test-message/",
+        SendTestMessageView.as_view(),
+        name="location-test-message",
     ),
     path("locations/<int:pk>/setup/", LocationSetupView.as_view(), name="location-setup"),
     path(

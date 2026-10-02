@@ -1,13 +1,16 @@
 {% extends "base.html" %}
 {% load display_time %}
 {% comment %}
-UI-SPEC screen B (D-13): the location page. Sections in order: Status, Switches, Settings
-(with the "Edit location" link-button, UI-D10), Device setup, Delete location (a secondary
-link-button that only opens the confirmation page, UI-D5). 04-08 adds Test message after
-Switches and the Delivery row. The switch rows come from location_views.switch_rows, in
-D-05 order: Maintenance, Alerts, Router grace.
+UI-SPEC screen B (D-13): the location page. Sections in order: Status, Switches, Test
+message, Settings (with the "Edit location" link-button, UI-D10), Device setup, Delete
+location (a secondary link-button that only opens the confirmation page, UI-D5). The switch
+rows come from location_views.switch_rows, in D-05 order: Maintenance, Alerts, Router grace.
 Read-only except the switches, each a one-click POST form (CSRF) that posts its target value
-(UI-D3) and redirects back here (UI-D4). No script, no inline style.
+(UI-D3) and redirects back here (UI-D4), and the test message, a one-click POST form whose
+button is the page's only accent button (UI-D15, D-11). No script, no inline style.
+The status panel's last row is Delivery (D-13): "OK" with its help, or the failing indicator
+with the full display_time of the incident's start, the cause line (or the supergroup line)
+and the retry line, from location_views.delivery_row.
 Secrets (SEC-04): no device key appears on this page, not even masked; the bot token only
 in its masked form, in the settings panel.
 {% endcomment %}
@@ -41,6 +44,8 @@ in its masked form, in the settings panel.
   {% endif %}
   <dt>Last heartbeat</dt>
   <dd><span class="num">{{ status.last_heartbeat_at|display_time }}</span></dd>
+  <dt>Delivery</dt>
+  <dd>{% if delivery.failing_since %}<span class="status status--failing">Failing since {{ delivery.failing_since|display_time }} ({{ delivery.code }})</span>{% else %}OK{% endif %}{% for line in delivery.lines %}<p class="help">{{ line }}</p>{% endfor %}</dd>
 </dl>
 
 <h2>Switches</h2>
@@ -59,6 +64,13 @@ in its masked form, in the settings panel.
   </li>
   {% endfor %}
 </ul>
+
+<h2>Test message</h2>
+<p>Sends one silent message to the channel with this location's bot, to check the bot token and the chat ID. It is not an alert: it is sent even while alerts are off or maintenance is on. Telegram can take up to 15 seconds to answer.</p>
+<form method="post" action="{% url 'location-test-message' location.pk %}">
+  {% csrf_token %}
+  <button class="btn btn--primary" type="submit">Send test message</button>
+</form>
 
 <h2>Settings</h2>
 {% include "web/_settings_panel.html" %}

@@ -37,6 +37,7 @@ from django.views.decorators.common import no_append_slash
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET
 
+from powermon.alerts import delivery
 from powermon.clock import Clock, SystemClock
 from powermon.engine import transitions
 from powermon.engine.models import LocationState
@@ -44,7 +45,7 @@ from powermon.locations import examples, keys, validators
 from powermon.locations.models import LANGUAGE_CHOICES, Location
 from powermon.throttle import rules, store
 from powermon.web.forms import LocationForm, SignInForm
-from powermon.web.status import location_status
+from powermon.web.status import failing_since_text, location_status
 
 log = logging.getLogger(__name__)
 
@@ -157,6 +158,20 @@ class LocationRow:
     # The Status cell's tags, shown in this order: "Alerts off", "Router grace".
     alerts_off: bool
     router_grace: bool
+    # The Delivery cell: None for "OK", else "Failing since {time} ({code})" (D-13, UI-D6).
+    delivery: str | None = None
+
+
+def delivery_text(failing: delivery.Failing | None, now: datetime) -> str | None:
+    """The list's Delivery cell text for an open failing incident, or None ("OK").
+
+    ``{time}`` is HH:MM in the display TZ when the incident started today, else with its
+    date (UI-D6); ``{code}`` is ``http_{status}`` of the refusal the incident describes.
+    """
+    if failing is None:
+        return None
+    since = failing_since_text(failing.started_at, now, settings.TIME_ZONE)
+    return f"Failing since {since} (http_{failing.http_status})"
 
 
 class LocationListView(View):
@@ -165,19 +180,25 @@ class LocationListView(View):
     Read-only, one server-rendered response with no live refresh: the admin reloads to
     see a new status. Names sort without regard to case, ties by the lower id. The status
     uses the one Phase 4 vocabulary of the admin pages (``status.location_status``), with
-    the switch tags after it; the Language column is gone (UI-D1). There is no pagination
-    (at most about 20 locations). While the ops chat is not configured, the page says so
-    (Phase 2 D-09, INV-20).
+    the switch tags after it; the Language column is gone (UI-D1). The last column is the
+    delivery health (D-13): "OK", or "Failing since …" while the location's
+    ``delivery_failing`` incident is open, the badge's single source (D-10), read for
+    every row in one query. There is no pagination (at most about 20 locations). While
+    the ops chat is not configured, the page says so (Phase 2 D-09, INV-20).
     """
 
     template_name = "web/location_list.html"
+    # Tests inject a FakeClock with LocationListView.as_view(clock=...): "today" (UI-D6).
+    clock: Clock = SystemClock()
 
     def get(self, request: HttpRequest) -> HttpResponse:
-        locations = (
+        locations = list(
             Location.objects.filter(deleted_at__isnull=True)
             .select_related("state")
             .order_by(Lower("name"), "pk")
         )
+        failing = delivery.failing_incidents([location.pk for location in locations])
+        now = self.clock.now()
         rows = []
         for location in locations:
             status = location_status(location)
@@ -190,6 +211,7 @@ class LocationListView(View):
                     last_heartbeat_at=status.last_heartbeat_at,
                     alerts_off=not location.alerts_enabled,
                     router_grace=location.router_grace,
+                    delivery=delivery_text(failing.get(location.pk), now),
                 )
             )
         context = {"rows": rows, "ops_configured": settings.CFG.ops_configured}

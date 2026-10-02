@@ -4,10 +4,13 @@ Maintenance is a flag, not a status (ARCHITECTURE › Location Status Machine), 
 sees it as one: "Maintenance" whenever the flag is on, else the stored status ("On", "Off"
 or "Waiting for first heartbeat"). A location with no state row counts as waiting (Phase 1
 behaviour). The stored status underneath maintenance stays visible as the power state.
+
+Delivery health has one text here too: the list's "Failing since {time}" (UI-D6).
 """
 
 from dataclasses import dataclass
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from powermon.engine.models import LocationState
 from powermon.locations.models import Location
@@ -52,3 +55,20 @@ def location_status(location: Location) -> LocationStatus:
         on_since=None if state is None else state.on_since,
         outage_started_at=None if state is None else state.outage_started_at,
     )
+
+
+def failing_since_text(started_at: datetime, now: datetime, tz: str) -> str:
+    """The time in the list's "Failing since {time} ({code})" (D-13, UI-D6).
+
+    ``HH:MM`` in the display TZ ``tz`` when the incident started on the local date of
+    ``now``, else ``YYYY-MM-DD HH:MM``: a bot can stay removed for days, and a bare time
+    would then point to the wrong day. Seconds are cut off, never rounded. A naive
+    ``started_at`` or ``now`` has no defined instant: ValueError.
+    """
+    if started_at.utcoffset() is None or now.utcoffset() is None:
+        raise ValueError("a naive datetime has no defined instant")
+    zone = ZoneInfo(tz)
+    local = started_at.astimezone(zone)
+    if local.date() == now.astimezone(zone).date():
+        return local.strftime("%H:%M")
+    return local.strftime("%Y-%m-%d %H:%M")

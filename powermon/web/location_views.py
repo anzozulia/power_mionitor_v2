@@ -1,5 +1,5 @@
-"""The Phase 4 location pages: the location page, its one-click switches, the edit form, the
-delete and the key rotation (D-13, D-05, D-07, D-09, D-14).
+"""The Phase 4 location pages: the location page, its one-click switches, the test message,
+the edit form, the delete and the key rotation (D-13, D-05, D-11, D-07, D-09, D-14).
 
 - Every view here needs the signed-in admin: LoginRequiredMiddleware denies by default and
   none of them is ``login_not_required``.
@@ -13,8 +13,15 @@ delete and the key rotation (D-13, D-05, D-07, D-09, D-14).
 - A switch posts its target value, never "toggle" (UI-D3): the same state again writes
   nothing and gets the "already" info flash, so a double click, a second tab or a stale page
   can never flip it back. Each switch changes exactly one flag (D-05).
-- No view here does network I/O (KD2). The only admin action that will is the test message
-  (04-08).
+- The test message is the only admin action with network I/O (KD2, D-11): one silent
+  ``sendMessage`` with the location's current token and chat, no retry, the client's
+  (5 s, 10 s) timeouts, never through the outbox. Views run in autocommit (no
+  ``ATOMIC_REQUESTS``), so no transaction is open while it waits. Only after a success
+  does one transaction record it (``delivery.record_test_success``, D-12); a failure
+  never opens the delivery-failing incident (D-10). Its flash holds fixed copy, the
+  client's short code and integers only, never Telegram's text or the token (OPS-08).
+  It is POST -> redirect -> GET too, so a reload never sends it again (UI-D4).
+- Every other view here does no network I/O.
 - Every location URL answers 404 for an unknown or deleted location (UI-SPEC screen H).
 """
 
@@ -31,10 +38,13 @@ from django.utils.decorators import method_decorator
 from django.views import View
 from django.views.decorators.cache import never_cache
 
+from powermon.alerts import delivery
 from powermon.clock import Clock, SystemClock
 from powermon.engine import maintenance
+from powermon.i18n import strings
 from powermon.locations import actions, validators
 from powermon.locations.models import LANGUAGE_CHOICES, Location
+from powermon.telegram.client import DEFAULT_RETRY_AFTER_S, SendResult, TelegramClient
 from powermon.web import views
 from powermon.web.forms import LocationEditForm
 from powermon.web.status import location_status
@@ -66,6 +76,69 @@ LOCATION_DELETED_MESSAGE = (
     "do so; if the pin stays, unpin it by hand in Telegram."
 )
 ALREADY_DELETED_MESSAGE = "This location was already deleted."
+
+# UI-SPEC Copywriting › Test message, verbatim. {code} is the client's short code (e.g.
+# http_403, read_timeout): never Telegram's description text, a URL or the token (D-11).
+TEST_SENT_MESSAGE = "Test message sent. Check that it arrived in the channel."
+TEST_RECOVERED_MESSAGE = (
+    "Test message sent. Delivery is marked OK again, and any queued alerts go out next."
+)
+TEST_NOT_IN_CHAT_MESSAGE = (
+    "Test message not sent ({code}): the bot is not in the chat, or the chat was not found. "
+    "Make the bot an admin of the channel and check the chat ID."
+)
+TEST_BOT_REJECTED_MESSAGE = (
+    "Test message not sent ({code}): Telegram rejected the bot token. Paste the current token "
+    "from @BotFather in Edit location."
+)
+TEST_REFUSED_MESSAGE = (
+    "Test message not sent ({code}): Telegram refused it. Check the bot token and the chat ID."
+)
+TEST_MAYBE_SENT_MESSAGE = (
+    "No answer from Telegram in time ({code}). The message may have been sent: check the "
+    "channel before you try again."
+)
+TEST_UNREACHABLE_MESSAGE = (
+    "Telegram could not be reached ({code}), so the test message was not sent. Try again in a "
+    "minute."
+)
+# {wait} is "1 second" or "{N} seconds", N an integer.
+TEST_RATE_LIMITED_MESSAGE = "Telegram asks to wait before the next message. Try again in {wait}."
+# The permanent codes with their own cause (the other permanent codes get the refused copy).
+NOT_IN_CHAT_CODES = ("http_400", "http_403")
+BAD_TOKEN_CODES = ("http_401", "http_404")
+
+# UI-SPEC Copywriting › List and status, verbatim: the location page's Delivery row (D-13).
+DELIVERY_OK_HELP = "No alert has been refused by Telegram since the last successful send."
+DELIVERY_NOT_IN_CHAT_CAUSE = (
+    "Telegram did not accept the chat: the chat ID is wrong, or the bot is not in that chat. "
+    "Check the chat ID in Edit location, then send a test message."
+)
+DELIVERY_BOT_REJECTED_CAUSE = (
+    "Telegram rejected the bot token. Paste the current token from @BotFather in Edit "
+    "location, then send a test message."
+)
+DELIVERY_CANNOT_POST_CAUSE = (
+    "The bot cannot post in the channel: it was removed or is not an admin. Make the bot an "
+    "admin with the right to post messages, then send a test message."
+)
+DELIVERY_OTHER_CAUSE = (
+    "Telegram refused the alerts. Check the bot token and the chat ID in Edit location, then "
+    "send a test message."
+)
+# The cause line for each HTTP status with its own copy; any other status gets the other.
+DELIVERY_CAUSES = {
+    400: DELIVERY_NOT_IN_CHAT_CAUSE,
+    401: DELIVERY_BOT_REJECTED_CAUSE,
+    403: DELIVERY_CANNOT_POST_CAUSE,
+    404: DELIVERY_BOT_REJECTED_CAUSE,
+}
+# Replaces the cause line when Telegram reported the supergroup's chat ID (D-10).
+DELIVERY_MIGRATE_LINE = (
+    "The group became a supergroup. Its new chat ID is {new_chat_id}: put it in Edit location, "
+    "then send a test message."
+)
+DELIVERY_RETRY_LINE = "Queued alerts are retried every 15 minutes until they expire."
 
 # UI-SPEC Copywriting › Switches, verbatim.
 MAINTENANCE_HELP = (
@@ -263,11 +336,114 @@ class RouterGraceSwitchView(SwitchView):
         return self.copy[key].format(off_after_s=location.period_s + location.grace_s)
 
 
+def flash_for_test_message(result: SendResult, recovered: bool) -> tuple[int, str]:
+    """The test message's flash (level, text) for its result (D-11, UI-SPEC Test message).
+
+    ``recovered`` is True when the success closed an open delivery-failing incident (D-12).
+    - ok: success, "sent", or "sent while delivery was failing" when ``recovered``;
+    - maybe_delivered (no answer in time): warning, check the channel before a retry;
+    - not_sent or transient (5xx): error, Telegram unreachable;
+    - rate_limited: warning, with the wait in whole seconds ("1 second" when it is 1);
+    - permanent: error, the cause for 400/403 (not in the chat), 401/404 (bad token) or
+      any other code (refused). ``edit_target_missing``, which sendMessage never returns,
+      reads as refused too.
+    The text is fixed copy plus the client's short code and integers: never Telegram's
+    text, a URL or the token (OPS-08).
+    """
+    if result.kind == "ok":
+        return messages.SUCCESS, TEST_RECOVERED_MESSAGE if recovered else TEST_SENT_MESSAGE
+    if result.kind == "maybe_delivered":
+        return messages.WARNING, TEST_MAYBE_SENT_MESSAGE.format(code=result.code)
+    if result.kind in ("not_sent", "transient"):
+        return messages.ERROR, TEST_UNREACHABLE_MESSAGE.format(code=result.code)
+    if result.kind == "rate_limited":
+        seconds = result.retry_after or DEFAULT_RETRY_AFTER_S
+        wait = "1 second" if seconds == 1 else f"{seconds} seconds"
+        return messages.WARNING, TEST_RATE_LIMITED_MESSAGE.format(wait=wait)
+    if result.code in NOT_IN_CHAT_CODES:
+        return messages.ERROR, TEST_NOT_IN_CHAT_MESSAGE.format(code=result.code)
+    if result.code in BAD_TOKEN_CODES:
+        return messages.ERROR, TEST_BOT_REJECTED_MESSAGE.format(code=result.code)
+    return messages.ERROR, TEST_REFUSED_MESSAGE.format(code=result.code)
+
+
+class SendTestMessageView(View):
+    """``/locations/<pk>/test-message/``: send the admin's test message (LOC-07, D-11, D-12).
+
+    POST only (CSRF); GET and every other method answer 405, and an unknown or deleted
+    location 404. The view makes exactly one ``sendMessage`` with the location's current
+    token and chat: the fixed D-11 text in the location's language, sent silently
+    (``disable_notification``), whatever the switches say. It is not an alert: it never
+    goes through the outbox and is never retried; the client's (5 s, 10 s) timeouts bound
+    the wait. Views run in autocommit, so no transaction is open during the call.
+
+    After an ``ok`` only, one transaction records the success at the clock's time
+    (``delivery.record_test_success``): the location's queued alerts become due, and an
+    open delivery-failing incident closes with one recovery notice, so the worker lifts
+    its hold of the channel in its next pass (D-12). A failure changes nothing and never
+    opens the incident (D-10): its short cause is shown in the flash only. Then a
+    redirect to the location page (UI-D4), so a reload never sends a second message.
+    """
+
+    http_method_names = ["post"]
+    # Tests inject a FakeClock with SendTestMessageView.as_view(clock=...).
+    clock: Clock = SystemClock()
+
+    def post(self, request: HttpRequest, pk: int) -> HttpResponse:
+        location = location_or_404(pk)
+        result = TelegramClient(location.bot_token).send_message(
+            location.chat_id,
+            strings.telegram_test_text(location.language),
+            disable_notification=True,
+        )
+        # The success is recorded once the answer is in, at that time (D-12).
+        recovered = result.kind == "ok" and delivery.record_test_success(pk, self.clock.now())
+        # The id, the kind and the short code only: never the token or a chat ID (OPS-08).
+        log.info("test message for location %s: %s (%s)", pk, result.kind, result.code or "-")
+        level, text = flash_for_test_message(result, recovered)
+        messages.add_message(request, level, text)
+        return redirect("location-detail", pk=pk)
+
+
+@dataclass(frozen=True)
+class DeliveryRow:
+    """The status panel's Delivery row (D-13): "OK", or failing since a time, with help."""
+
+    # When the open delivery_failing incident started; None while delivery is OK.
+    failing_since: datetime | None
+    # The short code of the refusal the incident describes, e.g. "http_403"; "" while OK.
+    code: str
+    # The help lines under the value, in order.
+    lines: tuple[str, ...]
+
+
+def delivery_row(location_id: int) -> DeliveryRow:
+    """The location's delivery health for its page, from its open failing incident (D-10).
+
+    OK: its help line. Failing: the cause line for the HTTP status the incident describes
+    (the latest refusal), or the supergroup line with the new chat ID when Telegram
+    reported one, then the retry line. The chat ID is only shown, never applied.
+    """
+    failing = delivery.failing_incidents([location_id]).get(location_id)
+    if failing is None:
+        return DeliveryRow(failing_since=None, code="", lines=(DELIVERY_OK_HELP,))
+    if failing.migrate_to_chat_id is not None:
+        cause = DELIVERY_MIGRATE_LINE.format(new_chat_id=failing.migrate_to_chat_id)
+    else:
+        cause = DELIVERY_CAUSES.get(failing.http_status, DELIVERY_OTHER_CAUSE)
+    return DeliveryRow(
+        failing_since=failing.started_at,
+        code=f"http_{failing.http_status}",
+        lines=(cause, DELIVERY_RETRY_LINE),
+    )
+
+
 class LocationDetailView(View):
     """``/locations/<pk>/``: the location page (UI-SPEC screen B, D-13).
 
-    Read-only: the status, the switches, the settings and the way to the device setup. It
-    never shows the device key, not even masked, and the bot token only masked (SEC-04).
+    Read-only: the status with the delivery health, the switches, the test message, the
+    settings and the way to the device setup. It never shows the device key, not even
+    masked, and the bot token only masked (SEC-04).
     """
 
     template_name = "web/location_detail.html"
@@ -277,6 +453,7 @@ class LocationDetailView(View):
         context = {
             "location": location,
             "status": location_status(location),
+            "delivery": delivery_row(location.pk),
             "switch_rows": switch_rows(location),
             **settings_context(location),
         }

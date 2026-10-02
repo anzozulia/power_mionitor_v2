@@ -3,8 +3,10 @@
 The list is read-only: one row per location, sorted by name without regard to case (ties
 by id), with the Phase 4 status label (Maintenance whenever the flag is on) and its
 "Alerts off" / "Router grace" tags, and the last heartbeat in the display TZ
-(``display_time``, P-3). The Language column is gone (Phase 4 UI-D1). With no locations
-it shows the empty-state panel instead of the table.
+(``display_time``, P-3), then its delivery health ("OK" while no delivery-failing incident
+is open; tests/web/test_delivery_display.py covers "Failing since …"). The Language column
+is gone (Phase 4 UI-D1): the four columns are Name, Status, Last heartbeat and Delivery
+(D-13). With no locations it shows the empty-state panel instead of the table.
 While the admin ops chat is not configured, both states show a warning callout (D-09,
 INV-20). Every page escapes the user-typed location name (UI-SPEC security rule 1).
 """
@@ -110,17 +112,17 @@ def test_list_rows_sorted_with_labels(
 
     # Case-insensitive: a plain code-point sort would put "Delta" before "beta".
     assert _table_rows(html) == [
-        ["Alpha", "On", "2026-10-01 11:00:00 EEST"],
-        ["beta", "Waiting for first heartbeat", "Never"],
-        ["Delta", "Waiting for first heartbeat", "Never"],
-        ["gamma", "Off", "2026-10-01 10:58:00 EEST"],
+        ["Alpha", "On", "2026-10-01 11:00:00 EEST", "OK"],
+        ["beta", "Waiting for first heartbeat", "Never", "OK"],
+        ["Delta", "Waiting for first heartbeat", "Never", "OK"],
+        ["gamma", "Off", "2026-10-01 10:58:00 EEST", "OK"],
     ]
     # Each name opens the location's page (Phase 4 UI-SPEC screen A), not its setup page.
     for location in (alpha, beta, gamma, delta):
         assert f'<a class="name" href="/locations/{location.pk}/">' in html
         assert f'href="/locations/{location.pk}/setup/"' not in html
-    # UI-D1: no Language column (04-08 adds Delivery as the fourth).
-    assert _headers(html) == ["Name", "Status", "Last heartbeat"]
+    # UI-D1: no Language column; Delivery is the fourth (D-13).
+    assert _headers(html) == ["Name", "Status", "Last heartbeat", "Delivery"]
     for label in ("English", "Ukrainian", "Russian"):
         assert label not in html
     assert '<span class="status status--on">On</span>' in html
@@ -147,11 +149,11 @@ def test_list_rows_use_the_phase4_vocabulary_and_tags(
 
     html = admin.get("/").content.decode()
 
-    assert _headers(html) == ["Name", "Status", "Last heartbeat"]
+    assert _headers(html) == ["Name", "Status", "Last heartbeat", "Delivery"]
     assert _table_rows(html) == [
-        ["Basement", "Waiting for first heartbeat Router grace", "Never"],
-        ["office", "Maintenance Alerts off Router grace", "2026-10-01 11:00:00 EEST"],
-        ["Office", "Off Alerts off", "2026-10-01 11:00:00 EEST"],
+        ["Basement", "Waiting for first heartbeat Router grace", "Never", "OK"],
+        ["office", "Maintenance Alerts off Router grace", "2026-10-01 11:00:00 EEST", "OK"],
+        ["Office", "Off Alerts off", "2026-10-01 11:00:00 EEST", "OK"],
     ]
     # Maintenance is shown whenever the flag is on, with the grey dot (UI-D11); the tags
     # follow the status label, "Alerts off" before "Router grace".
@@ -189,7 +191,7 @@ def test_list_last_heartbeat_uses_display_time(
 
     html = admin.get("/").content.decode()
 
-    assert _table_rows(html) == [["Office", "On", "2026-10-25 03:30:00 EET"]]
+    assert _table_rows(html) == [["Office", "On", "2026-10-25 03:30:00 EET", "OK"]]
     assert '<td class="num">2026-10-25 03:30:00 EET</td>' in html
 
 
@@ -203,7 +205,8 @@ def test_list_location_without_state_row_shows_waiting(
 
     html = admin.get("/").content.decode()
 
-    assert _table_rows(html) == [["Orphan", "Waiting for first heartbeat", "Never"]]
+    # No state row and no delivery incident: waiting, never, OK (E1 partial).
+    assert _table_rows(html) == [["Orphan", "Waiting for first heartbeat", "Never", "OK"]]
 
 
 @pytest.mark.django_db
