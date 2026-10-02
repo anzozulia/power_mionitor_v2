@@ -20,12 +20,23 @@ worker was down is simply due on the next pass.
   record, never the location's current chat (D-01, D-04). A permanent pin failure (the
   bot may post but not pin, INV-17 #1) is stored as ``pin_failed_at``; the pin is tried
   again only after the next successful render (D-07).
+- Finalize: every older record (``local_date`` before today) that has no final edit yet
+  gets its finished-day render (chart-spec §7: now = the local midnight that ends its
+  day, no now line, no pill, the caption's line 1 only, D-01, D-13), edited in the chat
+  and message stored with it (D-04); oldest first. A finalized chart is never rendered
+  again (D-14).
+- Unpin: every older record still pinned is unpinned by its own message id in its own
+  chat, oldest first, and nothing else is ever unpinned (D-04, INV-19).
 - Refresh: today's chart is due ``REFRESH_EVERY`` (15 min) after its last successful
   render (``last_rendered_at``, the answer time), and is edited in place in its recorded
   chat; "message is not modified" counts as rendered (D-05, CHRT-02). The state is in the
   database, so after downtime exactly one catch-up refresh is made, not one per missed
-  slot (INV-18). Midnight-class steps (post, pin) beat any refresh; among due refreshes
-  the oldest render goes first, ties to the lower location id.
+  slot (INV-18). Midnight-class steps (post, pin, finalize, unpin) beat any refresh; among
+  due refreshes the oldest render goes first, ties to the lower location id.
+
+Each step is its own condition, checked on every pass (D-02): after downtime across one
+or more midnights the passes post and pin one chart for today and finalize and unpin
+every older chart, and a day the worker missed gets no chart (D-03, INV-18, INV-19).
 
 Rendering runs inline in the I/O thread right before its call (D-05), with the location's
 current name and language and the display time zone read at render time (D-14). The
@@ -84,7 +95,7 @@ STEP_RETRY_MAX = REFRESH_EVERY
 # Doublings after which STEP_RETRY is past STEP_RETRY_MAX (30 s * 2**5 = 16 min).
 _MAX_DOUBLINGS = 5
 # The steps that render a chart right before their call.
-_RENDERED: tuple[Step, ...] = ("post", "refresh")
+_RENDERED: tuple[Step, ...] = ("post", "refresh", "finalize")
 # Outcomes that end a step's tries for now with the fixed 15-min wait. "message to edit
 # not found" waits too until 03-09 retires the record.
 _PERMANENT_KINDS = ("permanent", "edit_target_missing")
@@ -215,14 +226,16 @@ def plan(
     """The one chart step due now, or None. Pure: reads nothing but its arguments.
 
     Midnight-class steps go first: locations by ascending id, and the first one with a due
-    step wins; within a location the steps go in D-02 order (post today's chart, then pin
-    it). Only when none is due anywhere, the refresh that has waited longest goes: today's
-    record with the oldest ``last_rendered_at`` at least ``REFRESH_EVERY`` ago, ties to
-    the lower location id (CHRT-02). A step whose own key in ``not_before`` is in the
-    future is skipped, so the next due step goes instead (D-02). The alert relay's
-    backoff is respected, read only: a location whose bot waits (``bot_wide_key``) makes
-    no step, and a step whose channel waits (``chat_key`` of the chat it would call)
-    is skipped (D-06).
+    step wins, so one location's midnight work is done before the next one's starts.
+    Within a location the steps go in D-02 order: post today's chart, pin it, give the
+    oldest older record without one its final edit, unpin the oldest older record still
+    pinned. Only when none is due anywhere, the refresh that has waited longest goes:
+    today's record with the oldest ``last_rendered_at`` at least ``REFRESH_EVERY`` ago,
+    ties to the lower location id (CHRT-02). A step whose own key in ``not_before`` is in
+    the future is skipped, so the next due step goes instead: a failing post never blocks
+    the older charts' cleanup (D-02, INV-19). The alert relay's backoff is respected, read
+    only: a location whose bot waits (``bot_wide_key``) makes no step, and a step whose
+    channel waits (``chat_key`` of the chat it would call) is skipped (D-06).
     """
 
     def waiting(key: str) -> bool:
@@ -233,7 +246,7 @@ def plan(
         if waiting(io_loop.bot_wide_key(location.bot_token)):
             continue
         today_row = _today_row(rows, location.location_id, today)
-        action = _midnight_step(location, today_row, waiting)
+        action = _midnight_step(location, rows, today_row, today, waiting)
         if action is not None:
             return action
         if (
@@ -258,23 +271,44 @@ def _today_row(rows: list[ChartRow], location_id: int, today: date) -> ChartRow 
 
 
 def _midnight_step(
-    location: ChartLocation, today_row: ChartRow | None, waiting: Callable[[str], bool]
+    location: ChartLocation,
+    rows: list[ChartRow],
+    today_row: ChartRow | None,
+    today: date,
+    waiting: Callable[[str], bool],
 ) -> Action | None:
-    """The location's first due step of D-02 (post, pin), or None."""
+    """The location's first due step of D-02 (post, pin, finalize, unpin), or None."""
     location_id = location.location_id
-    token = location.bot_token
     if today_row is None:
         if not waiting(chart_key(location_id, "post")) and not waiting(
-            io_loop.chat_key(token, location.chat_id)
+            io_loop.chat_key(location.bot_token, location.chat_id)
         ):
             return Action("post", location)
-    elif (
-        _pin_due(today_row)
-        and not waiting(chart_key(location_id, "pin", today_row.id))
-        and not waiting(io_loop.chat_key(token, today_row.chat_id))
-    ):
+    elif _pin_due(today_row) and _free(location, "pin", today_row, waiting):
         return Action("pin", location, today_row)
+    older = sorted(
+        (row for row in rows if row.location_id == location_id and row.local_date < today),
+        key=lambda row: (row.local_date, row.id),
+    )
+    for row in older:
+        if row.finalized_at is None and _free(location, "finalize", row, waiting):
+            return Action("finalize", location, row)
+    for row in older:
+        if row.pinned and _free(location, "unpin", row, waiting):
+            return Action("unpin", location, row)
     return None
+
+
+def _free(
+    location: ChartLocation, step: Step, row: ChartRow, waiting: Callable[[str], bool]
+) -> bool:
+    """Neither the step's own key nor the record's channel (the relay's ``chat_key``) waits.
+
+    The channel is the chat stored with the record, which the call goes to (D-04).
+    """
+    return not waiting(chart_key(location.location_id, step, row.id)) and not waiting(
+        io_loop.chat_key(location.bot_token, row.chat_id)
+    )
 
 
 def _pin_due(row: ChartRow) -> bool:
@@ -331,7 +365,7 @@ def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | No
     started = clock.monotonic()
     if action.step in _RENDERED:
         try:
-            content = chart_content(location, today, now, live=True, tz=tz)
+            content = _content(action, today, now, tz)
         except Error:
             raise  # the database, not the chart: the pass ends and is retried (MON-06)
         except Exception as exc:
@@ -368,6 +402,20 @@ def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | No
     return True
 
 
+def _content(action: Action, today: date, now: datetime, tz: str) -> tuple[bytes, str]:
+    """The step's render: today's live chart, or an older record's finished day (D-01, D-13).
+
+    A finished day is drawn as of the local midnight that ends it (chart-spec §7), never as
+    of the time the final edit happens to run, so a catch-up after downtime draws the same
+    day as a final edit made at midnight.
+    """
+    row = action.row
+    if action.step == "finalize" and row is not None:
+        end_of_day = model.next_midnight(row.local_date, tz)
+        return chart_content(action.location, row.local_date, end_of_day, live=False, tz=tz)
+    return chart_content(action.location, today, now, live=True, tz=tz)
+
+
 def _call(client: TelegramClient, action: Action, content: tuple[bytes, str] | None) -> SendResult:
     """The step's one Telegram call; a record's own chat is the one called (D-04)."""
     row = action.row
@@ -376,9 +424,12 @@ def _call(client: TelegramClient, action: Action, content: tuple[bytes, str] | N
         return client.send_photo(action.location.chat_id, png, caption)
     if action.step == "pin" and row is not None:
         return client.pin_chat_message(row.chat_id, row.message_id)
-    if action.step == "refresh" and row is not None and content is not None:
+    if action.step in ("refresh", "finalize") and row is not None and content is not None:
         png, caption = content
         return client.edit_message_media(row.chat_id, row.message_id, png, caption)
+    if action.step == "unpin" and row is not None:
+        # By its message id, in its own chat: never the admin's own pins (D-04, INV-19).
+        return client.unpin_chat_message(row.chat_id, row.message_id)
     raise ValueError(f"no call for the chart step {action.step!r}")
 
 
@@ -407,6 +458,13 @@ def _apply(
             ChartMessage.objects.filter(pk=row.id, retired_at__isnull=True).update(
                 last_rendered_at=answered
             )
+        elif action.step == "finalize" and row is not None:
+            # Conditional: a repeated or concurrent final edit changes nothing twice.
+            ChartMessage.objects.filter(pk=row.id, finalized_at__isnull=True).update(
+                finalized_at=answered
+            )
+        elif action.step == "unpin" and row is not None:
+            ChartMessage.objects.filter(pk=row.id, pinned=True).update(pinned=False)
         # The step is done: its failures and its spent key are forgotten.
         state.chart_failures.pop(key, None)
         state.not_before.pop(key, None)
