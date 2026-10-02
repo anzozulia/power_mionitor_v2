@@ -754,18 +754,20 @@ def test_D08_chat_change_makes_alerts_due_and_moves_the_chart(
     [off] = fake_telegram.sent[sent_before:]
     assert off["chat_id"] == CHAT_B
     assert "POWER OFF" in off["text"]
-    # The old chart's release goes to chat A, whose channel still waits out that hold
-    # (shared per-chat backoff, Phase 3 D-06), and nothing is posted in chat B before the
-    # release (Pitfall 1).
-    assert _chart_steps(fake_telegram, charts_before) == []
-    assert _pass(clock, relay) is False
+    # The same pass unpins the old chart in chat A by its message id, though chat A's hold
+    # runs 10 more minutes: a release is one best-effort call, never held by the old
+    # chat's refusal (D-08, W3-A1). Nothing is posted in chat B before it (Pitfall 1).
+    assert _chart_steps(fake_telegram, charts_before) == [
+        ("unpinChatMessage", DEFAULT_CHAT_ID, 1001)
+    ]
+    assert relay.not_before[io_loop.chat_key(DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID)] == _kyiv(
+        "2026-10-01 12:20:30"
+    )
 
-    # Once chat A's hold is over, the old chart is unpinned there by its message id, then
-    # today's chart is posted and pinned in chat B.
-    clock.set(_kyiv("2026-10-01 12:20:30"))
+    # The next two passes post and pin today's chart in chat B; nothing waits for 12:20:30.
     assert _pass(clock, relay) is True
     assert _pass(clock, relay) is True
-    assert _pass(clock, relay) is True
+    assert _pass(clock, relay) is False
     assert _chart_steps(fake_telegram, charts_before) == [
         ("unpinChatMessage", DEFAULT_CHAT_ID, 1001),
         ("sendPhoto", CHAT_B, None),

@@ -303,17 +303,21 @@ def test_plan_releases_a_stale_record_and_never_posts_meanwhile() -> None:
     assert lifecycle.plan([moved], [old_today], today=TODAY, now=NOON_05, not_before={}) == (
         lifecycle.Action("release", moved, old_today)
     )
-    # While its release waits (its own key, or the stored chat's channel for the current
-    # bot), the location makes no step at all: never a post (Pitfall 1).
+    # While its release waits (its own key, or its bot's hold: a 429, a 5xx or a refused
+    # connection), the location makes no step at all: never a post (Pitfall 1).
     later = NOON_05 + timedelta(seconds=30)
     for held in (
         {lifecycle.chart_key(1, "release", 10): later},
-        {io_loop.chat_key(DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID): later},
         {io_loop.bot_wide_key(DEFAULT_BOT_TOKEN): later},
     ):
         assert (
             lifecycle.plan([moved], [old_today], today=TODAY, now=NOON_05, not_before=held) is None
         )
+    # The stored chat's own hold (an alert refused there) never holds the release (D-08).
+    old_chat = {io_loop.chat_key(DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID): later}
+    assert lifecycle.plan(
+        [moved], [old_today], today=TODAY, now=NOON_05, not_before=old_chat
+    ) == lifecycle.Action("release", moved, old_today)
     # Another location's chart work goes on meanwhile.
     other = _location(2, TOKEN_B, CHAT_B)
     held = {lifecycle.chart_key(1, "release", 10): later}
@@ -349,6 +353,70 @@ def test_plan_releases_stale_records_oldest_first() -> None:
     assert lifecycle.plan(
         [moved], [today_row, older], today=TODAY, now=NOON_05, not_before={}, settled={9}
     ) == lifecycle.Action("release", moved, older)
+
+
+def test_plan_release_waits_for_its_bot_never_for_the_old_chats_hold() -> None:
+    # W3-A1: the relay holds a chat for 15 min after an alert there is refused (the bot was
+    # removed, the usual reason to move the location). A release is one best-effort call
+    # that retires its record on any permanent answer (INV-19), so that hold never delays
+    # it; only its own key and its bot's hold do (D-08, D-09).
+    refused = NOON_05 + timedelta(minutes=15)
+    old_chat = {io_loop.chat_key(DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID): refused}
+    bot_ends = NOON_05 + timedelta(seconds=30)
+    bot_held = {**old_chat, io_loop.bot_wide_key(DEFAULT_BOT_TOKEN): bot_ends}
+    old_today = _row(10, rendered=NOON_05 - timedelta(hours=1))
+    older = _row(9, day=YESTERDAY, rendered=NOON_05 - timedelta(days=1))
+    rows = [old_today, older]
+
+    for location in (_location(chat_id=CHAT_B), _location(deleted=True)):
+        # Oldest first, in spite of the old chat's hold.
+        assert lifecycle.plan(
+            [location], rows, today=TODAY, now=NOON_05, not_before=old_chat
+        ) == lifecycle.Action("release", location, older)
+        assert lifecycle.plan(
+            [location], [old_today], today=TODAY, now=NOON_05, not_before=old_chat
+        ) == lifecycle.Action("release", location, old_today)
+        # A bot-wide hold still holds every release, and so every step (Pitfall 1)...
+        assert (
+            lifecycle.plan([location], rows, today=TODAY, now=NOON_05, not_before=bot_held) is None
+        )
+        # ...and its end lets the release go, though the old chat's hold runs 14.5 min more.
+        assert lifecycle.plan(
+            [location], rows, today=TODAY, now=bot_ends, not_before=bot_held
+        ) == lifecycle.Action("release", location, older)
+
+    # A token change: the new bot's hold in the old chat does not hold the release either.
+    rebotted = _location(token=TOKEN_B)
+    new_bot_old_chat = {io_loop.chat_key(TOKEN_B, DEFAULT_CHAT_ID): refused}
+    assert lifecycle.plan(
+        [rebotted], [old_today], today=TODAY, now=NOON_05, not_before=new_bot_old_chat
+    ) == lifecycle.Action("release", rebotted, old_today)
+
+
+def test_plan_old_chats_hold_still_holds_every_other_step() -> None:
+    # Only the release ignores a chat's hold: another location on the same bot and chat
+    # still makes no call there, and the moved location's post goes to its new chat.
+    moved = _location(chat_id=CHAT_B)
+    stays = _location(2)
+    old_chat = {
+        io_loop.chat_key(DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID): NOON_05 + timedelta(minutes=15)
+    }
+    old_today = _row(10, rendered=NOON_05 - timedelta(hours=1))
+    stays_today = _row(20, 2, pinned=False, rendered=NOON_05 - timedelta(hours=1))
+
+    assert lifecycle.plan(
+        [moved, stays], [old_today], today=TODAY, now=NOON_05, not_before=old_chat
+    ) == lifecycle.Action("release", moved, old_today)
+    # Once the record is retired: the post in chat B goes; the other location waits.
+    assert lifecycle.plan(
+        [moved, stays], [], today=TODAY, now=NOON_05, not_before=old_chat
+    ) == lifecycle.Action("post", moved)
+    assert lifecycle.plan([stays], [], today=TODAY, now=NOON_05, not_before=old_chat) is None
+    # Its pin and its refresh in the held chat wait too.
+    assert (
+        lifecycle.plan([stays], [stays_today], today=TODAY, now=NOON_05, not_before=old_chat)
+        is None
+    )
 
 
 def test_plan_deleted_location_only_releases() -> None:
@@ -678,6 +746,54 @@ def test_release_transient_backs_off_and_blocks_the_post(
         (other.pk, CHAT_C, True),
         (moved.pk, CHAT_B, True),
     ]
+
+
+# W3-A1: the old chat's refusal hold never delays a release; the bot's hold still does
+
+
+@DB
+def test_D08_release_ignores_the_old_chats_refusal_hold_but_waits_for_the_bot(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    location = _monitored(location_factory)
+    _seed(location, message_id=501)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+    # An alert in the old chat was refused 5 min ago (the bot was removed there), so the
+    # relay holds that chat until 12:15; and a 429 just now holds the whole bot for 30 s.
+    old_chat = io_loop.chat_key(DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID)
+    refused_until = NOON_05 + timedelta(minutes=10)
+    bot_until = NOON_05 + timedelta(seconds=30)
+    state.not_before[old_chat] = refused_until
+    state.not_before[io_loop.bot_wide_key(DEFAULT_BOT_TOKEN)] = bot_until
+    # The admin moves the location to chat B, with the same bot.
+    Location.objects.filter(pk=location.pk).update(chat_id=CHAT_B)
+
+    # The bot's hold holds the release, and so every step of the location (Pitfall 1).
+    for at in (NOON_05, bot_until - timedelta(seconds=1)):
+        clock.set(at)
+        assert _pass(clock, state) is False
+    assert len(fake_telegram.calls) == 0
+    # Once the bot may call again, the release goes at once, though the old chat's hold
+    # runs 9.5 min more; then today's chart is posted and pinned in chat B, one per pass.
+    clock.set(bot_until)
+    passes = []
+    while True:
+        start = len(fake_telegram.chart_calls)
+        if not _pass(clock, state):
+            break
+        passes.append(_calls(fake_telegram)[start:])
+        assert len(passes) < 10
+
+    assert passes == [
+        [("unpinChatMessage", DEFAULT_CHAT_ID, 501)],
+        [("sendPhoto", CHAT_B, None)],
+        [("pinChatMessage", CHAT_B, 1001)],
+    ]
+    assert ChartMessage.objects.get(message_id=501).retired_at == bot_until
+    # The relay's hold on the old chat is read only: it is still there, unchanged.
+    assert state.not_before[old_chat] == refused_until
 
 
 # A change of only the name or the language releases nothing (Phase 3 D-14)
