@@ -19,13 +19,14 @@ from chart_fixtures import (
     SAMPLE_NAMES,
     SAMPLE_NOW,
     SAMPLE_TODAY,
+    kyiv,
     local_pieces,
     sample_pieces,
 )
 from PIL import Image
 
 from powermon.chart import render
-from powermon.chart.model import HOUR_US, Piece, Week, build_week
+from powermon.chart.model import HOUR_US, Piece, Week, build_week, next_midnight, wall_us
 from powermon.i18n import chart_texts
 
 RGB = tuple[int, int, int]
@@ -81,7 +82,7 @@ def _near(a: RGB, b: RGB, tol: int) -> bool:
 
 
 def _total_box(lay: render.Layout, row: int) -> tuple[float, float]:
-    """The baseline of a row's total text and the y above which its glyphs start."""
+    """The y span of a row's total text: one font size above its baseline to 8 px below."""
     baseline = lay.bar_ys[row] + render.BAR_H / 2 + render.BASELINE * render.TOTAL_SIZE - 1
     return baseline - render.TOTAL_SIZE, baseline + 8
 
@@ -218,3 +219,266 @@ def test_font_fails_loudly_when_the_bundled_file_is_missing(
     monkeypatch.setattr(render, "FONT_DIR", tmp_path)
     with pytest.raises(FileNotFoundError, match="bundled font file is missing"):
         render.font.__wrapped__("regular", 30)
+
+
+# --- Today's row, the now marker and the finished render (chart-spec §7, CHRT-02, D-01) ---
+
+
+def _pill_centre_y(bar_y: float) -> float:
+    # The 36 px pill's bottom is 2 px above the line top (bar top - 8).
+    return bar_y - 8 - 2 - 36 + 18
+
+
+def _between(pixel: RGB, low: RGB, high: RGB) -> bool:
+    return all(a <= p <= b for a, p, b in zip(low, pixel, high, strict=True))
+
+
+def test_live_today_row_has_band_line_and_pill() -> None:
+    week = _sample()
+    img = _render(week)
+    lay = render.layout(week, "uk")
+    bar_y = lay.bar_ys[THU]
+    assert _px(img, 35, bar_y + 22) == render.TODAY_BAND
+    now_x = round(lay.hx(wall_us(week.now, KYIV, end=False)))
+    # The 3 px now line runs from bar top - 8 to bar bottom + 8, over the bar.
+    for y in range(int(bar_y) - 7, int(bar_y) + 52):
+        assert _px(img, now_x, y) == render.INK_PRIMARY, y
+    # The pill above it is ink-primary with the time in surface ink.
+    pill = _region(img, now_x - 20, bar_y - 46, now_x + 21, bar_y - 10)
+    assert render.INK_PRIMARY in pill
+    assert render.SURFACE in pill
+
+
+def test_finished_render_has_no_line_and_no_pill() -> None:
+    # D-01: the final render of a day has now = its end, no line and no pill; the band stays.
+    week = _week(sample_pieces(), now=next_midnight(SAMPLE_TODAY, KYIV), live=False)
+    img = _render(week)
+    lay = render.layout(week, "uk")
+    bar_y = lay.bar_ys[THU]
+    pill_zone = _region(img, lay.bar_x0 - 8, bar_y - 46, lay.bar_x1 + 9, bar_y - 10)
+    assert render.INK_PRIMARY not in pill_zone
+    line_zone = _region(img, lay.bar_x0 - 8, bar_y - 8, lay.bar_x1 + 9, bar_y + 52)
+    assert render.INK_PRIMARY not in line_zone
+    assert _px(img, 35, bar_y + 22) == render.TODAY_BAND
+    # The whole day is drawn to 24:00: the open on interval runs to the day's end.
+    for h in range(24):
+        assert _px(img, lay.hx(_hours(h + 0.5)), bar_y + 22) in {render.ON, render.OFF}, h
+    assert _px(img, lay.hx(_hours(23.5)), bar_y + 22) == render.ON
+
+
+@pytest.mark.parametrize(("hm", "edge"), [("00:01", "left"), ("23:59", "right")])
+def test_pill_is_clamped_at_both_ends(hm: str, edge: str) -> None:
+    week = _week(sample_pieces(), now=kyiv(f"2026-10-01 {hm}"))
+    img = _render(week)
+    lay = render.layout(week, "uk")
+    y = _pill_centre_y(lay.bar_ys[THU])
+    if edge == "left":
+        # The pill's left edge is at bar_x0 - 8, never further left.
+        assert _px(img, lay.bar_x0 - 4, y) == render.INK_PRIMARY
+        assert _px(img, lay.bar_x0 - 10, y) == render.SURFACE
+    else:
+        assert _px(img, lay.bar_x1 + 4, y) == render.INK_PRIMARY
+        assert _px(img, lay.bar_x1 + 10, y) == render.SURFACE
+
+
+def test_now_at_midnight_leaves_an_empty_today_bar() -> None:
+    # Edge (CHRT-02 empty): now is exactly today's local midnight.
+    week = _week(sample_pieces(), now=kyiv("2026-10-01 00:00"))
+    assert week.today_row.segments == ()
+    img = _render(week)
+    lay = render.layout(week, "uk")
+    bar_y = lay.bar_ys[THU]
+    for quarter in range(1, 96):
+        if quarter % 4:
+            x = lay.hx(quarter * 15 * MIN_US)
+            assert _px(img, x, bar_y + 22) == render.NO_DATA, quarter
+    assert _px(img, lay.bar_x0 - 4, _pill_centre_y(bar_y)) == render.INK_PRIMARY
+    assert _px(img, lay.bar_x0 - 10, _pill_centre_y(bar_y)) == render.SURFACE
+
+
+def test_nothing_is_drawn_after_now() -> None:
+    # The prohibition: right of now, today's row shows only the empty track (chart-spec §7, §9).
+    week = _sample()
+    img = _render(week)
+    lay = render.layout(week, "uk")
+    bar_y = lay.bar_ys[THU]
+    for quarter in range(59, 96):  # 14:45 to 23:45, between the hour separators
+        if quarter % 4:
+            x = lay.hx(quarter * 15 * MIN_US)
+            assert _px(img, x, bar_y + 22) == render.NO_DATA, quarter
+    # Every pixel right of the line (away from the rounded end) is the empty track or an
+    # hour separator over it, never a state colour.
+    now_x = lay.hx(wall_us(week.now, KYIV, end=False))
+    for pixel in _region(img, now_x + 3, bar_y, lay.bar_x1 - 9, bar_y + render.BAR_H):
+        assert _between(pixel, render.NO_DATA, render.SURFACE), pixel
+
+
+def _off_runs(img: Image.Image, lay: render.Layout, row: int) -> list[tuple[int, int]]:
+    """The ``[start, end)`` runs of exact OFF pixels on a bar's centre row."""
+    y = lay.bar_ys[row] + 22
+    runs: list[list[int]] = []
+    for x in range(int(lay.bar_x0) - 2, int(lay.bar_x1) + 3):
+        if _px(img, x, y) != render.OFF:
+            continue
+        if runs and runs[-1][1] == x:
+            runs[-1][1] = x + 1
+        else:
+            runs.append([x, x + 1])
+    return [(start, end) for start, end in runs]
+
+
+def test_min_off_width_at_both_ends() -> None:
+    # One-minute outages at 00:00 (Mon), 23:59 (Tue) and half past noon (Wed, between
+    # two hour separators): each is drawn 8 px wide and kept inside the bar (chart-spec §6).
+    pieces = local_pieces(
+        [
+            ("off", "2026-09-28 00:00", "2026-09-28 00:01"),
+            ("on", "2026-09-28 00:01", "2026-09-29 23:59"),
+            ("off", "2026-09-29 23:59", "2026-09-30 00:00"),
+            ("on", "2026-09-30 00:00", "2026-09-30 12:30"),
+            ("off", "2026-09-30 12:30", "2026-09-30 12:31"),
+            ("on", "2026-09-30 12:31", None),
+        ]
+    )
+    week = _week(pieces)
+    img = _render(week)
+    lay = render.layout(week, "uk")
+    ((start, end),) = _off_runs(img, lay, MON)
+    assert 7 <= end - start <= 8
+    assert abs(start - round(lay.bar_x0)) <= 1
+    ((start, end),) = _off_runs(img, lay, TUE)
+    assert 7 <= end - start <= 8
+    assert abs(end - round(lay.bar_x1)) <= 1
+    ((start, end),) = _off_runs(img, lay, WED)
+    assert 7 <= end - start <= 8
+    assert start <= lay.hx(_hours(12.5) + MIN_US // 2) <= end
+    # OFF is drawn over its on neighbours, which continue right next to it.
+    y = lay.bar_ys[WED] + 22
+    assert _px(img, start - 2, y) == render.ON
+    assert _px(img, end + 1, y) == render.ON
+
+
+# --- Previous week, legend, grid and axis (chart-spec §5-§7, CHRT-07, CHRT-08, K-5) ---
+
+
+def _gridline_columns(lay: render.Layout) -> set[int]:
+    return {int(lay.hx(_hours(h))) + d for h in range(0, 25, 3) for d in (-1, 0, 1)}
+
+
+def test_previous_week_divider_and_dimmed_text() -> None:
+    week = _sample()
+    img = _render(week)
+    lay = render.layout(week, "uk")
+    top = lay.divider_top
+    assert top == 620
+    caption_end = 48 + render.font("medium", render.HEAD_SIZE).getlength(chart_texts.DIVIDER["uk"])
+    caption = _region(img, 48, top, caption_end + 1, top + render.DIVIDER_H)
+    assert _near(_darkest(caption), render.INK_MUTED, 12)
+    # The 1.5 px hairline is centred at zone top + 32 and runs to x 1232.
+    hairline_y = top + 32
+    for x in range(int(caption_end) + 17, 1232):
+        assert _near(_px(img, x, hairline_y), render.GRID, 10), x
+    assert _px(img, 1232, hairline_y) == render.SURFACE
+    # It starts 16 px after the caption: the gap holds only surface and gridlines.
+    gridlines = _gridline_columns(lay)
+    for x in range(int(caption_end) + 3, int(caption_end) + 15):
+        if x not in gridlines:
+            assert _px(img, x, hairline_y) == render.SURFACE, x
+    # Dimmed row labels are ink-muted.
+    fri_label = _region(img, 48, lay.bar_ys[FRI], lay.bar_x0 - 24, lay.bar_ys[FRI] + 44)
+    assert _near(_darkest(fri_label), render.INK_MUTED, 12)
+
+    # Monday: six dimmed rows under the divider (chart-spec §10 row mapping).
+    monday = _week(sample_pieces(), today=date(2026, 9, 28), now=kyiv("2026-09-28 14:37"))
+    assert sum(row.dimmed for row in monday.rows) == 6
+    mon_lay = render.layout(monday, "uk")
+    assert mon_lay.divider_top == 254 + 38 + 82
+    assert mon_lay.grid_bottom == 922
+    # Sunday: no dimmed row, no divider, and the layout ends 56 px higher.
+    sunday = _week(sample_pieces(), today=date(2026, 10, 4), now=kyiv("2026-10-04 14:37"))
+    sun_lay = render.layout(sunday, "uk")
+    assert sun_lay.divider_top is None
+    assert sun_lay.grid_bottom == 866
+    assert sun_lay.axis_baseline == 896
+    sun_img = _render(sunday)
+    assert sun_img.size == (1280, 1000)
+    assert set(_region(sun_img, 0, 930, 1280, 1000)) == {render.SURFACE}
+
+
+def test_dim_colours_match_the_spec() -> None:
+    assert render.dim(render.ON) == (0xA0, 0xD9, 0xB7)
+    assert render.dim(render.OFF) == (0xDF, 0x84, 0x84)
+    assert render.dim(render.NM_BASE) == (0xEC, 0xEB, 0xE7)
+    assert render.dim(render.NM_INK) == (0xC5, 0xC3, 0xBD)
+    # Edge: the surface is its own dimmed colour.
+    assert render.dim(render.SURFACE) == render.SURFACE
+    # Edge: a dimmed row's empty track is no-data itself (#E5E4DE), never dim(no-data).
+    assert render.dim(render.NO_DATA) != render.NO_DATA
+    week = _sample()
+    img = _render(week)
+    lay = render.layout(week, "uk")
+    assert _px(img, lay.hx(_hours(5.5)), lay.bar_ys[FRI] + 22) == render.NO_DATA
+
+
+def test_legend_axis_and_hour_cells() -> None:
+    week = _sample()
+    img = _render(week)
+    lay = render.layout(week, "uk")
+    # Four swatches in a fixed order: on, off, not monitored (hatched), no data.
+    legend_font = render.font("regular", render.LEGEND_SIZE)
+    lefts = []
+    x = 48.0
+    for label in chart_texts.LEGEND["uk"]:
+        lefts.append(x)
+        x += 38 + 12 + legend_font.getlength(label) + 34
+    on_x, off_x, nm_x, no_data_x = lefts
+    assert _px(img, on_x + 19, 165) == render.ON
+    assert _px(img, on_x + 19, 188) == render.ON
+    assert _px(img, on_x + 19, 164) == render.SURFACE
+    assert _px(img, on_x + 19, 189) == render.SURFACE
+    assert _px(img, off_x + 19, 177) == render.OFF
+    assert {render.NM_BASE, render.NM_INK} <= set(_region(img, nm_x + 3, 168, nm_x + 35, 186))
+    assert _px(img, no_data_x + 19, 177) == render.NO_DATA
+    # Each label is ink-secondary, 12 px after its swatch.
+    label = _region(img, on_x + 50, 160, on_x + 50 + legend_font.getlength("Світло є"), 194)
+    assert _near(_darkest(label), render.INK_SECONDARY, 12)
+    # The totals header, right-aligned at x 1232 on baseline 236, is ink-muted.
+    header = _region(img, 1000, 236 - 27, 1232, 236 + 7)
+    assert _near(_darkest(header), render.INK_MUTED, 12)
+    assert set(_region(img, 1233, 200, 1280, 250)) == {render.SURFACE}
+    # Axis labels 00..24 sit on the axis baseline under their gridlines.
+    for h in range(0, 25, 3):
+        centre = lay.hx(_hours(h))
+        box = _region(img, centre - 20, lay.axis_baseline - 24, centre + 21, lay.axis_baseline + 1)
+        assert _near(_darkest(box), render.INK_MUTED, 12), h
+    # Gridlines run through every zone (a row box under its bar, the pill zone above the
+    # pill, the divider zone above its caption, the last row box) and stop at the plot's
+    # top and bottom.
+    for h in range(0, 25, 3):
+        columns = range(int(lay.hx(_hours(h))) - 1, int(lay.hx(_hours(h))) + 2)
+        for y in (330, 505, 630, 915):
+            assert _near(_darkest([_px(img, c, y) for c in columns]), render.GRID, 10), (h, y)
+        assert {_px(img, c, 250) for c in columns} == {render.SURFACE}
+        assert {_px(img, c, 925) for c in columns} == {render.SURFACE}
+    # Hour cells: a separator over the segments, 90 % at 03:00 and 55 % at 01:00.
+    y = lay.bar_ys[MON] + 22
+
+    def cell(h: int) -> RGB:
+        return _px(img, round(lay.hx(_hours(h)) * render.S) // render.S, y)
+
+    strong, weak = cell(3), cell(1)
+    assert sum(render.ON) < sum(weak) < sum(strong) <= sum(render.SURFACE)
+
+
+def test_K5_uk_and_ru_draw_cyrillic_labels() -> None:
+    week = _sample()
+    title_box = (48, 40, 700, 90)
+    legend_box = (48, 160, 1232, 195)
+    renders = {lang: _render(week, lang) for lang in ("uk", "en", "ru")}
+    for box, ink in ((title_box, render.INK_PRIMARY), (legend_box, render.INK_SECONDARY)):
+        crops = {lang: img.crop(box) for lang, img in renders.items()}
+        for lang in ("uk", "ru"):
+            colours = crops[lang].getcolors(maxcolors=1 << 16) or []
+            assert ink in {colour for _, colour in colours}, (lang, box)
+            assert crops[lang].tobytes() != crops["en"].tobytes(), (lang, box)
+        assert crops["uk"].tobytes() != crops["ru"].tobytes(), box
