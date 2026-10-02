@@ -3,6 +3,10 @@
 - The status panel uses the one Phase 4 vocabulary: "Maintenance" whenever the flag is on,
   else the stored status. Under maintenance the stored status shows as the power state,
   with its help line. Rows that do not apply are omitted (E2).
+- Its last row, Delivery, shows "OK" with its help, or "Failing since {display_time}
+  ({code})" with the cause line for that code (or the supergroup line with the new chat
+  ID) and the retry line, read from the open delivery_failing incident (D-10, D-13).
+- The page's one accent button is "Send test message", after the switches (UI-D15).
 - The settings panel is the setup page's, shared through one include, so both pages show
   identical values; with router grace on, "Reported OFF after" names the longer timeout
   right after power returns.
@@ -23,8 +27,10 @@ from typing import Any
 import pytest
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.db import transaction
 from django.test import Client
 
+from powermon.alerts import delivery
 from powermon.engine import rules
 from powermon.engine.models import LocationState
 from powermon.locations import keys
@@ -40,6 +46,31 @@ ESCAPED_XSS_NAME = "&lt;script&gt;alert(1)&lt;/script&gt;"
 ROUTER_GRACE_S = int(rules.ROUTER_GRACE.total_seconds())
 HELP_POWER_ON = "OFF is not detected during maintenance."
 HELP_POWER_OFF = "The outage goes on. When power returns, the ON alert is sent as usual."
+# UI-SPEC Copywriting › List and status, verbatim (D-13, D-10).
+HELP_DELIVERY_OK = "No alert has been refused by Telegram since the last successful send."
+CAUSE_400 = (
+    "Telegram did not accept the chat: the chat ID is wrong, or the bot is not in that chat. "
+    "Check the chat ID in Edit location, then send a test message."
+)
+CAUSE_401_404 = (
+    "Telegram rejected the bot token. Paste the current token from @BotFather in Edit "
+    "location, then send a test message."
+)
+CAUSE_403 = (
+    "The bot cannot post in the channel: it was removed or is not an admin. Make the bot an "
+    "admin with the right to post messages, then send a test message."
+)
+CAUSE_OTHER = (
+    "Telegram refused the alerts. Check the bot token and the chat ID in Edit location, then "
+    "send a test message."
+)
+MIGRATED_CHAT_ID = -1001234567999
+MIGRATE_LINE = (
+    f"The group became a supergroup. Its new chat ID is {MIGRATED_CHAT_ID}: put it in Edit "
+    "location, then send a test message."
+)
+RETRY_LINE = "Queued alerts are retried every 15 minutes until they expire."
+DELIVERY_OK_ROW = ("Delivery", "OK", HELP_DELIVERY_OK)
 DEVICE_SETUP_SENTENCE = "Heartbeat URL, device key and copy-paste examples for the device."
 TEST_MESSAGE_PARAGRAPH = (
     "Sends one silent message to the channel with this location's bot, to check the bot "
@@ -140,21 +171,25 @@ def test_LOC03_location_page_status_panel(
     off_beat = ("Last heartbeat", "2026-10-01 10:58:00 EEST", "")
     never = ("Last heartbeat", "Never", "")
 
+    # Delivery is the last row, "OK" while no delivery-failing incident is open (D-13).
     assert _status_rows(admin.get(_page(on)).content.decode()) == [
         ("Status", "On", ""),
         on_since,
         on_beat,
+        DELIVERY_OK_ROW,
     ]
     assert _status_rows(admin.get(_page(off)).content.decode()) == [
         ("Status", "Off", ""),
         outage_since,
         off_beat,
+        DELIVERY_OK_ROW,
     ]
     # Waiting: no On since / Outage since row (E2), and no state row counts as waiting.
     for place in (waiting, stateless):
         assert _status_rows(admin.get(_page(place)).content.decode()) == [
             ("Status", "Waiting for first heartbeat", ""),
             never,
+            DELIVERY_OK_ROW,
         ]
 
     for place in (on, off, waiting):
@@ -166,6 +201,7 @@ def test_LOC03_location_page_status_panel(
         ("Power state", "On", HELP_POWER_ON),
         on_since,
         on_beat,
+        DELIVERY_OK_ROW,
     ]
     # UI-D11: the maintenance label gets its own (grey) dot; the power state keeps its own.
     assert '<span class="status status--maintenance">Maintenance</span>' in maintenance_on
@@ -175,12 +211,86 @@ def test_LOC03_location_page_status_panel(
         ("Power state", "Off", HELP_POWER_OFF),
         outage_since,
         off_beat,
+        DELIVERY_OK_ROW,
     ]
     assert _status_rows(admin.get(_page(waiting)).content.decode()) == [
         ("Status", "Maintenance", ""),
         ("Power state", "Waiting for first heartbeat", ""),
         never,
+        DELIVERY_OK_ROW,
     ]
+
+
+# The Delivery row (LOC-03, D-10, D-13)
+
+
+def _delivery(page: str) -> tuple[str, list[str]]:
+    """The status panel's Delivery row: its value (HTML) and its help lines (text)."""
+    row = re.search(r"<dt>Delivery</dt>\s*<dd>(.*?)</dd>", page, re.S)
+    assert row is not None, "no Delivery row"
+    lines = [_text(line) for line in re.findall(r'<p class="help">(.*?)</p>', row.group(1), re.S)]
+    value = re.sub(r'<p class="help">.*?</p>', "", row.group(1), flags=re.S).strip()
+    return value, lines
+
+
+@pytest.mark.django_db
+def test_location_page_delivery_row_ok(admin: Client, location_factory: Callable[..., Any]) -> None:
+    location = location_factory(name="Office")
+    # Another location's failure and this location's closed one never show here.
+    other = location_factory(name="Other")
+    with transaction.atomic():
+        delivery.open_failing(other.pk, _at(7, 0), 403)
+        delivery.open_failing(location.pk, _at(7, 0), 403)
+        delivery.close_failing(location.pk, _at(7, 30))
+
+    page = admin.get(_page(location)).content.decode()
+
+    # Plain "OK", no dot, and its help line.
+    assert _delivery(page) == ("OK", [HELP_DELIVERY_OK])
+    assert "status--failing" not in page
+    assert _status_rows(page)[-1][0] == "Delivery"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("status", "migrate_to", "cause"),
+    [
+        (403, None, CAUSE_403),
+        (400, None, CAUSE_400),
+        (401, None, CAUSE_401_404),
+        (404, None, CAUSE_401_404),
+        (409, None, CAUSE_OTHER),
+        # Telegram reported a supergroup: the migrate line replaces the cause line (D-10).
+        (400, MIGRATED_CHAT_ID, MIGRATE_LINE),
+        (403, MIGRATED_CHAT_ID, MIGRATE_LINE),
+    ],
+    ids=["http_403", "http_400", "http_401", "http_404", "other", "migrate-400", "migrate-403"],
+)
+def test_location_page_delivery_row(
+    admin: Client,
+    kyiv: Any,
+    location_factory: Callable[..., Any],
+    status: int,
+    migrate_to: int | None,
+    cause: str,
+) -> None:
+    location = location_factory(name="Office", bot_token=TOKEN)
+    with transaction.atomic():
+        delivery.open_failing(location.pk, _at(8, 0, 59), status, migrate_to)
+
+    page = admin.get(_page(location)).content.decode()
+
+    # The full display_time of the start (seconds and zone), whatever the day (UI-D6).
+    assert _delivery(page) == (
+        '<span class="status status--failing">'
+        f"Failing since 2026-10-01 11:00:59 EEST (http_{status})</span>",
+        [cause, RETRY_LINE],
+    )
+    assert _status_rows(page)[-1][0] == "Delivery"
+    # The chat stays as stored: the new ID is only shown (PITFALLS 6e); no secret shows.
+    assert Location.objects.get(pk=location.pk).chat_id != MIGRATED_CHAT_ID
+    assert TOKEN not in page
+    assert SECRET not in page
 
 
 # Sections: settings (shared with the setup page) and device setup
