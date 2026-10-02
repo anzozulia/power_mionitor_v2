@@ -4,6 +4,20 @@
 - ``send_photo``: post a chart silently (multipart ``sendPhoto`` with
   ``disable_notification``, D-01). The result carries the new message's id, which the chart
   lifecycle records before it pins (INV-17).
+- ``edit_message_media``: replace a chart's image and caption in one call (multipart
+  ``editMessageMedia``, the caption inside the ``media`` JSON, D-05).
+- ``pin_chat_message`` / ``unpin_chat_message``: pin a chart silently, and unpin exactly
+  that message (D-04). There is no call that unpins everything: pins the channel admin
+  made stay (INV-19).
+
+Edit, pin and unpin name a stored message, so a ``message_id`` that is not an int above 0
+is a programming error: ``ValueError``, before any request. For these three calls only, a
+400 whose description says the message is unchanged ("message is not modified", or
+``CHAT_NOT_MODIFIED`` for a pin or unpin already in place) is ``ok`` with code
+``not_modified``, and one that says the message is gone ("message to edit / pin / unpin
+not found") is ``edit_target_missing``. Any other 400, such as a missing pin right, stays
+``permanent`` (D-07). The description is untrusted: it is only matched, never logged,
+stored or returned.
 
 No method raises across its boundary. Every outcome comes back as a ``SendResult`` whose
 ``code`` is a short fixed string, never the token, a URL or Telegram's description text:
@@ -40,6 +54,7 @@ lifecycle). Every call passes explicit (connect, read) timeouts, because request
 default timeout.
 """
 
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -75,6 +90,13 @@ PHOTO_FILENAME = "chart.png"
 _PNG_TYPE = "image/png"
 # The largest message id the chart record can store (a PostgreSQL bigint).
 _MAX_MESSAGE_ID = 2**63 - 1
+# Lower-case substrings of Telegram's 400 descriptions for an edit, a pin or an unpin.
+_NOT_MODIFIED = ("message is not modified", "chat_not_modified")
+_TARGET_MISSING = (
+    "message to edit not found",
+    "message to pin not found",
+    "message to unpin not found",
+)
 
 _RETRY_AFTER_TEXT = re.compile(r"[0-9]{1,9}")
 
@@ -181,9 +203,52 @@ class TelegramClient:
             files={PHOTO_FIELD: (PHOTO_FILENAME, png, _PNG_TYPE)},
             want_message_id=True,
         )
-        if result.kind != "ok":
-            log.warning("telegram sendPhoto: %s (%s)", result.kind, result.code)
-        return result
+        return _logged("sendPhoto", result)
+
+    def edit_message_media(
+        self, chat_id: int, message_id: int, png: bytes, caption: str
+    ) -> SendResult:
+        """Replace the image and the plain-text caption of chart message ``message_id``.
+
+        The caption sits inside the ``media`` JSON, so both change in one call (D-05).
+        """
+        _check_message_id(message_id)
+        media = {"type": "photo", "media": f"attach://{MEDIA_ATTACH}", "caption": caption}
+        result = self._call(
+            "editMessageMedia",
+            data={
+                "chat_id": str(chat_id),
+                "message_id": str(message_id),
+                "media": json.dumps(media, ensure_ascii=False),
+            },
+            files={MEDIA_ATTACH: (PHOTO_FILENAME, png, _PNG_TYPE)},
+            chart=True,
+        )
+        return _logged("editMessageMedia", result)
+
+    def pin_chat_message(self, chat_id: int, message_id: int) -> SendResult:
+        """Pin chart message ``message_id`` in ``chat_id`` without a notification (D-01)."""
+        _check_message_id(message_id)
+        result = self._call(
+            "pinChatMessage",
+            json_body={"chat_id": chat_id, "message_id": message_id, "disable_notification": True},
+            chart=True,
+        )
+        return _logged("pinChatMessage", result)
+
+    def unpin_chat_message(self, chat_id: int, message_id: int) -> SendResult:
+        """Unpin chart message ``message_id`` in ``chat_id``, and nothing else (D-04).
+
+        The id is always sent: without it Telegram would unpin the most recent pin, which
+        may be one the channel admin made (INV-19).
+        """
+        _check_message_id(message_id)
+        result = self._call(
+            "unpinChatMessage",
+            json_body={"chat_id": chat_id, "message_id": message_id},
+            chart=True,
+        )
+        return _logged("unpinChatMessage", result)
 
     def _call(
         self,
@@ -193,6 +258,7 @@ class TelegramClient:
         data: dict[str, str] | None = None,
         files: dict[str, tuple[str, bytes, str]] | None = None,
         want_message_id: bool = False,
+        chart: bool = False,
     ) -> SendResult:
         """POST one Bot API ``method`` (a JSON body, or ``data`` + ``files`` as multipart)."""
         try:
@@ -222,7 +288,20 @@ class TelegramClient:
         except Exception as exc:  # never raise across the boundary; the outcome is unknown
             log.warning("telegram %s: unexpected %s", method, type(exc).__name__)
             return SendResult("maybe_delivered", code="unexpected_error")
-        return _classify(resp, want_message_id=want_message_id)
+        return _classify(resp, want_message_id=want_message_id, chart=chart)
+
+
+def _logged(method: str, result: SendResult) -> SendResult:
+    """Log a result other than ``ok`` by method, kind and code only; return it."""
+    if result.kind != "ok":
+        log.warning("telegram %s: %s (%s)", method, result.kind, result.code)
+    return result
+
+
+def _check_message_id(message_id: object) -> None:
+    """An edit, pin or unpin names a stored message: anything but an int above 0 is a bug."""
+    if not isinstance(message_id, int) or isinstance(message_id, bool) or message_id <= 0:
+        raise ValueError("message_id must be an int above 0")
 
 
 def _not_sent_code(exc: requests.ConnectionError) -> str | None:
@@ -237,11 +316,14 @@ def _not_sent_code(exc: requests.ConnectionError) -> str | None:
     return None
 
 
-def _classify(resp: requests.Response, *, want_message_id: bool = False) -> SendResult:
+def _classify(
+    resp: requests.Response, *, want_message_id: bool = False, chart: bool = False
+) -> SendResult:
     """Classify an HTTP answer by its status and JSON body. The body is untrusted input.
 
     With ``want_message_id`` an ``ok`` needs ``result.message_id`` to be an int (not a
-    bool) in 1..2**63-1, else the answer is ``maybe_delivered`` / ``no_message_id``.
+    bool) in 1..2**63-1, else the answer is ``maybe_delivered`` / ``no_message_id``. With
+    ``chart`` (edit, pin, unpin) a 400 is read by its description first.
     """
     try:
         payload: Any = resp.json()
@@ -263,7 +345,26 @@ def _classify(resp: requests.Response, *, want_message_id: bool = False) -> Send
         return SendResult("rate_limited", retry_after=retry_after, code="429")
     if resp.status_code >= 500:
         return SendResult("transient", code=f"http_{resp.status_code}")
+    if chart and code == 400:
+        known = _chart_bad_request(data.get("description"))
+        if known is not None:
+            return known
     return SendResult("permanent", code=f"http_{code}")
+
+
+def _chart_bad_request(description: object) -> SendResult | None:
+    """The result for a 400 on an edit, pin or unpin whose description is known, else None.
+
+    The description is only matched here: it is never logged, stored or returned.
+    """
+    if not isinstance(description, str):
+        return None
+    text = description.lower()
+    if any(part in text for part in _NOT_MODIFIED):
+        return SendResult("ok", code="not_modified")
+    if any(part in text for part in _TARGET_MISSING):
+        return SendResult("edit_target_missing", code="target_missing")
+    return None
 
 
 def _message_id(result: object) -> int | None:
