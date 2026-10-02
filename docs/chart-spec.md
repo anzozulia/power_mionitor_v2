@@ -214,8 +214,15 @@ On a 400 px wide phone, the smallest text (27 px) shows at about 8.4 px, and the
 |---|---|---|---|
 | Outages | `Сьогодні без світла: 4 год 10 хв · 2 відключення` | `Today off: 4h 10m · 2 outages` | `Сегодня без света: 4 ч 10 мин · 2 отключения` |
 | None | `Сьогодні відключень не було` | `No outages today` | `Сегодня отключений не было` |
+| Today, not monitored | `Сьогодні: не відстежувалось` | `Today: not monitored` | `Сегодня: не отслеживалось` |
+| Finished day, not monitored | `Чт 01.10: не відстежувалось` | `Thu 01.10: not monitored` | `Чт 01.10: не отслеживалось` |
 | Line 2 | `Оновлено о 14:37` | `Updated 14:37` | `Обновлено в 14:37` |
 
+  - The neutral "not monitored" form (amendment, Phase 4 D-03) is used when the day has no on or
+    off time at all, i.e. its row total shows "—": the caption must not claim "no outages" for a day
+    the chart shows as unknown. The words are the legend's "Not monitored". Line 2 stays on the live
+    chart; the finished-day render keeps line 1 only. A day with any on or off time keeps the
+    "Outages" and "None" forms.
   - Plural forms follow CLDR rules:
     - uk: 1, 21 відключення (one); 2-4, 22 відключення (few); 5-20, 25 відключень (many).
     - ru: отключение / отключения / отключений.
@@ -272,6 +279,7 @@ Interval-level tests (unit, no image):
 - [ ] Nothing is drawn after *now*, and the open interval ends at *now*.
 - [ ] An OFF interval under 8 px is drawn 8 px wide and stays inside the bar, including at 00:00 and 24:00.
 - [ ] Caption plural forms are correct for n = 1, 2, 5, 11, 21, 22 in uk and ru, and the finished-day caption uses the date.
+- [ ] A day with no on or off time at all is captioned in the neutral form in uk, en and ru (`Today: not monitored` with line 2 on the live chart, `Thu 01.10: not monitored` on the finished day), never "no outages" (D-03).
 - [ ] Every character in every localized string (plus digits, "·", "–", "—", "<") is in the bundled
       font's cmap, so no tofu boxes.
 

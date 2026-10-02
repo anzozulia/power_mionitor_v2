@@ -6,9 +6,11 @@ now line, no pill, the caption's line 1 only) and is unpinned (D-01, D-13). Each
 its own condition on every I/O pass, in D-02 order (post, pin, finalize, unpin), so after
 downtime across one or more midnights exactly one chart for today is posted and every
 older chart is finalized and unpinned, a day the worker missed gets no chart (D-03), and
-a failing step never blocks the others (D-02). Edits and unpins go to the chat and the
-message stored with each record, never the location's current chat, and nothing but a
-recorded message is ever unpinned (D-04, INV-19).
+a failing step never blocks the others (D-02). Edits and unpins use the chat and the
+message id stored with each record, never the location's current chat, and nothing but a
+recorded message is ever unpinned (D-04, INV-19). A record whose chat or bot no longer
+matches its location's is released instead: unpinned in its stored chat, retired, and
+never given a final edit (D-08).
 
 A day's final edit waits until detection has settled past the end of that day (INV-03):
 OFF is recorded after the fact, backdated to the last heartbeat, so an outage that started
@@ -123,12 +125,17 @@ def _seed(
     chat_id: int = DEFAULT_CHAT_ID,
     rendered: datetime | None = None,
 ) -> ChartMessage:
-    """A record as an earlier run left it: posted (and maybe pinned) on ``day``."""
+    """A record as an earlier run left it: posted (and maybe pinned) on ``day``.
+
+    Posted by the location's own bot (``bot_key``), so only a chat that differs from the
+    location's makes it stale (D-08).
+    """
     at = rendered if rendered is not None else model.next_midnight(day, KYIV) - _min(15)
     return ChartMessage.objects.create(
         location=location,
         local_date=day,
         chat_id=chat_id,
+        bot_key=io_loop.bot_key(location.bot_token),
         message_id=message_id,
         pinned=pinned,
         last_rendered_at=at,
@@ -247,7 +254,9 @@ def test_INV18_1_worker_down_across_midnight(
         ("unpinChatMessage", DEFAULT_CHAT_ID, 501),
     ]
     photo, _pin, final, unpin = fake_telegram.chart_calls
-    assert _caption(photo) == "No outages today\nUpdated 00:07"
+    # Today so far (00:00-00:07) is all downtime, not monitored: no on or off time, so the
+    # caption says so instead of "No outages today" (D-03).
+    assert _caption(photo) == "Today: not monitored\nUpdated 00:07"
     # The finished day: line 1 only, no "Updated" line (D-13).
     assert _caption(final) == "No outages on Thu 01.10"
     assert "\n" not in _caption(final)
@@ -418,21 +427,24 @@ def test_INV18_2_down_all_of_10_02(
 def test_INV19_1_both_older_charts_finalized_and_unpinned(
     location_factory: Callable[..., Any], fake_telegram: Any
 ) -> None:
+    # The 10-01 and 10-02 charts are both still pinned, in the location's current chat
+    # and posted by its current bot: neither moved, so neither is released (D-08).
     location = _monitored(location_factory)
-    first = _seed(location, YESTERDAY, message_id=501, pinned=True, chat_id=OLD_CHAT_ID)
+    first = _seed(location, YESTERDAY, message_id=501, pinned=True)
     second = _seed(location, TODAY, message_id=502, pinned=True)
     fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
     clock = FakeClock(kyiv("2026-10-03 00:05"))
 
     assert _run_until_idle(clock, io_loop.RelayState()) == 6
 
-    # Each final edit and unpin in the record's own chat, with its own message id.
+    # Each final edit and unpin names the record's stored chat and its own message id
+    # (Phase 3 D-04, still true for every record that did not move), each exactly once.
     assert _calls(fake_telegram) == [
         ("sendPhoto", DEFAULT_CHAT_ID, None),
         ("pinChatMessage", DEFAULT_CHAT_ID, 1001),
-        ("editMessageMedia", OLD_CHAT_ID, 501),
+        ("editMessageMedia", DEFAULT_CHAT_ID, 501),
         ("editMessageMedia", DEFAULT_CHAT_ID, 502),
-        ("unpinChatMessage", OLD_CHAT_ID, 501),
+        ("unpinChatMessage", DEFAULT_CHAT_ID, 501),
         ("unpinChatMessage", DEFAULT_CHAT_ID, 502),
     ]
     for record in (first, second):
@@ -442,23 +454,34 @@ def test_INV19_1_both_older_charts_finalized_and_unpinned(
     assert list(pinned) == [(date(2026, 10, 3), 1001)]
 
 
-def test_D04_edits_and_unpins_use_the_stored_chat(
+def test_D04_D08_moved_record_is_unpinned_in_its_stored_chat_and_never_finalized(
     location_factory: Callable[..., Any], fake_telegram: Any
 ) -> None:
-    # The location's chat changed after yesterday's chart was posted to OLD_CHAT_ID.
+    # The location's chat changed after yesterday's chart was posted to OLD_CHAT_ID, by
+    # the location's own bot. At 00:07 its day has settled, so Phase 3 would have made its
+    # final edit in OLD_CHAT_ID; D-08 releases it instead: one unpin in its stored chat, by
+    # its message id (D-04), then it is retired. No sendPhoto goes before the release
+    # (Pitfall 1).
     location = _monitored(location_factory)
-    _seed(location, YESTERDAY, message_id=501, pinned=True, chat_id=OLD_CHAT_ID)
+    moved = _seed(location, YESTERDAY, message_id=501, pinned=True, chat_id=OLD_CHAT_ID)
     fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
 
-    assert _run_until_idle(FakeClock(AFTER_MIDNIGHT), io_loop.RelayState()) == 4
+    assert _run_until_idle(FakeClock(AFTER_MIDNIGHT), io_loop.RelayState()) == 3
 
     assert _calls(fake_telegram) == [
+        ("unpinChatMessage", OLD_CHAT_ID, 501),
         ("sendPhoto", DEFAULT_CHAT_ID, None),
         ("pinChatMessage", DEFAULT_CHAT_ID, 1001),
-        ("editMessageMedia", OLD_CHAT_ID, 501),
-        ("unpinChatMessage", OLD_CHAT_ID, 501),
     ]
-    assert ChartMessage.objects.get(local_date=TODAY).chat_id == DEFAULT_CHAT_ID
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "editMessageMedia") == 0
+    moved.refresh_from_db()
+    assert (moved.retired_at, moved.pinned, moved.finalized_at) == (AFTER_MIDNIGHT, False, None)
+    today_row = ChartMessage.objects.get(local_date=TODAY)
+    assert (today_row.chat_id, today_row.message_id, today_row.pinned) == (
+        DEFAULT_CHAT_ID,
+        1001,
+        True,
+    )
 
 
 # D-02: a failing step never blocks the others (INV-19, T-03-34)

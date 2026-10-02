@@ -59,7 +59,7 @@ from powermon.alerts.models import OutboxMessage
 from powermon.chart import lifecycle, render
 from powermon.chart.models import ChartMessage
 from powermon.engine.models import LocationState, PowerInterval, SystemState
-from powermon.worker import detection, supervision
+from powermon.worker import detection, io_loop, supervision
 from powermon.worker.lease import Lease
 from powermon.worker.management.commands import run_worker
 
@@ -201,6 +201,8 @@ def _midnight(location_factory: Callable[..., Any]) -> list[Any]:
             location=location,
             local_date=YESTERDAY,
             chat_id=chat_id,
+            # Posted by the location's own bot, so it is not released (D-08).
+            bot_key=io_loop.bot_key(location.bot_token),
             message_id=500 + n,
             pinned=True,
             last_rendered_at=LAST_REFRESH,

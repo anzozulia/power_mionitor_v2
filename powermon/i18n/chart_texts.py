@@ -2,7 +2,9 @@
 
 The labels of the chart image and the caption under it, verbatim from docs/chart-spec.md
 section 8, with the finished-day caption of D-13: line 1 only, with the weekday and date in
-place of "Today". Every table has the same keys and shape in every language, and an unknown
+place of "Today". A day with no on or off time at all (its row total is "—") gets the
+neutral caption form, the legend's "Not monitored", instead of a claim of no outages
+(Phase 4 D-03). Every table has the same keys and shape in every language, and an unknown
 language falls back to en (docs/v1-lessons.md section 2). The renderer and the chart
 lifecycle only call into this module, so each string has one tested source.
 
@@ -17,7 +19,7 @@ Inputs are checked up front, so a function fails the same way whichever branch i
 take: a count or a duration that is not an int (a bool is not) raises TypeError, a negative
 one ValueError; a day that is not a ``datetime.date`` raises TypeError, and so does a
 ``datetime`` (a stored instant's date is the UTC date, not the local one); a language that
-is not a str raises TypeError.
+is not a str raises TypeError, and so does a ``monitored`` flag that is not a bool.
 
 Pure: imports nothing from Django. Like ``duration.py`` it never divides with "/" and never
 calls the built-in rounding (a test scans every file in this package); the plural rules use
@@ -109,28 +111,35 @@ NO_OUTAGES: dict[str, str] = {
 
 # Captions (chart-spec section 8, D-13). ``{count}`` is the plural phrase from ``outages``
 # ("2 відключення"), ``{duration}`` the shared total formatter's text, ``{time}`` HH:MM and
-# ``{day}`` the weekday and date ("Чт 01.10").
+# ``{day}`` the weekday and date ("Чт 01.10"). The ``*_unmonitored`` forms are for a day
+# with no on or off time at all, in the legend's "Not monitored" words (D-03).
 CAPTIONS: dict[str, dict[str, str]] = {
     "uk": {
         "today_off": "Сьогодні без світла: {duration} · {count}",
         "today_none": "Сьогодні відключень не було",
+        "today_unmonitored": "Сьогодні: не відстежувалось",
         "updated": "Оновлено о {time}",
         "day_off": "{day} без світла: {duration} · {count}",
         "day_none": "{day} відключень не було",
+        "day_unmonitored": "{day}: не відстежувалось",
     },
     "en": {
         "today_off": "Today off: {duration} · {count}",
         "today_none": "No outages today",
+        "today_unmonitored": "Today: not monitored",
         "updated": "Updated {time}",
         "day_off": "{day} off: {duration} · {count}",
         "day_none": "No outages on {day}",
+        "day_unmonitored": "{day}: not monitored",
     },
     "ru": {
         "today_off": "Сегодня без света: {duration} · {count}",
         "today_none": "Сегодня отключений не было",
+        "today_unmonitored": "Сегодня: не отслеживалось",
         "updated": "Обновлено в {time}",
         "day_off": "{day} без света: {duration} · {count}",
         "day_none": "{day} отключений не было",
+        "day_unmonitored": "{day}: не отслеживалось",
     },
 }
 
@@ -169,6 +178,12 @@ def _check_day(day: date) -> None:
     """TypeError unless ``day`` is a local ``datetime.date`` (a ``datetime`` is not)."""
     if not isinstance(day, date) or isinstance(day, datetime):
         raise TypeError(f"a day must be a datetime.date, not {type(day).__name__}")
+
+
+def _check_monitored(monitored: bool) -> None:
+    """TypeError unless ``monitored`` is a bool (0, 1 and None are not)."""
+    if not isinstance(monitored, bool):
+        raise TypeError(f"monitored must be a bool, not {type(monitored).__name__}")
 
 
 def plural_form(n: int, lang: str) -> str:
@@ -238,8 +253,7 @@ def row_total(off_us: int, count: int, monitored: bool, lang: str) -> tuple[str,
     """
     _check_count(off_us, "off_us")
     _check_count(count, "count")
-    if not isinstance(monitored, bool):
-        raise TypeError(f"monitored must be a bool, not {type(monitored).__name__}")
+    _check_monitored(monitored)
     lang = _lang(lang)
     if not monitored:
         return NO_DATA_TOTAL, ""
@@ -254,9 +268,18 @@ def worst_total(lang: str) -> str:
     return f"{duration}{suffix}"
 
 
-def _summary(kind: str, off_us: int, count: int, lang: str, **fields: str) -> str:
-    """Caption line 1 for ``kind`` "today" or "day": the off time and outages, or none."""
+def _summary(
+    kind: str, off_us: int, count: int, lang: str, *, monitored: bool = True, **fields: str
+) -> str:
+    """Caption line 1 for ``kind`` "today" or "day": the off time and outages, or none.
+
+    A day with no on or off time at all (``monitored`` False) gets the neutral form, "not
+    monitored", whatever the count: the chart shows it as unknown, so the caption must not
+    claim "no outages" (D-03).
+    """
     captions = CAPTIONS[lang]
+    if not monitored:
+        return captions[f"{kind}_unmonitored"].format(**fields)
     if count == 0:
         return captions[f"{kind}_none"].format(**fields)
     return captions[f"{kind}_off"].format(
@@ -264,13 +287,18 @@ def _summary(kind: str, off_us: int, count: int, lang: str, **fields: str) -> st
     )
 
 
-def live_caption(off_us: int, count: int, updated_hm: str, lang: str) -> str:
+def live_caption(
+    off_us: int, count: int, updated_hm: str, lang: str, *, monitored: bool = True
+) -> str:
     """Today's caption, two lines: the day so far, then the update time (CHRT-04).
 
     ``Today off: 4h 10m · 2 outages`` + newline + ``Updated 14:37``; with no outage today,
-    ``No outages today`` + newline + ``Updated 14:37``. ``off_us`` is today's OFF time so
-    far in integer microseconds (the same integer as today's row total), ``count`` the
-    number of outages, ``updated_hm`` the render time as local ``HH:MM``.
+    ``No outages today`` + newline + ``Updated 14:37``; with no on or off time today at
+    all (``monitored`` False, the row total "—"), ``Today: not monitored`` + newline +
+    ``Updated 14:37`` (D-03). ``off_us`` is today's OFF time so far in integer
+    microseconds (the same integer as today's row total), ``count`` the number of
+    outages, ``updated_hm`` the render time as local ``HH:MM``, ``monitored`` the row's
+    flag (a bool; the default True is the monitored day).
     """
     _check_count(off_us, "off_us")
     _check_count(count, "count")
@@ -278,22 +306,27 @@ def live_caption(off_us: int, count: int, updated_hm: str, lang: str) -> str:
         raise TypeError(f"the update time must be a str, not {type(updated_hm).__name__}")
     if not _HM_RE.fullmatch(updated_hm):
         raise ValueError(f"the update time must be HH:MM, not {updated_hm!r}")
+    _check_monitored(monitored)
     lang = _lang(lang)
     updated = CAPTIONS[lang]["updated"].format(time=updated_hm)
-    return f"{_summary('today', off_us, count, lang)}\n{updated}"
+    return f"{_summary('today', off_us, count, lang, monitored=monitored)}\n{updated}"
 
 
-def finished_caption(off_us: int, count: int, day: date, lang: str) -> str:
+def finished_caption(
+    off_us: int, count: int, day: date, lang: str, *, monitored: bool = True
+) -> str:
     """A finished day's caption, one line, with no update time (D-13).
 
     ``Thu 01.10 off: 4h 10m · 2 outages``, or ``No outages on Thu 01.10``; uk and ru put
-    the weekday and date first in both forms (``Чт 01.10 відключень не було``). ``day`` is
-    the local date of the finished day.
+    the weekday and date first in both forms (``Чт 01.10 відключень не було``). A day with
+    no on or off time at all (``monitored`` False) gets ``Thu 01.10: not monitored``
+    (D-03). ``day`` is the local date of the finished day.
     """
     _check_count(off_us, "off_us")
     _check_count(count, "count")
+    _check_monitored(monitored)
     lang = _lang(lang)
-    return _summary("day", off_us, count, lang, day=weekday_date(day, lang))
+    return _summary("day", off_us, count, lang, monitored=monitored, day=weekday_date(day, lang))
 
 
 def all_strings() -> list[str]:

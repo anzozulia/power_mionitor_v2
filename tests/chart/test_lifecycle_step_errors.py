@@ -187,6 +187,7 @@ def test_INV13_error_after_an_edit_waits_and_the_edit_is_made_again(
         location=location,
         local_date=TODAY,
         chat_id=DEFAULT_CHAT_ID,
+        bot_key=io_loop.bot_key(location.bot_token),
         message_id=1001,
         pinned=True,
         last_rendered_at=NOON_05,

@@ -75,12 +75,35 @@ worker was down is simply due on the next pass.
   database, so after downtime exactly one catch-up refresh is made, not one per missed
   slot (INV-18). Midnight-class steps (post, pin, finalize, unpin) beat any refresh; among
   due refreshes the oldest render goes first, ties to the lower location id.
+- Release (D-08, D-09, INV-19 #2): a record is ``stale`` once its channel is no longer its
+  location's: the chat stored with it differs from the location's chat, the bot that
+  posted it (``bot_key``) differs from the location's current bot (a token change is a
+  channel change), or the location was deleted. A stale record gets one unpin by its own
+  message id in its stored chat, with the location's current bot, and is then retired
+  (``retired_at``, unpinned), so no final edit, pin or refresh ever targets it again. The
+  admin's save writes nothing to the chart: the condition is checked on every pass
+  (INV-18 style), so a chat changed and changed back before the worker acts moves nothing,
+  and a restart needs no extra state. Release is best effort and never loops: "ok",
+  "message to unpin not found" and any other permanent error retire the record. A
+  permanent error logs one WARNING with its short code and sends no ops notice: if the
+  current bot may not unpin in the old chat, the old pin stays (the accepted Open Edge 6
+  risk). A transient, rate-limited or unsent outcome backs the release off like any other
+  step. While any stale record of a location is active, that location makes no other step
+  (Pitfall 1): a post in the new chat while the old today-record is active would hit
+  ``chart_message_one_active_per_day`` and leave an untracked photo on every pass. Once
+  its stale records are retired, a moved location has no record for today, so today's
+  chart is posted and pinned in its new chat on the next passes. A deleted location stays
+  in the snapshot (``ChartLocation.deleted``) only until its records are retired, and gets
+  nothing but releases: no post, pin, refresh or final edit. A change of only the name or
+  the language releases nothing: the next refresh shows it (D-14).
 
 Each step is its own condition, checked on every pass (D-02): after downtime across one
 or more midnights the passes post and pin one chart for today and finalize and unpin
-every older chart, and a day the worker missed gets no chart (D-03, INV-18, INV-19). When
-both are due, an older record's final edit goes before its unpin (D-02 order); a final
-edit not due yet (its day has not settled) never holds the unpin.
+every older chart, and a day the worker missed gets no chart (D-03, INV-18, INV-19). A
+location's stale records are released first, oldest first (local date, then id), before
+any other step of that location. When both are due, an older record's final edit goes
+before its unpin (D-02 order); a final edit not due yet (its day has not settled) never
+holds the unpin.
 
 Rendering runs inline in the I/O thread right before its call (D-05), with the location's
 current name and language and the display time zone read at render time (D-14). The
@@ -100,7 +123,9 @@ bot-wide outcome (429, 5xx, refused connection) also sets ``bot_wide_key``, for 
 hold the relay gives an alert's outcome of that kind. On top of that hold, the step waits
 ``step_delay(n)`` after its n-th consecutive failure (``RelayState.chart_failures``): 30 s,
 doubling, at most 15 min. So a failed step's key always outlives its bot's hold, and the
-location's other due steps go first (D-02); and an ambiguous post, which is posted again
+location's other due steps go first (D-02), except while it has a stale record: then a
+failed release holds every step of that location, and the location's next stale record,
+if any, goes first (Pitfall 1); and an ambiguous post, which is posted again
 (D-06), slows down to at most 4 untracked photos an hour. Permanent errors and render
 errors wait a fixed 15 min. A step whose call was made but whose record UPDATE raised a
 database error (refresh, pin, finalize, unpin: all idempotent) waits ``step_delay(n)``
@@ -115,7 +140,9 @@ first drops every ``chart:`` key that no longer guards a step, i.e. one of a loc
 that is not monitored, a post key once today's record exists, a refresh key while it
 does not, a pin key of a record that is pinned or no longer today's (an older record's
 pin is never retried: its one unpin follows instead), a finalize or unpin key of a record
-that is done or retired. The alert relay's keys are never touched.
+that is done or retired. A location with a stale record keeps only the keys of its
+releases, each until its record is retired; without them a transient release error
+would turn into a call per pass. The alert relay's keys are never touched.
 
 Each call logs one INFO line, ``chart <step> for location <id>: <kind> (<code>)
 render_ms=<n> call_ms=<n>``, with no token and no Telegram description (OPS-08).
@@ -153,7 +180,7 @@ from powermon.worker.lease import LOCK_KEY
 
 log = logging.getLogger(__name__)
 
-Step = Literal["post", "pin", "finalize", "unpin", "refresh"]
+Step = Literal["post", "pin", "finalize", "unpin", "refresh", "release"]
 
 # The ops_incident kind of a location whose bot may post but not pin (D-07, INV-17 #1).
 KIND_CHART_PIN_FAILED = "chart_pin_failed"
@@ -179,18 +206,28 @@ _CLEANUP: tuple[Step, ...] = ("finalize", "unpin")
 # The steps on today's record: its message gone means today's chart is posted again.
 _TODAYS: tuple[Step, ...] = ("pin", "refresh")
 
+# The monitored locations (status on or off, not deleted), and the deleted ones that still
+# have an active record (ROWS_SQL's predicate): those only get their records released, and
+# leave the snapshot once every record is retired (D-09).
 LOCATIONS_SQL = """
-SELECT l.id, l.name, l.language, l.bot_token, l.chat_id, l.period_s, l.grace_s, l.router_grace
+SELECT l.id, l.name, l.language, l.bot_token, l.chat_id, l.period_s, l.grace_s, l.router_grace,
+       l.deleted_at IS NOT NULL
   FROM location l
   JOIN location_state s ON s.location_id = l.id
- WHERE s.status IN ('on', 'off') AND l.deleted_at IS NULL
+ WHERE (s.status IN ('on', 'off') AND l.deleted_at IS NULL)
+    OR (l.deleted_at IS NOT NULL
+        AND EXISTS (SELECT 1 FROM chart_message c
+                     WHERE c.location_id = l.id AND c.retired_at IS NULL
+                       AND (c.local_date = %(today)s
+                            OR (c.local_date < %(today)s
+                                AND (c.finalized_at IS NULL OR c.unpinned_at IS NULL)))))
  ORDER BY l.id
 """
 # Today's active records, and older ones that still need their final edit or their unpin
 # (whether or not they are known pinned, INV-19).
 ROWS_SQL = """
 SELECT id, location_id, local_date, chat_id, message_id, pinned, pin_failed_at,
-       last_rendered_at, finalized_at, unpinned_at
+       last_rendered_at, finalized_at, unpinned_at, bot_key
   FROM chart_message
  WHERE retired_at IS NULL
    AND (local_date = %(today)s
@@ -230,6 +267,8 @@ class ChartLocation:
     # How long after a day ends detection may still record an OFF that started in it
     # (``settle_time``): the day's final edit waits until the detection cursor passed it.
     settle: timedelta
+    # A deleted location (D-09): every record it still has is released, nothing else.
+    deleted: bool = False
 
 
 @dataclass(frozen=True)
@@ -247,6 +286,8 @@ class ChartRow:
     finalized_at: datetime | None
     # The older record's one unpin was made (INV-19); None until then.
     unpinned_at: datetime | None
+    # The bot that posted it: ``io_loop.bot_key`` of its token, never the token (D-08).
+    bot_key: str
 
 
 @dataclass(frozen=True)
@@ -262,6 +303,30 @@ def chart_key(location_id: int, step: Step, row_id: int | None = None) -> str:
     """A chart step's own backoff key in ``RelayState.not_before``: by location, never a token."""
     key = f"{_KEY_PREFIX}{location_id}:{step}"
     return key if row_id is None else f"{key}:{row_id}"
+
+
+def stale(location: ChartLocation, row: ChartRow) -> bool:
+    """True when the record's channel is no longer its location's: it is released (D-08).
+
+    The channel is the (bot, chat) pair the relay keys on too (``io_loop.chat_key``): the
+    record is stale when its stored chat differs from the location's chat, when the bot
+    that posted it differs from the location's current bot, or when the location was
+    deleted (D-09). A record whose ``bot_key`` is empty names no bot, so it is stale like
+    any other mismatch. Pure.
+    """
+    return (
+        location.deleted
+        or row.chat_id != location.chat_id
+        or row.bot_key != io_loop.bot_key(location.bot_token)
+    )
+
+
+def _stale_rows(location: ChartLocation, rows: list[ChartRow]) -> list[ChartRow]:
+    """The location's stale records, oldest first (local date, then id)."""
+    return sorted(
+        (row for row in rows if row.location_id == location.location_id and stale(location, row)),
+        key=lambda row: (row.local_date, row.id),
+    )
 
 
 def step_delay(failures: int) -> timedelta:
@@ -321,25 +386,33 @@ def settled_records(
     The cursor, not the wall clock: while detection stalls, or across a lapse, the final
     edit waits too (a lapse carve commits before the cursor moves). With no cursor
     (detection has not run yet) no day has settled. Only records not finalized yet, of
-    monitored locations.
+    monitored locations: a deleted location's record, or one whose chat or bot is no
+    longer its location's (``stale``), is released and never finalized (D-08, D-09).
     """
     if detected_until is None:
         return frozenset()
-    settle = {location.location_id: location.settle for location in locations}
+    by_id = {location.location_id: location for location in locations if not location.deleted}
     return frozenset(
         row.id
         for row in rows
         if row.local_date < today
         and row.finalized_at is None
-        and row.location_id in settle
-        and detected_until >= model.next_midnight(row.local_date, tz) + settle[row.location_id]
+        and row.location_id in by_id
+        and not stale(by_id[row.location_id], row)
+        and detected_until
+        >= model.next_midnight(row.local_date, tz) + by_id[row.location_id].settle
     )
 
 
 def read_snapshot(today: date) -> tuple[list[ChartLocation], list[ChartRow]]:
-    """The monitored locations by id, and the records ``plan`` may act on, oldest first."""
+    """The locations by id, and the records ``plan`` may act on, oldest first.
+
+    The locations are the monitored ones plus the deleted ones that still have an active
+    record, marked ``deleted``: a deleted location stays only until its records are
+    retired (D-09).
+    """
     with connection.cursor() as cur:
-        cur.execute(LOCATIONS_SQL)
+        cur.execute(LOCATIONS_SQL, {"today": today})
         locations = [
             ChartLocation(
                 location_id=r[0],
@@ -348,6 +421,7 @@ def read_snapshot(today: date) -> tuple[list[ChartLocation], list[ChartRow]]:
                 bot_token=r[3],
                 chat_id=r[4],
                 settle=settle_time(r[5], r[6], r[7]),
+                deleted=r[8],
             )
             for r in cur.fetchall()
         ]
@@ -364,6 +438,7 @@ def read_snapshot(today: date) -> tuple[list[ChartLocation], list[ChartRow]]:
                 last_rendered_at=r[7],
                 finalized_at=r[8],
                 unpinned_at=r[9],
+                bot_key=r[10],
             )
             for r in cur.fetchall()
         ]
@@ -383,6 +458,10 @@ def plan(
 
     Midnight-class steps go first: locations by ascending id, and the first one with a due
     step wins, so one location's midnight work is done before the next one's starts.
+    A location with a ``stale`` record (its chat or bot changed, or it was deleted) makes
+    only releases, oldest record first, until every stale record is retired; its release
+    waiting for its own key or its channel makes no other step of that location either, so
+    nothing is posted while the old today-record is active (D-08, D-09, Pitfall 1).
     Within a location the steps go in D-02 order: post today's chart, pin it, give the
     oldest older record without one its final edit, unpin the oldest older record not
     unpinned yet, whatever ``pinned`` says (its pin may have taken effect unrecorded,
@@ -404,6 +483,12 @@ def plan(
     due_refreshes: list[tuple[datetime, int, Action]] = []
     for location in locations:
         if waiting(io_loop.bot_wide_key(location.bot_token)):
+            continue
+        stale_rows = _stale_rows(location, rows)
+        if stale_rows or location.deleted:
+            for row in stale_rows:
+                if _free(location, "release", row, waiting):
+                    return Action("release", location, row)
             continue
         today_row = _today_row(rows, location.location_id, today)
         action = _midnight_step(location, rows, today_row, today, waiting, settled)
@@ -494,8 +579,9 @@ def chart_content(
 
     A live chart's caption carries today's off time, outage count and the update time,
     all from the same ``now`` as the image's now pill (CHRT-04); a finished one has line 1
-    only (D-13). The render module is imported here, in the worker, and called as a module
-    attribute.
+    only (D-13). A day with no on or off time at all (its row total is "—") is captioned
+    "not monitored", never "no outages" (D-03). The render module is imported here, in the
+    worker, and called as a module attribute.
     """
     from powermon.chart import render  # Pillow: worker only, never at import time
 
@@ -504,10 +590,16 @@ def chart_content(
     row = week.today_row
     if live:
         caption = chart_texts.live_caption(
-            row.off_us, row.count, times.hm(now, tz), location.language
+            row.off_us,
+            row.count,
+            times.hm(now, tz),
+            location.language,
+            monitored=row.monitored,
         )
     else:
-        caption = chart_texts.finished_caption(row.off_us, row.count, day, location.language)
+        caption = chart_texts.finished_caption(
+            row.off_us, row.count, day, location.language, monitored=row.monitored
+        )
     return png, caption
 
 
@@ -628,8 +720,10 @@ def _call(client: TelegramClient, action: Action, content: tuple[bytes, str] | N
     if action.step in ("refresh", "finalize") and row is not None and content is not None:
         png, caption = content
         return client.edit_message_media(row.chat_id, row.message_id, png, caption)
-    if action.step == "unpin" and row is not None:
+    if action.step in ("unpin", "release") and row is not None:
         # By its message id, in its own chat: never the admin's own pins (D-04, INV-19).
+        # A release is made even when the record was unpinned already: unpinning a
+        # message that is not pinned answers "not modified" (ok) or "not found" (D-08).
         return client.unpin_chat_message(row.chat_id, row.message_id)
     raise ValueError(f"no call for the chart step {action.step!r}")
 
@@ -644,6 +738,9 @@ def _apply(
 ) -> None:
     """Write the step's outcome: its record on success, else its own backoff (``_fail``)."""
     row = action.row
+    if action.step == "release" and row is not None:
+        _released(action, row, key, result, answered, state)
+        return
     if result.kind == "ok" and action.step == "post" and result.message_id is None:
         # Cannot happen with the client (it answers no_message_id), and must not record.
         result = SendResult("maybe_delivered", code="no_message_id")
@@ -687,6 +784,38 @@ def _apply(
         # The bot may not pin here: tried again after the next render, not before (D-07).
         _pin_refused(action.location, row, result, answered)
     _fail(action, key, result, answered, state)
+
+
+def _released(
+    action: Action,
+    row: ChartRow,
+    key: str,
+    result: SendResult,
+    answered: datetime,
+    state: io_loop.RelayState,
+) -> None:
+    """A stale record's release ends, best effort, unless it may still succeed (D-08, D-09).
+
+    "ok" (unpinned, or it was not pinned), "message to unpin not found" and any other
+    permanent error retire the record, so no later call ever targets it and the release
+    never loops (INV-19). A permanent error logs one WARNING with its short code and sends
+    no ops notice: the old pin may stay (the accepted Open Edge 6 risk). Any other outcome
+    (transient, rate limited, not sent, maybe delivered) backs the release off like any
+    step (``_fail``); the location makes no other step meanwhile (Pitfall 1).
+    """
+    if result.kind != "ok" and result.kind not in _PERMANENT_KINDS:
+        _fail(action, key, result, answered, state)
+        return
+    _retire(row, answered)
+    if result.kind == "permanent":
+        log.warning(
+            "chart release for location %s: permanent error %s for record %s; it is retired "
+            "(best effort, the old pin may stay)",
+            action.location.location_id,
+            result.code,
+            row.id,
+        )
+    _step_done(key, state)
 
 
 def _pinned(location: ChartLocation, row: ChartRow, answered: datetime) -> None:
@@ -804,7 +933,10 @@ def _unpinned(row: ChartRow, answered: datetime) -> None:
 
 
 def _retire(row: ChartRow, answered: datetime) -> None:
-    """The record's message is gone: retired and unpinned, never called again (D-06)."""
+    """The record leaves the lifecycle: retired and unpinned, never called again.
+
+    Its message is gone (D-06), or its channel is no longer its location's (D-08, D-09).
+    """
     ChartMessage.objects.filter(pk=row.id, retired_at__isnull=True).update(
         retired_at=answered, pinned=False
     )
@@ -941,9 +1073,21 @@ def _prune(
 
 
 def _live_keys(locations: list[ChartLocation], rows: list[ChartRow], today: date) -> set[str]:
-    """Every key that can still guard a step: the steps the snapshot may still make."""
-    monitored = {location.location_id for location in locations}
+    """Every key that can still guard a step: the steps the snapshot may still make.
+
+    A location with a stale record (or a deleted one) makes only releases until every
+    stale record is retired (D-08, D-09): its live keys are those releases' keys, so a
+    release's backoff survives every pass and a transient error never turns into a call
+    per pass; none of its other keys is live.
+    """
+    monitored: set[int] = set()
     live: set[str] = set()
+    for location in locations:
+        stale_rows = _stale_rows(location, rows)
+        if stale_rows or location.deleted:
+            live.update(chart_key(location.location_id, "release", row.id) for row in stale_rows)
+        else:
+            monitored.add(location.location_id)
     for location_id in monitored:
         today_row = _today_row(rows, location_id, today)
         if today_row is None:
@@ -1066,7 +1210,7 @@ def _unwritten(
 ) -> None:
     """The call was made but its record UPDATE could not be written: the step waits.
 
-    For a refresh, pin, final edit or unpin, all idempotent: the call is simply made again
+    For a refresh, pin, final edit, unpin or release, all idempotent: the call is made again
     after ``step_delay``, so an UPDATE that keeps failing never turns into a call per pass.
     A post never gets here: its record is kept and written first (``_record_or_keep``).
     """

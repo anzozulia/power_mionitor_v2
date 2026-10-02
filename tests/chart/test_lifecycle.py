@@ -167,11 +167,12 @@ def _seed(
     chat_id: int = DEFAULT_CHAT_ID,
     pinned: bool = True,
 ) -> ChartMessage:
-    """A record as an earlier post left it (pinned by default)."""
+    """A record as an earlier post left it (pinned by default), by the location's own bot."""
     return ChartMessage.objects.create(
         location=location,
         local_date=day,
         chat_id=chat_id,
+        bot_key=io_loop.bot_key(location.bot_token),
         message_id=message_id,
         pinned=pinned,
         last_rendered_at=rendered,
@@ -210,7 +211,9 @@ def _row(
     day: date = TODAY,
     pinned: bool = True,
     pin_failed_at: datetime | None = None,
+    token: str = DEFAULT_BOT_TOKEN,
 ) -> lifecycle.ChartRow:
+    """A record of location ``location_id`` posted by the bot ``token`` (its location's)."""
     return lifecycle.ChartRow(
         id=row_id,
         location_id=location_id,
@@ -222,6 +225,7 @@ def _row(
         last_rendered_at=rendered,
         finalized_at=None,
         unpinned_at=None,
+        bot_key=io_loop.bot_key(token),
     )
 
 
@@ -315,6 +319,7 @@ def test_kept_post_records_the_bot_that_posted_it(
     # The admin changes the token before the kept post is written: the record still
     # names the bot that posted the photo, not the location's current one.
     Location.objects.filter(pk=location.pk).update(bot_token=TOKEN_B)
+    start = len(fake_telegram.calls)
     _pass(clock, state)
 
     assert state.chart_posted == {}
@@ -322,6 +327,12 @@ def test_kept_post_records_the_bot_that_posted_it(
     assert (row.message_id, row.chat_id, row.bot_key) == (1001, DEFAULT_CHAT_ID, posting_bot)
     assert row.bot_key != io_loop.bot_key(TOKEN_B)
     assert fake_telegram.count(DEFAULT_BOT_TOKEN, "sendPhoto") == 1
+    # So that pass made the token change's release (D-08): one unpin through the new
+    # bot, in the stored chat, for the kept message id; the record is retired.
+    assert _requests(fake_telegram, start) == [("B", "unpinChatMessage")]
+    [unpin] = _chart_calls(fake_telegram, "unpinChatMessage")
+    assert unpin.fields == {"chat_id": DEFAULT_CHAT_ID, "message_id": 1001}
+    assert row.retired_at == NOON_05
 
 
 def test_record_without_a_bot_key_is_refused(location_factory: Callable[..., Any]) -> None:
@@ -417,21 +428,44 @@ def test_the_record_exists_before_the_pin(
     assert _rows()[0].pinned is True
 
 
-def test_pin_uses_the_recorded_chat(
+def test_D08_record_moved_before_its_pin_is_released_and_never_pinned_there(
     location_factory: Callable[..., Any], fake_telegram: Any
 ) -> None:
     location = _monitored(location_factory)
     fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
     clock = FakeClock(NOON_05)
     state = io_loop.RelayState()
-    _pass(clock, state)
+    assert _pass(clock, state) is True
+    [posted] = _rows()
+    assert (posted.message_id, posted.chat_id, posted.pinned) == (1001, DEFAULT_CHAT_ID, False)
 
-    # The location moves to another chat after the post (D-04: the record's chat wins).
+    # The location moves to another chat after the post, before its pin (D-08): the old
+    # record is unpinned in its stored chat and retired, never pinned there; then today's
+    # chart is posted and pinned in the new chat.
     Location.objects.filter(pk=location.pk).update(chat_id=OTHER_CHAT_ID)
-    _pass(clock, state)
+    for _ in range(3):
+        assert _pass(clock, state) is True
+    assert _pass(clock, state) is False
 
+    assert [
+        (call.method, int(call.fields["chat_id"]), call.fields.get("message_id"))
+        for call in fake_telegram.chart_calls
+    ] == [
+        ("sendPhoto", DEFAULT_CHAT_ID, None),
+        ("unpinChatMessage", DEFAULT_CHAT_ID, 1001),
+        ("sendPhoto", OTHER_CHAT_ID, None),
+        ("pinChatMessage", OTHER_CHAT_ID, 1002),
+    ]
     [pin] = _chart_calls(fake_telegram, "pinChatMessage")
-    assert (pin.fields["chat_id"], pin.fields["message_id"]) == (DEFAULT_CHAT_ID, 1001)
+    assert (pin.fields["chat_id"], pin.fields["message_id"]) == (OTHER_CHAT_ID, 1002)
+    old, new = _rows()
+    assert (old.message_id, old.retired_at, old.pinned) == (1001, NOON_05, False)
+    assert (new.message_id, new.chat_id, new.pinned, new.retired_at) == (
+        1002,
+        OTHER_CHAT_ID,
+        True,
+        None,
+    )
 
 
 def test_permanent_pin_failure_waits_for_the_next_refresh(
@@ -587,6 +621,36 @@ def test_INV05_chart_ignores_alerts_enabled_and_maintenance(
     ]
     [row] = _rows()
     assert (row.pinned, row.last_rendered_at) == (True, clock.now())
+
+
+def test_D03_maintenance_all_day_caption(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    # Monitored since yesterday; in maintenance since yesterday 20:00, so today has no on
+    # or off time at all: its row shows "—", and the caption no longer claims "no
+    # outages" but says "not monitored" (D-03, Phase 3 IN-05).
+    location = location_factory(maintenance=True)
+    set_status(location, "on", at=kyiv("2026-09-30 08:00"))
+    insert_pieces(
+        location,
+        local_pieces(
+            [
+                ("on", "2026-09-30 08:00", "2026-09-30 20:00"),
+                ("not_monitored", "2026-09-30 20:00", None),
+            ]
+        ),
+    )
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+
+    assert _pass(FakeClock(NOON_05), io_loop.RelayState()) is True
+
+    [photo] = _chart_calls(fake_telegram, "sendPhoto")
+    assert photo.fields["caption"] == "Today: not monitored\nUpdated 12:05"
+    # The day's finished render: line 1 only, in the neutral form too (D-13).
+    _, finished = lifecycle.chart_content(
+        _location(location.pk), TODAY, kyiv("2026-10-02 00:00"), live=False, tz=KYIV
+    )
+    assert finished == "Thu 01.10: not monitored"
 
 
 def test_INV17_2_a_second_run_the_same_day_posts_nothing(
@@ -786,8 +850,14 @@ def test_settled_records_wait_for_the_detection_cursor() -> None:
     b = _location(2, TOKEN_B, router_grace=True)
     yesterday = TODAY - timedelta(days=1)
     older_a = _row(10, 1, rendered=NOON_05 - timedelta(days=1), day=yesterday)
-    older_b = _row(20, 2, rendered=NOON_05 - timedelta(days=1), day=yesterday)
-    rows = [older_a, older_b, _row(11, 1, rendered=NOON_05), _row(21, 2, rendered=NOON_05)]
+    # Location 2's records were posted by its own bot, B.
+    older_b = _row(20, 2, rendered=NOON_05 - timedelta(days=1), day=yesterday, token=TOKEN_B)
+    rows = [
+        older_a,
+        older_b,
+        _row(11, 1, rendered=NOON_05),
+        _row(21, 2, rendered=NOON_05, token=TOKEN_B),
+    ]
     # Yesterday ends at today's local midnight.
     end = kyiv("2026-10-01 00:00")
     assert model.next_midnight(yesterday, KYIV) == end
@@ -1258,7 +1328,11 @@ def test_chart_content_finished_day_caption(location_factory: Callable[..., Any]
             ]
         ),
     )
+    # On all day from 08:00, no outage.
     quiet = location_factory()
+    insert_pieces(quiet, local_pieces([("on", "2026-10-01 08:00", None)]))
+    # No timeline at all on the day: no on or off time, shown as "—".
+    blank = location_factory()
     end_of_day = kyiv("2026-10-02 00:00")
 
     png, caption = lifecycle.chart_content(
@@ -1267,10 +1341,15 @@ def test_chart_content_finished_day_caption(location_factory: Callable[..., Any]
     _, quiet_caption = lifecycle.chart_content(
         _location(quiet.pk), TODAY, end_of_day, live=False, tz=KYIV
     )
+    _, blank_caption = lifecycle.chart_content(
+        _location(blank.pk), TODAY, end_of_day, live=False, tz=KYIV
+    )
 
     # A finished day: line 1 only, the weekday and date in place of "Today" (D-13).
     assert caption == "Thu 01.10 off: 2h · 1 outage"
     assert quiet_caption == "No outages on Thu 01.10"
+    # A day with no on or off time claims no "no outages" (D-03).
+    assert blank_caption == "Thu 01.10: not monitored"
     assert _png_size(png) == (1280, 1000)
 
 
