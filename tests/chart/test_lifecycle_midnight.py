@@ -21,6 +21,7 @@ monitored carves it itself with ``lapse.carve_window``.
 import dataclasses
 import io
 import json
+import logging
 from collections.abc import Callable
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -30,6 +31,7 @@ from chart_fixtures import KYIV, insert_pieces, kyiv, local_pieces, monitor, set
 from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, FakeClock
 from PIL import Image
 
+from powermon.alerts.models import OpsIncident
 from powermon.chart import lifecycle, model
 from powermon.chart.models import ChartMessage
 from powermon.engine import lapse
@@ -51,6 +53,23 @@ CHAT_C = -1008765432109
 LIFECYCLE_LOGGER = lifecycle.__name__
 # Which bot a request went to, by a short label (a failing assert never prints a token).
 BOTS = {DEFAULT_BOT_TOKEN: "A", TOKEN_B: "B", TOKEN_C: "C"}
+BAD_GATEWAY = {"ok": False, "error_code": 502, "description": "Bad Gateway"}
+CANT_EDIT = {"ok": False, "error_code": 400, "description": "Bad Request: message can't be edited"}
+KICKED = {
+    "ok": False,
+    "error_code": 403,
+    "description": "Forbidden: bot was kicked from the channel chat",
+}
+EDIT_GONE = {
+    "ok": False,
+    "error_code": 400,
+    "description": "Bad Request: message to edit not found",
+}
+UNPIN_GONE = {
+    "ok": False,
+    "error_code": 400,
+    "description": "Bad Request: message to unpin not found",
+}
 
 
 @pytest.fixture(autouse=True)
@@ -105,6 +124,12 @@ def _seed(
         finalized_at=at if finalized else None,
         created_at=at,
     )
+
+
+def _accept(fake: Any, token: str, *methods: str) -> None:
+    """Accept every call of these chart methods only; ``fail_method`` answers the others."""
+    for method in methods:
+        fake.answer_method(token, method, lambda: None)
 
 
 def _calls(fake: Any) -> list[tuple[str, int, int | None]]:
@@ -268,3 +293,331 @@ def test_finished_caption_with_outages(
         DEFAULT_BOT_TOKEN: "Thu 01.10 off: 2h · 1 outage",
         TOKEN_B: "Чт 01.10 без світла: 2 год · 1 відключення",
     }
+
+
+# INV-18 #2, INV-19 #1: catch-up after missed midnights (D-02, D-03, D-04)
+
+
+def test_INV18_2_down_all_of_10_02(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    location = _monitored(location_factory)
+    _seed(location, YESTERDAY, message_id=501, pinned=True)
+    start = kyiv("2026-10-03 09:00")
+    # The worker was down from 10-01 23:58 to 10-03 09:00: all of 10-02 is not monitored.
+    lapse.carve_window(kyiv("2026-10-01 23:58"), start)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    clock = FakeClock(start)
+
+    assert _run_until_idle(clock, io_loop.RelayState()) == 4
+
+    assert _calls(fake_telegram) == [
+        ("sendPhoto", DEFAULT_CHAT_ID, None),
+        ("pinChatMessage", DEFAULT_CHAT_ID, 1001),
+        ("editMessageMedia", DEFAULT_CHAT_ID, 501),
+        ("unpinChatMessage", DEFAULT_CHAT_ID, 501),
+    ]
+    assert _caption(fake_telegram.chart_calls[2]) == "No outages on Thu 01.10"
+    records = ChartMessage.objects.filter(location=location).order_by("local_date")
+    assert [(r.local_date, r.message_id, r.pinned, r.finalized_at) for r in records] == [
+        (YESTERDAY, 501, False, start),
+        (date(2026, 10, 3), 1001, True, None),
+    ]
+    # A day the worker missed entirely gets no chart afterwards (D-03).
+    assert not ChartMessage.objects.filter(local_date=TODAY).exists()
+
+
+def test_INV19_1_both_older_charts_finalized_and_unpinned(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    location = _monitored(location_factory)
+    first = _seed(location, YESTERDAY, message_id=501, pinned=True, chat_id=OLD_CHAT_ID)
+    second = _seed(location, TODAY, message_id=502, pinned=True)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    clock = FakeClock(kyiv("2026-10-03 00:05"))
+
+    assert _run_until_idle(clock, io_loop.RelayState()) == 6
+
+    # Each final edit and unpin in the record's own chat, with its own message id.
+    assert _calls(fake_telegram) == [
+        ("sendPhoto", DEFAULT_CHAT_ID, None),
+        ("pinChatMessage", DEFAULT_CHAT_ID, 1001),
+        ("editMessageMedia", OLD_CHAT_ID, 501),
+        ("editMessageMedia", DEFAULT_CHAT_ID, 502),
+        ("unpinChatMessage", OLD_CHAT_ID, 501),
+        ("unpinChatMessage", DEFAULT_CHAT_ID, 502),
+    ]
+    for record in (first, second):
+        record.refresh_from_db()
+        assert (record.pinned, record.finalized_at) == (False, clock.now())
+    pinned = ChartMessage.objects.filter(pinned=True).values_list("local_date", "message_id")
+    assert list(pinned) == [(date(2026, 10, 3), 1001)]
+
+
+def test_D04_edits_and_unpins_use_the_stored_chat(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    # The location's chat changed after yesterday's chart was posted to OLD_CHAT_ID.
+    location = _monitored(location_factory)
+    _seed(location, YESTERDAY, message_id=501, pinned=True, chat_id=OLD_CHAT_ID)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+
+    assert _run_until_idle(FakeClock(AFTER_MIDNIGHT), io_loop.RelayState()) == 4
+
+    assert _calls(fake_telegram) == [
+        ("sendPhoto", DEFAULT_CHAT_ID, None),
+        ("pinChatMessage", DEFAULT_CHAT_ID, 1001),
+        ("editMessageMedia", OLD_CHAT_ID, 501),
+        ("unpinChatMessage", OLD_CHAT_ID, 501),
+    ]
+    assert ChartMessage.objects.get(local_date=TODAY).chat_id == DEFAULT_CHAT_ID
+
+
+# D-02: a failing step never blocks the others (INV-19, T-03-34)
+
+
+def test_D02_failing_post_never_blocks_cleanup(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    location = _monitored(location_factory)
+    older = _seed(location, YESTERDAY, message_id=501, pinned=True)
+    # Every sendPhoto answers 502; final edits and unpins are accepted.
+    fake_telegram.fail_method(DEFAULT_BOT_TOKEN, "sendPhoto", status=502, json_body=BAD_GATEWAY)
+    _accept(fake_telegram, DEFAULT_BOT_TOKEN, "editMessageMedia", "unpinChatMessage")
+    answer = kyiv("2026-10-02 09:00")
+    clock = FakeClock(answer)
+    state = io_loop.RelayState()
+    post_key = lifecycle.chart_key(location.pk, "post")
+    bot = io_loop.bot_wide_key(DEFAULT_BOT_TOKEN)
+
+    assert _pass(clock, state) is True
+    # The bot is held as an alert's 5xx would hold it; the post waits step_delay(1) longer.
+    assert state.not_before == {bot: answer + _sec(2), post_key: answer + _sec(2 + 30)}
+    assert not ChartMessage.objects.filter(local_date=TODAY).exists()
+    clock.set(answer + _sec(1))
+    assert _pass(clock, state) is False
+    # Once the bot's hold ends, the older chart is finalized and unpinned...
+    clock.set(answer + _sec(2))
+    assert _pass(clock, state) is True
+    assert _pass(clock, state) is True
+    assert _pass(clock, state) is False
+    # ...and the post is retried at its own key.
+    clock.set(answer + _sec(31))
+    assert _pass(clock, state) is False
+    second = answer + _sec(32)
+    clock.set(second)
+    assert _pass(clock, state) is True
+    assert state.not_before[bot] == second + _sec(4)
+    assert state.not_before[post_key] == second + _sec(4 + 60)
+
+    assert _requests(fake_telegram) == [
+        ("A", "sendPhoto"),
+        ("A", "editMessageMedia"),
+        ("A", "unpinChatMessage"),
+        ("A", "sendPhoto"),
+    ]
+    older.refresh_from_db()
+    assert (older.finalized_at, older.pinned) == (answer + _sec(2), False)
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "sendPhoto") == 2
+    assert not ChartMessage.objects.filter(local_date=TODAY).exists()
+
+
+def test_D02_failing_pin_never_blocks_cleanup(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    location = _monitored(location_factory)
+    older = _seed(location, YESTERDAY, message_id=501, pinned=True)
+    fake_telegram.fail_method(
+        DEFAULT_BOT_TOKEN, "pinChatMessage", status=502, json_body=BAD_GATEWAY
+    )
+    _accept(fake_telegram, DEFAULT_BOT_TOKEN, "sendPhoto", "editMessageMedia", "unpinChatMessage")
+    answer = kyiv("2026-10-02 09:00")
+    clock = FakeClock(answer)
+    state = io_loop.RelayState()
+
+    assert _pass(clock, state) is True
+    today_row = ChartMessage.objects.get(local_date=TODAY)
+    pin_key = lifecycle.chart_key(location.pk, "pin", today_row.pk)
+    assert _pass(clock, state) is True
+    assert state.not_before == {
+        io_loop.bot_wide_key(DEFAULT_BOT_TOKEN): answer + _sec(2),
+        pin_key: answer + _sec(2 + 30),
+    }
+    clock.set(answer + _sec(1))
+    assert _pass(clock, state) is False
+    clock.set(answer + _sec(2))
+    assert _pass(clock, state) is True
+    assert _pass(clock, state) is True
+    assert _pass(clock, state) is False
+    clock.set(answer + _sec(32))
+    assert _pass(clock, state) is True
+
+    assert _requests(fake_telegram) == [
+        ("A", "sendPhoto"),
+        ("A", "pinChatMessage"),
+        ("A", "editMessageMedia"),
+        ("A", "unpinChatMessage"),
+        ("A", "pinChatMessage"),
+    ]
+    older.refresh_from_db()
+    assert (older.finalized_at, older.pinned) == (answer + _sec(2), False)
+    today_row.refresh_from_db()
+    # A 5xx is not "the bot may not pin": no pin failure, no incident (D-07).
+    assert (today_row.pinned, today_row.pin_failed_at) == (False, None)
+    assert not OpsIncident.objects.filter(kind="chart_pin_failed").exists()
+
+
+# Older charts: cleanup is best effort, a gone chart is forgotten (INV-19, D-06)
+
+
+def test_permanent_cleanup_errors_are_best_effort(
+    location_factory: Callable[..., Any], fake_telegram: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    location = _monitored(location_factory)
+    _seed(location, TODAY, message_id=900, pinned=True, rendered=AFTER_MIDNIGHT)
+    older = _seed(location, YESTERDAY, message_id=501, pinned=True)
+    fake_telegram.fail_method(
+        DEFAULT_BOT_TOKEN, "editMessageMedia", status=400, json_body=CANT_EDIT
+    )
+    fake_telegram.fail_method(DEFAULT_BOT_TOKEN, "unpinChatMessage", status=403, json_body=KICKED)
+    caplog.set_level(logging.WARNING, logger=LIFECYCLE_LOGGER)
+    clock = FakeClock(AFTER_MIDNIGHT)
+    state = io_loop.RelayState()
+
+    assert _pass(clock, state) is True
+    older.refresh_from_db()
+    assert (older.finalized_at, older.pinned) == (AFTER_MIDNIGHT, True)
+    assert _pass(clock, state) is True
+    older.refresh_from_db()
+    assert older.pinned is False
+
+    # Done for good: no retry on later passes, and no step key or failure count is left.
+    for minutes in (0, 1, 5, 14):
+        clock.set(AFTER_MIDNIGHT + _min(minutes))
+        assert _pass(clock, state) is False
+    assert _requests(fake_telegram) == [("A", "editMessageMedia"), ("A", "unpinChatMessage")]
+    assert state.not_before == {}
+    assert state.chart_failures == {}
+    lines = [r.getMessage() for r in caplog.records if r.name == LIFECYCLE_LOGGER]
+    assert len(lines) == 2
+    assert all(str(location.pk) in line and str(older.pk) in line for line in lines)
+    assert "http_400" in lines[0] and "finalized" in lines[0]
+    assert "http_403" in lines[1] and "unpinned" in lines[1]
+    assert "can't be edited" not in caplog.text and "kicked" not in caplog.text
+
+
+def test_older_chart_gone_is_forgotten(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    location = _monitored(location_factory)
+    _seed(location, TODAY, message_id=900, pinned=True, rendered=AFTER_MIDNIGHT)
+    unpinned_gone = _seed(location, date(2026, 9, 30), message_id=401, pinned=True, finalized=True)
+    edit_gone = _seed(location, YESTERDAY, message_id=501, pinned=True)
+    fake_telegram.fail_method(
+        DEFAULT_BOT_TOKEN, "editMessageMedia", status=400, json_body=EDIT_GONE
+    )
+    fake_telegram.fail_method(
+        DEFAULT_BOT_TOKEN, "unpinChatMessage", status=400, json_body=UNPIN_GONE
+    )
+    clock = FakeClock(AFTER_MIDNIGHT)
+    state = io_loop.RelayState()
+
+    assert _run_until_idle(clock, state) == 2
+
+    # The deleted 10-01 chart is retired: no repost for that day, no unpin of it.
+    edit_gone.refresh_from_db()
+    assert (edit_gone.retired_at, edit_gone.pinned, edit_gone.finalized_at) == (
+        AFTER_MIDNIGHT,
+        False,
+        None,
+    )
+    # The 09-30 chart was already finalized; "message to unpin not found" ends its unpin.
+    unpinned_gone.refresh_from_db()
+    assert (unpinned_gone.pinned, unpinned_gone.retired_at) == (False, None)
+    assert _requests(fake_telegram) == [("A", "editMessageMedia"), ("A", "unpinChatMessage")]
+    unpin_body = json.loads(fake_telegram.calls[1].request.body)
+    assert unpin_body == {"chat_id": DEFAULT_CHAT_ID, "message_id": 401}
+    assert ChartMessage.objects.filter(local_date=YESTERDAY).count() == 1
+    assert state.chart_failures == {}
+
+
+# Ordering across locations, idempotency, concurrency (D-02, CHRT-05)
+
+
+def test_midnight_work_of_one_location_finishes_before_the_next(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    a = _monitored(location_factory)
+    b = _monitored(location_factory, bot_token=TOKEN_B, chat_id=CHAT_B)
+    c = _monitored(location_factory, bot_token=TOKEN_C, chat_id=CHAT_C)
+    assert a.pk < b.pk < c.pk
+    _seed(a, YESTERDAY, message_id=501, pinned=True)
+    _seed(b, YESTERDAY, message_id=601, pinned=True, chat_id=CHAT_B)
+    # C did its midnight work at 00:05; its refresh is due at 00:20.
+    _seed(c, TODAY, message_id=701, pinned=True, chat_id=CHAT_C, rendered=kyiv("2026-10-02 00:05"))
+    for token in (DEFAULT_BOT_TOKEN, TOKEN_B, TOKEN_C):
+        fake_telegram.accept_chart(token)
+    clock = FakeClock(kyiv("2026-10-02 00:30"))
+
+    assert _run_until_idle(clock, io_loop.RelayState()) == 9
+
+    assert _requests(fake_telegram) == [
+        ("A", "sendPhoto"),
+        ("A", "pinChatMessage"),
+        ("A", "editMessageMedia"),
+        ("A", "unpinChatMessage"),
+        ("B", "sendPhoto"),
+        ("B", "pinChatMessage"),
+        ("B", "editMessageMedia"),
+        ("B", "unpinChatMessage"),
+        ("C", "editMessageMedia"),
+    ]
+
+
+def test_midnight_job_twice_changes_nothing(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    location = _monitored(location_factory)
+    _seed(location, YESTERDAY, message_id=501, pinned=True)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    clock = FakeClock(AFTER_MIDNIGHT)
+    state = io_loop.RelayState()
+    assert _run_until_idle(clock, state) == 4
+    done = _records()
+
+    clock.set(kyiv("2026-10-02 00:10"))
+    for _ in range(3):
+        assert _pass(clock, state) is False
+
+    assert len(fake_telegram.calls) == 4
+    assert _records() == done
+
+
+def test_a_concurrent_final_edit_is_not_written_twice(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    location = _monitored(location_factory)
+    _seed(location, TODAY, message_id=900, pinned=True, rendered=AFTER_MIDNIGHT)
+    older = _seed(location, YESTERDAY, message_id=501, pinned=True)
+    other_worker = kyiv("2026-10-02 00:06")
+
+    def finalized_by_another_worker() -> None:
+        ChartMessage.objects.filter(pk=older.pk).update(finalized_at=other_worker)
+
+    # Another worker writes its final edit while this one's call is in flight.
+    fake_telegram.answer_method(DEFAULT_BOT_TOKEN, "editMessageMedia", finalized_by_another_worker)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    clock = FakeClock(AFTER_MIDNIGHT)
+    state = io_loop.RelayState()
+
+    assert _pass(clock, state) is True
+
+    # finalized_at NULL -> set is conditional: the first write stays.
+    older.refresh_from_db()
+    assert older.finalized_at == other_worker
+    # The next pass sees it finalized: the unpin goes, and no second final edit is made.
+    assert _run_until_idle(clock, state) == 1
+    assert [call.method for call in fake_telegram.chart_calls] == [
+        "editMessageMedia",
+        "unpinChatMessage",
+    ]
