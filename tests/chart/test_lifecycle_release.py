@@ -21,6 +21,7 @@ new chat and new bot.
 
 import dataclasses
 import json
+import logging
 from collections.abc import Callable
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -28,9 +29,15 @@ from typing import Any
 import pytest
 from chart_fixtures import KYIV, kyiv, monitor
 from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, FakeClock
+from django.db.models import Value
+from django.db.models.functions import Greatest
 
-from powermon.chart import lifecycle
+from powermon.alerts import outbox
+from powermon.alerts.models import OpsIncident, OutboxMessage
+from powermon.chart import lifecycle, model, render
+from powermon.chart.model import Week
 from powermon.chart.models import ChartMessage
+from powermon.engine.models import SystemState
 from powermon.locations.models import Location
 from powermon.worker import io_loop
 
@@ -42,9 +49,23 @@ SINCE = kyiv("2026-10-01 08:00")
 # The location's new chat and new bot.
 CHAT_B = -1009876543210
 TOKEN_B = "987654321:" + "B" * 35
+# Another location's chat (its bot is TOKEN_B).
+CHAT_C = -1008765432109
 # Which bot a request went to, by a short label (a failing assert never prints a token).
 BOTS = {DEFAULT_BOT_TOKEN: "A", TOKEN_B: "B"}
 DB = pytest.mark.django_db(transaction=True)
+LIFECYCLE_LOGGER = lifecycle.__name__
+NO_UNPIN_RIGHTS = {
+    "ok": False,
+    "error_code": 400,
+    "description": "Bad Request: not enough rights to unpin a message",
+}
+UNPIN_GONE = {
+    "ok": False,
+    "error_code": 400,
+    "description": "Bad Request: message to unpin not found",
+}
+BAD_GATEWAY = {"ok": False, "error_code": 502, "description": "Bad Gateway"}
 
 
 @pytest.fixture(autouse=True)
@@ -61,7 +82,47 @@ def _monitored(location_factory: Callable[..., Any], since: datetime = SINCE, **
 
 
 def _pass(clock: FakeClock, state: io_loop.RelayState) -> bool:
+    """One I/O pass, with the detection cursor moved to the clock's now (never back).
+
+    The worker's detection thread keeps the cursor within a cycle of now, so an older
+    record's day has settled and Phase 3 would make its final edit: a stale record must
+    get its release instead (D-08).
+    """
+    SystemState.objects.get_or_create(pk=1)
+    SystemState.objects.filter(pk=1).update(
+        last_cycle_completed_at=Greatest("last_cycle_completed_at", Value(clock.now()))
+    )
     return io_loop.run_iteration(clock, state, charts=True)
+
+
+def _seed(
+    location: Any,
+    day: date = TODAY,
+    *,
+    message_id: int,
+    pinned: bool = True,
+    rendered: datetime = NOON_05,
+) -> ChartMessage:
+    """A record an earlier pass left, in the location's chat, by the location's bot."""
+    return ChartMessage.objects.create(
+        location=location,
+        local_date=day,
+        chat_id=location.chat_id,
+        bot_key=io_loop.bot_key(location.bot_token),
+        message_id=message_id,
+        pinned=pinned,
+        last_rendered_at=rendered,
+        created_at=rendered,
+    )
+
+
+def _lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The lifecycle's WARNING (and worse) lines, in order."""
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == LIFECYCLE_LOGGER and r.levelno >= logging.WARNING
+    ]
 
 
 def _rows() -> list[ChartMessage]:
@@ -288,3 +349,387 @@ def test_plan_releases_stale_records_oldest_first() -> None:
     assert lifecycle.plan(
         [moved], [today_row, older], today=TODAY, now=NOON_05, not_before={}, settled={9}
     ) == lifecycle.Action("release", moved, older)
+
+
+def test_plan_deleted_location_only_releases() -> None:
+    # A deleted location's records are released, and it never gets a new post (D-09).
+    gone = _location(deleted=True)
+    today_row = _row(10, rendered=NOON_05 - timedelta(hours=1))
+
+    assert lifecycle.plan([gone], [today_row], today=TODAY, now=NOON_05, not_before={}) == (
+        lifecycle.Action("release", gone, today_row)
+    )
+    assert lifecycle.plan([gone], [], today=TODAY, now=NOON_05, not_before={}) is None
+
+
+# INV-19 #2, D-08: a token change is a channel change
+
+
+@DB
+def test_INV19_2_token_change_is_a_channel_change(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    location = _monitored(location_factory)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    fake_telegram.accept_chart(TOKEN_B)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+    assert _pass(clock, state) is True
+    assert _pass(clock, state) is True
+    [old] = _rows()
+    assert (old.message_id, old.pinned, old.bot_key) == (
+        1001,
+        True,
+        io_loop.bot_key(DEFAULT_BOT_TOKEN),
+    )
+
+    # The admin gives the location a new bot; the chat stays.
+    Location.objects.filter(pk=location.pk).update(bot_token=TOKEN_B)
+    start = len(fake_telegram.calls)
+    assert _pass(clock, state) is True
+
+    # One unpin through the new bot, in the stored chat, by the old message id.
+    assert _requests(fake_telegram, start) == [("B", "unpinChatMessage")]
+    assert json.loads(fake_telegram.calls[start].request.body) == {
+        "chat_id": DEFAULT_CHAT_ID,
+        "message_id": 1001,
+    }
+    old.refresh_from_db()
+    assert (old.retired_at, old.pinned) == (NOON_05, False)
+    # Then today's chart is posted and pinned by the new bot in the location's chat.
+    assert _pass(clock, state) is True
+    assert _pass(clock, state) is True
+    assert _pass(clock, state) is False
+    assert _requests(fake_telegram, start) == [
+        ("B", "unpinChatMessage"),
+        ("B", "sendPhoto"),
+        ("B", "pinChatMessage"),
+    ]
+    new = ChartMessage.objects.get(retired_at__isnull=True)
+    assert (new.message_id, new.chat_id, new.pinned, new.bot_key) == (
+        1002,
+        DEFAULT_CHAT_ID,
+        True,
+        io_loop.bot_key(TOKEN_B),
+    )
+    assert _calls(fake_telegram)[-1] == ("pinChatMessage", DEFAULT_CHAT_ID, 1002)
+
+
+# INV-19 #2, D-09: a deleted location's chart is unpinned and never posted again
+
+
+@DB
+def test_INV19_2_deleted_location_is_unpinned_and_never_posted_again(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    location = _monitored(location_factory)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+    assert _pass(clock, state) is True
+    assert _pass(clock, state) is True
+    [record] = _rows()
+    assert (record.message_id, record.pinned) == (1001, True)
+
+    # The admin deletes the location (the tombstone keeps its token and chat).
+    Location.objects.filter(pk=location.pk).update(deleted_at=NOON_05)
+    locations, rows = lifecycle.read_snapshot(TODAY)
+    assert [(loc.location_id, loc.deleted) for loc in locations] == [(location.pk, True)]
+    assert [row.id for row in rows] == [record.pk]
+    start = len(fake_telegram.calls)
+    assert _pass(clock, state) is True
+
+    # One unpin in the stored chat with the tombstone's bot; the record is retired.
+    assert _requests(fake_telegram, start) == [("A", "unpinChatMessage")]
+    assert json.loads(fake_telegram.calls[start].request.body) == {
+        "chat_id": DEFAULT_CHAT_ID,
+        "message_id": 1001,
+    }
+    record.refresh_from_db()
+    assert (record.retired_at, record.pinned, record.finalized_at) == (NOON_05, False, None)
+    # The deleted location leaves the snapshot and never gets another chart call: no
+    # refresh 15 min later, no post after the next midnight, no final edit.
+    assert lifecycle.read_snapshot(TODAY) == ([], [])
+    for at in (NOON_05, NOON_05 + timedelta(minutes=15), kyiv("2026-10-03 00:05")):
+        clock.set(at)
+        assert _pass(clock, state) is False
+    assert len(fake_telegram.calls) == start + 1
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "sendPhoto") == 1
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "editMessageMedia") == 0
+    assert state.not_before == {}
+
+
+@DB
+def test_snapshot_keeps_a_deleted_location_only_while_it_has_active_records(
+    location_factory: Callable[..., Any],
+) -> None:
+    live = _monitored(location_factory)
+    # Deleted with today's chart still active: in the snapshot, marked deleted.
+    pending = _monitored(location_factory)
+    _seed(pending, message_id=501)
+    # Deleted with yesterday's chart finalized but not unpinned yet: still in it.
+    unpinning = _monitored(location_factory)
+    older = _seed(unpinning, YESTERDAY, message_id=601, rendered=NOON_05 - timedelta(days=1))
+    ChartMessage.objects.filter(pk=older.pk).update(finalized_at=NOON_05)
+    # Deleted with only a retired record, or a finished older one, or none: gone.
+    retired = _monitored(location_factory)
+    ChartMessage.objects.filter(pk=_seed(retired, message_id=701).pk).update(
+        retired_at=NOON_05, pinned=False
+    )
+    finished = _monitored(location_factory)
+    done = _seed(finished, YESTERDAY, message_id=801, pinned=False)
+    ChartMessage.objects.filter(pk=done.pk).update(finalized_at=NOON_05, unpinned_at=NOON_05)
+    bare = _monitored(location_factory)
+    gone = (pending, unpinning, retired, finished, bare)
+    Location.objects.filter(pk__in=[loc.pk for loc in gone]).update(deleted_at=NOON_05)
+
+    locations, rows = lifecycle.read_snapshot(TODAY)
+
+    assert [(loc.location_id, loc.deleted) for loc in locations] == [
+        (live.pk, False),
+        (pending.pk, True),
+        (unpinning.pk, True),
+    ]
+    assert sorted(row.message_id for row in rows) == [501, 601]
+
+
+# Older records are released too, oldest first, and never finalized (D-08)
+
+
+@DB
+def test_moved_location_releases_older_records_without_a_final_edit(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    location = _monitored(location_factory)
+    # Yesterday's chart: not finalized, not unpinned, its day long settled (``_pass``).
+    yesterday = _seed(location, YESTERDAY, message_id=501, rendered=kyiv("2026-10-01 23:45"))
+    today = _seed(location, message_id=502)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    Location.objects.filter(pk=location.pk).update(chat_id=CHAT_B)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+
+    passes = []
+    while True:
+        start = len(fake_telegram.chart_calls)
+        if not _pass(clock, state):
+            break
+        passes.append(_calls(fake_telegram)[start:])
+        assert len(passes) < 10
+
+    # One call per pass: two releases, oldest first, then the post and pin in chat B.
+    assert passes == [
+        [("unpinChatMessage", DEFAULT_CHAT_ID, 501)],
+        [("unpinChatMessage", DEFAULT_CHAT_ID, 502)],
+        [("sendPhoto", CHAT_B, None)],
+        [("pinChatMessage", CHAT_B, 1001)],
+    ]
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "editMessageMedia") == 0
+    for record in (yesterday, today):
+        record.refresh_from_db()
+        assert (record.retired_at, record.pinned, record.finalized_at) == (NOON_05, False, None)
+
+
+# Best effort: a release that cannot succeed retires the record and never loops (INV-19)
+
+
+@DB
+def test_release_permanent_error_retires_and_moves_on(
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    ops_settings: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    location = _monitored(location_factory)
+    record = _seed(location, message_id=501)
+    Location.objects.filter(pk=location.pk).update(chat_id=CHAT_B)
+    # The bot may not unpin in the old chat (Open Edge 6); the later calls are accepted.
+    fake_telegram.fail_method(
+        DEFAULT_BOT_TOKEN, "unpinChatMessage", status=400, json_body=NO_UNPIN_RIGHTS
+    )
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    caplog.set_level(logging.DEBUG)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+
+    assert _pass(clock, state) is True
+
+    record.refresh_from_db()
+    assert (record.retired_at, record.pinned) == (NOON_05, False)
+    # Done for good: no backoff, no failure count, one WARNING with the short code.
+    assert state.not_before == {}
+    assert state.chart_failures == {}
+    [line] = _lines(caplog)
+    assert "release" in line and str(location.pk) in line and str(record.pk) in line
+    assert "http_400" in line
+    assert "not enough rights" not in caplog.text
+    secret = DEFAULT_BOT_TOKEN.split(":", 1)[1]
+    assert secret not in caplog.text
+    # No ops notice and no incident in v1 (the accepted Open Edge 6 risk).
+    assert not OutboxMessage.objects.filter(channel=outbox.CHANNEL_OPS).exists()
+    assert not OpsIncident.objects.exists()
+    # The next pass posts in the new chat; the old record is never called again.
+    assert _pass(clock, state) is True
+    assert _pass(clock, state) is True
+    assert _pass(clock, state) is False
+    assert _requests(fake_telegram) == [
+        ("A", "unpinChatMessage"),
+        ("A", "sendPhoto"),
+        ("A", "pinChatMessage"),
+    ]
+    assert _calls(fake_telegram) == [
+        ("sendPhoto", CHAT_B, None),
+        ("pinChatMessage", CHAT_B, 1001),
+    ]
+
+
+@DB
+def test_release_not_found_retires(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    location = _monitored(location_factory)
+    record = _seed(location, message_id=501)
+    Location.objects.filter(pk=location.pk).update(chat_id=CHAT_B)
+    # The old chart was deleted in the old chat.
+    fake_telegram.fail_method(
+        DEFAULT_BOT_TOKEN, "unpinChatMessage", status=400, json_body=UNPIN_GONE
+    )
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+
+    assert _pass(clock, state) is True
+
+    record.refresh_from_db()
+    assert (record.retired_at, record.pinned) == (NOON_05, False)
+    assert state.not_before == {}
+    assert _pass(clock, state) is True
+    assert _requests(fake_telegram) == [("A", "unpinChatMessage"), ("A", "sendPhoto")]
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "unpinChatMessage") == 1
+
+
+# Backoff: a transient release waits under a key _prune keeps, and blocks the post
+
+
+@DB
+def test_release_transient_backs_off_and_blocks_the_post(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    moved = _monitored(location_factory)
+    _seed(moved, message_id=501)
+    other = _monitored(location_factory, bot_token=TOKEN_B, chat_id=CHAT_C)
+    assert moved.pk < other.pk
+    Location.objects.filter(pk=moved.pk).update(chat_id=CHAT_B)
+    # The old chat's unpin answers 502 twice, then works.
+    for _ in range(2):
+        fake_telegram.fail_method(
+            DEFAULT_BOT_TOKEN, "unpinChatMessage", status=502, json_body=BAD_GATEWAY
+        )
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    fake_telegram.accept_chart(TOKEN_B)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+    record = ChartMessage.objects.get(location=moved)
+    key = lifecycle.chart_key(moved.pk, "release", record.pk)
+    bot = io_loop.bot_wide_key(DEFAULT_BOT_TOKEN)
+
+    # 12:05:00: the release answers 502. The bot is held as an alert's 5xx would hold
+    # it (2 s), and the release waits step_delay(1) (30 s) longer.
+    assert _pass(clock, state) is True
+    assert state.not_before == {
+        bot: NOON_05 + timedelta(seconds=2),
+        key: NOON_05 + timedelta(seconds=32),
+    }
+    # The other location's chart work goes on; the moved one's key survives every prune.
+    assert _pass(clock, state) is True
+    assert _pass(clock, state) is True
+    assert state.not_before.get(key) == NOON_05 + timedelta(seconds=32)
+    for seconds in (2, 10, 31):
+        clock.set(NOON_05 + timedelta(seconds=seconds))
+        assert _pass(clock, state) is False
+        assert state.not_before.get(key) == NOON_05 + timedelta(seconds=32)
+    # 12:05:32: the second try answers 502 too: 4 s bot hold + step_delay(2) (60 s).
+    second = NOON_05 + timedelta(seconds=32)
+    clock.set(second)
+    assert _pass(clock, state) is True
+    assert state.not_before.get(key) == second + timedelta(seconds=64)
+    assert state.chart_failures.get(key) == 2
+    clock.set(second + timedelta(seconds=63))
+    assert _pass(clock, state) is False
+    # Until the release succeeds, nothing is posted for the moved location (Pitfall 1).
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "sendPhoto") == 0
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "unpinChatMessage") == 2
+    # 12:06:36: the release works; then today's chart goes to chat B.
+    clock.set(second + timedelta(seconds=64))
+    assert _pass(clock, state) is True
+    assert key not in state.not_before and key not in state.chart_failures
+    assert _pass(clock, state) is True
+
+    assert _requests(fake_telegram) == [
+        ("A", "unpinChatMessage"),
+        ("B", "sendPhoto"),
+        ("B", "pinChatMessage"),
+        ("A", "unpinChatMessage"),
+        ("A", "unpinChatMessage"),
+        ("A", "sendPhoto"),
+    ]
+    assert [(row.location_id, row.chat_id, row.retired_at is None) for row in _rows()] == [
+        (moved.pk, DEFAULT_CHAT_ID, False),
+        (other.pk, CHAT_C, True),
+        (moved.pk, CHAT_B, True),
+    ]
+
+
+# A change of only the name or the language releases nothing (Phase 3 D-14)
+
+
+@DB
+def test_name_or_language_change_releases_nothing(
+    location_factory: Callable[..., Any], fake_telegram: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    location = _monitored(location_factory)
+    _seed(location, message_id=501)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    seen: list[tuple[str, str]] = []
+    real = render.render_png
+
+    def spy(week: Week, *, lang: str, name: str) -> bytes:
+        seen.append((lang, name))
+        return real(week, lang=lang, name=name)
+
+    monkeypatch.setattr(render, "render_png", spy)
+    Location.objects.filter(pk=location.pk).update(name="Дача", language="uk")
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+
+    assert _pass(clock, state) is False
+    clock.advance(minutes=15)
+    assert _pass(clock, state) is True
+
+    assert _requests(fake_telegram) == [("A", "editMessageMedia")]
+    [edit] = fake_telegram.chart_calls
+    assert json.loads(edit.fields["media"])["caption"] == (
+        "Сьогодні відключень не було\nОновлено о 12:20"
+    )
+    assert seen == [("uk", "Дача")]
+    assert ChartMessage.objects.get().retired_at is None
+
+
+# settled_records: a deleted location's or a moved record's day never gets a final edit
+
+
+def test_settled_records_skip_deleted_locations() -> None:
+    older = _row(10, day=YESTERDAY, rendered=NOON_05 - timedelta(days=1))
+    moved_older = _row(20, 2, day=YESTERDAY, rendered=NOON_05 - timedelta(days=1))
+    later = model.next_midnight(YESTERDAY, KYIV) + timedelta(hours=12)
+
+    def settled(locations: list[lifecycle.ChartLocation]) -> frozenset[int]:
+        return lifecycle.settled_records(
+            locations, [older, moved_older], today=TODAY, detected_until=later, tz=KYIV
+        )
+
+    # Both days have settled while both locations keep their channel.
+    assert settled([_location(1), _location(2)]) == {10, 20}
+    # A deleted location's record, or a record whose chat moved, is released instead.
+    assert settled([_location(1, deleted=True), _location(2, chat_id=CHAT_B)]) == frozenset()
+    assert settled([_location(1), _location(2, token=TOKEN_B)]) == {10}
