@@ -1328,7 +1328,11 @@ def test_chart_content_finished_day_caption(location_factory: Callable[..., Any]
             ]
         ),
     )
+    # On all day from 08:00, no outage.
     quiet = location_factory()
+    insert_pieces(quiet, local_pieces([("on", "2026-10-01 08:00", None)]))
+    # No timeline at all on the day: no on or off time, shown as "—".
+    blank = location_factory()
     end_of_day = kyiv("2026-10-02 00:00")
 
     png, caption = lifecycle.chart_content(
@@ -1337,10 +1341,15 @@ def test_chart_content_finished_day_caption(location_factory: Callable[..., Any]
     _, quiet_caption = lifecycle.chart_content(
         _location(quiet.pk), TODAY, end_of_day, live=False, tz=KYIV
     )
+    _, blank_caption = lifecycle.chart_content(
+        _location(blank.pk), TODAY, end_of_day, live=False, tz=KYIV
+    )
 
     # A finished day: line 1 only, the weekday and date in place of "Today" (D-13).
     assert caption == "Thu 01.10 off: 2h · 1 outage"
     assert quiet_caption == "No outages on Thu 01.10"
+    # A day with no on or off time claims no "no outages" (D-03).
+    assert blank_caption == "Thu 01.10: not monitored"
     assert _png_size(png) == (1280, 1000)
 
 

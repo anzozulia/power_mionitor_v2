@@ -579,8 +579,9 @@ def chart_content(
 
     A live chart's caption carries today's off time, outage count and the update time,
     all from the same ``now`` as the image's now pill (CHRT-04); a finished one has line 1
-    only (D-13). The render module is imported here, in the worker, and called as a module
-    attribute.
+    only (D-13). A day with no on or off time at all (its row total is "—") is captioned
+    "not monitored", never "no outages" (D-03). The render module is imported here, in the
+    worker, and called as a module attribute.
     """
     from powermon.chart import render  # Pillow: worker only, never at import time
 
@@ -589,10 +590,16 @@ def chart_content(
     row = week.today_row
     if live:
         caption = chart_texts.live_caption(
-            row.off_us, row.count, times.hm(now, tz), location.language
+            row.off_us,
+            row.count,
+            times.hm(now, tz),
+            location.language,
+            monitored=row.monitored,
         )
     else:
-        caption = chart_texts.finished_caption(row.off_us, row.count, day, location.language)
+        caption = chart_texts.finished_caption(
+            row.off_us, row.count, day, location.language, monitored=row.monitored
+        )
     return png, caption
 
 
