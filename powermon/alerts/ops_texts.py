@@ -123,3 +123,19 @@ def uncertain(
         f"(event {event_prefix(event_at, now, tz)}) may not have been delivered ({reason}). "
         "It will not be resent; please check the channel."
     )
+
+
+def pin_failed(status: int, name: str, *, escape: bool = True) -> str:
+    """D-07: a location's bot posted today's chart but cannot pin it.
+
+    ``status`` is the HTTP status of Telegram's refusal. Anything but an integer (a bool is
+    not one) from 100 to 599 raises ValueError, so the text only ever shows a short code
+    and never Telegram's description.
+    """
+    if not isinstance(status, int) or isinstance(status, bool) or not 100 <= status <= 599:
+        raise ValueError("a pin failure needs an HTTP status from 100 to 599")
+    return (
+        f"📌 Can't pin today's chart for {_name(name, escape)} (Telegram: http_{status}). "
+        "The chart is still posted and refreshed; pinning is retried every 15 min. "
+        "Check that the bot may pin messages in the chat."
+    )
