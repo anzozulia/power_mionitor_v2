@@ -20,6 +20,12 @@ worker was down is simply due on the next pass.
   record, never the location's current chat (D-01, D-04). A permanent pin failure (the
   bot may post but not pin, INV-17 #1) is stored as ``pin_failed_at``; the pin is tried
   again only after the next successful render (D-07).
+- Refresh: today's chart is due ``REFRESH_EVERY`` (15 min) after its last successful
+  render (``last_rendered_at``, the answer time), and is edited in place in its recorded
+  chat; "message is not modified" counts as rendered (D-05, CHRT-02). The state is in the
+  database, so after downtime exactly one catch-up refresh is made, not one per missed
+  slot (INV-18). Midnight-class steps (post, pin) beat any refresh; among due refreshes
+  the oldest render goes first, ties to the lower location id.
 
 Rendering runs inline in the I/O thread right before its call (D-05), with the location's
 current name and language and the display time zone read at render time (D-14). The
@@ -56,8 +62,12 @@ log = logging.getLogger(__name__)
 
 Step = Literal["post", "pin", "finalize", "unpin", "refresh"]
 
+# Today's chart is due for a refresh this long after its last successful render (D-05).
+REFRESH_EVERY = timedelta(minutes=15)
 # The first wait after a failed step.
 STEP_RETRY = timedelta(seconds=io_loop.BACKOFF_CAP_S)
+# The steps that render a chart right before their call.
+_RENDERED: tuple[Step, ...] = ("post", "refresh")
 
 LOCATIONS_SQL = """
 SELECT l.id, l.name, l.language, l.bot_token, l.chat_id
@@ -173,21 +183,33 @@ def plan(
 ) -> Action | None:
     """The one chart step due now, or None. Pure: reads nothing but its arguments.
 
-    Locations go by ascending id, and the first one with a due step wins; within a
-    location the steps go in D-02 order: post today's chart, then pin it. A step whose own
-    key in ``not_before`` is in the future is skipped, so the location's next due step
-    goes instead.
+    Midnight-class steps go first: locations by ascending id, and the first one with a due
+    step wins; within a location the steps go in D-02 order (post today's chart, then pin
+    it). Only when none is due anywhere, the refresh that has waited longest goes: today's
+    record with the oldest ``last_rendered_at`` at least ``REFRESH_EVERY`` ago, ties to
+    the lower location id (CHRT-02). A step whose own key in ``not_before`` is in the
+    future is skipped, so the next due step goes instead.
     """
 
     def waiting(key: str) -> bool:
         return not_before.get(key, now) > now
 
+    due_refreshes: list[tuple[datetime, int, Action]] = []
     for location in locations:
         today_row = _today_row(rows, location.location_id, today)
         action = _midnight_step(location, today_row, waiting)
         if action is not None:
             return action
-    return None
+        if (
+            today_row is not None
+            and now - today_row.last_rendered_at >= REFRESH_EVERY
+            and not waiting(chart_key(location.location_id, "refresh"))
+        ):
+            refresh = Action("refresh", location, today_row)
+            due_refreshes.append((today_row.last_rendered_at, location.location_id, refresh))
+    if not due_refreshes:
+        return None
+    return min(due_refreshes, key=lambda due: (due[0], due[1]))[2]
 
 
 def _today_row(rows: list[ChartRow], location_id: int, today: date) -> ChartRow | None:
@@ -254,7 +276,7 @@ def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | No
     location = action.location
     content: tuple[bytes, str] | None = None
     started = clock.monotonic()
-    if action.step == "post":
+    if action.step in _RENDERED:
         content = chart_content(location, today, now, live=True, tz=tz)
     render_ms = _ms(clock.monotonic() - started)
     if not _lease_holds(state.lease_pid):
@@ -285,6 +307,9 @@ def _call(client: TelegramClient, action: Action, content: tuple[bytes, str] | N
         return client.send_photo(action.location.chat_id, png, caption)
     if action.step == "pin" and row is not None:
         return client.pin_chat_message(row.chat_id, row.message_id)
+    if action.step == "refresh" and row is not None and content is not None:
+        png, caption = content
+        return client.edit_message_media(row.chat_id, row.message_id, png, caption)
     raise ValueError(f"no call for the chart step {action.step!r}")
 
 
@@ -304,6 +329,11 @@ def _apply(
         elif action.step == "pin" and row is not None:
             ChartMessage.objects.filter(pk=row.id, pinned=False).update(
                 pinned=True, pin_failed_at=None
+            )
+        elif action.step == "refresh" and row is not None:
+            # "message is not modified" is ok too: the chart shows this render (D-05).
+            ChartMessage.objects.filter(pk=row.id, retired_at__isnull=True).update(
+                last_rendered_at=answered
             )
         state.not_before.pop(key, None)
         return
