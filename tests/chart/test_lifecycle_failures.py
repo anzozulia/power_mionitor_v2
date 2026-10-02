@@ -17,7 +17,9 @@
 
 Every test runs ``io_loop.run_iteration(..., charts=True)`` and is
 ``django_db(transaction=True)``. Time comes only from the ``FakeClock``; Telegram is faked
-at the HTTP boundary (``fake_telegram``); renders are real.
+at the HTTP boundary (``fake_telegram``); renders are real. A day's final edit waits for
+the detection cursor (INV-03), which the worker's detection thread keeps within a cycle of
+now, so ``_pass`` first moves the cursor to the clock's now.
 """
 
 import dataclasses
@@ -31,11 +33,14 @@ import requests
 from chart_fixtures import KYIV, kyiv, monitor
 from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, OPS_BOT_TOKEN, FakeClock
 from django.db import OperationalError, transaction
+from django.db.models import Value
+from django.db.models.functions import Greatest
 
 from powermon.alerts import outbox
 from powermon.alerts.models import OpsIncident, OutboxMessage
 from powermon.chart import lifecycle, model
 from powermon.chart.models import ChartMessage
+from powermon.engine.models import SystemState
 from powermon.locations.models import Location
 from powermon.worker import io_loop
 
@@ -101,6 +106,11 @@ def _accept(fake: Any, token: str, *methods: str) -> None:
 
 
 def _pass(clock: FakeClock, state: io_loop.RelayState) -> bool:
+    """One I/O pass, with the detection cursor moved to the clock's now (never back)."""
+    SystemState.objects.get_or_create(pk=1)
+    SystemState.objects.filter(pk=1).update(
+        last_cycle_completed_at=Greatest("last_cycle_completed_at", Value(clock.now()))
+    )
     return io_loop.run_iteration(clock, state, charts=True)
 
 
@@ -399,12 +409,17 @@ def test_kept_post_of_an_earlier_day_is_recorded_for_that_day(
     assert _pass(clock, state) is True
     assert state.chart_posted == {(location.pk, YESTERDAY): (DEFAULT_CHAT_ID, 1001, late)}
 
-    # Midnight passes before the flush: the kept post is still yesterday's chart.
+    # Midnight passes before the flush: the kept post is still yesterday's chart. Its
+    # final edit waits until detection has settled past yesterday's end (INV-03).
     clock.set(kyiv("2026-10-02 00:00:20"))
-    assert _run_until_idle(clock, state) == 3
-
+    assert _run_until_idle(clock, state) == 2
     yesterday = ChartMessage.objects.get(local_date=YESTERDAY)
-    assert (yesterday.message_id, yesterday.pinned) == (1001, False)
+    assert (yesterday.message_id, yesterday.pinned, yesterday.finalized_at) == (1001, False, None)
+    # 00:00 + 90 s (period + grace) + the lapse threshold (15 s).
+    clock.set(kyiv("2026-10-02 00:01:45"))
+    assert _run_until_idle(clock, state) == 1
+
+    yesterday.refresh_from_db()
     assert yesterday.finalized_at == clock.now()
     assert _chart(fake_telegram) == [
         ("sendPhoto", None),

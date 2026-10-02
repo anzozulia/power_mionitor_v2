@@ -10,12 +10,20 @@ a failing step never blocks the others (D-02). Edits and unpins go to the chat a
 message stored with each record, never the location's current chat, and nothing but a
 recorded message is ever unpinned (D-04, INV-19).
 
+A day's final edit waits until detection has settled past the end of that day (INV-03):
+OFF is recorded after the fact, backdated to the last heartbeat, so an outage that started
+in the day's last minutes is only in the timeline a timeout after midnight. The unpin does
+not wait for it, so two charts are pinned for seconds only (D-02).
+
 Every test runs ``io_loop.run_iteration(..., charts=True)``, which calls
 ``close_old_connections()``, so each is ``django_db(transaction=True)``. Time comes only
 from the ``FakeClock``; Telegram is faked at the HTTP boundary (``fake_telegram``); renders
 are real (Pillow). Older records are seeded with ``ChartMessage.objects.create``. The
 worker's first-cycle gate arrives in 03-10, so a test that needs the downtime drawn as not
-monitored carves it itself with ``lapse.carve_window``.
+monitored carves it itself with ``lapse.carve_window``. The worker's detection thread keeps
+its cursor (``system_state.last_cycle_completed_at``) within a cycle of now, so ``_pass``
+first moves the cursor to the clock's now; a test about the settle time runs detection
+cycles itself (``_detection_cycle``).
 """
 
 import dataclasses
@@ -29,14 +37,17 @@ from typing import Any
 import pytest
 from chart_fixtures import KYIV, insert_pieces, kyiv, local_pieces, monitor, set_status
 from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, FakeClock
+from django.db.models import Value
+from django.db.models.functions import Greatest
 from PIL import Image
 
 from powermon.alerts.models import OpsIncident
 from powermon.chart import lifecycle, model
 from powermon.chart.models import ChartMessage
 from powermon.engine import lapse
+from powermon.engine.models import LocationState, PowerInterval, SystemState
 from powermon.locations.models import Location
-from powermon.worker import io_loop
+from powermon.worker import detection, io_loop
 
 pytestmark = pytest.mark.django_db(transaction=True)
 
@@ -163,7 +174,23 @@ def _caption(call: Any) -> str:
     return str(call.fields["caption"])
 
 
+def _detected(at: datetime) -> None:
+    """Detection has completed its cycles up to ``at``: its cursor moves there, never back."""
+    SystemState.objects.get_or_create(pk=1)
+    SystemState.objects.filter(pk=1).update(
+        last_cycle_completed_at=Greatest("last_cycle_completed_at", Value(at))
+    )
+
+
+def _detection_cycle(at: datetime) -> int:
+    """One detection cycle at ``at``, in the worker's order: the cursor, then the OFF decisions."""
+    _detected(at)
+    return detection.run_cycle(at)
+
+
 def _pass(clock: FakeClock, state: io_loop.RelayState) -> bool:
+    """One I/O pass, with detection caught up to the clock's now (``_detected``)."""
+    _detected(clock.now())
     return io_loop.run_iteration(clock, state, charts=True)
 
 
@@ -203,7 +230,8 @@ def test_INV18_1_worker_down_across_midnight(
     yesterday = _seed(
         location, YESTERDAY, message_id=501, pinned=True, rendered=kyiv("2026-10-01 23:45")
     )
-    # Down from 23:58 to 00:07: the restart's lapse carve draws it as not monitored.
+    # Down from 23:58 to 00:07: the restart's lapse carve draws it as not monitored, and
+    # the detection cursor is at 00:07 (``_pass``), so yesterday has settled.
     lapse.carve_window(kyiv("2026-10-01 23:58"), AFTER_MIDNIGHT)
     fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
     clock = FakeClock(AFTER_MIDNIGHT)
@@ -293,6 +321,67 @@ def test_finished_caption_with_outages(
         DEFAULT_BOT_TOKEN: "Thu 01.10 off: 2h · 1 outage",
         TOKEN_B: "Чт 01.10 без світла: 2 год · 1 відключення",
     }
+
+
+# INV-03, INV-08: the finished day comes from its settled timeline (Wave 4 audit, fix 1)
+
+
+def test_INV03_INV08_final_edit_waits_for_an_outage_detected_after_midnight(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    # Period 60 s + grace 30 s: detection records an OFF once 90 s have passed in silence,
+    # backdated to the last heartbeat, which came at 23:59:25 (a blackout at midnight).
+    location = _monitored(location_factory)
+    last_heartbeat = kyiv("2026-10-01 23:59:25")
+    LocationState.objects.filter(location=location).update(last_heartbeat_at=last_heartbeat)
+    yesterday = _seed(
+        location, YESTERDAY, message_id=501, pinned=True, rendered=kyiv("2026-10-01 23:45")
+    )
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    # The OFF alert.
+    fake_telegram.accept(DEFAULT_BOT_TOKEN)
+    start = kyiv("2026-10-02 00:00:01")
+    clock = FakeClock(start)
+    state = io_loop.RelayState()
+    calls_at: list[tuple[datetime, str]] = []
+    off_recorded_at: list[datetime] = []
+
+    # Detection runs a cycle every 5 s, and the I/O thread a pass after each, to 00:02:01.
+    for step in range(25):
+        at = start + _sec(5 * step)
+        clock.set(at)
+        if _detection_cycle(at):
+            off_recorded_at.append(at)
+        before = len(fake_telegram.chart_calls)
+        io_loop.run_iteration(clock, state, charts=True)
+        calls_at.extend((at, call.method) for call in fake_telegram.chart_calls[before:])
+
+    # The OFF is recorded at 00:00:56, backdated into yesterday (INV-03).
+    assert off_recorded_at == [kyiv("2026-10-02 00:00:56")]
+    assert PowerInterval.objects.get(location=location, state="off").start_at == last_heartbeat
+    # Today's chart is posted and pinned and yesterday's is unpinned right away: two
+    # charts are pinned for seconds only (D-02). The final edit waits until the detection
+    # cursor is past yesterday's end + 90 s + the lapse threshold (00:01:45), so it is made
+    # by the first pass after that, never before the cursor passed midnight + the timeout.
+    assert calls_at == [
+        (start, "sendPhoto"),
+        (start + _sec(5), "pinChatMessage"),
+        (start + _sec(10), "unpinChatMessage"),
+        (kyiv("2026-10-02 00:01:46"), "editMessageMedia"),
+    ]
+    final = fake_telegram.chart_calls[-1]
+    assert final.fields["message_id"] == "501"
+    # The finished day counts the outage from 23:59:25 (35 s, shown as 1m), the outage
+    # today's row starts with: it counts on both days (chart-spec §8).
+    assert _caption(final) == "Thu 01.10 off: 1m · 1 outage"
+    [snapshot], _ = lifecycle.read_snapshot(TODAY)
+    end_of_day = model.next_midnight(YESTERDAY, KYIV)
+    settled, _ = lifecycle.chart_content(snapshot, YESTERDAY, end_of_day, live=False, tz=KYIV)
+    assert final.files["chart"] == settled
+    yesterday.refresh_from_db()
+    assert (yesterday.finalized_at, yesterday.pinned) == (kyiv("2026-10-02 00:01:46"), False)
+    pinned = ChartMessage.objects.filter(pinned=True).values_list("message_id", flat=True)
+    assert list(pinned) == [1001]
 
 
 # INV-18 #2, INV-19 #1: catch-up after missed midnights (D-02, D-03, D-04)
