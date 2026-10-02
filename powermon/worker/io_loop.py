@@ -2,11 +2,12 @@
 
 ``run_iteration`` is one pass over the outbox, always in this order: the connection step
 (``close_old_connections()``), the flush of outcomes kept from an earlier pass (WR-04),
-expiry (ALRT-03), the subscriber heads, then at most one ops row. For each location it
-looks only at the oldest open row (``outbox.subscriber_heads``), so OFF always goes before
-ON. A due row is rendered at send time in the location's current language, claimed with
-one conditional UPDATE (committed at once, Django autocommit), and sent with no
-transaction open. In the worker the claim also names the lease session of the HELD
+expiry (ALRT-03), the lift of channels held for a delivery failure that has since
+recovered (D-12, ``_lift``), the subscriber heads, then at most one ops row. For each
+location it looks only at the oldest open row (``outbox.subscriber_heads``), so OFF always
+goes before ON. A due row is rendered at send time in the location's current language,
+claimed with one conditional UPDATE (committed at once, Django autocommit), and sent with
+no transaction open. In the worker the claim also names the lease session of the HELD
 status the pass runs under (``RelayState.lease_pid``) and succeeds only while that
 session holds the worker lock: a worker that lost its session claims nothing, even
 before its detection loop notices and while another worker holds the lock (C1).
@@ -35,7 +36,9 @@ step in ``RelayState.chart_failures``.
 
 The result decides the row's next status, for both channels (D-14 policy):
 
-- ok: sent.
+- ok: sent. For a subscriber row, in the same transaction, a failing location recovers:
+  its open ``delivery_failing`` incident closes with one ``ops_delivery_restored`` notice
+  (D-10, ``powermon.alerts.delivery``).
 - maybe_delivered (read timeout, connection dropped after sending): uncertain, never
   resent (at-most-once, INV-16, D-13). A subscriber row queues exactly one "may not have
   been delivered" ops notice in the same transaction (``ops.mark_uncertain``, D-11 #5); an
@@ -43,7 +46,22 @@ The result decides the row's next status, for both channels (D-14 policy):
 - not_sent (nothing left the client) or transient (5xx): retried after
   min(2 ** attempts, BACKOFF_CAP_S) seconds.
 - rate_limited (429): retried after retry_after seconds, capped at MAX_RETRY_AFTER_S.
-- permanent (400/401/403/404): retried after PERMANENT_BACKOFF, with one warning.
+- permanent (400/401/403/404): retried after PERMANENT_BACKOFF, with one warning. For a
+  subscriber row, in the same transaction, the location's delivery is marked failing: its
+  ``delivery_failing`` incident opens with one ``ops_delivery_failing`` notice to the
+  admin (D-10); a refusal while the incident is open adds nothing (INV-20 #1).
+
+Only those two outcomes of a subscriber send touch the incident: a 429, a 5xx, a refused
+connection, an ambiguous send, an ops row and every chart call leave it alone (D-10).
+When Telegram reports the supergroup a group became (``migrate_to_chat_id``), the
+incident and the notice carry that chat ID for the admin; the location's chat is never
+changed here (PITFALLS 6e).
+
+A permanent refusal holds that channel for 15 minutes in memory and records it in
+``RelayState.failing``. The admin may fix the bot and send a test message before then:
+the web then closes the incident and makes the alerts due (``delivery.record_test_success``,
+D-12). The lift step notices the closed incident in the next pass and drops the channel's
+hold, so the queued alerts go out at once, with their event times.
 
 Every retry of a subscriber row also backs off its channel in ``RelayState.not_before``
 (``chat_key``: the bot and the chat id), so that channel's rows wait (D-14). Two locations
@@ -86,12 +104,15 @@ from the backdated outage start (INV-15). Ops notices carry their own times and 
 this prefix.
 
 Expiry (ALRT-03, D-07, D-08) is the first work step of every pass, before any head is
-sent: in one transaction every pending row whose ``expires_at`` has come becomes
-"expired" (``outbox.expire_due``) and is never sent, and each expired subscriber alert
-queues one ``ops_expired`` notice; an expired ops row is only logged, so a broken admin
-chat cannot loop. The location's next alert (the ON after an expired OFF) is then its head
-and goes out in the same pass. A database error in this step ends the pass before any
-claim and reaches the caller (``run_worker`` logs it once per outage, by class name).
+sent: in one transaction the pending alerts of deleted locations are dropped first (D-09,
+INV-19 #2: never sent, never expired into a notice), then every pending row whose
+``expires_at`` has come becomes "expired" (``outbox.expire_due``) and is never sent, and
+each expired subscriber alert queues one ``ops_expired`` notice; an expired ops row is
+only logged, so a broken admin chat cannot loop. The location's next alert (the ON after
+an expired OFF) is then its head and goes out in the same pass. A deleted location has no
+head at all (``outbox.subscriber_heads``). A database error in this step ends the pass
+before any claim and reaches the caller (``run_worker`` logs it once per outage, by class
+name).
 
 WR-04 (D-13): an error after a row was claimed never blocks its queue (a location's line,
 or the ops queue) for the rest of a lease generation, and never turns a known send into an
@@ -148,8 +169,8 @@ from datetime import date, datetime, timedelta
 from django.conf import settings
 from django.db import Error, close_old_connections, transaction
 
-from powermon.alerts import ops, ops_texts, outbox
-from powermon.alerts.models import OutboxMessage
+from powermon.alerts import delivery, ops, ops_texts, outbox
+from powermon.alerts.models import OpsIncident, OutboxMessage
 from powermon.alerts.texts import render_alert
 from powermon.clock import Clock
 from powermon.i18n import times
@@ -219,6 +240,9 @@ class RelayState:
     yet, by (location id, local date) -> (chat id, message id, answer time, bot key); the
     bot key (``bot_key``) is that of the token that posted it (D-08). The next chart step
     writes it first, so it is never posted a second time (WR-04 analogue).
+    ``failing``: the ``chat_key`` the relay holds for each location whose subscriber alert
+    was refused permanently, by location id; that channel's 15-minute hold lasts while the
+    location's ``delivery_failing`` incident is open, and goes once it closes (D-12).
     """
 
     not_before: dict[str, datetime] = field(default_factory=dict)
@@ -229,6 +253,7 @@ class RelayState:
     chart_posted: dict[tuple[int, date], tuple[int, int, datetime, str]] = field(
         default_factory=dict
     )
+    failing: dict[int, str] = field(default_factory=dict)
 
 
 def bot_key(token: str) -> str:
@@ -316,6 +341,8 @@ def run_iteration(
     _flush_unapplied(state)
     # Nothing past its maximum age may go out, so expiry runs before any head (ALRT-03).
     _expire(clock.now())
+    # A channel held for a delivery failure that has since recovered goes at once (D-12).
+    _lift(state)
     attempted = False
     for row in outbox.subscriber_heads():
         if stop is not None and stop.is_set():
@@ -403,12 +430,20 @@ def notify_db_down(status: LeaseStatus, clock: Clock, state: RelayState) -> bool
 def _expire(now: datetime) -> int:
     """Expire every pending row past its ``expires_at``; notify once per subscriber alert.
 
-    One transaction: the rows become "expired" and each subscriber row queues (or, with no
-    ops chat, logs) one ``ops_expired`` notice with them (D-08). An expired ops row is only
-    logged: a notice about a notice would loop on a broken admin chat. Returns how many
-    rows expired.
+    One transaction. First the pending subscriber rows of deleted locations are dropped
+    (``outbox.drop_deleted_pending``, D-09, INV-19 #2), so such a row is never expired and
+    never named in a notice, even one whose send was in flight at delete time. Pending ops
+    notices about a deleted location are left alone: they render from the tombstone's
+    name, and dropping them by location would also drop a global all-silent end notice
+    that names it. Then the rows past their age become "expired" and each subscriber row
+    queues (or, with no ops chat, logs) one ``ops_expired`` notice with them (D-08). An
+    expired ops row is only logged: a notice about a notice would loop on a broken admin
+    chat. Returns how many rows expired.
     """
     with transaction.atomic():
+        dropped = outbox.drop_deleted_pending()
+        if dropped:
+            log.info("relay: %d queued alert(s) of deleted locations dropped", dropped)
         rows = outbox.expire_due(now)
         for ref in rows:
             if ref.channel == outbox.CHANNEL_SUBSCRIBER:
@@ -421,6 +456,33 @@ def _expire(now: datetime) -> int:
             else:
                 log.warning("ops notice %s expired undelivered; it is not resent", ref.id)
     return len(rows)
+
+
+def _lift(state: RelayState) -> None:
+    """Drop the hold of each channel whose delivery failure has been closed (D-12).
+
+    ``state.failing`` names the chat key held for each location whose subscriber alert
+    was refused. Its ``delivery_failing`` incident closed means a success was recorded:
+    the web's test message, whose transaction also made the alerts due. The closed
+    incident is that explicit fact, so its channel's hold is dropped and the alerts go
+    out in this pass. Only that ``chat_key`` goes: a ``bot_wide_key`` (a 429, a 5xx, a
+    refused connection) concerns the whole bot and still holds. One query, and only while
+    something is held. After a restart nothing is held in memory, and the rows'
+    ``next_attempt_at`` governs.
+    """
+    if not state.failing:
+        return
+    still_open = set(
+        OpsIncident.objects.filter(
+            kind=delivery.KIND_DELIVERY_FAILING,
+            ended_at__isnull=True,
+            location_id__in=list(state.failing),
+        ).values_list("location_id", flat=True)
+    )
+    for location_id, key in list(state.failing.items()):
+        if location_id not in still_open:
+            state.not_before.pop(key, None)
+            del state.failing[location_id]
 
 
 def _deliver(row: OutboxMessage, clock: Clock, state: RelayState) -> bool:
@@ -605,9 +667,26 @@ def _apply(
     key: str,
     bot_wide: str | None = None,
 ) -> None:
-    """Record a send's outcome on the claimed row (and on the chat or bot, for a retry)."""
+    """Record a send's outcome on the claimed row (and on the chat or bot, for a retry).
+
+    For a subscriber row an ok or a permanent outcome also closes or opens the location's
+    ``delivery_failing`` incident, in the transaction that writes the row (D-10). This is
+    also the WR-04 flush path, so every write here is idempotent: the reset is fenced by
+    the claim's attempt count, a second open gets no incident id and a second close
+    changes no row, so no notice is ever repeated.
+    """
+    # The location of a subscriber alert; None for an ops row, which never touches it.
+    location_id = row.location_id if row.channel == outbox.CHANNEL_SUBSCRIBER else None
     if result.kind == "ok":
-        outbox.mark_sent(row.pk, now)
+        if location_id is None:
+            outbox.mark_sent(row.pk, now)
+            return
+        with transaction.atomic():
+            outbox.mark_sent(row.pk, now)
+            # Telegram took the alert, so the channel works: a failing location recovers.
+            delivery.close_failing(location_id, now)
+        # After the commit: the incident is closed, so nothing holds the channel for it.
+        state.failing.pop(location_id, None)
         return
     if result.kind == "maybe_delivered":
         # Never resent; a subscriber row queues one notice, an ops row is only logged.
@@ -639,6 +718,22 @@ def _apply(
         # it waits, and so does a shared admin chat (D1). A 400/401/403 stays with this
         # channel (CR-01).
         state.not_before[bot_wide] = next_attempt_at
+    code = result.code or result.kind
+    if result.kind == "permanent" and location_id is not None:
+        # The row's reset and the failing incident (with its one notice) commit together.
+        with transaction.atomic():
+            # Only this claim's attempt (WR-01): a later claim's row is not this outcome's.
+            if outbox.mark_retry(row.pk, next_attempt_at, code, attempts=attempts):
+                delivery.open_failing(
+                    location_id,
+                    now,
+                    delivery.http_status(result.code),
+                    # Reported to the admin only: the location's chat stays (PITFALLS 6e).
+                    result.migrate_to_chat_id,
+                )
+        # After the commit: the channel is held until the incident closes (D-12).
+        state.failing[location_id] = key
+        return
     # Only this claim's attempt: a kept outcome may be written after another worker claimed
     # the row again (WR-01).
-    outbox.mark_retry(row.pk, next_attempt_at, result.code or result.kind, attempts=attempts)
+    outbox.mark_retry(row.pk, next_attempt_at, code, attempts=attempts)

@@ -23,6 +23,7 @@ from django.db import IntegrityError, connection, transaction
 from powermon import config
 from powermon.alerts import outbox
 from powermon.alerts.models import OutboxMessage
+from powermon.locations.models import Location
 from powermon.worker.lease import Lease
 
 EVENT_AT = datetime(2026, 10, 1, 10, 5, tzinfo=UTC)
@@ -241,3 +242,118 @@ def test_WR01_a_relay_reset_moves_only_the_attempt_of_its_claim(
     assert outbox.mark_retry(row.pk, due, "y", attempts=1) is False
     assert outbox.mark_retry(row.pk, due, "y", attempts=2) is True
     assert _claim_state(row) == ("pending", 2)
+
+
+# D-08 / D-12: make a location's held subscriber alerts due at once
+
+
+def _held(location: Any, until: datetime, *, status: str = "pending") -> OutboxMessage:
+    """A subscriber row of ``location`` waiting until ``until`` (a backoff), in ``status``."""
+    row = _enqueue(location)
+    OutboxMessage.objects.filter(pk=row.pk).update(next_attempt_at=until, status=status)
+    return row
+
+
+def _due_at(row: OutboxMessage) -> datetime:
+    return OutboxMessage.objects.get(pk=row.pk).next_attempt_at
+
+
+@pytest.mark.django_db
+def test_make_due_moves_only_the_locations_held_pending_subscriber_rows(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = location_factory()
+    other = location_factory()
+    now = RECORDED_AT + timedelta(minutes=5)
+    later = now + timedelta(minutes=10)
+    held = [_held(location, later), _held(location, later)]
+    already_due = _held(location, now - timedelta(seconds=1))
+    at_now = _held(location, now)
+    sending = _held(location, later, status="sending")
+    sent = _held(location, later, status="sent")
+    other_location = _held(other, later)
+    with transaction.atomic():
+        notice = outbox.enqueue_ops(
+            outbox.KIND_OPS_GAP,
+            payload={"start_us": 1, "end_us": 2},
+            recorded_at=later,
+            location_id=location.pk,
+        )
+
+    assert outbox.make_due(location.pk, now) == 2
+
+    assert [_due_at(row) for row in held] == [now, now]
+    # Rows already due, not pending, of another location or of the ops queue: unchanged.
+    assert _due_at(already_due) == now - timedelta(seconds=1)
+    assert _due_at(at_now) == now
+    assert [_due_at(row) for row in (sending, sent, other_location, notice)] == [later] * 4
+    # Nothing left to move: a second call changes no row.
+    assert outbox.make_due(location.pk, now) == 0
+
+
+@pytest.mark.django_db
+def test_make_due_refuses_a_naive_time(location_factory: Callable[..., Any]) -> None:
+    location = location_factory()
+    later = RECORDED_AT + timedelta(minutes=15)
+    row = _held(location, later)
+
+    with pytest.raises(ValueError, match="naive"):
+        outbox.make_due(location.pk, datetime(2026, 10, 1, 10, 10))  # noqa: DTZ001
+
+    assert _due_at(row) == later
+
+
+# D-09, INV-19 #2: a deleted location's queued alerts are never sent
+
+
+def _status(row: OutboxMessage) -> tuple[str, str]:
+    stored = OutboxMessage.objects.get(pk=row.pk)
+    return stored.status, stored.last_error
+
+
+@pytest.mark.django_db
+def test_subscriber_heads_skip_deleted_locations(location_factory: Callable[..., Any]) -> None:
+    live = location_factory()
+    deleted = location_factory()
+    live_head = _enqueue(live)
+    _enqueue(live)
+    _enqueue(deleted)
+    assert len(outbox.subscriber_heads()) == 2
+
+    Location.objects.filter(pk=deleted.pk).update(deleted_at=RECORDED_AT)
+
+    assert [row.pk for row in outbox.subscriber_heads()] == [live_head.pk]
+
+
+@pytest.mark.django_db
+def test_drop_deleted_pending_touches_only_pending_subscriber_rows(
+    location_factory: Callable[..., Any],
+) -> None:
+    live = location_factory()
+    deleted = location_factory()
+    later = RECORDED_AT + timedelta(minutes=15)
+    pending = [_enqueue(deleted), _held(deleted, later)]
+    sending = _held(deleted, later, status="sending")
+    sent = _held(deleted, later, status="sent")
+    live_pending = _enqueue(live)
+    with transaction.atomic():
+        notice = outbox.enqueue_ops(
+            outbox.KIND_OPS_GAP,
+            payload={"start_us": 1, "end_us": 2},
+            recorded_at=RECORDED_AT,
+            location_id=deleted.pk,
+        )
+    # No location is deleted yet: nothing moves.
+    assert outbox.drop_deleted_pending() == 0
+
+    Location.objects.filter(pk=deleted.pk).update(deleted_at=RECORDED_AT)
+
+    assert outbox.drop_deleted_pending() == 2
+    assert [_status(row) for row in pending] == [("dropped", "location_deleted")] * 2
+    # In flight or finished rows, a live location's rows and ops notices stay as they are.
+    assert _status(sending) == ("sending", "")
+    assert _status(sent) == ("sent", "")
+    assert _status(live_pending) == ("pending", "")
+    assert _status(notice) == ("pending", "")
+    # Nothing left to drop: a second sweep changes no row.
+    assert outbox.drop_deleted_pending() == 0

@@ -165,6 +165,32 @@ def test_ok_response(fake_telegram: Any) -> None:
     assert fake_telegram.calls[0].request.url == SEND_URL
 
 
+def test_send_message_disable_notification(fake_telegram: Any) -> None:
+    # D-11: the admin's test message is sent silently; an alert's body is unchanged.
+    fake_telegram.accept(TOKEN)
+    client = TelegramClient(TOKEN)
+    body = {"chat_id": DEFAULT_CHAT_ID, "text": TEXT, "parse_mode": "HTML"}
+
+    assert client.send_message(DEFAULT_CHAT_ID, TEXT, disable_notification=True) == (
+        SendResult("ok")
+    )
+    assert client.send_message(DEFAULT_CHAT_ID, TEXT) == SendResult("ok")
+    assert client.send_message(DEFAULT_CHAT_ID, TEXT, disable_notification=False) == (
+        SendResult("ok")
+    )
+
+    assert fake_telegram.sent == [{**body, "disable_notification": True}, body, body]
+
+
+def test_send_message_takes_the_silent_flag_by_name_only(fake_telegram: Any) -> None:
+    fake_telegram.accept(TOKEN)
+
+    with pytest.raises(TypeError):
+        TelegramClient(TOKEN).send_message(DEFAULT_CHAT_ID, TEXT, True)  # type: ignore[misc]
+
+    assert len(fake_telegram.calls) == 0
+
+
 def test_every_call_passes_the_short_timeouts(fake_telegram: Any) -> None:
     fake_telegram.accept(TOKEN)
 
@@ -358,8 +384,78 @@ def test_send_result_defaults() -> None:
     result = SendResult("ok")
 
     assert (result.kind, result.retry_after, result.code) == ("ok", None, "")
+    assert (result.message_id, result.migrate_to_chat_id) == (None, None)
     with pytest.raises(AttributeError):
         result.code = "changed"
+
+
+# D-10, PITFALLS 6e: a group upgraded to a supergroup answers 400 with the new chat ID
+
+
+MIGRATED = -1009999999999
+
+
+def _upgraded(parameters: Any) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error_code": 400,
+        "description": "Bad Request: group chat was upgraded to a supergroup chat",
+        "parameters": parameters,
+    }
+
+
+@pytest.mark.parametrize("value", [MIGRATED, -(2**63), 2**63 - 1, 1])
+def test_migrate_to_chat_id_is_read_from_a_refusal(fake_telegram: Any, value: int) -> None:
+    fake_telegram.fail(TOKEN, status=400, json_body=_upgraded({"migrate_to_chat_id": value}))
+
+    result = _send()
+
+    assert result == SendResult("permanent", code="http_400", migrate_to_chat_id=value)
+
+
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        {"migrate_to_chat_id": True},
+        {"migrate_to_chat_id": -1009999999999.0},
+        {"migrate_to_chat_id": "-1009999999999"},
+        {"migrate_to_chat_id": 2**63},
+        {"migrate_to_chat_id": -(2**63) - 1},
+        {"migrate_to_chat_id": None},
+        {},
+        "not-a-dict",
+        None,
+    ],
+    ids=[
+        "bool",
+        "float",
+        "str",
+        "above-int64",
+        "below-int64",
+        "null",
+        "missing",
+        "str-params",
+        "none",
+    ],
+)
+def test_migrate_to_chat_id_needs_an_int64(fake_telegram: Any, parameters: Any) -> None:
+    # The body is untrusted: anything but a 64-bit integer is ignored, never raised.
+    fake_telegram.fail(TOKEN, status=400, json_body=_upgraded(parameters))
+
+    result = _send()
+
+    assert result == SendResult("permanent", code="http_400")
+    assert result.migrate_to_chat_id is None
+
+
+def test_migrate_to_chat_id_is_only_on_a_permanent_result(fake_telegram: Any) -> None:
+    # A 429 or a 5xx is not a refusal of the chat: the field stays empty.
+    body = {**_upgraded({"migrate_to_chat_id": MIGRATED, "retry_after": 7}), "error_code": 429}
+    fake_telegram.fail(TOKEN, status=429, json_body=body)
+    fake_telegram.fail(TOKEN, status=502, json_body=_upgraded({"migrate_to_chat_id": MIGRATED}))
+
+    assert _send() == SendResult("rate_limited", retry_after=7, code="429")
+    assert _send() == SendResult("transient", code="http_502")
 
 
 def test_client_source_never_raises_for_status_or_mounts_retries() -> None:

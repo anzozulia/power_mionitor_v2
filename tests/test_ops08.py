@@ -424,7 +424,8 @@ def test_INV23_db_columns_and_payloads_secret_free(
     fake_telegram.accept(OPS_BOT_TOKEN)
     state = io_loop.RelayState()
 
-    # One ops notice per pass: the gap, the expired alert, the uncertain one.
+    # One ops notice per pass: the gap, the expired alert, the 403's failing notice (D-10),
+    # the uncertain one.
     for _ in range(4):
         io_loop.run_iteration(FakeClock(now), state)
 
@@ -437,11 +438,13 @@ def test_INV23_db_columns_and_payloads_secret_free(
     }
     ops_rows = OutboxMessage.objects.filter(channel=outbox.CHANNEL_OPS)
     assert sorted(ops_rows.values_list("kind", "status")) == [
+        (outbox.KIND_OPS_DELIVERY_FAILING, "sent"),
         (outbox.KIND_OPS_EXPIRED, "sent"),
         (outbox.KIND_OPS_GAP, "sent"),
         (outbox.KIND_OPS_UNCERTAIN, "sent"),
     ]
-    assert OpsIncident.objects.count() == 1
+    # The monitoring gap and the 403's delivery_failing incident (integer details only).
+    assert OpsIncident.objects.count() == 2
     keys = [loc.device_key for loc in (sent, forbidden, refused, timed_out, expired)]
     stored = repr(list(OutboxMessage.objects.values())) + repr(list(OpsIncident.objects.values()))
     _assert_secret_free(stored, _secrets(*keys))
@@ -470,6 +473,12 @@ def test_INV23_ops_notice_texts_secret_free(location_factory: Callable[..., Any]
         # The chart pin notices (Phase 3 D-07): an HTTP status, or nothing at all.
         outbox.KIND_OPS_PIN_FAILED: ({"http_status": 400}, location.pk),
         outbox.KIND_OPS_PIN_RESTORED: ({}, location.pk),
+        # The delivery notices (Phase 4 D-10): a status and a reported supergroup chat ID.
+        outbox.KIND_OPS_DELIVERY_FAILING: (
+            {"http_status": 403, "migrate_to_chat_id": -1009999999999},
+            location.pk,
+        ),
+        outbox.KIND_OPS_DELIVERY_RESTORED: ({}, location.pk),
     }
     assert set(notices) == set(outbox.OPS_KINDS)
     texts = [
