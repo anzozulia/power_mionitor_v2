@@ -93,7 +93,11 @@ location's other due steps go first (D-02); and an ambiguous post, which is post
 (D-06), slows down to at most 4 untracked photos an hour. Permanent errors and render
 errors wait a fixed 15 min. A step whose call was made but whose record UPDATE raised a
 database error (refresh, pin, finalize, unpin: all idempotent) waits ``step_delay(n)``
-too, so a write that keeps failing never turns into a call per pass. Nothing here sleeps.
+too, so a write that keeps failing never turns into a call per pass. Any other
+unexpected error once a step is chosen, except a lost connection, also makes that step
+alone wait 15 min, with one ERROR line and its traceback, so the next pass chooses
+another step and one location's error never stops the other charts (INV-13). Nothing
+here sleeps.
 
 The step keys stay bounded (``RelayState`` lives as long as the worker): each chart step
 first drops every ``chart:`` key that no longer guards a step, i.e. one of a location
@@ -115,7 +119,14 @@ from datetime import date, datetime, timedelta
 from typing import Literal
 
 from django.conf import settings
-from django.db import Error, IntegrityError, connection, transaction
+from django.db import (
+    Error,
+    IntegrityError,
+    InterfaceError,
+    OperationalError,
+    connection,
+    transaction,
+)
 
 from powermon.alerts import ops, outbox
 from powermon.alerts.models import OpsIncident
@@ -494,9 +505,14 @@ def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | No
     time all come from it (CHRT-04, Pitfall 8); the outcome counts from the answer time.
     ``stop`` is checked before the render and again before the call. A render error backs
     off that step only, for 15 min, and makes no call (INV-13 pattern). A database error
-    propagates, except one writing the outcome of a call that was made: a post's is kept,
-    and any other step waits ``step_delay``, so a write that keeps failing never turns
-    into a call per pass.
+    writing the outcome of a call that was made is handled: a post's is kept, and any
+    other step waits ``step_delay``, so a write that keeps failing never turns into a call
+    per pass.
+
+    Once the step is chosen, a lost connection (OperationalError, InterfaceError)
+    propagates: the pass ends and the step is retried on the next one (MON-06). Any other
+    error backs off that step only (``_step_crashed``), so the next pass chooses another
+    step and one location's error never stops the other locations' charts (INV-13).
     """
     _flush_posted(state)
     now = clock.now()
@@ -514,45 +530,58 @@ def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | No
         return False
     location = action.location
     key = _key(action)
-    content: tuple[bytes, str] | None = None
-    started = clock.monotonic()
-    if action.step in _RENDERED:
-        try:
-            content = _content(action, today, now, tz)
-        except Error:
-            raise  # the database, not the chart: the pass ends and is retried (MON-06)
-        except Exception as exc:
-            # The class only: an exception's text could carry anything.
-            state.not_before[key] = now + io_loop.PERMANENT_BACKOFF
-            log.error(
-                "chart %s for location %s: render failed (%s); the step waits 15 min",
-                action.step,
-                location.location_id,
-                type(exc).__name__,
-            )
-            return False
-    render_ms = _ms(clock.monotonic() - started)
-    if _stopped(stop) or not _lease_holds(state.lease_pid):
-        return False
-    client = TelegramClient(location.bot_token)
-    called = clock.monotonic()
-    result = _call(client, action, content)
-    call_ms = _ms(clock.monotonic() - called)
-    answered = clock.now()
-    log.info(
-        "chart %s for location %s: %s (%s) render_ms=%d call_ms=%d",
-        action.step,
-        location.location_id,
-        result.kind,
-        result.code,
-        render_ms,
-        call_ms,
-    )
+    # Telegram's answer and its time, once the call returned: an accepted post must then
+    # be recorded, never posted again.
+    result: SendResult | None = None
+    answered: datetime | None = None
     try:
-        _apply(action, key, result, today, answered, state)
-    except Error as exc:
-        _unwritten(action, key, result, answered, state, exc)
-    return True
+        content: tuple[bytes, str] | None = None
+        started = clock.monotonic()
+        if action.step in _RENDERED:
+            try:
+                content = _content(action, today, now, tz)
+            except Error:
+                raise  # the database, not the chart: handled below
+            except Exception as exc:
+                # The class only: an exception's text could carry anything.
+                state.not_before[key] = now + io_loop.PERMANENT_BACKOFF
+                log.error(
+                    "chart %s for location %s: render failed (%s); the step waits 15 min",
+                    action.step,
+                    location.location_id,
+                    type(exc).__name__,
+                )
+                return False
+        render_ms = _ms(clock.monotonic() - started)
+        if _stopped(stop) or not _lease_holds(state.lease_pid):
+            return False
+        client = TelegramClient(location.bot_token)
+        called = clock.monotonic()
+        result = _call(client, action, content)
+        call_ms = _ms(clock.monotonic() - called)
+        answered = clock.now()
+        log.info(
+            "chart %s for location %s: %s (%s) render_ms=%d call_ms=%d",
+            action.step,
+            location.location_id,
+            result.kind,
+            result.code,
+            render_ms,
+            call_ms,
+        )
+        try:
+            _apply(action, key, result, today, answered, state)
+        except Error as exc:
+            _unwritten(action, key, result, answered, state, exc)
+        return True
+    except OperationalError, InterfaceError:
+        # The connection, not the chart: the pass ends and is retried (MON-06). Never
+        # after the call: ``_apply``'s database errors are handled above.
+        raise
+    except Exception:
+        at = clock.now() if answered is None else answered
+        _step_crashed(action, key, result, today, at, state)
+        return result is not None
 
 
 def _content(action: Action, today: date, now: datetime, tz: str) -> tuple[bytes, str]:
@@ -954,6 +983,41 @@ def _bot_hold(result: SendResult, failures: int) -> timedelta | None:
         wait = min(result.retry_after or DEFAULT_RETRY_AFTER_S, io_loop.MAX_RETRY_AFTER_S)
         return timedelta(seconds=wait)
     return timedelta(seconds=min(2**failures, io_loop.BACKOFF_CAP_S))
+
+
+def _step_crashed(
+    action: Action,
+    key: str,
+    result: SendResult | None,
+    today: date,
+    at: datetime,
+    state: io_loop.RelayState,
+) -> None:
+    """An unexpected error once the step was chosen: that step alone waits 15 min (INV-13).
+
+    Without its key the pure ``plan`` would choose the same failing step on every pass,
+    and no other location's chart would move. Only the step's own key is set, never
+    ``chat_key`` or ``bot_wide_key``: neither the channel's alerts nor the bot's other
+    steps wait for it. A post Telegram accepted (``result``) is kept in ``chart_posted``,
+    as after a database error, so the next chart step records it and it is never posted
+    again. One ERROR line with the traceback; the worker's redacting formatter scrubs any
+    token in it (OPS-08). Called from an ``except`` block only.
+    """
+    location = action.location
+    if (
+        action.step == "post"
+        and result is not None
+        and result.kind == "ok"
+        and result.message_id is not None
+    ):
+        posted = (location.chat_id, result.message_id, at)
+        state.chart_posted.setdefault((location.location_id, today), posted)
+    state.not_before[key] = at + io_loop.PERMANENT_BACKOFF
+    log.exception(
+        "chart %s for location %s failed; the step waits 15 min",
+        action.step,
+        location.location_id,
+    )
 
 
 def _unwritten(
