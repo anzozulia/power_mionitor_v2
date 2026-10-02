@@ -58,6 +58,7 @@ from powermon.i18n import chart_texts
 from powermon.locations import actions
 from powermon.locations.models import Location
 from powermon.locations.validators import TOKEN_FORMAT
+from powermon.web import location_views
 from powermon.web.location_views import LocationEditView
 from powermon.worker import detection, io_loop
 
@@ -397,6 +398,28 @@ def test_edit_unknown_or_deleted_location_is_404(
         saved = actions.update_config(pk, {**posted, "chat_id": DEFAULT_CHAT_ID}, _at(9, 5))
         assert saved == actions.ConfigSaved(found=False, channel_changed=False)
     assert Location.objects.get(pk=gone.pk).name == "Gone"
+
+
+@pytest.mark.django_db
+def test_edit_of_a_location_deleted_meanwhile_is_404(
+    admin: Client, location_factory: Callable[..., Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    location = location_factory(name="Office")
+    found = location_views.location_or_404
+
+    def found_then_deleted(pk: int) -> Location:
+        # The page's lookup finds the location; a delete commits before the save runs.
+        result = found(pk)
+        assert actions.delete_location(pk, _at(9, 0)) is True
+        return result
+
+    monkeypatch.setattr(location_views, "location_or_404", found_then_deleted)
+
+    response = admin.post(_edit(location), _form(location, name="Renamed"))
+
+    # The save's locking read sees the tombstone: nothing is written, the answer is 404.
+    assert response.status_code == 404
+    assert Location.objects.get(pk=location.pk).name == "Office"
 
 
 @pytest.mark.django_db

@@ -79,10 +79,11 @@ CONSEQUENCES = [
     "unpins its weekly chart in the channel if the bot can still pin there; otherwise unpin "
     "it by hand in Telegram (the posted messages stay in the channel);",
     "closes its open problems, such as failing delivery, without a recovery notice;",
-    "hides it from the admin panel. Its history stays in the database but is never shown "
-    "again.",
+    "hides it from the admin panel. Its history stays in the database but is never shown again.",
 ]
-ALTERNATIVES = "To pause this location instead, turn maintenance on or alerts off on the location page."
+ALTERNATIVES = (
+    "To pause this location instead, turn maintenance on or alerts off on the location page."
+)
 RECREATE = (
     "To monitor this place again later, add a new location. It gets a new device key and "
     "starts with an empty history."

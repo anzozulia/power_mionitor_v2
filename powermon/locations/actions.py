@@ -1,13 +1,14 @@
-"""The admin's configuration writes on a location (D-05, D-07, D-14; LOC-04, LOC-06,
-LOC-09, LOC-10, DATA-04).
+"""The admin's writes on a location (D-05, D-07, D-09, D-14; LOC-04, LOC-06, LOC-09,
+LOC-10, DATA-04).
 
-Each write is one explicit, column-limited conditional UPDATE, decided by its row count,
-and never ``Model.save()`` (INV-02 #3): a save writes every column from an instance read
-earlier, so a stale page could switch a toggle back or bring a replaced device key back.
-None of them does network I/O (KD2),
-and none touches ``location_state``: they are configuration, not engine transitions. The
-maintenance switch is an engine transition and lives in ``powermon.engine.maintenance``
-(D-02).
+Each configuration write is one explicit, column-limited conditional UPDATE, decided by its
+row count, and never ``Model.save()`` (INV-02 #3): a save writes every column from an
+instance read earlier, so a stale page could switch a toggle back or bring a replaced
+device key back. None of them touches ``location_state``: they are configuration, not
+engine transitions. The maintenance switch is an engine transition and lives in
+``powermon.engine.maintenance`` (D-02). The delete is the one exception: it takes the
+``location_state`` row lock first, like every timeline writer, and bumps ``state_version``
+(D-09). Nothing here does network I/O (KD2).
 """
 
 from collections.abc import Mapping
@@ -15,9 +16,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal, get_args
 
-from django.db import transaction
+from django.db import connection, transaction
 
 from powermon.alerts import outbox
+from powermon.alerts.models import OpsIncident, OutboxMessage
+from powermon.engine.maintenance import BUMP_SQL
+from powermon.engine.transitions import LOCK_SQL
 from powermon.locations import keys
 from powermon.locations.models import Location
 
@@ -138,3 +142,61 @@ def regenerate_key(location_id: int, current_key: str) -> bool:
         pk=location_id, deleted_at__isnull=True, device_key=current_key
     ).update(device_key=keys.generate_device_key())
     return replaced == 1
+
+
+def delete_location(location_id: int, now: datetime) -> bool:
+    """Delete the location at ``now``: True if this call deleted it (D-09, LOC-04, INV-19 #2).
+
+    One transaction, in this order:
+
+    1. the location's ``location_state`` row lock (``transitions.LOCK_SQL``, imported, never
+       copied), so the delete serializes with heartbeats, the OFF transition and the
+       maintenance toggle; lock order is state row, then location row, as every writer's;
+    2. the ``deleted_at`` tombstone, only while the location is not deleted yet: False,
+       with nothing else written, for an unknown or already deleted location, so a second
+       delete (a double click, a second tab) changes nothing (UI-D8);
+    3. the ``state_version`` bump (``maintenance.BUMP_SQL``, the D-02 toggle's), so a
+       detector snapshot read before the delete loses its OFF CAS on ``state_version`` as
+       well as on ``deleted_at``;
+    4. the location's pending subscriber alerts dropped with last_error="location_deleted"
+       (``outbox.LOCATION_DELETED``): never sent;
+    5. its open ops incidents closed at ``now`` without a recovery notice.
+
+    The races the transaction alone does not close, and where each is handled:
+
+    - a heartbeat that looked up its key before the delete and waits on the row lock sees
+      the tombstone under the lock and writes nothing (``record_heartbeat``, 04-03);
+    - a detector snapshot read before the delete: its ``mark_off`` waits on the same row
+      lock and its OFF CAS then matches no row (``state_version`` bumped here, ``deleted_at``
+      set), so no OFF, no off interval and no OFF alert;
+    - a send in flight ("sending") is not pending, so it is not dropped here; if its outcome
+      puts it back to pending, the relay never sends it (``subscriber_heads`` skips deleted
+      locations) and drops it on its next pass (``drop_deleted_pending``, 04-05);
+    - a concurrent permanent refusal: ``delivery.open_failing`` re-reads the location
+      ``FOR SHARE`` and writes nothing for a tombstone, so it either sees the delete and
+      opens nothing, or commits first and has its incident closed here without a notice.
+
+    Pending ops notices about the location are left alone: they render from the tombstone's
+    name, and dropping by location would also drop a global notice that names it. The
+    tombstone keeps its bot token, because the worker's chart release still needs it to
+    unpin the location's charts in their stored chats (04-06). History rows stay; there is
+    no undelete. No network I/O (KD2).
+    """
+    if now.utcoffset() is None:
+        raise ValueError("delete_location needs an aware now, not a naive datetime")
+    with transaction.atomic(), connection.cursor() as cur:
+        cur.execute(LOCK_SQL, [location_id])
+        cur.fetchone()
+        tombstoned = Location.objects.filter(pk=location_id, deleted_at__isnull=True).update(
+            deleted_at=now
+        )
+        if tombstoned != 1:
+            return False
+        cur.execute(BUMP_SQL, {"id": location_id})
+        OutboxMessage.objects.filter(
+            channel=outbox.CHANNEL_SUBSCRIBER, location_id=location_id, status="pending"
+        ).update(status="dropped", last_error=outbox.LOCATION_DELETED)
+        OpsIncident.objects.filter(location_id=location_id, ended_at__isnull=True).update(
+            ended_at=now
+        )
+    return True

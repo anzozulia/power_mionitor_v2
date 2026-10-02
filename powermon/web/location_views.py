@@ -1,12 +1,12 @@
-"""The Phase 4 location pages: the location page, its one-click switches, the edit form and
-the key rotation (D-13, D-05, D-07, D-14).
+"""The Phase 4 location pages: the location page, its one-click switches, the edit form, the
+delete and the key rotation (D-13, D-05, D-07, D-09, D-14).
 
 - Every view here needs the signed-in admin: LoginRequiredMiddleware denies by default and
   none of them is ``login_not_required``.
 - Every switch is a POST with CSRF, answered POST -> redirect -> GET with a flash (UI-D4),
-  so a reload never repeats it. The edit save is too. Regenerate key is a GET
-  confirmation, then a POST answered with the revealed setup page itself (D-14, D-17),
-  guarded against a resubmit (UI-D7).
+  so a reload never repeats it. The edit save is too. Delete and Regenerate key are a GET
+  confirmation, then a POST (D-17): the delete redirects to the list, the regenerate
+  answers with the revealed setup page itself (D-14), guarded against a resubmit (UI-D7).
 - The edit save writes only the configuration columns, through ``actions.update_config``,
   never ``form.save()`` or ``Location.save()``: a form loaded earlier can never revert the
   status, a switch or the device key (D-07, INV-02 #3).
@@ -59,6 +59,13 @@ CHANNEL_CHANGED_MESSAGE = (
     "Changes saved. The weekly chart is posted again with the new bot or chat. The old one "
     "is unpinned if this location's bot is an admin of the old channel."
 )
+
+# UI-SPEC Copywriting › Delete, verbatim.
+LOCATION_DELETED_MESSAGE = (
+    "Location deleted. Its alerts have stopped. Its weekly chart is unpinned when the bot can "
+    "do so; if the pin stays, unpin it by hand in Telegram."
+)
+ALREADY_DELETED_MESSAGE = "This location was already deleted."
 
 # UI-SPEC Copywriting › Switches, verbatim.
 MAINTENANCE_HELP = (
@@ -328,6 +335,38 @@ class LocationEditView(View):
         self, request: HttpRequest, location: Location, form: LocationEditForm
     ) -> HttpResponse:
         return render(request, self.template_name, {"location": location, "form": form})
+
+
+class LocationDeleteView(View):
+    """``/locations/<pk>/delete/``: delete the location (LOC-04, D-09, D-17; screen D).
+
+    GET is the confirmation page: it changes nothing and holds one form, the destructive
+    POST, next to "Keep location"; 404 for an unknown or deleted location. POST runs
+    ``actions.delete_location`` (one transaction under the row lock, no network I/O, KD2)
+    and redirects to the list: with the success flash, or, for a location that is already
+    deleted (a double click, a second tab), with the UI-D8 info flash and nothing changed.
+    A POST for an id that never existed answers 404. The worker then unpins the location's
+    charts in their stored chats; the flash says so without promising a time.
+    """
+
+    template_name = "web/location_delete.html"
+    # Tests inject a FakeClock with LocationDeleteView.as_view(clock=...).
+    clock: Clock = SystemClock()
+
+    def get(self, request: HttpRequest, pk: int) -> HttpResponse:
+        location = location_or_404(pk)
+        return render(request, self.template_name, {"location": location})
+
+    def post(self, request: HttpRequest, pk: int) -> HttpResponse:
+        # Deleted or not: only an id that never existed is 404 (UI-D8).
+        get_object_or_404(Location.objects.only("pk"), pk=pk)
+        if actions.delete_location(pk, self.clock.now()):
+            # The id only (OPS-08).
+            log.info("location %s deleted", pk)
+            messages.success(request, LOCATION_DELETED_MESSAGE)
+        else:
+            messages.info(request, ALREADY_DELETED_MESSAGE)
+        return redirect("location-list")
 
 
 def regenerate_marker(key: str) -> str:
