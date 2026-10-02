@@ -357,21 +357,33 @@ def _draw_gridlines(band: _Band, lay: Layout) -> None:
         band.draw.rectangle((_x(x - GRID_W / 2), 0, _x(x + GRID_W / 2) - 1, bottom), fill=GRID)
 
 
-def _off_span(lay: Layout, x0: float, x1: float) -> tuple[float, float]:
-    """An OFF span at least 8 px wide around its midpoint, kept inside the bar (§6)."""
+def _off_span(x0: float, x1: float, lo: float, hi: float) -> tuple[float, float]:
+    """An OFF span at least 8 px wide around its midpoint, shifted inward into [lo, hi] (§6).
+
+    ``[lo, hi]`` is the bar, or in a live render's today row the bar up to now: nothing is
+    drawn right of now (chart-spec §7, §9). When that room is under 8 px (the first ~16
+    minutes after midnight) the span is the whole room: "nothing after now" wins over the
+    minimum width.
+    """
     if x1 - x0 >= MIN_OFF_PX:
         return x0, x1
+    if hi - lo < MIN_OFF_PX:
+        return lo, hi
     mid = (x0 + x1) / 2
-    x0 = min(max(mid - MIN_OFF_PX / 2, lay.bar_x0), lay.bar_x1 - MIN_OFF_PX)
+    x0 = min(max(mid - MIN_OFF_PX / 2, lo), hi - MIN_OFF_PX)
     return x0, x0 + MIN_OFF_PX
 
 
-def _draw_bar(band: _Band, lay: Layout, row: Row, bar_y: float) -> None:
-    """The row's track, segments and hour cells, clipped to the rounded bar (chart-spec §6)."""
+def _draw_bar(band: _Band, lay: Layout, row: Row, bar_y: float, now_x: float | None) -> None:
+    """The row's track, segments and hour cells, clipped to the rounded bar (chart-spec §6).
+
+    ``now_x`` is set only for a live render's today row; a widened OFF then ends at now.
+    """
     pal = _DIMMED if row.dimmed else _CURRENT
     left = _x(lay.bar_x0)
     lw = _x(lay.bar_x1) - left
     lh = BAR_H * S
+    off_hi = lay.bar_x1 if now_x is None else min(lay.bar_x1, now_x)
     # The empty track is no-data in every row: a dimmed row's no-data is no-data itself.
     layer = Image.new("RGB", (lw, lh), NO_DATA)
     draw = ImageDraw.Draw(layer)
@@ -380,7 +392,7 @@ def _draw_bar(band: _Band, lay: Layout, row: Row, bar_y: float) -> None:
     for seg in sorted(row.segments, key=lambda s: _ORDER[s.state]):
         x0, x1 = lay.hx(seg.start_us), lay.hx(seg.end_us)
         if seg.state == "off":
-            x0, x1 = _off_span(lay, x0, x1)
+            x0, x1 = _off_span(x0, x1, lay.bar_x0, off_hi)
         a, b = _x(x0) - left, _x(x1) - left
         if b <= a:
             continue
@@ -436,7 +448,7 @@ def _draw_plot(canvas: Image.Image, lay: Layout, week: Week, lang: str) -> None:
                 TODAY_BAND,
             )
         _draw_gridlines(band, lay)
-        _draw_bar(band, lay, row, bar_y)
+        _draw_bar(band, lay, row, bar_y, now_x if row.is_today else None)
         if row.is_today and now_x is not None:
             band.rounded(
                 now_x - NOW_LINE_W / 2,

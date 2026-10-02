@@ -13,6 +13,7 @@ half hour sits about 15 px from the nearest hour edge, inside a solid area.
 
 import ast
 import io
+import math
 import pathlib
 import subprocess
 import sys
@@ -403,6 +404,101 @@ def test_off_over_not_monitored_sub_pixel_spans_and_repeated_hatch() -> None:
     assert 7 <= end - start <= 8
     # The widened OFF reaches back over the end of the not-monitored span.
     assert start < lay.hx(_hours(12.5)) < end
+
+
+# --- A short OFF next to now never crosses it (chart-spec §6, §7, §9, §10; INV-08) ---
+
+ON_SINCE = "2026-09-28 00:00"
+LocalRows = list[tuple[str, str, str | None]]
+
+
+def _ongoing_off(minutes: int) -> LocalRows:
+    """On since Monday, then an OFF open since ``minutes`` before 14:37 today."""
+    start = f"2026-10-01 14:{37 - minutes:02d}"
+    return [("on", ON_SINCE, start), ("off", start, None)]
+
+
+@pytest.mark.parametrize(
+    ("now", "rows", "visible"),
+    [
+        # An ongoing OFF that started 1, 3 and 5 minutes before now (14:37): 0.5-2.5 px wide.
+        ("2026-10-01 14:37", _ongoing_off(1), True),
+        ("2026-10-01 14:37", _ongoing_off(3), True),
+        ("2026-10-01 14:37", _ongoing_off(5), True),
+        # A 2-minute OFF that ended 1 minute before now.
+        (
+            "2026-10-01 14:37",
+            [
+                ("on", ON_SINCE, "2026-10-01 14:34"),
+                ("off", "2026-10-01 14:34", "2026-10-01 14:36"),
+                ("on", "2026-10-01 14:36", None),
+            ],
+            True,
+        ),
+        # Just after local midnight: an OFF open since 23:50 yesterday is 2 minutes into
+        # today, so there is only ~1 px of room left of now. "Nothing after now" wins over
+        # the 8 px minimum width.
+        (
+            "2026-10-01 00:02",
+            [("on", ON_SINCE, "2026-09-30 23:50"), ("off", "2026-09-30 23:50", None)],
+            False,
+        ),
+    ],
+    ids=["ongoing-1m", "ongoing-3m", "ongoing-5m", "just-ended", "after-midnight"],
+)
+def test_INV08_short_ongoing_off_never_drawn_after_now(
+    now: str, rows: LocalRows, visible: bool
+) -> None:
+    # chart-spec §7/§9/§10: segments run only up to now and nothing is drawn right of it in
+    # today's row. A short OFF is widened to 8 px (§6), but in a live today row its room
+    # ends at now: the span is shifted left so its right edge is at now.
+    week = _week(local_pieces(rows), now=kyiv(now))
+    img = _render(week)
+    lay = render.layout(week, "uk")
+    bar_y = lay.bar_ys[THU]
+    now_x = lay.hx(wall_us(week.now, KYIV, end=False))
+    # Every pixel strictly right of the 3 px line is the empty track or an hour separator
+    # over it: no OFF, and no OFF blended into the track or the rounded end.
+    first = math.ceil(now_x + render.NOW_LINE_W / 2)
+    for x in range(first, int(lay.bar_x1) - 9):
+        for y in range(int(bar_y), int(bar_y) + render.BAR_H):
+            pixel = _px(img, x, y)
+            assert not _near(pixel, render.OFF, 24), (x, y, pixel)
+            assert _between(pixel, render.NO_DATA, render.SURFACE), (x, y, pixel)
+    if visible:
+        # The OFF is still drawn left of now, 8 px wide and ending at now (the line covers
+        # its last 1.5 px).
+        ((start, end),) = _off_runs(img, lay, THU)
+        assert abs(start - (now_x - render.MIN_OFF_PX)) <= 1
+        assert end <= first
+        assert end - start >= render.MIN_OFF_PX - render.NOW_LINE_W
+
+
+def test_INV08_short_off_away_from_now_keeps_the_8px_minimum() -> None:
+    # Edge: the now limit applies only to a live render's today row. A 1-minute OFF well
+    # before now keeps its 8 px around its midpoint; on the finished render (no now line)
+    # a 1-minute OFF at 23:59 is still 8 px and stays inside the bar (chart-spec §6).
+    pieces = local_pieces(
+        [
+            ("on", ON_SINCE, "2026-10-01 12:30"),
+            ("off", "2026-10-01 12:30", "2026-10-01 12:31"),
+            ("on", "2026-10-01 12:31", "2026-10-01 23:59"),
+            ("off", "2026-10-01 23:59", "2026-10-02 00:00"),
+            ("on", "2026-10-02 00:00", None),
+        ]
+    )
+    live = _week(pieces)
+    img = _render(live)
+    lay = render.layout(live, "uk")
+    ((start, end),) = _off_runs(img, lay, THU)
+    assert 7 <= end - start <= 8
+    assert start <= lay.hx(_hours(12.5) + MIN_US // 2) <= end
+    finished = _week(pieces, now=next_midnight(SAMPLE_TODAY, KYIV), live=False)
+    img = _render(finished)
+    lay = render.layout(finished, "uk")
+    (_, (start, end)) = _off_runs(img, lay, THU)
+    assert 7 <= end - start <= 8
+    assert abs(end - round(lay.bar_x1)) <= 1
 
 
 # --- Previous week, legend, grid and axis (chart-spec §5-§7, CHRT-07, CHRT-08, K-5) ---
