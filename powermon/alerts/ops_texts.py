@@ -12,6 +12,9 @@ take several locations off the grid at once, so silence everywhere is named as e
 area power/ISP outage or a server/network problem, never as a confirmed cause, and the
 notice says that subscriber alerts go on as normal.
 
+The chart pin texts (Phase 3 D-07) name the HTTP status of Telegram's refusal as a short
+``http_NNN`` code only, never Telegram's description.
+
 Pure: imports nothing from Django.
 """
 
@@ -139,3 +142,8 @@ def pin_failed(status: int, name: str, *, escape: bool = True) -> str:
         "The chart is still posted and refreshed; pinning is retried every 15 min. "
         "Check that the bot may pin messages in the chat."
     )
+
+
+def pin_restored(name: str, *, escape: bool = True) -> str:
+    """D-07: a location's bot could pin today's chart again after a pin failure."""
+    return f"📌 Pinning works again for {_name(name, escape)}."

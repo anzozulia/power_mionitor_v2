@@ -180,6 +180,8 @@ def render_text(
         return ops_texts.pin_failed(
             _int(payload, "http_status"), _location_name(location_id), escape=escape
         )
+    if kind == outbox.KIND_OPS_PIN_RESTORED:
+        return ops_texts.pin_restored(_location_name(location_id), escape=escape)
     raise ValueError(f"unknown ops notice kind: {kind!r}")
 
 
