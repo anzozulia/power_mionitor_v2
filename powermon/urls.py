@@ -2,7 +2,11 @@
 
 from django.urls import path
 
-from powermon.web.location_views import LocationDetailView, MaintenanceSwitchView
+from powermon.web.location_views import (
+    AlertsSwitchView,
+    LocationDetailView,
+    MaintenanceSwitchView,
+)
 from powermon.web.views import (
     HeartbeatView,
     LocationCreateView,
@@ -22,6 +26,7 @@ urlpatterns = [
         MaintenanceSwitchView.as_view(),
         name="location-maintenance",
     ),
+    path("locations/<int:pk>/alerts/", AlertsSwitchView.as_view(), name="location-alerts"),
     path("locations/<int:pk>/setup/", LocationSetupView.as_view(), name="location-setup"),
     path("login/", SignInView.as_view(), name="login"),
     path("logout/", SignOutView.as_view(), name="logout"),

@@ -1,9 +1,11 @@
-"""The location page's one-click switches (LOC-08; D-02, D-05, D-17; UI-D3, UI-D4).
+"""The location page's one-click switches (LOC-08, LOC-10; D-02, D-05, D-06, D-17; UI-D3, UI-D4).
 
 A switch is a POST form (CSRF) that posts its target value, never "toggle" (UI-D3), and is
 answered POST -> redirect -> GET with a flash (UI-D4). The maintenance switch calls the
 engine transition (``maintenance.set_maintenance``), stamped from the view's injected
-clock. No switch makes a Telegram call (KD2).
+clock. The alerts switch is a configuration-only write (``actions.set_flag``): exactly one
+column changes, with no ``location_state`` lock and no ``state_version`` bump (D-05). No
+switch makes a Telegram call (KD2).
 
 Edges (UI-SPEC screen H, E3 error): the same state again writes nothing and gets the
 "already" info flash; GET and other methods answer 405; a missing or unknown value answers
@@ -20,10 +22,12 @@ from conftest import FakeClock, FakeTelegram
 from django.contrib.auth import get_user_model
 from django.contrib.messages.storage.fallback import FallbackStorage
 from django.contrib.sessions.backends.db import SessionStore
+from django.db import connection
 from django.test import Client, RequestFactory
 
 from powermon.engine import transitions
 from powermon.engine.models import LocationState, PowerInterval
+from powermon.locations import actions
 from powermon.locations.models import Location
 from powermon.web.location_views import MaintenanceSwitchView
 
@@ -38,6 +42,17 @@ MAINTENANCE_OFF_FLASH = (
 )
 ALREADY_ON_FLASH = "Maintenance was already on. Nothing changed."
 ALREADY_OFF_FLASH = "Maintenance was already off. Nothing changed."
+ALERTS_OFF_FLASH = (
+    "Alerts are off. Subscribers get no new alerts; alerts already queued still go out. "
+    "The chart keeps updating."
+)
+ALERTS_ON_FLASH = "Alerts are on. Subscribers get alerts for changes recorded from now on."
+ALERTS_ALREADY_OFF_FLASH = "Alerts were already off. Nothing changed."
+ALERTS_ALREADY_ON_FLASH = "Alerts were already on. Nothing changed."
+ALERTS_HELP = (
+    "While off, subscribers get no new alerts, and none are saved for later. Alerts already "
+    "queued still go out. The chart, its 15-minute refresh and the midnight re-pin carry on."
+)
 
 
 @pytest.fixture
@@ -233,3 +248,149 @@ def test_switch_without_a_csrf_token_is_refused(location_factory: Callable[..., 
 
     assert response.status_code == 403
     assert Location.objects.get(pk=location.pk).maintenance is False
+
+
+# The alerts switch (LOC-10, D-05, D-06): one configuration column, nothing else
+
+
+def _form(page: str, url: str) -> str:
+    """The body of the one form that posts to ``url``."""
+    forms = re.findall(rf'<form method="post" action="{url}">(.*?)</form>', page, re.S)
+    assert len(forms) == 1
+    return str(forms[0])
+
+
+def _alerts(location: Any) -> str:
+    return f"/locations/{location.pk}/alerts/"
+
+
+def _columns(location: Any) -> dict[str, Any]:
+    """Every column of the location row, as stored."""
+    return dict(Location.objects.filter(pk=location.pk).values().get())
+
+
+def _ctid(location: Any) -> str:
+    """The physical row version: every UPDATE that matches the row changes it, a no-op too."""
+    with connection.cursor() as cur:
+        cur.execute("SELECT ctid::text FROM location WHERE id = %s", [location.pk])
+        return str(cur.fetchone()[0])
+
+
+@pytest.mark.django_db
+def test_LOC10_alerts_off_from_the_location_page(
+    admin: Client, location_factory: Callable[..., Any], fake_telegram: FakeTelegram
+) -> None:
+    location = _on_since_8(location_factory)
+    before = _columns(location)
+    version = LocationState.objects.get(location=location).state_version
+
+    page = admin.get(_page(location)).content.decode()
+
+    assert "<h3>Alerts are on</h3>" in page
+    assert f'<p class="help">{ALERTS_HELP}</p>' in page
+    form = _form(page, _alerts(location))
+    assert 'name="csrfmiddlewaretoken"' in form
+    assert '<input type="hidden" name="value" value="off">' in form
+    assert '<button class="btn btn--secondary" type="submit">Turn alerts off</button>' in form
+    # D-05 order: Maintenance first, then Alerts.
+    assert page.index("<h3>Maintenance is off</h3>") < page.index("<h3>Alerts are on</h3>")
+
+    response = admin.post(_alerts(location), {"value": "off"})
+
+    assert (response.status_code, response.url) == (302, _page(location))
+    followed = admin.get(response.url).content.decode()
+    assert re.findall(r'role="status">([^<]*)<', followed) == [ALERTS_OFF_FLASH]
+    assert "<h3>Alerts are off</h3>" in followed
+    after = _form(followed, _alerts(location))
+    assert '<input type="hidden" name="value" value="on">' in after
+    assert '<button class="btn btn--secondary" type="submit">Turn alerts on</button>' in after
+    # Exactly one column changed (D-05): no other setting, no state row, no timeline.
+    assert _columns(location) == {**before, "alerts_enabled": False}
+    assert LocationState.objects.get(location=location).state_version == version
+    assert _open_state(location) == "on"
+    assert len(fake_telegram.calls) == 0
+
+
+@pytest.mark.django_db
+def test_alerts_switch_already_off_shows_the_info_flash(
+    admin: Client, location_factory: Callable[..., Any], fake_telegram: FakeTelegram
+) -> None:
+    location = _on_since_8(location_factory)
+    admin.post(_alerts(location), {"value": "off"})
+    admin.get(_page(location))
+    row = _ctid(location)
+
+    again = admin.post(_alerts(location), {"value": "off"}, follow=True).content.decode()
+
+    # UI-D3: the same state again writes nothing, not even a no-op UPDATE of the row.
+    assert re.findall(r'role="status">([^<]*)<', again) == [ALERTS_ALREADY_OFF_FLASH]
+    assert '<p class="callout" role="status">' in again
+    assert _ctid(location) == row
+
+    on = admin.post(_alerts(location), {"value": "on"}, follow=True).content.decode()
+
+    assert re.findall(r'role="status">([^<]*)<', on) == [ALERTS_ON_FLASH]
+    assert Location.objects.get(pk=location.pk).alerts_enabled is True
+    on_again = admin.post(_alerts(location), {"value": "on"}, follow=True).content.decode()
+    assert re.findall(r'role="status">([^<]*)<', on_again) == [ALERTS_ALREADY_ON_FLASH]
+    assert len(fake_telegram.calls) == 0
+
+
+@pytest.mark.django_db
+def test_alerts_switch_refuses_a_bad_value_a_get_and_an_unknown_location(
+    admin: Client, location_factory: Callable[..., Any], fake_telegram: FakeTelegram
+) -> None:
+    location = _on_since_8(location_factory)
+    gone = location_factory(name="Gone", deleted_at=_at(9, 0))
+    row = _ctid(location)
+
+    for data in ({}, {"value": "toggle"}, {"value": "OFF"}, {"value": ""}):
+        response = admin.post(_alerts(location), data)
+        assert (response.status_code, response.content) == (400, b"")
+    assert admin.get(_alerts(location)).status_code == 405
+    for pk in (gone.pk, gone.pk + 1000):
+        assert admin.post(f"/locations/{pk}/alerts/", {"value": "off"}).status_code == 404
+
+    assert _ctid(location) == row
+    assert list(Location.objects.order_by("pk").values_list("alerts_enabled", flat=True)) == [
+        True,
+        True,
+    ]
+    assert len(fake_telegram.calls) == 0
+
+
+@pytest.mark.django_db
+def test_set_flag_changes_one_column_once(location_factory: Callable[..., Any]) -> None:
+    location = location_factory()
+    before = _columns(location)
+
+    assert actions.set_flag(location.pk, "router_grace", True) is True
+    assert actions.set_flag(location.pk, "router_grace", True) is False
+    assert actions.set_flag(location.pk, "alerts_enabled", False) is True
+
+    assert _columns(location) == {**before, "router_grace": True, "alerts_enabled": False}
+
+
+@pytest.mark.django_db
+def test_set_flag_rejects_a_field_outside_the_switches(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = location_factory()
+    before, row = _columns(location), _ctid(location)
+
+    # Maintenance is an engine transition (D-02), and the key, the tombstone and the
+    # settings have their own paths: set_flag refuses them before any write.
+    for field in ("maintenance", "device_key", "deleted_at", "name", "period_s"):
+        with pytest.raises(ValueError, match="set_flag"):
+            actions.set_flag(location.pk, field, True)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="bool"):
+        actions.set_flag(location.pk, "alerts_enabled", "off")  # type: ignore[arg-type]
+
+    assert (_columns(location), _ctid(location)) == (before, row)
+    # A deleted or unknown location is never written.
+    gone = location_factory(name="Gone", deleted_at=_at(9, 0))
+    gone_row = _ctid(gone)
+    assert actions.set_flag(gone.pk, "alerts_enabled", False) is False
+    assert actions.set_flag(gone.pk + 1000, "router_grace", True) is False
+    assert _ctid(gone) == gone_row
+    assert Location.objects.get(pk=gone.pk).alerts_enabled is True

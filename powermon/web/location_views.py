@@ -23,7 +23,7 @@ from django.views import View
 
 from powermon.clock import Clock, SystemClock
 from powermon.engine import maintenance
-from powermon.locations import validators
+from powermon.locations import actions, validators
 from powermon.locations.models import LANGUAGE_CHOICES, Location
 from powermon.web.status import location_status
 
@@ -48,6 +48,19 @@ MAINTENANCE_COPY = {
     ),
     "already_on": "Maintenance was already on. Nothing changed.",
     "already_off": "Maintenance was already off. Nothing changed.",
+}
+ALERTS_HELP = (
+    "While off, subscribers get no new alerts, and none are saved for later. Alerts already "
+    "queued still go out. The chart, its 15-minute refresh and the midnight re-pin carry on."
+)
+ALERTS_COPY = {
+    "on": "Alerts are on. Subscribers get alerts for changes recorded from now on.",
+    "off": (
+        "Alerts are off. Subscribers get no new alerts; alerts already queued still go out. "
+        "The chart keeps updating."
+    ),
+    "already_on": "Alerts were already on. Nothing changed.",
+    "already_off": "Alerts were already off. Nothing changed.",
 }
 
 
@@ -89,15 +102,23 @@ class SwitchRow:
 
 
 def switch_rows(location: Location) -> list[SwitchRow]:
-    """The location page's switches, in UI-SPEC order."""
-    on = location.maintenance
+    """The location page's switches, in UI-SPEC order (D-05): Maintenance, Alerts."""
+    maintenance_on = location.maintenance
+    alerts_on = location.alerts_enabled
     return [
         SwitchRow(
             url_name="location-maintenance",
-            heading="Maintenance is on" if on else "Maintenance is off",
+            heading="Maintenance is on" if maintenance_on else "Maintenance is off",
             help=MAINTENANCE_HELP,
-            button="Turn maintenance off" if on else "Turn maintenance on",
-            target="off" if on else "on",
+            button="Turn maintenance off" if maintenance_on else "Turn maintenance on",
+            target="off" if maintenance_on else "on",
+        ),
+        SwitchRow(
+            url_name="location-alerts",
+            heading="Alerts are on" if alerts_on else "Alerts are off",
+            help=ALERTS_HELP,
+            button="Turn alerts off" if alerts_on else "Turn alerts on",
+            target="off" if alerts_on else "on",
         ),
     ]
 
@@ -141,6 +162,20 @@ class MaintenanceSwitchView(SwitchView):
 
     def apply(self, pk: int, on: bool, now: datetime) -> bool:
         return maintenance.set_maintenance(pk, on, now)
+
+
+class AlertsSwitchView(SwitchView):
+    """``/locations/<pk>/alerts/``: the alerts switch (LOC-10, D-05, D-06).
+
+    A configuration-only write (``actions.set_flag``). With alerts off, a transition
+    recorded from then on queues no alert and nothing is held for later; alerts already
+    queued still go out, and the chart carries on (INV-05).
+    """
+
+    copy = ALERTS_COPY
+
+    def apply(self, pk: int, on: bool, now: datetime) -> bool:
+        return actions.set_flag(pk, "alerts_enabled", on)
 
 
 class LocationDetailView(View):
