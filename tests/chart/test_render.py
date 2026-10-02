@@ -1,15 +1,22 @@
-"""The chart image: canvas, layout, state colours and totals (D-09, CHRT-01, CHRT-07).
+"""The chart image (D-09, D-15, CHRT-01, CHRT-02, CHRT-07, CHRT-08; chart-spec §2-§9).
 
-docs/chart-spec.md sections 2-6. Scenarios: INV-04 chart part (server downtime and
-maintenance are drawn hatched, never in OFF).
+Canvas, layout, state colours and totals; today's row, the now marker and the finished
+render; previous-week rows, legend, grid and axis; the subtitle's name filter and
+truncation; byte-identical output; the per-band memory budget. Scenarios: INV-04 chart
+part (server downtime and maintenance are drawn hatched, never in OFF) and K-5 (uk and
+ru draw Cyrillic labels).
 
 Pure: no database. Probe positions come from ``render.layout`` (bar x-range, bar tops),
 never from hard-coded pixels, except the chart-spec values a test checks. A probe at a
 half hour sits about 15 px from the nearest hour edge, inside a solid area.
 """
 
+import ast
 import io
 import pathlib
+import subprocess
+import sys
+import textwrap
 from dataclasses import replace
 from datetime import date, datetime
 
@@ -32,6 +39,8 @@ from powermon.i18n import chart_texts
 RGB = tuple[int, int, int]
 MON, TUE, WED, THU, FRI, SAT, SUN = range(7)
 MIN_US = 60_000_000
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+CHART_DIR = REPO_ROOT / "powermon" / "chart"
 
 
 def _week(
@@ -487,3 +496,142 @@ def test_K5_uk_and_ru_draw_cyrillic_labels() -> None:
             assert ink in {colour for _, colour in colours}, (lang, box)
             assert crops[lang].tobytes() != crops["en"].tobytes(), (lang, box)
         assert crops["uk"].tobytes() != crops["ru"].tobytes(), box
+
+
+# --- The subtitle's name (D-15, chart-spec §8), determinism and memory (chart-spec §9, D-09) ---
+
+UK_RANGE = "28 вересня – 4 жовтня 2026"
+
+
+def test_subtitle_keeps_a_name_that_fits() -> None:
+    week = _sample()
+    assert render.subtitle_text("Дім, Оболонь", week, "uk") == f"Дім, Оболонь · {UK_RANGE}"
+    assert render.subtitle_text("Home, Obolon", week, "en") == "Home, Obolon · 28 Sep – 4 Oct 2026"
+    # The filter runs first: the emoji goes, the rest of the name stays.
+    assert render.subtitle_text("🏠 Дім", week, "uk") == f"Дім · {UK_RANGE}"
+
+
+def test_subtitle_drops_the_name_when_nothing_printable_is_left() -> None:
+    # Edge (CHRT-08 empty): no "{name} · " prefix when nothing printable is left.
+    week = _sample()
+    assert render.subtitle_text("🏠", week, "uk") == UK_RANGE
+    assert render.subtitle_text("", week, "uk") == UK_RANGE
+    assert render.subtitle_text("​\n ", week, "uk") == UK_RANGE
+    # The image draws the same subtitle as for a location without a name.
+    assert render.render_png(week, lang="uk", name="🏠") == render.render_png(
+        week, lang="uk", name=""
+    )
+
+
+def test_subtitle_truncates_long_names_with_an_ellipsis() -> None:
+    # Edge (CHRT-08 encoding): measured in rendered pixels, cut at whole code points.
+    week = _sample()
+    sub_font = render.font("regular", render.SUB_SIZE)
+    text = render.subtitle_text("Ш" * 100, week, "uk")
+    assert sub_font.getlength(text) <= render.SUBTITLE_MAX == 1184
+    suffix = f"… · {UK_RANGE}"
+    assert text.endswith(suffix)
+    kept = text.removesuffix(suffix)
+    assert kept and set(kept) == {"Ш"}
+    # The cut keeps as much of the name as fits: one more letter would not.
+    assert sub_font.getlength(f"{kept}Ш{suffix}") > render.SUBTITLE_MAX
+    # A cut that lands after a space drops the space too, never "Ш …".
+    spaced = render.subtitle_text(f"{kept} {'Ш' * 50}", week, "uk")
+    assert spaced == f"{kept}{suffix}"
+
+
+def test_render_is_byte_identical() -> None:
+    # chart-spec §9: the same inputs give the same bytes, whatever the font cache holds.
+    week = _sample()
+    first = render.render_png(week, lang="uk", name=SAMPLE_NAMES["uk"])
+    render.font.cache_clear()
+    second = render.render_png(week, lang="uk", name=SAMPLE_NAMES["uk"])
+    assert first == second
+    # Edge: another location name changes the image.
+    assert render.render_png(week, lang="uk", name="Офіс") != first
+
+
+MEMORY_PROBE = textwrap.dedent(
+    """
+    import resource
+    import sys
+    import time
+    from datetime import UTC, date, datetime
+
+    from powermon.chart import render
+    from powermon.chart.model import Piece, build_week
+
+
+    def at(text):
+        return datetime.fromisoformat(text).replace(tzinfo=UTC)
+
+
+    sizes = (
+        render.TITLE_SIZE, render.SUB_SIZE, render.LEGEND_SIZE, render.LABEL_SIZE,
+        render.TOTAL_SIZE, render.HEAD_SIZE, render.AXIS_SIZE, render.NOW_SIZE,
+    )
+    for face in ("regular", "medium", "semibold"):
+        for size in sizes:
+            render.font(face, size)
+    # Kyiv is UTC+3: monitoring from Fri 10:42, an outage, maintenance, an open on.
+    pieces = [
+        Piece("on", at("2026-09-25T07:42"), at("2026-09-28T05:00"), None),
+        Piece("off", at("2026-09-28T05:00"), at("2026-09-28T09:05"), at("2026-09-28T05:00")),
+        Piece("on", at("2026-09-28T09:05"), at("2026-09-30T00:10"), None),
+        Piece("not_monitored", at("2026-09-30T00:10"), at("2026-09-30T00:52"), None),
+        Piece("on", at("2026-09-30T00:52"), None, None),
+    ]
+    week = build_week(
+        pieces, today=date(2026, 10, 1), now=at("2026-10-01T11:37"), tz="Europe/Kyiv",
+        live=True,
+    )
+    before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    start = time.perf_counter()
+    png = render.render_png(week, lang="uk", name="Дім, Оболонь")
+    seconds = time.perf_counter() - start
+    after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    print(after - before, f"{seconds:.3f}", len(png), "django" in sys.modules)
+    """
+)
+
+
+def test_render_peak_memory_stays_within_the_band_budget() -> None:
+    # D-09: per-band 4× layers keep a render's peak RSS growth to ~+25-35 MB; a full 4×
+    # canvas would need ~+180 MB. Measured in a fresh interpreter (Linux: ru_maxrss in KiB).
+    result = subprocess.run(
+        [sys.executable, "-c", MEMORY_PROBE],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    growth_kib, seconds, size, django_loaded = result.stdout.split()
+    print(f"render peak RSS growth {growth_kib} KiB, {seconds} s, {size} bytes")
+    assert 0 <= int(growth_kib) < 80 * 1024
+    assert int(size) > 10_000
+    # The renderer pulls in nothing from Django, not even indirectly.
+    assert django_loaded == "False"
+
+
+def _imported_modules(path: pathlib.Path) -> set[str]:
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            names.add(node.module)
+    return names
+
+
+def test_chart_modules_stay_pure() -> None:
+    render_imports = _imported_modules(CHART_DIR / "render.py")
+    glyph_imports = _imported_modules(CHART_DIR / "glyphs.py")
+    # The scan saw the real modules.
+    assert "PIL" in render_imports
+    assert "unicodedata" in glyph_imports
+    for names in (render_imports, glyph_imports):
+        assert sorted(n for n in names if n.split(".")[0] == "django") == []
+    # fontTools is a dev tool: the committed table replaces it at run time.
+    assert sorted(n for n in glyph_imports if n.split(".")[0] == "fontTools") == []
