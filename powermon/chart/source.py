@@ -27,7 +27,13 @@ SELECT state, start_at, end_at, outage_start_at
 
 
 def read_pieces(location_id: int, start: datetime, end: datetime) -> list[model.Piece]:
-    """The location's stored pieces that overlap ``[start, end)``, in start order."""
+    """The location's stored pieces that overlap ``[start, end)``, in start order.
+
+    An empty or inverted window (``end <= start``) overlaps nothing and runs no query: the
+    overlap predicate alone would still return a piece that spans both bounds.
+    """
+    if end <= start:
+        return []
     with connection.cursor() as cur:
         cur.execute(WEEK_SQL, {"location_id": location_id, "a": start, "b": end})
         rows = cur.fetchall()
