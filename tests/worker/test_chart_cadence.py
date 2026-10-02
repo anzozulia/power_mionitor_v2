@@ -4,8 +4,10 @@
 cadence during it" (docs/v1-lessons.md INV-14). The worker runs for real
 (``run_worker.serve(..., charts=True)``: both loops, the lease on the test database, the
 first-cycle gate), with real renders (Pillow) and Telegram faked at the HTTP boundary.
-At 00:00:30 local on Fri 2026-10-02, each of 20 locations has its Thu 2026-10-01 chart
-pinned and not finalized, so the Telegram I/O thread runs the whole midnight job: for
+At 00:02:00 local on Fri 2026-10-02, each of 20 locations has its Thu 2026-10-01 chart
+pinned and not finalized. That is past every location's settle point (midnight + longest
+effective timeout + lapse threshold, 00:01:45 with the defaults), so yesterday's final
+edit is due too, and the Telegram I/O thread runs the whole midnight job: for
 each location a post (live render), a pin, a final edit (finished render) and an unpin,
 80 calls and 40 renders, one call per pass (D-02, D-05). Meanwhile
 ``detection.run_detection`` (spied on as the module attribute run_worker calls) must keep
@@ -101,7 +103,7 @@ def _monitor(location: Any, since: datetime) -> None:
 
 TODAY = date(2026, 10, 2)
 YESTERDAY = date(2026, 10, 1)
-NOW = _kyiv("2026-10-02 00:00:30")
+NOW = _kyiv("2026-10-02 00:02:00")
 SINCE = _kyiv("2026-09-28 00:00")
 # Yesterday's chart was last refreshed at 23:45, as the 15-min cadence leaves it.
 LAST_REFRESH = _kyiv("2026-10-01 23:45")
