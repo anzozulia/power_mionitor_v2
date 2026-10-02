@@ -1,11 +1,15 @@
-"""The Phase 4 location pages: the location page, its one-click switches and the key
-rotation (D-13, D-05, D-14).
+"""The Phase 4 location pages: the location page, its one-click switches, the edit form and
+the key rotation (D-13, D-05, D-07, D-14).
 
 - Every view here needs the signed-in admin: LoginRequiredMiddleware denies by default and
   none of them is ``login_not_required``.
 - Every switch is a POST with CSRF, answered POST -> redirect -> GET with a flash (UI-D4),
-  so a reload never repeats it. Regenerate key is a GET confirmation, then a POST answered
-  with the revealed setup page itself (D-14, D-17), guarded against a resubmit (UI-D7).
+  so a reload never repeats it. The edit save is too. Regenerate key is a GET
+  confirmation, then a POST answered with the revealed setup page itself (D-14, D-17),
+  guarded against a resubmit (UI-D7).
+- The edit save writes only the configuration columns, through ``actions.update_config``,
+  never ``form.save()`` or ``Location.save()``: a form loaded earlier can never revert the
+  status, a switch or the device key (D-07, INV-02 #3).
 - A switch posts its target value, never "toggle" (UI-D3): the same state again writes
   nothing and gets the "already" info flash, so a double click, a second tab or a stale page
   can never flip it back. Each switch changes exactly one flag (D-05).
@@ -20,7 +24,7 @@ from datetime import datetime
 from typing import Any, ClassVar
 
 from django.contrib import messages
-from django.http import HttpRequest, HttpResponse, HttpResponseBadRequest
+from django.http import Http404, HttpRequest, HttpResponse, HttpResponseBadRequest
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils.crypto import constant_time_compare, salted_hmac
 from django.utils.decorators import method_decorator
@@ -32,6 +36,7 @@ from powermon.engine import maintenance
 from powermon.locations import actions, validators
 from powermon.locations.models import LANGUAGE_CHOICES, Location
 from powermon.web import views
+from powermon.web.forms import LocationEditForm
 from powermon.web.status import location_status
 
 log = logging.getLogger(__name__)
@@ -47,6 +52,9 @@ REGENERATED_MESSAGE = (
     "the device."
 )
 ALREADY_REGENERATED_MESSAGE = "The key was already regenerated. The key below is the current one."
+
+# UI-SPEC Copywriting › Edit form, verbatim.
+CHANGES_SAVED_MESSAGE = "Changes saved."
 
 # UI-SPEC Copywriting › Switches, verbatim.
 MAINTENANCE_HELP = (
@@ -262,6 +270,56 @@ class LocationDetailView(View):
             **settings_context(location),
         }
         return render(request, self.template_name, context)
+
+
+def stored_settings(location: Location) -> dict[str, Any]:
+    """The edit form's initial values: the stored configuration, never the bot token."""
+    return {
+        "name": location.name,
+        "period_s": location.period_s,
+        "grace_s": location.grace_s,
+        "chat_id": location.chat_id,
+        "language": location.language,
+    }
+
+
+class LocationEditView(View):
+    """``/locations/<pk>/edit/``: edit the location's settings (LOC-04, D-07, D-08; screen C).
+
+    GET shows the form with the stored values; "New bot token" is always empty and its
+    help shows the current token masked (SEC-04). An invalid POST answers 200 with the
+    form, every value kept except the token; the title and the breadcrumbs keep the stored
+    name. A valid POST is one ``actions.update_config``, the view's only write, then a
+    redirect to the location page with "Changes saved." (UI-D4). No network I/O (KD2).
+    """
+
+    template_name = "web/location_edit.html"
+    # Tests inject a FakeClock with LocationEditView.as_view(clock=...).
+    clock: Clock = SystemClock()
+
+    def get(self, request: HttpRequest, pk: int) -> HttpResponse:
+        location = location_or_404(pk)
+        form = LocationEditForm(initial=stored_settings(location), current_token=location.bot_token)
+        return self._render(request, location, form)
+
+    def post(self, request: HttpRequest, pk: int) -> HttpResponse:
+        location = location_or_404(pk)
+        form = LocationEditForm(request.POST, current_token=location.bot_token)
+        if not form.is_valid():
+            return self._render(request, location, form)
+        result = actions.update_config(pk, form.cleaned_data, self.clock.now())
+        if not result.found:
+            # Deleted between the lookup and the save: nothing was written.
+            raise Http404
+        # The id and a flag only: never a token or a chat ID (OPS-08).
+        log.info("settings saved for location %s (channel changed: %s)", pk, result.channel_changed)
+        messages.success(request, CHANGES_SAVED_MESSAGE)
+        return redirect("location-detail", pk=pk)
+
+    def _render(
+        self, request: HttpRequest, location: Location, form: LocationEditForm
+    ) -> HttpResponse:
+        return render(request, self.template_name, {"location": location, "form": form})
 
 
 def regenerate_marker(key: str) -> str:

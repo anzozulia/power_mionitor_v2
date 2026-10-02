@@ -1,4 +1,5 @@
-"""The admin's configuration writes on a location (D-05, D-14; LOC-06, LOC-09, LOC-10).
+"""The admin's configuration writes on a location (D-05, D-07, D-14; LOC-04, LOC-06,
+LOC-09, LOC-10, DATA-04).
 
 Each write is one explicit, column-limited conditional UPDATE, decided by its row count,
 and never ``Model.save()`` (INV-02 #3): a save writes every column from an instance read
@@ -9,7 +10,12 @@ maintenance switch is an engine transition and lives in ``powermon.engine.mainte
 (D-02).
 """
 
-from typing import Literal, get_args
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Literal, get_args
+
+from django.db import transaction
 
 from powermon.locations import keys
 from powermon.locations.models import Location
@@ -18,6 +24,63 @@ from powermon.locations.models import Location
 # timeline under the state row lock (``engine.maintenance.set_maintenance``).
 FlagField = Literal["alerts_enabled", "router_grace"]
 FLAG_FIELDS: tuple[str, ...] = get_args(FlagField)
+
+# The columns the edit form writes on every save (D-07). The bot token is written only
+# when a new one was typed. The switches, the device key and the live state are never
+# among them, so a form loaded earlier can never revert what changed since (INV-02 #3).
+CONFIG_FIELDS = ("name", "period_s", "grace_s", "chat_id", "language")
+
+
+@dataclass(frozen=True)
+class ConfigSaved:
+    """What ``update_config`` did: ``found`` False when the location is gone (nothing written);
+    ``channel_changed`` when the chat ID or the bot token changed (D-08)."""
+
+    found: bool
+    channel_changed: bool
+
+
+def update_config(location_id: int, data: Mapping[str, Any], now: datetime) -> ConfigSaved:
+    """Save the edit form's configuration of the location at ``now`` (D-07, D-08).
+
+    One transaction. The stored chat ID and token are read first with ``SELECT ... FOR NO
+    KEY UPDATE`` on the location row (it does not block the KEY SHARE that a concurrent
+    outbox insert takes through its foreign key), then one UPDATE writes exactly
+    ``CONFIG_FIELDS`` from ``data``, plus ``bot_token`` only when ``data["bot_token"]`` is
+    not empty (an empty token keeps the current one). Never ``Model.save()``: the
+    switches, ``device_key`` and ``location_state`` are not written, so with two stale
+    forms the last save wins for these fields only, and the status, the outage start and
+    the switches can never be reverted (INV-02 #3).
+
+    Thresholds apply from the next detection cycle, which reads them afresh, and the
+    stored timeline is never recomputed: raising grace changes no past row or total, and
+    lowering it below the current silence makes the next cycle record OFF from the last
+    heartbeat (DATA-04, INV-06).
+
+    ``found`` is False, with nothing written, for an unknown or deleted location (a
+    delete that commits first is seen: the locking read re-checks ``deleted_at``). No
+    network I/O (KD2): nothing is sent to Telegram on save.
+    """
+    if now.utcoffset() is None:
+        raise ValueError("update_config needs an aware now, not a naive datetime")
+    with transaction.atomic():
+        stored = (
+            Location.objects.select_for_update(no_key=True)
+            .filter(pk=location_id, deleted_at__isnull=True)
+            .values("chat_id", "bot_token")
+            .first()
+        )
+        if stored is None:
+            return ConfigSaved(found=False, channel_changed=False)
+        fields = {name: data[name] for name in CONFIG_FIELDS}
+        new_token = str(data.get("bot_token") or "")
+        if new_token:
+            fields["bot_token"] = new_token
+        Location.objects.filter(pk=location_id, deleted_at__isnull=True).update(**fields)
+        channel_changed = fields["chat_id"] != stored["chat_id"] or (
+            bool(new_token) and new_token != stored["bot_token"]
+        )
+    return ConfigSaved(found=True, channel_changed=channel_changed)
 
 
 def set_flag(location_id: int, field: FlagField, value: bool) -> bool:

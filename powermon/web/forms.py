@@ -5,6 +5,7 @@ from typing import Any
 from django import forms
 from django.contrib.auth.forms import AuthenticationForm
 from django.forms.boundfield import BoundField
+from django.utils.html import format_html
 
 from powermon.locations import validators
 from powermon.locations.models import LANGUAGE_CHOICES, MAX_SECONDS, MIN_SECONDS
@@ -45,6 +46,16 @@ HELP_CHAT_ID = (
     "is needed to update and pin the weekly chart)."
 )
 HELP_LANGUAGE = "Language of this location's alerts and weekly chart."
+
+# Edit-location form copy (Phase 4 UI-SPEC › Edit form, verbatim).
+EDIT_FORM_ERROR = "The changes were not saved. Fix the fields marked below."
+NEW_TOKEN_LABEL = "New bot token"  # noqa: S105
+# {masked} is validators.mask_token of the current token, in inline monospace; format_html
+# escapes it. The rest is fixed copy.
+HELP_NEW_BOT_TOKEN = (
+    "Leave this empty to keep the current token, <code>{masked}</code>. To use another "  # noqa: S105
+    "bot, paste its token from @BotFather. The token is saved but never shown again."
+)
 
 # Text inputs for secrets and IDs: no browser autofill, no spell-check underline.
 _NO_ASSIST = {"autocomplete": "off", "spellcheck": "false"}
@@ -107,8 +118,11 @@ class LocationBoundField(BoundField):
     @property
     def aria_describedby(self) -> str | None:
         ids = super().aria_describedby
-        if ids and self.name == "bot_token" and self.form.is_bound and self.form.errors:
-            return f"{ids} {self.auto_id}_note"
+        form = self.form
+        # The form decides when the note shows (LocationForm.show_token_note).
+        if ids and self.name == "bot_token" and isinstance(form, LocationForm):
+            if form.show_token_note:
+                return f"{ids} {self.auto_id}_note"
         return ids
 
 
@@ -167,6 +181,11 @@ class LocationForm(forms.Form):
         error_messages={"required": LANGUAGE_INVALID, "invalid_choice": LANGUAGE_INVALID},
     )
 
+    @property
+    def show_token_note(self) -> bool:
+        """Show the token re-paste note: after any invalid submit (the input is always empty)."""
+        return self.is_bound and bool(self.errors)
+
     def clean_bot_token(self) -> str:
         try:
             return validators.clean_bot_token(self.cleaned_data["bot_token"])
@@ -179,3 +198,49 @@ class LocationForm(forms.Form):
             return validators.parse_chat_id(self.cleaned_data["chat_id"])
         except ValueError as exc:
             raise forms.ValidationError(str(exc), code="invalid") from None
+
+
+class LocationEditForm(LocationForm):
+    """The edit-location form (Phase 4 UI-SPEC screen C; D-07, UI-D12, SEC-04).
+
+    The add form's fields, rules and copy, with the stored values as initial values (the
+    view passes them), except the bot token: "New bot token" is optional and write-only.
+    Its input never carries a value, not even after an invalid submit; empty (after
+    trimming) keeps the current token, which the help shows only masked as
+    ``{bot_id}:••••••••``; a typed token gets the add form's format check and copy. The
+    re-paste note shows only when the invalid submit contained a non-empty token: a note
+    asking to re-paste a token the admin never typed would be wrong (UI-D12).
+
+    The form holds no switch, no device key and no state, and the view saves it through
+    ``actions.update_config``, never ``form.save()`` or ``Location.save()`` (INV-02 #3).
+    """
+
+    form_error = EDIT_FORM_ERROR
+
+    # Redefined in place: the field keeps its position between the grace period and the
+    # chat ID. A NUL keeps the format copy, as on the add form.
+    bot_token = forms.CharField(
+        label=NEW_TOKEN_LABEL,
+        required=False,
+        widget=forms.PasswordInput(render_value=False, attrs=_NO_ASSIST),
+        error_messages={"null_characters_not_allowed": validators.TOKEN_FORMAT},
+    )
+
+    def __init__(self, *args: Any, current_token: str, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # The current token only ever goes out masked (SEC-04); format_html escapes it.
+        self.fields["bot_token"].help_text = format_html(
+            HELP_NEW_BOT_TOKEN, masked=validators.mask_token(current_token)
+        )
+
+    @property
+    def show_token_note(self) -> bool:
+        """Only after an invalid submit that carried a non-empty token (UI-D12)."""
+        submitted = str(self.data.get(self.add_prefix("bot_token"), ""))
+        return super().show_token_note and bool(submitted.strip())
+
+    def clean_bot_token(self) -> str:
+        """``""`` keeps the current token; anything else must be a valid token."""
+        if not self.cleaned_data["bot_token"].strip():
+            return ""
+        return super().clean_bot_token()
