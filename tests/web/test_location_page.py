@@ -41,6 +41,10 @@ ROUTER_GRACE_S = int(rules.ROUTER_GRACE.total_seconds())
 HELP_POWER_ON = "OFF is not detected during maintenance."
 HELP_POWER_OFF = "The outage goes on. When power returns, the ON alert is sent as usual."
 DEVICE_SETUP_SENTENCE = "Heartbeat URL, device key and copy-paste examples for the device."
+DELETE_SENTENCE = (
+    "Stops this location's alerts, drops the alerts still queued, unpins its weekly chart "
+    "where the bot still can, and hides it from the admin panel. There is no undo."
+)
 CSS_PATH = Path(settings.BASE_DIR) / "powermon" / "web" / "static" / "web" / "app.css"
 
 
@@ -209,8 +213,21 @@ def test_location_page_settings_and_setup_sections(
     assert ROUTER_GRACE_S == 180
     assert _settings_rows(page) == expected
     assert _settings_rows(setup) == expected
-    assert re.findall(r"<h2>(.*?)</h2>", page) == ["Status", "Switches", "Settings", "Device setup"]
-    device = page[page.index("<h2>Device setup</h2>") :]
+    assert re.findall(r"<h2>(.*?)</h2>", page) == [
+        "Status",
+        "Switches",
+        "Settings",
+        "Device setup",
+        "Delete location",
+    ]
+    # UI-D10: "Edit location" is a secondary link-button under the settings panel.
+    settings_section = page[page.index("<h2>Settings</h2>") : page.index("<h2>Device setup</h2>")]
+    assert settings_section.index("</dl>") < settings_section.index("Edit location")
+    assert (
+        f'<p><a class="btn btn--secondary" href="/locations/{location.pk}/edit/">'
+        "Edit location</a></p>"
+    ) in settings_section
+    device = page[page.index("<h2>Device setup</h2>") : page.index("<h2>Delete location</h2>")]
     assert f"<p>{DEVICE_SETUP_SENTENCE}</p>" in device
     assert (
         f'<a class="btn btn--secondary" href="/locations/{location.pk}/setup/">'
@@ -221,6 +238,25 @@ def test_location_page_settings_and_setup_sections(
 
     plain = admin.get(_page(location)).content.decode()
     assert ("Reported OFF after", "65 s without a heartbeat") in _settings_rows(plain)
+
+
+@pytest.mark.django_db
+def test_location_page_delete_section(admin: Client, location_factory: Callable[..., Any]) -> None:
+    location = location_factory(name="Office")
+
+    page = admin.get(_page(location)).content.decode()
+
+    # UI-D5: the last section, a sentence and a secondary link-button that only opens the
+    # confirmation page; the destructive button is on that page, not here.
+    section = page[page.index("<h2>Delete location</h2>") :]
+    section = section[: section.index("</main>")]
+    assert f"<p>{DELETE_SENTENCE}</p>" in section
+    assert (
+        f'<p><a class="btn btn--secondary" href="/locations/{location.pk}/delete/">'
+        "Delete location</a></p>"
+    ) in section
+    assert "<form" not in section
+    assert "btn--danger" not in page
 
 
 # Secrets (SEC-04) and the admin-typed name (UI rule 1, E2)
@@ -319,8 +355,9 @@ def test_location_page_has_one_accent_button_at_most(
 
     page = admin.get(_page(location)).content.decode()
 
-    # With only the Maintenance switch, the page has no accent and no destructive button:
-    # the one accent button is "Send test message" (04-08), and Delete is a link (04-07).
+    # The switches, "Edit location", "Open device setup" and the "Delete location" entry are
+    # all secondary: the page's one accent button is "Send test message" (04-08), and the
+    # destructive style is used only on the delete confirmation page (UI-D5, UI-D15).
     assert "btn--primary" not in page
     assert "btn--danger" not in page
 

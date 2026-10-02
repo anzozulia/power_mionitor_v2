@@ -4,7 +4,9 @@ from django.urls import path
 
 from powermon.web.location_views import (
     AlertsSwitchView,
+    LocationDeleteView,
     LocationDetailView,
+    LocationEditView,
     MaintenanceSwitchView,
     RegenerateKeyView,
     RouterGraceSwitchView,
@@ -23,6 +25,8 @@ urlpatterns = [
     path("", LocationListView.as_view(), name="location-list"),
     path("locations/new/", LocationCreateView.as_view(), name="location-create"),
     path("locations/<int:pk>/", LocationDetailView.as_view(), name="location-detail"),
+    path("locations/<int:pk>/edit/", LocationEditView.as_view(), name="location-edit"),
+    path("locations/<int:pk>/delete/", LocationDeleteView.as_view(), name="location-delete"),
     path(
         "locations/<int:pk>/maintenance/",
         MaintenanceSwitchView.as_view(),

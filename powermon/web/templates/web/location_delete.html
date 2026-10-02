@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% comment %}
+Phase 4 UI-SPEC screen D (D-09, D-17; UI-D2, UI-D5, UI-D8): the delete confirmation. A GET
+page that changes nothing: the lead, the five consequences (ul.list), the reversible
+alternatives, how to monitor the place again, then the button row. The page holds exactly
+one form, the destructive Delete POST (CSRF); "Keep location" is a plain link back to the
+location page. No autofocus on a page whose action is destructive. The name is
+auto-escaped and wraps (.name). Secrets (SEC-04): no device key and no bot token, not even
+masked. No script, no inline style.
+{% endcomment %}
+{% block title %}{{ location.name }} · Delete{% endblock %}
+{% block crumbs %}
+<nav aria-label="Breadcrumb">
+  <ol class="crumbs">
+    <li><a href="{% url 'location-list' %}">Locations</a></li>
+    <li><a class="name" href="{% url 'location-detail' location.pk %}">{{ location.name }}</a></li>
+    <li aria-current="page">Delete</li>
+  </ol>
+</nav>
+{% endblock %}
+{% block content %}
+<h1 class="name">Delete {{ location.name }}?</h1>
+<p>This cannot be undone. Deleting this location:</p>
+<ul class="list">
+  <li>stops its alerts at once and drops the alerts still queued, so they are never sent;</li>
+  <li>makes its device key stop working: the device gets HTTP 401;</li>
+  <li>unpins its weekly chart in the channel if the bot can still pin there; otherwise unpin it by hand in Telegram (the posted messages stay in the channel);</li>
+  <li>closes its open problems, such as failing delivery, without a recovery notice;</li>
+  <li>hides it from the admin panel. Its history stays in the database but is never shown again.</li>
+</ul>
+<p>To pause this location instead, turn maintenance on or alerts off on the location page.</p>
+<p>To monitor this place again later, add a new location. It gets a new device key and starts with an empty history.</p>
+<div class="actions">
+  <form method="post" action="{% url 'location-delete' location.pk %}">
+    {% csrf_token %}
+    <button class="btn btn--danger" type="submit">Delete location</button>
+  </form>
+  <a class="btn btn--secondary" href="{% url 'location-detail' location.pk %}">Keep location</a>
+</div>
+{% endblock %}

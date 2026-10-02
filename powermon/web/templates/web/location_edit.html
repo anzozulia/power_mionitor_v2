@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% comment %}
+Phase 4 UI-SPEC screen C (D-07, D-08; UI-D2, UI-D12): edit a location's settings. The add
+form's layout and field loop: novalidate, so every message comes from the server; Django
+links each input to its "<id>_helptext" and "<id>_error" elements (aria-describedby).
+The title, the breadcrumbs and the h1 use the stored location (location), never the
+posted values. The form holds the six configuration fields and the CSRF token only: no
+switch, no device key, no state and no other hidden field (D-05, D-07).
+Secrets (SEC-04): the "New bot token" input never carries a value, not even after an
+invalid submit; its help shows the current token masked. The re-paste note shows only
+when the invalid submit contained a non-empty token (form.show_token_note, UI-D12).
+No script, no inline style.
+{% endcomment %}
+{% block title %}{{ location.name }} · Edit{% endblock %}
+{% block crumbs %}
+<nav aria-label="Breadcrumb">
+  <ol class="crumbs">
+    <li><a href="{% url 'location-list' %}">Locations</a></li>
+    <li><a class="name" href="{% url 'location-detail' location.pk %}">{{ location.name }}</a></li>
+    <li aria-current="page">Edit</li>
+  </ol>
+</nav>
+{% endblock %}
+{% block content %}
+<h1>Edit location</h1>
+<form class="form" method="post" action="{% url 'location-edit' location.pk %}" novalidate>
+  {% csrf_token %}
+  {% if form.errors %}
+  <p class="callout callout--error" role="alert">{{ form.form_error }}</p>
+  {% endif %}
+  {% for field in form %}
+  <div class="field">
+    <label for="{{ field.id_for_label }}">{{ field.label }}</label>
+    {{ field }}
+    {% if field.errors %}
+    <p class="error" id="{{ field.auto_id }}_error">{{ field.errors|join:" " }}</p>
+    {% endif %}
+    {% if field.name == "bot_token" and form.show_token_note %}
+    <p class="help" id="{{ field.auto_id }}_note">{{ form.token_note }}</p>
+    {% endif %}
+    <p class="help" id="{{ field.auto_id }}_helptext">{{ field.help_text }}</p>
+  </div>
+  {% endfor %}
+  <p class="callout"><strong>Note:</strong> New period and grace values apply from the next check and never change past history. Lower values can report OFF at the next check if the device has already been silent that long. A new chat ID or bot token moves the weekly chart: a new one is posted and pinned, and the old one is unpinned if this location's bot is an admin of the old channel. Otherwise the old pin stays: unpin it by hand in Telegram. Maintenance, alerts and router grace are switched on the location page.</p>
+  <div class="actions">
+    <button class="btn btn--primary" type="submit">Save changes</button>
+    <a class="btn btn--secondary" href="{% url 'location-detail' location.pk %}">Discard changes</a>
+  </div>
+</form>
+{% endblock %}
