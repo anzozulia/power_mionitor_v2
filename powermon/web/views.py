@@ -29,6 +29,7 @@ from django.db import (
 from django.db.models.functions import Lower
 from django.http import HttpRequest, HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
+from django.utils.cache import add_never_cache_headers
 from django.utils.decorators import method_decorator
 from django.views import View
 from django.views.decorators.cache import never_cache
@@ -43,6 +44,7 @@ from powermon.locations import examples, keys, validators
 from powermon.locations.models import LANGUAGE_CHOICES, Location
 from powermon.throttle import rules, store
 from powermon.web.forms import LocationForm, SignInForm
+from powermon.web.status import location_status
 
 log = logging.getLogger(__name__)
 
@@ -50,7 +52,6 @@ SIGNED_OUT_MESSAGE = "You are signed out."
 LOCATION_CREATED_MESSAGE = (
     "Location created. Reveal the key below, then copy an example to the device."
 )
-STATUS_LABELS = {"waiting": "Waiting for first heartbeat", "on": "On", "off": "Off"}
 LANGUAGE_LABELS = dict(LANGUAGE_CHOICES)
 # Before the engine has written anything, a location waits for its first heartbeat.
 WAITING = "waiting"
@@ -144,30 +145,29 @@ class SignOutView(LogoutView):
 
 @dataclass(frozen=True)
 class LocationRow:
-    """One row of the location list."""
+    """One row of the location list (Phase 4 UI-SPEC screen A, D-13, UI-D1)."""
 
     pk: int
     name: str
+    # The Phase 4 status (``status.location_status``): "maintenance" whenever the flag is
+    # on, else the stored status "on", "off" or "waiting".
     status: str
     status_label: str
     last_heartbeat_at: datetime | None
-    language_label: str
-
-
-def _state_of(location: Location) -> tuple[str, datetime | None]:
-    """The status and last heartbeat time; a location with no state row counts as waiting."""
-    state: LocationState | None = getattr(location, "state", None)
-    if state is None:
-        return WAITING, None
-    return state.status, state.last_heartbeat_at
+    # The Status cell's tags, shown in this order: "Alerts off", "Router grace".
+    alerts_off: bool
+    router_grace: bool
 
 
 class LocationListView(View):
-    """``/``: every location that is not deleted, sorted by name (UI-SPEC screen 2, D-09).
+    """``/``: every location that is not deleted, sorted by name (Phase 4 UI-SPEC screen A).
 
     Read-only, one server-rendered response with no live refresh: the admin reloads to
-    see a new status. There is no pagination (at most about 20 locations). While the ops
-    chat is not configured, the page says so (Phase 2 D-09, INV-20).
+    see a new status. Names sort without regard to case, ties by the lower id. The status
+    uses the one Phase 4 vocabulary of the admin pages (``status.location_status``), with
+    the switch tags after it; the Language column is gone (UI-D1). There is no pagination
+    (at most about 20 locations). While the ops chat is not configured, the page says so
+    (Phase 2 D-09, INV-20).
     """
 
     template_name = "web/location_list.html"
@@ -180,15 +180,16 @@ class LocationListView(View):
         )
         rows = []
         for location in locations:
-            status, last_heartbeat_at = _state_of(location)
+            status = location_status(location)
             rows.append(
                 LocationRow(
                     pk=location.pk,
                     name=location.name,
-                    status=status,
-                    status_label=STATUS_LABELS[status],
-                    last_heartbeat_at=last_heartbeat_at,
-                    language_label=LANGUAGE_LABELS[location.language],
+                    status=status.key,
+                    status_label=status.label,
+                    last_heartbeat_at=status.last_heartbeat_at,
+                    alerts_off=not location.alerts_enabled,
+                    router_grace=location.router_grace,
                 )
             )
         context = {"rows": rows, "ops_configured": settings.CFG.ops_configured}
@@ -240,54 +241,64 @@ class LocationCreateView(View):
         return redirect("location-setup", pk=location.pk)
 
 
+SETUP_TEMPLATE = "web/location_setup.html"
+
+
+def render_setup(request: HttpRequest, pk: int, *, revealed: bool) -> HttpResponse:
+    """The device setup page of the location (UI-SPEC screen E): masked, or revealed.
+
+    Shared by the setup view (GET masked, the Reveal POST revealed) and the Regenerate
+    POST (D-14), which answers with this page revealed. Revealed, it carries the full
+    device key (SEC-04), so the response is always ``Cache-Control: no-store``, whatever
+    the caller. 404 for an unknown or deleted location. The meta line uses the one Phase 4
+    status vocabulary (``status.location_status``: Maintenance whenever the flag is on).
+    The examples are the exact strings the 01-09 generators return, the ones the INV-24 #3
+    test runs verbatim against ``/hb``.
+    """
+    location = get_object_or_404(
+        Location.objects.select_related("state"), pk=pk, deleted_at__isnull=True
+    )
+    key = location.device_key
+    shown_key = key if revealed else keys.mask_key(key)
+    # The configured base URL only, never the request's Host header.
+    url = examples.heartbeat_url(settings.PUBLIC_BASE_URL)
+    context = {
+        "location": location,
+        "status": location_status(location),
+        "language_label": LANGUAGE_LABELS[location.language],
+        "revealed": revealed,
+        "shown_key": shown_key,
+        "key_tail": key[-keys.MASK_VISIBLE :],
+        "heartbeat_url": url,
+        "curl_example": examples.curl_cmd(url, shown_key, multiline=True),
+        "cron_example": "\n".join(examples.cron_lines(url, shown_key, location.period_s)),
+        "wget_gnu_example": examples.wget_gnu(url, shown_key),
+        "wget_busybox_example": examples.wget_busybox(url, shown_key),
+        "period_s": location.period_s,
+        "grace_s": location.grace_s,
+        "off_after_s": location.period_s + location.grace_s,
+        "masked_token": validators.mask_token(location.bot_token),
+    }
+    response = render(request, SETUP_TEMPLATE, context)
+    add_never_cache_headers(response)
+    return response
+
+
 @method_decorator(never_cache, name="dispatch")
 class LocationSetupView(View):
-    """``/locations/<pk>/setup/``: device setup (UI-SPEC screen 4; LOC-05, HB-01, D-11).
+    """``/locations/<pk>/setup/``: device setup (UI-SPEC screen E; LOC-05, HB-01, D-11).
 
     GET shows the device key masked. POST (CSRF) is the explicit reveal, answered with the
-    revealed page itself (200, no redirect): the only response that ever carries the full
-    key. Every response is ``Cache-Control: no-store``, so neither the Back button nor a
-    cache shows a revealed key again. The examples are the exact strings the 01-09
-    generators return, the ones the INV-24 #3 test runs verbatim against ``/hb``.
+    revealed page itself (200, no redirect). Only it and the Regenerate POST ever carry
+    the full key. Every response is ``Cache-Control: no-store``, so neither the Back
+    button nor a cache shows a revealed key again.
     """
 
-    template_name = "web/location_setup.html"
-
     def get(self, request: HttpRequest, pk: int) -> HttpResponse:
-        return self._render(request, pk, revealed=False)
+        return render_setup(request, pk, revealed=False)
 
     def post(self, request: HttpRequest, pk: int) -> HttpResponse:
-        return self._render(request, pk, revealed=True)
-
-    def _render(self, request: HttpRequest, pk: int, *, revealed: bool) -> HttpResponse:
-        location = get_object_or_404(
-            Location.objects.select_related("state"), pk=pk, deleted_at__isnull=True
-        )
-        status, last_heartbeat_at = _state_of(location)
-        key = location.device_key
-        shown_key = key if revealed else keys.mask_key(key)
-        # The configured base URL only, never the request's Host header.
-        url = examples.heartbeat_url(settings.PUBLIC_BASE_URL)
-        context = {
-            "location": location,
-            "status": status,
-            "status_label": STATUS_LABELS[status],
-            "last_heartbeat_at": last_heartbeat_at,
-            "language_label": LANGUAGE_LABELS[location.language],
-            "revealed": revealed,
-            "shown_key": shown_key,
-            "key_tail": key[-keys.MASK_VISIBLE :],
-            "heartbeat_url": url,
-            "curl_example": examples.curl_cmd(url, shown_key, multiline=True),
-            "cron_example": "\n".join(examples.cron_lines(url, shown_key, location.period_s)),
-            "wget_gnu_example": examples.wget_gnu(url, shown_key),
-            "wget_busybox_example": examples.wget_busybox(url, shown_key),
-            "period_s": location.period_s,
-            "grace_s": location.grace_s,
-            "off_after_s": location.period_s + location.grace_s,
-            "masked_token": validators.mask_token(location.bot_token),
-        }
-        return render(request, self.template_name, context)
+        return render_setup(request, pk, revealed=True)
 
 
 # D-07: exactly 32 characters from [A-Za-z0-9]. Explicit ASCII classes with fullmatch:

@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% comment %}
+Phase 4 UI-SPEC screen F (D-14, D-15, D-17; UI-D5, UI-D7, UI-D9): the regenerate key
+confirmation. A GET page that changes nothing: the always-shown lead, exactly one D-15
+state block (location_views.regenerate_block), then the button row. The page holds exactly
+one form, the destructive Regenerate POST, whose hidden marker is a salted HMAC of the key
+it replaces (never key characters). No key appears here, not even masked (SEC-04). The
+"maintenance first" path is a plain link to the location page, never a second form (UI-D9).
+No autofocus on a page whose action is destructive; no script, no inline style.
+{% endcomment %}
+{% block title %}{{ location.name }} · Regenerate key{% endblock %}
+{% block crumbs %}
+<nav aria-label="Breadcrumb">
+  <ol class="crumbs">
+    <li><a href="{% url 'location-list' %}">Locations</a></li>
+    <li><a class="name" href="{% url 'location-detail' location.pk %}">{{ location.name }}</a></li>
+    <li><a href="{% url 'location-setup' location.pk %}">Device setup</a></li>
+    <li aria-current="page">Regenerate key</li>
+  </ol>
+</nav>
+{% endblock %}
+{% block content %}
+<h1>Regenerate the device key?</h1>
+<p>The old key stops working at once. Until the device has the new key, it gets HTTP 401 and its heartbeats are not recorded. The history is kept.</p>
+{% if state_block == "warning" %}
+<p class="callout"><strong>Warning:</strong> While maintenance is off, this location can be reported OFF as soon as {{ off_after_s }} seconds after its last heartbeat, and subscribers then get an OFF alert if alerts are on. Turn maintenance on first on the location page, update the device, then turn maintenance off there.</p>
+<p><a href="{% url 'location-detail' location.pk %}">Open the location page</a></p>
+{% elif state_block == "off" %}
+<p class="callout"><strong>Note:</strong> This location is off now. Until the device has the new key, the return of power is not seen: the outage is recorded until the first heartbeat with the new key, so the chart, the day totals and the ON alert (if alerts are on) count that time as off. Turn maintenance on first to have that time shown as not monitored instead.</p>
+{% elif state_block == "waiting" %}
+<p class="callout"><strong>Note:</strong> This location has had no heartbeat yet, so nothing is reported while you update the device.</p>
+{% elif state_block == "maintenance" %}
+<p class="callout"><strong>Note:</strong> Maintenance is on, so OFF is not detected while you update the device. Turn maintenance off on the location page once the device sends heartbeats with the new key.</p>
+{% endif %}
+<div class="actions">
+  <form method="post" action="{% url 'location-regenerate' location.pk %}">
+    {% csrf_token %}
+    <input type="hidden" name="marker" value="{{ marker }}">
+    <button class="btn btn--danger" type="submit">Regenerate key</button>
+  </form>
+  <a class="btn btn--secondary" href="{% url 'location-setup' location.pk %}">Keep current key</a>
+</div>
+{% endblock %}

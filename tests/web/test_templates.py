@@ -1,8 +1,10 @@
 """The location pages through the signed-in shell (D-09 surfaces 2-4, UI-SPEC screens 2-4).
 
-The list is read-only: one row per location, sorted by name without regard to case, with
-the status label, the last heartbeat in the display TZ (``display_time``, P-3) and the
-language label. With no locations it shows the empty-state panel instead of the table.
+The list is read-only: one row per location, sorted by name without regard to case (ties
+by id), with the Phase 4 status label (Maintenance whenever the flag is on) and its
+"Alerts off" / "Router grace" tags, and the last heartbeat in the display TZ
+(``display_time``, P-3). The Language column is gone (Phase 4 UI-D1). With no locations
+it shows the empty-state panel instead of the table.
 While the admin ops chat is not configured, both states show a warning callout (D-09,
 INV-20). Every page escapes the user-typed location name (UI-SPEC security rule 1).
 """
@@ -63,6 +65,16 @@ def _table_rows(html: str) -> list[list[str]]:
     ]
 
 
+def _headers(html: str) -> list[str]:
+    """The column headers of the location table, in order."""
+    return re.findall(r'<th scope="col">([^<]*)</th>', html)
+
+
+def _status_cells(html: str) -> list[str]:
+    """The markup inside each row's ``.status-cell``, in row order."""
+    return re.findall(r'<div class="status-cell">(.*?)</div>', html, re.S)
+
+
 # Location list
 
 
@@ -98,17 +110,19 @@ def test_list_rows_sorted_with_labels(
 
     # Case-insensitive: a plain code-point sort would put "Delta" before "beta".
     assert _table_rows(html) == [
-        ["Alpha", "On", "2026-10-01 11:00:00 EEST", "English"],
-        ["beta", "Waiting for first heartbeat", "Never", "Ukrainian"],
-        ["Delta", "Waiting for first heartbeat", "Never", "English"],
-        ["gamma", "Off", "2026-10-01 10:58:00 EEST", "Russian"],
+        ["Alpha", "On", "2026-10-01 11:00:00 EEST"],
+        ["beta", "Waiting for first heartbeat", "Never"],
+        ["Delta", "Waiting for first heartbeat", "Never"],
+        ["gamma", "Off", "2026-10-01 10:58:00 EEST"],
     ]
     # Each name opens the location's page (Phase 4 UI-SPEC screen A), not its setup page.
     for location in (alpha, beta, gamma, delta):
         assert f'<a class="name" href="/locations/{location.pk}/">' in html
         assert f'href="/locations/{location.pk}/setup/"' not in html
-    for heading in ("Name", "Status", "Last heartbeat", "Language"):
-        assert f'<th scope="col">{heading}</th>' in html
+    # UI-D1: no Language column (04-08 adds Delivery as the fourth).
+    assert _headers(html) == ["Name", "Status", "Last heartbeat"]
+    for label in ("English", "Ukrainian", "Russian"):
+        assert label not in html
     assert '<span class="status status--on">On</span>' in html
     assert '<span class="status status--off">Off</span>' in html
     assert '<span class="status status--waiting">Waiting for first heartbeat</span>' in html
@@ -116,6 +130,41 @@ def test_list_rows_sorted_with_labels(
     assert re.search(r'<div class="table-wrap">\s*<table>', html)
     assert html.count(">Add location</a>") == 1
     assert "No locations yet" not in html
+
+
+@pytest.mark.django_db
+def test_list_rows_use_the_phase4_vocabulary_and_tags(
+    admin: Client, kyiv: Any, location_factory: Callable[..., Any], fixed_now: datetime
+) -> None:
+    # Two names that differ only in case: the lower id goes first (LOC-03 ordering).
+    first = location_factory(
+        name="office", maintenance=True, alerts_enabled=False, router_grace=True
+    )
+    second = location_factory(name="Office", alerts_enabled=False)
+    location_factory(name="Basement", router_grace=True)
+    _set_state(first, status="on", last_heartbeat_at=fixed_now, on_since=fixed_now)
+    _set_state(second, status="off", last_heartbeat_at=fixed_now, outage_started_at=fixed_now)
+
+    html = admin.get("/").content.decode()
+
+    assert _headers(html) == ["Name", "Status", "Last heartbeat"]
+    assert _table_rows(html) == [
+        ["Basement", "Waiting for first heartbeat Router grace", "Never"],
+        ["office", "Maintenance Alerts off Router grace", "2026-10-01 11:00:00 EEST"],
+        ["Office", "Off Alerts off", "2026-10-01 11:00:00 EEST"],
+    ]
+    # Maintenance is shown whenever the flag is on, with the grey dot (UI-D11); the tags
+    # follow the status label, "Alerts off" before "Router grace".
+    assert _status_cells(html) == [
+        '<span class="status status--waiting">Waiting for first heartbeat</span>'
+        '<span class="tag">Router grace</span>',
+        '<span class="status status--maintenance">Maintenance</span>'
+        '<span class="tag">Alerts off</span><span class="tag">Router grace</span>',
+        '<span class="status status--off">Off</span><span class="tag">Alerts off</span>',
+    ]
+    assert html.index(f'href="/locations/{first.pk}/"') < html.index(
+        f'href="/locations/{second.pk}/"'
+    )
 
 
 @pytest.mark.django_db
@@ -140,8 +189,7 @@ def test_list_last_heartbeat_uses_display_time(
 
     html = admin.get("/").content.decode()
 
-    # The factory's default language is English.
-    assert _table_rows(html) == [["Office", "On", "2026-10-25 03:30:00 EET", "English"]]
+    assert _table_rows(html) == [["Office", "On", "2026-10-25 03:30:00 EET"]]
     assert '<td class="num">2026-10-25 03:30:00 EET</td>' in html
 
 
@@ -155,7 +203,7 @@ def test_list_location_without_state_row_shows_waiting(
 
     html = admin.get("/").content.decode()
 
-    assert _table_rows(html) == [["Orphan", "Waiting for first heartbeat", "Never", "English"]]
+    assert _table_rows(html) == [["Orphan", "Waiting for first heartbeat", "Never"]]
 
 
 @pytest.mark.django_db

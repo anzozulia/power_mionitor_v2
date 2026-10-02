@@ -1,10 +1,12 @@
 {% extends "base.html" %}
 {% load display_time %}
 {% comment %}
-UI-SPEC screen 4 (LOC-05, D-06, D-11). The full device key is in the page only when
-"revealed" is true, which only the reveal POST response sets. Every command in a code
-block is a string from powermon.locations.examples (the generator the INV-24 #3 test runs
-verbatim); none is written here. The bot token is shown only as its masked form.
+UI-SPEC screen 4 / Phase 4 screen E (LOC-05, D-06, D-11). The full device key is in the
+page only when "revealed" is true, which only the Reveal and Regenerate POST responses set
+(views.render_setup). Every command in a code block is a string from
+powermon.locations.examples (the generator the INV-24 #3 test runs verbatim); none is
+written here. The bot token is shown only as its masked form. The meta line uses the Phase
+4 status vocabulary (status = web.status.LocationStatus).
 {% endcomment %}
 {% block title %}{{ location.name }} · Device setup{% endblock %}
 {% block crumbs %}
@@ -18,7 +20,7 @@ verbatim); none is written here. The bot token is shown only as its masked form.
 {% endblock %}
 {% block content %}
 <h1 class="name">{{ location.name }}</h1>
-<p class="meta"><span class="status status--{{ status }}">{{ status_label }}</span> · Last heartbeat: <span class="num">{{ last_heartbeat_at|display_time }}</span></p>
+<p class="meta"><span class="status status--{{ status.key }}">{{ status.label }}</span> · Last heartbeat: <span class="num">{{ status.last_heartbeat_at|display_time }}</span></p>
 
 <h2>Before you start</h2>
 <p>Use a device that loses power in a blackout: plugged into mains, with no UPS, power bank or battery. A device on backup power keeps reporting and hides the outage.</p>
@@ -48,6 +50,9 @@ verbatim); none is written here. The bot token is shown only as its masked form.
 </div>
 <p>Anyone with this key can send heartbeats for this location. Keep it private.</p>
 {% endif %}
+{% comment %}Both key states (UI-SPEC screen E): the entry point only opens the confirmation page (UI-D5).{% endcomment %}
+<p>If the key has leaked, regenerate it. The old key stops working at once.</p>
+<p><a class="btn btn--secondary" href="{% url 'location-regenerate' location.pk %}">Regenerate key</a></p>
 
 <h2>Examples</h2>
 {% if not revealed %}
