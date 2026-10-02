@@ -401,6 +401,26 @@ def test_edit_unknown_or_deleted_location_is_404(
 
 
 @pytest.mark.django_db
+def test_edit_requires_sign_in_and_a_csrf_token(
+    client: Client, location_factory: Callable[..., Any]
+) -> None:
+    location = location_factory(name="Office")
+    url = _edit(location)
+
+    # Anonymous: the sign-in page, for the form and for the save (T-04-32).
+    assert client.get(url).url == f"/login/?next={url}"
+    anonymous = client.post(url, _form(location, name="Renamed"))
+    assert anonymous.status_code == 302
+    assert anonymous.url == f"/login/?next={url}"
+    # Signed in but without the form's CSRF token: refused.
+    strict = Client(enforce_csrf_checks=True)
+    strict.force_login(User.objects.create_user("admin", password="not-used-here"))
+    assert strict.post(url, _form(location, name="Renamed")).status_code == 403
+
+    assert Location.objects.get(pk=location.pk).name == "Office"
+
+
+@pytest.mark.django_db
 def test_edit_of_a_location_deleted_meanwhile_is_404(
     admin: Client, location_factory: Callable[..., Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
