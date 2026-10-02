@@ -2,11 +2,12 @@
 
 ``run_iteration`` is one pass over the outbox, always in this order: the connection step
 (``close_old_connections()``), the flush of outcomes kept from an earlier pass (WR-04),
-expiry (ALRT-03), the subscriber heads, then at most one ops row. For each location it
-looks only at the oldest open row (``outbox.subscriber_heads``), so OFF always goes before
-ON. A due row is rendered at send time in the location's current language, claimed with
-one conditional UPDATE (committed at once, Django autocommit), and sent with no
-transaction open. In the worker the claim also names the lease session of the HELD
+expiry (ALRT-03), the lift of channels held for a delivery failure that has since
+recovered (D-12, ``_lift``), the subscriber heads, then at most one ops row. For each
+location it looks only at the oldest open row (``outbox.subscriber_heads``), so OFF always
+goes before ON. A due row is rendered at send time in the location's current language,
+claimed with one conditional UPDATE (committed at once, Django autocommit), and sent with
+no transaction open. In the worker the claim also names the lease session of the HELD
 status the pass runs under (``RelayState.lease_pid``) and succeeds only while that
 session holds the worker lock: a worker that lost its session claims nothing, even
 before its detection loop notices and while another worker holds the lock (C1).
@@ -52,6 +53,15 @@ The result decides the row's next status, for both channels (D-14 policy):
 
 Only those two outcomes of a subscriber send touch the incident: a 429, a 5xx, a refused
 connection, an ambiguous send, an ops row and every chart call leave it alone (D-10).
+When Telegram reports the supergroup a group became (``migrate_to_chat_id``), the
+incident and the notice carry that chat ID for the admin; the location's chat is never
+changed here (PITFALLS 6e).
+
+A permanent refusal holds that channel for 15 minutes in memory and records it in
+``RelayState.failing``. The admin may fix the bot and send a test message before then:
+the web then closes the incident and makes the alerts due (``delivery.record_test_success``,
+D-12). The lift step notices the closed incident in the next pass and drops the channel's
+hold, so the queued alerts go out at once, with their event times.
 
 Every retry of a subscriber row also backs off its channel in ``RelayState.not_before``
 (``chat_key``: the bot and the chat id), so that channel's rows wait (D-14). Two locations
@@ -157,7 +167,7 @@ from django.conf import settings
 from django.db import Error, close_old_connections, transaction
 
 from powermon.alerts import delivery, ops, ops_texts, outbox
-from powermon.alerts.models import OutboxMessage
+from powermon.alerts.models import OpsIncident, OutboxMessage
 from powermon.alerts.texts import render_alert
 from powermon.clock import Clock
 from powermon.i18n import times
@@ -328,6 +338,8 @@ def run_iteration(
     _flush_unapplied(state)
     # Nothing past its maximum age may go out, so expiry runs before any head (ALRT-03).
     _expire(clock.now())
+    # A channel held for a delivery failure that has since recovered goes at once (D-12).
+    _lift(state)
     attempted = False
     for row in outbox.subscriber_heads():
         if stop is not None and stop.is_set():
@@ -433,6 +445,33 @@ def _expire(now: datetime) -> int:
             else:
                 log.warning("ops notice %s expired undelivered; it is not resent", ref.id)
     return len(rows)
+
+
+def _lift(state: RelayState) -> None:
+    """Drop the hold of each channel whose delivery failure has been closed (D-12).
+
+    ``state.failing`` names the chat key held for each location whose subscriber alert
+    was refused. Its ``delivery_failing`` incident closed means a success was recorded:
+    the web's test message, whose transaction also made the alerts due. The closed
+    incident is that explicit fact, so its channel's hold is dropped and the alerts go
+    out in this pass. Only that ``chat_key`` goes: a ``bot_wide_key`` (a 429, a 5xx, a
+    refused connection) concerns the whole bot and still holds. One query, and only while
+    something is held. After a restart nothing is held in memory, and the rows'
+    ``next_attempt_at`` governs.
+    """
+    if not state.failing:
+        return
+    still_open = set(
+        OpsIncident.objects.filter(
+            kind=delivery.KIND_DELIVERY_FAILING,
+            ended_at__isnull=True,
+            location_id__in=list(state.failing),
+        ).values_list("location_id", flat=True)
+    )
+    for location_id, key in list(state.failing.items()):
+        if location_id not in still_open:
+            state.not_before.pop(key, None)
+            del state.failing[location_id]
 
 
 def _deliver(row: OutboxMessage, clock: Clock, state: RelayState) -> bool:
@@ -674,7 +713,13 @@ def _apply(
         with transaction.atomic():
             # Only this claim's attempt (WR-01): a later claim's row is not this outcome's.
             if outbox.mark_retry(row.pk, next_attempt_at, code, attempts=attempts):
-                delivery.open_failing(location_id, now, delivery.http_status(result.code))
+                delivery.open_failing(
+                    location_id,
+                    now,
+                    delivery.http_status(result.code),
+                    # Reported to the admin only: the location's chat stays (PITFALLS 6e).
+                    result.migrate_to_chat_id,
+                )
         # After the commit: the channel is held until the incident closes (D-12).
         state.failing[location_id] = key
         return

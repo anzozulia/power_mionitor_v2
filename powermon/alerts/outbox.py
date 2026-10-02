@@ -21,6 +21,12 @@ during it:
     sending --recover_interrupted (worker activation)--> uncertain
     pending --expire_due (expires_at <= now)--> expired (never sent, ALRT-03)
     pending --mark_dropped (an ops notice that cannot be rendered)--> dropped (never sent)
+    pending --make_due (a recorded success or a channel change)--> pending, due now
+
+``make_due`` is the admin side's one write to a queued row: after a recorded test message
+success (D-12) or a chat or token change (D-08) a location's subscriber rows that wait for
+a backoff become due at once, so a 15-minute hold earned by a channel that works again
+does not delay them.
 
 A subscriber row that becomes uncertain queues one ``ops_uncertain`` notice in the same
 transaction (``powermon.alerts.ops``, D-11 #5); an uncertain ops row is only logged.
@@ -323,6 +329,24 @@ def mark_retry(
         status="pending", next_attempt_at=next_attempt_at, last_error=_short(code)
     )
     return updated == 1
+
+
+def make_due(location_id: int, now: datetime) -> int:
+    """Make the location's waiting subscriber alerts due at ``now``; return how many moved.
+
+    Only pending subscriber rows whose ``next_attempt_at`` is later than ``now`` change:
+    a row already due keeps its time, a row in flight or finished is left alone, and ops
+    rows and other locations are never touched. Runs on the caller's connection, inside
+    its transaction (D-08, D-12). A naive ``now`` raises ValueError before any write.
+    """
+    if now.utcoffset() is None:
+        raise ValueError("a naive datetime has no defined instant")
+    return OutboxMessage.objects.filter(
+        channel=CHANNEL_SUBSCRIBER,
+        location_id=location_id,
+        status="pending",
+        next_attempt_at__gt=now,
+    ).update(next_attempt_at=now)
 
 
 def recover_interrupted() -> list[RowRef]:

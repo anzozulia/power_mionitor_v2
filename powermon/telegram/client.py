@@ -34,7 +34,10 @@ No method raises across its boundary. Every outcome comes back as a ``SendResult
   ``no_message_id``): the photo may exist but cannot be recorded.
 - ``rate_limited``: HTTP 429; ``retry_after`` is the wait in whole seconds.
 - ``transient``: HTTP 5xx.
-- ``permanent``: any other answer (400, 401, 403, 404, ...).
+- ``permanent``: any other answer (400, 401, 403, 404, ...). When Telegram says the group
+  became a supergroup (``parameters.migrate_to_chat_id``), the result carries that new
+  chat ID, if it is a 64-bit integer, for the admin's notice (D-10); no caller ever sends
+  to it on its own (PITFALLS 6e).
 - ``edit_target_missing``: the chart message an edit, pin or unpin names no longer exists
   (deleted in the channel, INV-17).
 
@@ -90,6 +93,9 @@ PHOTO_FILENAME = "chart.png"
 _PNG_TYPE = "image/png"
 # The largest message id the chart record can store (a PostgreSQL bigint).
 _MAX_MESSAGE_ID = 2**63 - 1
+# A chat ID Telegram reports must fit a signed 64-bit integer (a location's chat_id).
+_MIN_CHAT_ID = -(2**63)
+_MAX_CHAT_ID = 2**63 - 1
 # Lower-case substrings of Telegram's 400 descriptions for an edit, a pin or an unpin.
 _NOT_MODIFIED = ("message is not modified", "chat_not_modified")
 _TARGET_MISSING = (
@@ -106,12 +112,15 @@ class SendResult:
     """The outcome of one call. ``code`` is short and never holds the token or a URL.
 
     ``message_id`` is set only on an ``ok`` from a call that posts a message (sendPhoto).
+    ``migrate_to_chat_id`` is set only on a ``permanent`` answer that reports the
+    supergroup a group became (D-10); it is reported, never sent to (PITFALLS 6e).
     """
 
     kind: SendKind
     retry_after: int | None = None
     code: str = ""
     message_id: int | None = None
+    migrate_to_chat_id: int | None = None
 
 
 class _HandshakeError(NewConnectionError):
@@ -338,10 +347,13 @@ def _classify(
             return SendResult("maybe_delivered", code="no_message_id")
         return SendResult("ok", message_id=message_id)
     code = _http_code(data.get("error_code"), default=resp.status_code)
+    parameters = data.get("parameters")
+    if not isinstance(parameters, dict):
+        parameters = {}
     if code == 429 or resp.status_code == 429:
-        parameters = data.get("parameters")
-        raw = parameters.get("retry_after") if isinstance(parameters, dict) else None
-        retry_after = _parse_retry_after(raw, default=DEFAULT_RETRY_AFTER_S)
+        retry_after = _parse_retry_after(
+            parameters.get("retry_after"), default=DEFAULT_RETRY_AFTER_S
+        )
         return SendResult("rate_limited", retry_after=retry_after, code="429")
     if resp.status_code >= 500:
         return SendResult("transient", code=f"http_{resp.status_code}")
@@ -349,7 +361,11 @@ def _classify(
         known = _chart_bad_request(data.get("description"))
         if known is not None:
             return known
-    return SendResult("permanent", code=f"http_{code}")
+    return SendResult(
+        "permanent",
+        code=f"http_{code}",
+        migrate_to_chat_id=_chat_id(parameters.get("migrate_to_chat_id")),
+    )
 
 
 def _chart_bad_request(description: object) -> SendResult | None:
@@ -372,6 +388,14 @@ def _message_id(result: object) -> int | None:
     value = result.get("message_id") if isinstance(result, dict) else None
     if isinstance(value, int) and not isinstance(value, bool) and 0 < value <= _MAX_MESSAGE_ID:
         return value
+    return None
+
+
+def _chat_id(value: object) -> int | None:
+    """A chat ID from an answer's ``parameters`` if it is a 64-bit integer (not a bool)."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        if _MIN_CHAT_ID <= value <= _MAX_CHAT_ID:
+            return value
     return None
 
 

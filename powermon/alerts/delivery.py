@@ -14,13 +14,22 @@ opener get an id back, and the close is conditional on the incident still being 
 a single closer sees one changed row. Each of them queues its notice only then, in the
 same transaction (``powermon.alerts.ops``).
 
+A recorded success (D-12): after the admin's test message went through, the web calls
+``record_test_success``, one transaction that closes the incident (one recovery notice)
+and makes the location's waiting alerts due at once (``outbox.make_due``). The worker
+holds that channel in memory for 15 minutes after a refusal (``RelayState.failing``); it
+lifts the hold in its next pass because the incident it holds for is no longer open, so
+the queued alerts go out within one pass, with their event times (ALRT-04).
+
 Every function runs on the caller's connection, inside its transaction: the relay calls
 ``open_failing`` and ``close_failing`` in the transaction that writes the outbox row's
 outcome, so the incident and its notice commit with that outcome or not at all. Nothing
 here does network I/O, and the incident's details and the notices' payloads hold integers
-only (OPS-08).
+only (OPS-08). ``failing_incidents`` reads them back for the admin pages and never raises
+on a malformed value.
 """
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -32,6 +41,9 @@ from powermon.alerts.models import OpsIncident
 KIND_DELIVERY_FAILING = "delivery_failing"
 # The status a client code with no plausible HTTP status stands for (a notice needs one).
 _DEFAULT_STATUS = 400
+# A reported chat ID fits a signed 64-bit integer, as a location's chat_id does.
+_MIN_CHAT_ID = -(2**63)
+_MAX_CHAT_ID = 2**63 - 1
 
 
 @dataclass(frozen=True)
@@ -107,3 +119,46 @@ def close_failing(location_id: int, now: datetime) -> bool:
             location_id=location_id,
         )
     return True
+
+
+def record_test_success(location_id: int, now: datetime) -> bool:
+    """The admin's test message went through at ``now`` (D-12); True if this closed an incident.
+
+    One transaction: the location's waiting subscriber alerts become due at once, and its
+    open failing incident, if any, closes with one recovery notice. The worker sees the
+    closed incident in its next pass and lifts its 15-minute hold of the channel, so the
+    alerts go out then. A naive ``now`` raises ValueError and nothing changes.
+    """
+    with transaction.atomic():
+        outbox.make_due(location_id, now)
+        return close_failing(location_id, now)
+
+
+def failing_incidents(location_ids: Iterable[int]) -> dict[int, Failing]:
+    """The open failing incident of each of these locations that has one, in one query.
+
+    For the admin pages (D-13), which must never fail on a stored value: details that are
+    not integers read as status 400 and no reported chat ID.
+    """
+    ids = list(location_ids)
+    if not ids:
+        return {}
+    rows = OpsIncident.objects.filter(
+        kind=KIND_DELIVERY_FAILING, ended_at__isnull=True, location_id__in=ids
+    ).values_list("location_id", "started_at", "details")
+    found: dict[int, Failing] = {}
+    for location_id, started_at, details in rows:
+        values = details if isinstance(details, dict) else {}
+        status = _int_in(values.get("http_status"), 100, 599)
+        migrate_to = _int_in(values.get("migrate_to_chat_id"), _MIN_CHAT_ID, _MAX_CHAT_ID)
+        found[location_id] = Failing(
+            started_at, _DEFAULT_STATUS if status is None else status, migrate_to
+        )
+    return found
+
+
+def _int_in(value: object, low: int, high: int) -> int | None:
+    """``value`` if it is an int (not a bool) from ``low`` to ``high``, else None."""
+    if isinstance(value, int) and not isinstance(value, bool) and low <= value <= high:
+        return value
+    return None
