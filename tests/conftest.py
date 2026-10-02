@@ -7,9 +7,10 @@ router-reconnect grace off, language en, display TZ Europe/Kyiv.
   views get a ``FakeClock`` by constructor injection (``SomeView.as_view(clock=...)``).
   There is no freezegun and no monkeypatching of time.
 - Telegram is faked at the HTTP boundary (``responses``), and any unregistered URL raises.
-  ``FakeTelegram`` answers sendMessage (``accept``, ``fail``, ``answer``) and the chart
-  calls (``accept_chart``), and records what each accepted call carried (``sent``;
-  ``chart_calls`` with multipart bodies read back by ``parse_multipart``).
+  ``FakeTelegram`` answers sendMessage (``accept``, ``fail``, ``answer``) and the four chart
+  calls (``accept_chart``, ``fail_method``, ``answer_method``), records what each accepted
+  call carried (``sent``; ``chart_calls``, multipart bodies read back by
+  ``parse_multipart``) and counts every request per method (``count``).
 - pytest-socket (``--allow-hosts`` in pyproject.toml) fails every real outbound connection
   except the database and localhost.
 - Races run on real PostgreSQL with the actor harness below (``Actor``, ``blocked_on_lock``,
@@ -180,11 +181,19 @@ class FakeTelegram:
     ``accept(token)`` answers that bot's sendMessage calls with ok and records each JSON
     body in ``sent``; ``fail(token, ...)`` answers them with an HTTP error or raises an
     exception. ``accept_chart(token)`` answers that bot's chart calls with ok and records
-    each one in ``chart_calls``: sendPhoto answers the message ids 1001, 1002, ... A call
-    to any bot or method that was not registered raises ``requests.ConnectionError``.
+    each one in ``chart_calls``: sendPhoto answers the message ids 1001, 1002, ...,
+    editMessageMedia the edited message, pinChatMessage and unpinChatMessage ``true``.
+    ``fail_method`` and ``answer_method`` are ``fail`` and ``answer`` for one method;
+    ``count(token, method)`` counts every request, failed ones included. Several
+    registrations for one URL answer in registration order and the last one repeats, so
+    ``fail_method`` before ``accept_chart`` fails the first call only. A call to any bot or
+    method that was not registered raises ``requests.ConnectionError``.
     """
 
     API = TELEGRAM_API
+    CHART_METHODS = ("sendPhoto", "editMessageMedia", "pinChatMessage", "unpinChatMessage")
+    # The chart calls with a multipart body (a PNG upload); the others send JSON.
+    MULTIPART_METHODS = ("sendPhoto", "editMessageMedia")
     FIRST_PHOTO_ID = 1001
 
     def __init__(self, rsps: responses.RequestsMock) -> None:
@@ -263,13 +272,69 @@ class FakeTelegram:
 
     def accept_chart(self, token: str) -> None:
         """Answer the bot's chart calls with ok and record each one in ``chart_calls``."""
-        for method in ("sendPhoto",):
+        for method in self.CHART_METHODS:
             self.rsps.add_callback(
                 responses.POST,
                 self._url(token, method),
                 callback=self._chart_callback(token, method),
                 content_type="application/json",
             )
+
+    def fail_method(
+        self,
+        token: str,
+        method: str,
+        *,
+        status: int | None = None,
+        json_body: Any = None,
+        exc: BaseException | None = None,
+    ) -> None:
+        """``fail`` for one Bot API method: answer ``status`` (and ``json_body``) or raise."""
+        if exc is not None:
+            self.rsps.add(responses.POST, self._url(token, method), body=exc)
+        elif status is not None:
+            self.rsps.add(responses.POST, self._url(token, method), status=status, json=json_body)
+        else:
+            raise TypeError("FakeTelegram.fail_method() needs status= or exc=")
+
+    def answer_method(
+        self,
+        token: str,
+        method: str,
+        during: Callable[[], None],
+        *,
+        status: int = 200,
+        json_body: Any = None,
+        exc: BaseException | None = None,
+    ) -> None:
+        """``answer`` for one chart method: run ``during``, then answer.
+
+        The call raises ``exc``, or answers ``status`` with ``json_body``, or (200 and no
+        body) is accepted and recorded as ``accept_chart`` does.
+        """
+        if method not in self.CHART_METHODS:
+            raise ValueError(f"answer_method() fakes the chart calls; use answer() for {method}")
+
+        def callback(request: PreparedRequest) -> tuple[int, dict[str, str], str]:
+            during()
+            if exc is not None:
+                raise exc
+            body = json_body
+            if status == 200 and body is None:
+                body = self._accept_chart_call(token, method, request)
+            return status, {}, json.dumps(body)
+
+        self.rsps.add_callback(
+            responses.POST,
+            self._url(token, method),
+            callback=callback,
+            content_type="application/json",
+        )
+
+    def count(self, token: str, method: str) -> int:
+        """How many requests reached the bot's ``method``, failed ones included."""
+        url = self._url(token, method)
+        return sum(1 for call in self.rsps.calls if call.request.url == url)
 
     def _chart_callback(
         self, token: str, method: str
@@ -283,11 +348,21 @@ class FakeTelegram:
         self, token: str, method: str, request: PreparedRequest
     ) -> dict[str, Any]:
         """Record one accepted chart call and return Telegram's ok body for it."""
-        fields, files = parse_multipart(request)
-        self.chart_calls.append(ChartCall(method, token, dict(fields), files))
-        message_id = self._next_photo_id
-        self._next_photo_id += 1
-        return {"ok": True, "result": {"message_id": message_id}}
+        fields: dict[str, Any]
+        files: dict[str, bytes]
+        if method in self.MULTIPART_METHODS:
+            text_fields, files = parse_multipart(request)
+            fields = dict(text_fields)
+        else:
+            fields, files = json.loads(request.body or b"{}"), {}
+        self.chart_calls.append(ChartCall(method, token, fields, files))
+        if method == "sendPhoto":
+            message_id = self._next_photo_id
+            self._next_photo_id += 1
+            return {"ok": True, "result": {"message_id": message_id}}
+        if method == "editMessageMedia":
+            return {"ok": True, "result": {"message_id": int(fields["message_id"])}}
+        return {"ok": True, "result": True}
 
     def _url(self, token: str, method: str = "sendMessage") -> str:
         return f"{self.API}/bot{token}/{method}"

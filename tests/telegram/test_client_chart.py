@@ -18,14 +18,20 @@ multipart bodies are read back with ``parse_multipart``.
 """
 
 import email.policy
+import json
 import logging
+import pathlib
+from collections.abc import Callable
 from email.parser import BytesParser
 from typing import Any
 
+import pytest
+import requests
 import responses
 from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, TELEGRAM_API, parse_multipart
 from requests import PreparedRequest
 
+from powermon.telegram import client as client_module
 from powermon.telegram.client import SendResult, TelegramClient
 
 TOKEN = DEFAULT_BOT_TOKEN
@@ -33,6 +39,23 @@ TOKEN = DEFAULT_BOT_TOKEN
 PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 64
 CAPTION = "Today off: 4h 10m · 2 outages\nUpdated 14:37"
 CAPTION_UK = "Сьогодні без світла: 4 год 10 хв · 2 відключення\nОновлено о 14:37"
+MESSAGE_ID = 1001
+CLIENT_SOURCE = pathlib.Path(__file__).resolve().parents[2] / "powermon/telegram/client.py"
+
+# One call of each chart method, with the same arguments every time.
+CALLS: dict[str, Callable[[TelegramClient], SendResult]] = {
+    "sendPhoto": lambda c: c.send_photo(DEFAULT_CHAT_ID, PNG, CAPTION),
+    "editMessageMedia": lambda c: c.edit_message_media(DEFAULT_CHAT_ID, MESSAGE_ID, PNG, CAPTION),
+    "pinChatMessage": lambda c: c.pin_chat_message(DEFAULT_CHAT_ID, MESSAGE_ID),
+    "unpinChatMessage": lambda c: c.unpin_chat_message(DEFAULT_CHAT_ID, MESSAGE_ID),
+}
+METHODS = list(CALLS)
+# The calls that name a stored message (D-04): a bad id is a programming error.
+BY_ID: dict[str, Callable[[TelegramClient, Any], SendResult]] = {
+    "editMessageMedia": lambda c, m: c.edit_message_media(DEFAULT_CHAT_ID, m, PNG, CAPTION),
+    "pinChatMessage": lambda c, m: c.pin_chat_message(DEFAULT_CHAT_ID, m),
+    "unpinChatMessage": lambda c, m: c.unpin_chat_message(DEFAULT_CHAT_ID, m),
+}
 
 
 def _url(method: str) -> str:
@@ -41,6 +64,13 @@ def _url(method: str) -> str:
 
 def _client() -> TelegramClient:
     return TelegramClient(TOKEN)
+
+
+def _bad_request(description: Any) -> dict[str, Any]:
+    return {
+        "status": 400,
+        "json_body": {"ok": False, "error_code": 400, "description": description},
+    }
 
 
 def _file_part(request: PreparedRequest, field: str) -> tuple[str | None, str]:
@@ -123,3 +153,393 @@ def test_send_photo_failure_is_logged_by_kind_and_code(fake_telegram: Any, caplo
     assert result == SendResult("permanent", code="http_403")
     assert "telegram sendPhoto: permanent (http_403)" in caplog.text
     assert "kicked" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        None,
+        [{"message_id": 5}],
+        {},
+        {"message_id": True},
+        {"message_id": 0},
+        {"message_id": -5},
+        {"message_id": "12"},
+        {"message_id": 12.0},
+        {"message_id": 2**63},
+    ],
+    ids=["missing", "list", "no-id", "bool", "zero", "negative", "str", "float", "too-big"],
+)
+def test_send_photo_needs_a_usable_message_id(fake_telegram: Any, caplog: Any, result: Any) -> None:
+    # D-06: the photo may exist, but without a usable id it cannot be recorded or pinned.
+    body: dict[str, Any] = {"ok": True}
+    if result is not None:
+        body["result"] = result
+    fake_telegram.fail_method(TOKEN, "sendPhoto", status=200, json_body=body)
+
+    with caplog.at_level(logging.WARNING, logger="powermon.telegram.client"):
+        answer = _client().send_photo(DEFAULT_CHAT_ID, PNG, CAPTION)
+
+    assert answer == SendResult("maybe_delivered", code="no_message_id")
+    assert "telegram sendPhoto: maybe_delivered (no_message_id)" in caplog.text
+
+
+def test_send_photo_accepts_the_largest_storable_message_id(fake_telegram: Any) -> None:
+    body = {"ok": True, "result": {"message_id": 2**63 - 1}}
+    fake_telegram.fail_method(TOKEN, "sendPhoto", status=200, json_body=body)
+
+    assert _client().send_photo(DEFAULT_CHAT_ID, PNG, CAPTION) == SendResult(
+        "ok", message_id=2**63 - 1
+    )
+
+
+# editMessageMedia, pinChatMessage, unpinChatMessage (D-01, D-04, D-05)
+
+
+def test_edit_message_media_puts_the_caption_inside_the_media(fake_telegram: Any) -> None:
+    fake_telegram.accept_chart(TOKEN)
+
+    result = _client().edit_message_media(DEFAULT_CHAT_ID, MESSAGE_ID, PNG, CAPTION_UK)
+
+    assert result == SendResult("ok")
+    request = fake_telegram.calls[0].request
+    assert request.url == _url("editMessageMedia")
+    fields, files = parse_multipart(request)
+    # No top-level caption and no parse_mode: the caption is replaced with the image.
+    assert set(fields) == {"chat_id", "message_id", "media"}
+    assert (fields["chat_id"], fields["message_id"]) == (str(DEFAULT_CHAT_ID), "1001")
+    assert json.loads(fields["media"]) == {
+        "type": "photo",
+        "media": "attach://chart",
+        "caption": CAPTION_UK,
+    }
+    assert files == {"chart": PNG}
+    assert _file_part(request, "chart") == ("chart.png", "image/png")
+    assert fake_telegram.count(TOKEN, "editMessageMedia") == 1
+
+
+def test_pin_is_silent_and_by_id(fake_telegram: Any) -> None:
+    fake_telegram.accept_chart(TOKEN)
+
+    result = _client().pin_chat_message(DEFAULT_CHAT_ID, MESSAGE_ID)
+
+    assert result == SendResult("ok")
+    request = fake_telegram.calls[0].request
+    assert request.url == _url("pinChatMessage")
+    assert request.headers["Content-Type"] == "application/json"
+    assert json.loads(request.body) == {
+        "chat_id": DEFAULT_CHAT_ID,
+        "message_id": MESSAGE_ID,
+        "disable_notification": True,
+    }
+
+
+def test_unpin_always_names_the_message(fake_telegram: Any) -> None:
+    fake_telegram.accept_chart(TOKEN)
+
+    result = _client().unpin_chat_message(DEFAULT_CHAT_ID, MESSAGE_ID)
+
+    assert result == SendResult("ok")
+    request = fake_telegram.calls[0].request
+    assert request.url == _url("unpinChatMessage")
+    assert json.loads(request.body) == {"chat_id": DEFAULT_CHAT_ID, "message_id": MESSAGE_ID}
+    assert [(c.method, c.fields) for c in fake_telegram.chart_calls] == [
+        ("unpinChatMessage", {"chat_id": DEFAULT_CHAT_ID, "message_id": MESSAGE_ID})
+    ]
+
+
+# Classification (D-05, D-06, D-07, INV-17)
+
+NOT_MODIFIED = (
+    "Bad Request: message is not modified: specified new message content and reply markup "
+    "are exactly the same as a current content and reply markup of the message"
+)
+NO_PIN_RIGHT = "Bad Request: not enough rights to manage pinned messages in the chat"
+KICKED = "Forbidden: bot was kicked from the channel chat"
+FORBIDDEN = {"status": 403, "json_body": {"ok": False, "error_code": 403, "description": KICKED}}
+RATE_LIMITED = {
+    "status": 429,
+    "json_body": {
+        "ok": False,
+        "error_code": 429,
+        "description": "Too Many Requests: retry after 7",
+        "parameters": {"retry_after": 7},
+    },
+}
+# Every chart method answers these the way sendMessage does.
+COMMON: list[tuple[str, dict[str, Any], SendResult]] = [
+    ("403", FORBIDDEN, SendResult("permanent", code="http_403")),
+    ("429", RATE_LIMITED, SendResult("rate_limited", retry_after=7, code="429")),
+    ("502", {"status": 502}, SendResult("transient", code="http_502")),
+    (
+        "read-timeout",
+        {"exc": requests.ReadTimeout("read timed out")},
+        SendResult("maybe_delivered", code="read_timeout"),
+    ),
+    (
+        "connect-timeout",
+        {"exc": requests.ConnectTimeout("connect timed out")},
+        SendResult("not_sent", code="connect_timeout"),
+    ),
+]
+
+# (id, method, FakeTelegram.fail_method kwargs, expected result)
+CLASSIFICATION: list[tuple[str, str, dict[str, Any], SendResult]] = [
+    (
+        "edit-not-modified",
+        "editMessageMedia",
+        _bad_request(NOT_MODIFIED),
+        SendResult("ok", code="not_modified"),
+    ),
+    (
+        "edit-not-modified-any-case",
+        "editMessageMedia",
+        _bad_request(NOT_MODIFIED.upper()),
+        SendResult("ok", code="not_modified"),
+    ),
+    (
+        "edit-target-gone",
+        "editMessageMedia",
+        _bad_request("Bad Request: message to edit not found"),
+        SendResult("edit_target_missing", code="target_missing"),
+    ),
+    (
+        "pin-target-gone",
+        "pinChatMessage",
+        _bad_request("Bad Request: message to pin not found"),
+        SendResult("edit_target_missing", code="target_missing"),
+    ),
+    (
+        "unpin-target-gone",
+        "unpinChatMessage",
+        _bad_request("Bad Request: message to unpin not found"),
+        SendResult("edit_target_missing", code="target_missing"),
+    ),
+    (
+        "pin-already-pinned",
+        "pinChatMessage",
+        _bad_request("Bad Request: CHAT_NOT_MODIFIED"),
+        SendResult("ok", code="not_modified"),
+    ),
+    (
+        "unpin-not-pinned",
+        "unpinChatMessage",
+        _bad_request("Bad Request: CHAT_NOT_MODIFIED"),
+        SendResult("ok", code="not_modified"),
+    ),
+    (
+        "pin-no-right",
+        "pinChatMessage",
+        _bad_request(NO_PIN_RIGHT),
+        SendResult("permanent", code="http_400"),
+    ),
+    (
+        "edit-cannot-be-edited",
+        "editMessageMedia",
+        _bad_request("Bad Request: message can't be edited"),
+        SendResult("permanent", code="http_400"),
+    ),
+    (
+        "edit-description-not-text",
+        "editMessageMedia",
+        _bad_request(["Bad Request: message to edit not found"]),
+        SendResult("permanent", code="http_400"),
+    ),
+    (
+        "edit-no-description",
+        "editMessageMedia",
+        {"status": 400, "json_body": {"ok": False, "error_code": 400}},
+        SendResult("permanent", code="http_400"),
+    ),
+    *(
+        (f"{method}-{case}", method, kwargs, result)
+        for method in METHODS
+        for case, kwargs, result in COMMON
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("method", "kwargs", "expected"),
+    [case[1:] for case in CLASSIFICATION],
+    ids=[case[0] for case in CLASSIFICATION],
+)
+def test_chart_call_classification(
+    fake_telegram: Any, caplog: Any, method: str, kwargs: dict[str, Any], expected: SendResult
+) -> None:
+    fake_telegram.fail_method(TOKEN, method, **kwargs)
+
+    with caplog.at_level(logging.DEBUG, logger="powermon.telegram.client"):
+        result = CALLS[method](_client())
+
+    assert result == expected
+    assert fake_telegram.count(TOKEN, method) == 1
+    if expected.kind == "ok":
+        assert caplog.text == ""
+    else:
+        assert f"telegram {method}: {expected.kind} ({expected.code})" in caplog.text
+    # Telegram's description is untrusted text: never logged, never in the result.
+    for text in ("Bad Request", "BAD REQUEST", "Forbidden", "Too Many Requests"):
+        assert text not in caplog.text + repr(result)
+
+
+@pytest.mark.parametrize("method", ["sendPhoto", "sendMessage"])
+@pytest.mark.parametrize(
+    "description",
+    ["Bad Request: message to edit not found", NOT_MODIFIED, "Bad Request: CHAT_NOT_MODIFIED"],
+    ids=["not-found", "not-modified", "chat-not-modified"],
+)
+def test_send_photo_and_send_message_keep_the_old_400_rule(
+    fake_telegram: Any, method: str, description: str
+) -> None:
+    # The description mapping is limited to edit, pin and unpin: a 400 on a send is
+    # permanent whatever Telegram says.
+    fake_telegram.fail_method(TOKEN, method, **_bad_request(description))
+    client = _client()
+
+    if method == "sendPhoto":
+        result = client.send_photo(DEFAULT_CHAT_ID, PNG, CAPTION)
+    else:
+        result = client.send_message(DEFAULT_CHAT_ID, "x")
+
+    assert result == SendResult("permanent", code="http_400")
+
+
+# Transport (D-08)
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_chart_calls_use_the_short_timeouts_and_no_redirects(
+    fake_telegram: Any, method: str
+) -> None:
+    # responses does not record allow_redirects, so the redirect is checked by behaviour:
+    # a followed 302 would POST again to an unregistered URL, which raises (a second call,
+    # maybe_delivered). Not following it leaves the 302 itself, from exactly one call.
+    elsewhere = f"{TELEGRAM_API}/elsewhere/{method}"
+    fake_telegram.rsps.add(
+        responses.POST, _url(method), status=302, headers={"Location": elsewhere}
+    )
+
+    result = CALLS[method](_client())
+
+    assert result == SendResult("permanent", code="http_302")
+    assert len(fake_telegram.calls) == 1
+    assert fake_telegram.calls[0].request.req_kwargs["timeout"] == (5.0, 10.0)
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_every_chart_call_opens_a_fresh_session(
+    fake_telegram: Any, monkeypatch: Any, method: str
+) -> None:
+    sessions: list[requests.Session] = []
+    original = client_module._new_session
+
+    def spy() -> requests.Session:
+        sessions.append(original())
+        return sessions[-1]
+
+    monkeypatch.setattr(client_module, "_new_session", spy)
+    fake_telegram.accept_chart(TOKEN)
+    client = _client()
+
+    assert CALLS[method](client).kind == "ok"
+    assert CALLS[method](client).kind == "ok"
+
+    assert len(sessions) == 2
+    assert sessions[0] is not sessions[1]
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_unexpected_error_in_a_chart_call_is_logged_by_class(
+    fake_telegram: Any, caplog: Any, method: str
+) -> None:
+    fake_telegram.fail_method(TOKEN, method, exc=RuntimeError(f"boom at {_url(method)}"))
+
+    with caplog.at_level(logging.WARNING, logger="powermon.telegram.client"):
+        result = CALLS[method](_client())
+
+    assert result == SendResult("maybe_delivered", code="unexpected_error")
+    assert f"telegram {method}: unexpected RuntimeError" in caplog.text
+    assert TOKEN.split(":", 1)[1] not in caplog.text
+
+
+@pytest.mark.parametrize("method", list(BY_ID))
+@pytest.mark.parametrize("message_id", [0, -1, True, "1001"], ids=["zero", "neg", "bool", "str"])
+def test_bad_message_ids_raise_before_any_request(
+    fake_telegram: Any, method: str, message_id: Any
+) -> None:
+    # A programming error, not a Telegram outcome: no request is made for it.
+    with pytest.raises(ValueError, match="message_id"):
+        BY_ID[method](_client(), message_id)
+
+    assert len(fake_telegram.calls) == 0
+
+
+def test_client_has_no_unpin_all_call() -> None:
+    # D-04, INV-19: only stored chart messages are unpinned, by id; admin pins stay.
+    names = [name.lower().replace("_", "") for name in dir(TelegramClient)]
+
+    assert "unpinchatmessage" in names  # the scan saw the real client
+    assert not [name for name in names if "unpinall" in name]
+    assert "unpinAll" not in CLIENT_SOURCE.read_text(encoding="utf-8")
+
+
+# The fake's per-method helpers, which the chart lifecycle tests build on
+
+
+def test_fail_method_then_accept_chart_answer_in_order(fake_telegram: Any) -> None:
+    fake_telegram.fail_method(TOKEN, "pinChatMessage", **_bad_request(NO_PIN_RIGHT))
+    fake_telegram.accept_chart(TOKEN)
+    client = _client()
+
+    first = client.pin_chat_message(DEFAULT_CHAT_ID, MESSAGE_ID)
+    second = client.pin_chat_message(DEFAULT_CHAT_ID, MESSAGE_ID)
+    third = client.pin_chat_message(DEFAULT_CHAT_ID, MESSAGE_ID)
+
+    assert [first.kind, second.kind, third.kind] == ["permanent", "ok", "ok"]
+    assert fake_telegram.count(TOKEN, "pinChatMessage") == 3
+    # Only accepted calls are recorded.
+    assert [c.method for c in fake_telegram.chart_calls] == ["pinChatMessage"] * 2
+
+
+def test_answer_method_runs_during_then_accepts(fake_telegram: Any) -> None:
+    seen: list[str] = []
+    fake_telegram.answer_method(TOKEN, "sendPhoto", lambda: seen.append("during"))
+
+    result = _client().send_photo(DEFAULT_CHAT_ID, PNG, CAPTION)
+
+    assert result == SendResult("ok", message_id=1001)
+    assert seen == ["during"]
+    assert [c.method for c in fake_telegram.chart_calls] == ["sendPhoto"]
+
+
+def test_answer_method_can_answer_an_error_or_raise(fake_telegram: Any) -> None:
+    gone = _bad_request("Bad Request: message to edit not found")
+    fake_telegram.answer_method(TOKEN, "editMessageMedia", lambda: None, **gone)
+    timeout = requests.ReadTimeout("read timed out")
+    fake_telegram.answer_method(TOKEN, "unpinChatMessage", lambda: None, exc=timeout)
+    client = _client()
+
+    edited = client.edit_message_media(DEFAULT_CHAT_ID, MESSAGE_ID, PNG, CAPTION)
+    unpinned = client.unpin_chat_message(DEFAULT_CHAT_ID, MESSAGE_ID)
+
+    assert edited == SendResult("edit_target_missing", code="target_missing")
+    assert unpinned == SendResult("maybe_delivered", code="read_timeout")
+    assert fake_telegram.chart_calls == []
+
+
+def test_answer_method_and_fail_method_refuse_misuse(fake_telegram: Any) -> None:
+    with pytest.raises(ValueError, match="sendMessage"):
+        fake_telegram.answer_method(TOKEN, "sendMessage", lambda: None)
+    with pytest.raises(TypeError):
+        fake_telegram.fail_method(TOKEN, "sendPhoto")
+
+
+def test_an_unregistered_chart_method_still_raises(fake_telegram: Any) -> None:
+    # Only sendPhoto is answered: any other URL raises in the transport (maybe_delivered).
+    fake_telegram.fail_method(TOKEN, "sendPhoto", status=200, json_body={"ok": True})
+
+    result = _client().pin_chat_message(DEFAULT_CHAT_ID, MESSAGE_ID)
+
+    assert result == SendResult("maybe_delivered", code="connection_dropped")
+    assert fake_telegram.count(TOKEN, "pinChatMessage") == 1
