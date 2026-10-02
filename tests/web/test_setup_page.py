@@ -26,6 +26,7 @@ from powermon.locations.examples import (
     wget_busybox,
     wget_gnu,
 )
+from powermon.locations.models import Location
 
 User = get_user_model()
 
@@ -384,4 +385,23 @@ def test_setup_meta_line_shows_status_and_last_heartbeat(admin: Client, location
         r'<p class="meta"><span class="status status--on">On</span> · Last heartbeat: '
         r'<span class="num">2026-10-25 03:30:00 EEST</span></p>',
         on,
+    )
+
+
+@pytest.mark.django_db
+def test_setup_meta_line_shows_maintenance(admin: Client, location: Any) -> None:
+    # The Phase 4 vocabulary (D-13, UI-SPEC screen E): "Maintenance" whenever the flag is
+    # on, whatever the stored status underneath.
+    beat = datetime(2026, 10, 25, 0, 30, tzinfo=UTC)
+    LocationState.objects.filter(location=location).update(
+        status="on", last_heartbeat_at=beat, on_since=beat
+    )
+    Location.objects.filter(pk=location.pk).update(maintenance=True)
+
+    page = admin.get(_url(location)).content.decode()
+
+    assert re.search(
+        r'<p class="meta"><span class="status status--maintenance">Maintenance</span> · '
+        r'Last heartbeat: <span class="num">2026-10-25 03:30:00 EEST</span></p>',
+        page,
     )

@@ -53,6 +53,16 @@ ALERTS_HELP = (
     "While off, subscribers get no new alerts, and none are saved for later. Alerts already "
     "queued still go out. The chart, its 15-minute refresh and the midnight re-pin carry on."
 )
+ROUTER_GRACE_ON_FLASH = (
+    "Router grace is on. From now on, OFF waits 180 seconds longer right after power returns."
+)
+ROUTER_GRACE_ALREADY_ON_FLASH = "Router grace was already on. Nothing changed."
+ROUTER_GRACE_ALREADY_OFF_FLASH = "Router grace was already off. Nothing changed."
+ROUTER_GRACE_HELP = (
+    "While on, OFF waits 180 seconds longer when the last heartbeat came within 5 minutes "
+    "after power returned, so a router that restarts after a blackout is not reported as a "
+    "second outage. It changes only decisions made from now on."
+)
 
 
 @pytest.fixture
@@ -394,3 +404,85 @@ def test_set_flag_rejects_a_field_outside_the_switches(
     assert actions.set_flag(gone.pk + 1000, "router_grace", True) is False
     assert _ctid(gone) == gone_row
     assert Location.objects.get(pk=gone.pk).alerts_enabled is True
+
+
+# The router-grace switch (LOC-09, D-05): one configuration column, future decisions only
+
+
+def _router_grace(location: Any) -> str:
+    return f"/locations/{location.pk}/router-grace/"
+
+
+@pytest.mark.django_db
+def test_router_grace_switch_flashes(
+    admin: Client, location_factory: Callable[..., Any], fake_telegram: FakeTelegram
+) -> None:
+    location = location_factory(name="Office", period_s=45, grace_s=20)
+    assert transitions.record_heartbeat(location.pk, _at(8, 0)) == "started"
+    before = _columns(location)
+    version = LocationState.objects.get(location=location).state_version
+
+    page = admin.get(_page(location)).content.decode()
+
+    assert "<h3>Router grace is off</h3>" in page
+    assert f'<p class="help">{ROUTER_GRACE_HELP}</p>' in page
+    form = _form(page, _router_grace(location))
+    assert 'name="csrfmiddlewaretoken"' in form
+    assert '<input type="hidden" name="value" value="on">' in form
+    assert '<button class="btn btn--secondary" type="submit">Turn router grace on</button>' in form
+    # D-05 order: Maintenance, Alerts, Router grace.
+    switches = re.search(r'<ul class="switches">(.*?)</ul>', page, re.S)
+    assert switches is not None
+    headings = re.findall(r"<h3>([^<]*)</h3>", switches.group(1))
+    assert headings == ["Maintenance is off", "Alerts are on", "Router grace is off"]
+
+    on = admin.post(_router_grace(location), {"value": "on"})
+
+    assert (on.status_code, on.url) == (302, _page(location))
+    followed = admin.get(on.url).content.decode()
+    assert re.findall(r'role="status">([^<]*)<', followed) == [ROUTER_GRACE_ON_FLASH]
+    assert "<h3>Router grace is on</h3>" in followed
+    assert '<button class="btn btn--secondary" type="submit">Turn router grace off</button>' in (
+        _form(followed, _router_grace(location))
+    )
+    assert _columns(location) == {**before, "router_grace": True}
+    assert LocationState.objects.get(location=location).state_version == version
+
+    # Edge (idempotency, UI-D3): on twice writes nothing the second time.
+    row = _ctid(location)
+    again = admin.post(_router_grace(location), {"value": "on"}, follow=True).content.decode()
+    assert re.findall(r'role="status">([^<]*)<', again) == [ROUTER_GRACE_ALREADY_ON_FLASH]
+    assert _ctid(location) == row
+
+    off = admin.post(_router_grace(location), {"value": "off"}, follow=True).content.decode()
+
+    # The off flash names the plain timeout of this location: P + G = 45 + 20 seconds.
+    assert re.findall(r'role="status">([^<]*)<', off) == [
+        "Router grace is off. From now on, OFF is reported after 65 seconds without a heartbeat."
+    ]
+    assert _columns(location) == before
+    off_again = admin.post(_router_grace(location), {"value": "off"}, follow=True).content.decode()
+    assert re.findall(r'role="status">([^<]*)<', off_again) == [ROUTER_GRACE_ALREADY_OFF_FLASH]
+    assert LocationState.objects.get(location=location).state_version == version
+    assert _open_state(location) == "on"
+    assert len(fake_telegram.calls) == 0
+
+
+@pytest.mark.django_db
+def test_router_grace_switch_refuses_a_bad_value_a_get_and_an_unknown_location(
+    admin: Client, location_factory: Callable[..., Any], fake_telegram: FakeTelegram
+) -> None:
+    location = location_factory()
+    gone = location_factory(name="Gone", deleted_at=_at(9, 0))
+    row = _ctid(location)
+
+    for data in ({}, {"value": "1"}, {"value": "On"}):
+        response = admin.post(_router_grace(location), data)
+        assert (response.status_code, response.content) == (400, b"")
+    assert admin.get(_router_grace(location)).status_code == 405
+    for pk in (gone.pk, gone.pk + 1000):
+        assert admin.post(f"/locations/{pk}/router-grace/", {"value": "on"}).status_code == 404
+
+    assert _ctid(location) == row
+    assert not Location.objects.filter(router_grace=True).exists()
+    assert len(fake_telegram.calls) == 0
