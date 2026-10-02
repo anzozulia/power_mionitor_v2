@@ -165,6 +165,32 @@ def test_ok_response(fake_telegram: Any) -> None:
     assert fake_telegram.calls[0].request.url == SEND_URL
 
 
+def test_send_message_disable_notification(fake_telegram: Any) -> None:
+    # D-11: the admin's test message is sent silently; an alert's body is unchanged.
+    fake_telegram.accept(TOKEN)
+    client = TelegramClient(TOKEN)
+    body = {"chat_id": DEFAULT_CHAT_ID, "text": TEXT, "parse_mode": "HTML"}
+
+    assert client.send_message(DEFAULT_CHAT_ID, TEXT, disable_notification=True) == (
+        SendResult("ok")
+    )
+    assert client.send_message(DEFAULT_CHAT_ID, TEXT) == SendResult("ok")
+    assert client.send_message(DEFAULT_CHAT_ID, TEXT, disable_notification=False) == (
+        SendResult("ok")
+    )
+
+    assert fake_telegram.sent == [{**body, "disable_notification": True}, body, body]
+
+
+def test_send_message_takes_the_silent_flag_by_name_only(fake_telegram: Any) -> None:
+    fake_telegram.accept(TOKEN)
+
+    with pytest.raises(TypeError):
+        TelegramClient(TOKEN).send_message(DEFAULT_CHAT_ID, TEXT, True)  # type: ignore[misc]
+
+    assert len(fake_telegram.calls) == 0
+
+
 def test_every_call_passes_the_short_timeouts(fake_telegram: Any) -> None:
     fake_telegram.accept(TOKEN)
 

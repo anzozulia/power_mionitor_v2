@@ -18,22 +18,38 @@
   refused connection, a 429, an ambiguous send or a chart call), and a
   ``migrate_to_chat_id`` from Telegram is reported to the admin, never applied (PITFALLS
   6e).
+- INV-19 #2 (relay part), D-09: a deleted location's queued alerts are never sent, not
+  even one in flight at delete time that came back to pending; they are dropped before
+  expiry, so no expiry notice names the deleted location. A deleted location never gets a
+  new failing incident or notice, even from a refusal answered while it was being deleted.
 
 The relay runs ``close_old_connections()``, so every test that runs ``run_iteration`` is
-``django_db(transaction=True)``. Time comes only from the ``FakeClock`` passed in;
-Telegram is faked at the HTTP boundary (``fake_telegram``), and ``ops_settings``
-configures the admin chat, whose bot is accepted wherever ops rows must be delivered.
+``django_db(transaction=True)``, as is the race with a concurrent delete (``Actor``, real
+PostgreSQL row locks). Time comes only from the ``FakeClock`` passed in; Telegram is faked
+at the HTTP boundary (``fake_telegram``), and ``ops_settings`` configures the admin chat,
+whose bot is accepted wherever ops rows must be delivered.
 """
 
 import dataclasses
+import threading
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 import requests
-from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, OPS_BOT_TOKEN, OPS_CHAT_ID, FakeClock
-from django.db import transaction
+from conftest import (
+    DEFAULT_BOT_TOKEN,
+    DEFAULT_CHAT_ID,
+    OPS_BOT_TOKEN,
+    OPS_CHAT_ID,
+    Actor,
+    FakeClock,
+    blocked_on_lock,
+    terminate_backends,
+    wait_for,
+)
+from django.db import connection, transaction
 from django.db.models import F, Value
 from django.db.models.functions import Greatest
 from urllib3.exceptions import MaxRetryError, NewConnectionError
@@ -596,3 +612,137 @@ def test_record_test_success_refuses_a_naive_time_and_changes_nothing(
     assert _incidents(location) == [(T0, None, {"http_status": 403})]
     assert _row(off).next_attempt_at == T0 + _min(15)
     assert _ops_rows(outbox.KIND_OPS_DELIVERY_RESTORED) == []
+
+
+# INV-19 #2 (relay part), D-09: a deleted location's queued alerts never go out
+
+
+def _delete(location: Any, at: datetime = T0) -> None:
+    """Set the tombstone as 04-07's delete does (its own pending-row drop is not run)."""
+    Location.objects.filter(pk=location.pk).update(deleted_at=at)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV19_2_deleted_locations_pending_alerts_are_dropped_never_sent(
+    location_factory: Callable[..., Any], fake_telegram: Any, ops_settings: Any
+) -> None:
+    location = location_factory()
+    off = _queue(location)
+    _delete(location)
+    fake_telegram.accept(TOKEN_A)
+    fake_telegram.accept(OPS_BOT_TOKEN)
+    state = io_loop.RelayState()
+
+    assert io_loop.run_iteration(FakeClock(T0), state) is False
+
+    assert _calls_to(fake_telegram, TOKEN_A) == 0
+    row = _row(off)
+    assert (row.status, row.attempts, row.last_error) == ("dropped", 0, "location_deleted")
+    # Past its maximum age nothing expires: no expiry notice names the deleted location.
+    assert io_loop.run_iteration(FakeClock(row.expires_at + _min(1)), state) is False
+    assert _row(off).status == "dropped"
+    assert _ops_rows(outbox.KIND_OPS_EXPIRED) == []
+    assert len(fake_telegram.calls) == 0
+
+
+@pytest.mark.django_db(transaction=True)
+def test_send_in_flight_at_delete_is_dropped_not_resent(
+    location_factory: Callable[..., Any], fake_telegram: Any, ops_settings: Any
+) -> None:
+    location = location_factory()
+    off = _queue(location)
+    # The admin deletes the location while its OFF is in flight; the bot was removed too.
+    fake_telegram.answer(TOKEN_A, lambda: _delete(location), status=403, json_body=KICKED)
+    fake_telegram.accept(TOKEN_A)
+    fake_telegram.accept(OPS_BOT_TOKEN)
+    state = io_loop.RelayState()
+
+    assert io_loop.run_iteration(FakeClock(T0), state) is True
+
+    # The refusal put the row back to pending, but nothing names the tombstone.
+    assert (_row(off).status, _row(off).last_error) == ("pending", "http_403")
+    assert not OpsIncident.objects.filter(kind=delivery.KIND_DELIVERY_FAILING).exists()
+    assert _ops_rows(outbox.KIND_OPS_DELIVERY_FAILING) == []
+
+    # Due again after 15 minutes: the next pass drops it, and nothing is sent again.
+    later = T0 + _min(15)
+    assert io_loop.run_iteration(FakeClock(later), state) is False
+    row = _row(off)
+    assert (row.status, row.attempts, row.last_error) == ("dropped", 1, "location_deleted")
+    assert _calls_to(fake_telegram, TOKEN_A) == 1
+    assert state.failing == {}
+    assert io_loop.run_iteration(FakeClock(row.expires_at + _min(1)), state) is False
+    assert _ops_rows(outbox.KIND_OPS_EXPIRED) == []
+    assert _calls_to(fake_telegram, TOKEN_A) == 1
+
+
+@pytest.mark.django_db
+def test_open_failing_on_a_deleted_location_writes_nothing(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    location = location_factory()
+    _delete(location)
+
+    with transaction.atomic():
+        assert delivery.open_failing(location.pk, T0, 403) is False
+
+    assert not OpsIncident.objects.exists()
+    assert not OutboxMessage.objects.exists()
+    # A live location still opens one (the rule is about tombstones only).
+    live = location_factory()
+    with transaction.atomic():
+        assert delivery.open_failing(live.pk, T0, 403) is True
+    assert _incidents(live) == [(T0, None, {"http_status": 403})]
+
+
+def _finish(*actors: Actor, release: threading.Event) -> None:
+    """Release the hook and join every started actor; end any session still stuck."""
+    release.set()
+    started = [actor for actor in actors if actor.ident is not None]
+    for actor in started:
+        actor.join(5)
+    if any(actor.is_alive() for actor in started):
+        terminate_backends(Actor.APPLICATION_NAME)
+        for actor in started:
+            actor.join(5)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_open_failing_waits_for_a_concurrent_delete_and_writes_nothing(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    # The admin's delete has written the tombstone but not committed yet when the relay's
+    # outcome transaction reaches open_failing: FOR SHARE waits for it, then sees the
+    # tombstone, so no incident and no notice name the deleted location.
+    location = location_factory()
+    locked, release = threading.Event(), threading.Event()
+
+    def delete_holding_the_row() -> None:
+        with transaction.atomic(), connection.cursor() as cur:
+            cur.execute("UPDATE location SET deleted_at = %s WHERE id = %s", [T0, location.pk])
+            locked.set()
+            if not release.wait(5):
+                raise AssertionError("the race hook was never released")
+
+    def refused() -> bool:
+        with transaction.atomic():
+            return delivery.open_failing(location.pk, T0 + _min(1), 403)
+
+    delete = Actor(delete_holding_the_row)
+    relay = Actor(refused)
+    try:
+        delete.start()
+        assert locked.wait(5)
+        relay.start()
+        assert wait_for(lambda: relay.pid is not None and blocked_on_lock(relay.pid))
+        release.set()
+        delete.join(5)
+        relay.join(5)
+    finally:
+        _finish(delete, relay, release=release)
+
+    assert delete.exc is None, delete.exc
+    assert relay.exc is None, relay.exc
+    assert relay.result is False
+    assert not OpsIncident.objects.exists()
+    assert _ops_rows(outbox.KIND_OPS_DELIVERY_FAILING) == []
