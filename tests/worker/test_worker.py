@@ -910,6 +910,26 @@ def test_run_worker_stops_on_sigterm_and_exits_0(
     assert exits == []
 
 
+def test_run_worker_enables_charts(worker_command: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The production worker runs the chart lifecycle; serve's default (every test above
+    # and every Phase 2 test) keeps it off (D-05, Pitfall 4).
+    captured: dict[str, Any] = {}
+    exits: list[int] = []
+
+    def fake_serve(stop: threading.Event, clock: Any, lease: Any, **kwargs: Any) -> int:
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(signal, "signal", lambda sig, handler: None)
+    monkeypatch.setattr(run_worker, "serve", fake_serve)
+    monkeypatch.setattr(os, "_exit", exits.append)
+
+    call_command("run_worker")
+
+    assert captured["charts"] is True
+    assert exits == []
+
+
 def test_run_worker_exits_with_the_code_serve_returns(
     worker_command: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:

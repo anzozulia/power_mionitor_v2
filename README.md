@@ -6,7 +6,9 @@ Power Monitor tracks whether mains power is on at a few locations. A small mains
 device at each location (a router cron job, an ESP32, a Raspberry Pi; no UPS) sends a
 heartbeat every minute or so. When the heartbeats stop for longer than the location's
 period plus grace, the location's Telegram channel gets an OFF alert; the first heartbeat
-after the outage brings an ON alert. One admin manages the locations in a small web panel.
+after the outage brings an ON alert. Each channel also gets a pinned weekly chart of when
+power was on and off, with daily totals, that updates itself (section 10, Weekly chart).
+One admin manages the locations in a small web panel.
 
 The stack is Django (web panel and heartbeat endpoint), one worker process (outage
 detection and Telegram delivery), PostgreSQL and Caddy (TLS), run with Docker Compose.
@@ -24,7 +26,11 @@ connected.
   **before the first start**: Caddy requests the TLS certificate on first start.
 - Ports 80 and 443 open to the internet (check the provider's firewall too).
 - For each location: a Telegram bot token from @BotFather and a private channel (see the
-  rule above) with the bot added as an administrator with the "Post messages" right.
+  rule above) with the bot added as an administrator with the "Post messages" and
+  "Edit messages of others" rights. The second one lets the bot pin, unpin and edit the
+  weekly chart in a channel. In a group (not recommended) the bot needs "Pin messages"
+  instead. Without the pin right the chart is still posted and refreshed, and the admin
+  gets a 📌 notice (section 10).
 - Optional, recommended: a private Telegram chat for the admin's ops notices (section 4).
 
 ## 3. Server prep
@@ -174,12 +180,15 @@ its OFF within one detection window (period plus grace) after the restart.
    60 and 30, at least 10), the bot token from @BotFather, the numeric chat ID of the
    private test channel (`-100...`; the form's help text says how to find it) and the
    alert language (uk, en or ru). The bot must be an administrator of the channel with the
-   "Post messages" right.
+   "Post messages" and "Edit messages of others" rights (the second one to pin, unpin and
+   edit the weekly chart; in a group it needs "Pin messages").
 3. On the location's setup page, click **Reveal key** and copy the curl or cron example
    onto the device. The device must run on mains power only (no UPS): heartbeats measure
    power and internet at the device.
 4. The location list shows **Waiting for first heartbeat**, then **On** after the first
-   heartbeat. The first heartbeat sends no alert.
+   heartbeat. The first heartbeat sends no alert, but within a few seconds the channel
+   gets its first weekly chart, posted and pinned silently (section 10). The chart starts
+   at the first heartbeat: the time before it is empty (no data).
 
 Never paste a URL that contains the key into Telegram or any other chat: link previewers
 open it, and every opening counts as a heartbeat.
@@ -328,11 +337,45 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
   - Alert may not have been delivered (a timeout after the request went out, or a worker
     stopped mid-send; it is never resent):
     `❓ ON alert for Office (event 17:45) may not have been delivered (Telegram timed out after the request was sent). It will not be resent; please check the channel.`
+  - The bot may post the weekly chart but not pin it (a missing pin right, section 2),
+    once when pinning starts failing and once when it works again:
+    `📌 Can't pin today's chart for Office (Telegram: http_400). The chart is still posted and refreshed; pinning is retried every 15 min. Check that the bot may pin messages in the chat.`
+    and `📌 Pinning works again for Office.`
 - **Late alerts:** an alert sent more than 2 minutes after its transition was recorded
   starts with the local time of its event (the outage start for OFF, the restore time for
   ON): `🔴 17:27 POWER OFF`, or `🔴 30.09 23:58 POWER OFF` when the event was on another
   day. While Telegram is unreachable, alerts wait in the outbox and are retried per bot;
   heartbeats and detection never wait for Telegram.
+- **Weekly chart:** each location's channel has one pinned chart of the current week,
+  in the location's language: one row per day, Monday to Sunday, in `DISPLAY_TZ`, each a
+  bar showing when power was on, off or not monitored (hatched: server downtime), with
+  the day's off time and outage count. Days still to come show the same weekday of the
+  previous week, dimmed. The worker keeps it up to date by itself:
+  - The first chart is posted at the location's first heartbeat; the chart starts there,
+    and the time before it is empty (no data). A location still waiting for its first
+    heartbeat gets no chart.
+  - At local midnight (`DISPLAY_TZ`) a new chart for the new day is posted silently and
+    pinned silently. The previous day's chart then gets its final render (no now marker,
+    the caption names its date, for example `No outages on Thu 01.10`) and is unpinned.
+    Two charts are pinned for a few seconds at most.
+  - Today's chart is edited in place every 15 minutes, so an outage shows on it within 15
+    minutes of its OFF alert.
+  - After the worker was down across one or more midnights, it posts exactly one chart
+    for today and gives every older pinned chart its final render and unpins it. A day
+    the worker missed entirely gets no chart. After any restart, the chart is first
+    redrawn only once the worker has recorded the downtime as not monitored, so a
+    downtime is never drawn as on.
+  - The worker unpins only the charts it posted itself, by their message, in the chat
+    they were posted to; pins the channel admin made stay. If today's chart is deleted in
+    the channel, one replacement is posted and pinned.
+  - A channel pin may leave a "pinned a photo" service message in the channel each day
+    (Telegram's behaviour; it is checked once in section 12).
+  - Cost: a render takes about 0.1 to 0.3 s of CPU and about 35 MB of extra worker memory
+    while it runs. Chart work runs in the worker's Telegram thread only, at most one chart
+    call per delivery pass and after all due alerts, so it never delays detection or
+    heartbeats and delays an alert by one call at most. Each chart call logs one INFO
+    line, `chart <post|pin|finalize|unpin|refresh> for location <id>: <result> (<code>)
+    render_ms=<n> call_ms=<n>`.
 - **Data:** everything lives in `docker_data/prod/` (PostgreSQL data and Caddy
   certificates). Nightly backups are not part of this release yet.
 
@@ -480,3 +523,130 @@ rises by 1, and it comes back `healthy`.
 
 Expected: every long-running service (`db`, `web`, `worker`, `caddy`) shows a health
 status.
+
+## 12. Chart checks (Phase 3 verification)
+
+These five checks cover what the tests cannot: how the chart looks to a person, what
+Telegram does with a channel pin, and the chart's behaviour and cost on the real stack.
+Run (a) on the dev machine. Run (b) to (e) on the production VPS while the charts still go
+to the private test channel (section 1), with the ops chat configured (section 4). Record
+each result (times, values, a screenshot where it helps) in the phase verification. The
+first live DST change is on 2026-10-25: the chart tests (DST goldens included) must pass
+and these checks must be recorded before real subscriber channels are connected.
+
+### (a) Design check
+
+The five golden images in `tests/chart/goldens/` are the renderer's own output: the
+sample week of `docs/chart-spec.md` section 10 in uk, en and ru, and the two DST Sundays
+(2026-10-25, 25 h; 2027-03-28, 23 h) in en. The maintainer approves them here.
+
+1. On the dev machine, in the checkout, render the five images into a new folder. The
+   folder is bind-mounted because the image has no source mount; the committed goldens
+   are not touched:
+
+   ```sh
+   mkdir -p /tmp/chart-check
+   docker compose -f docker-compose.local.yml run --build --rm --no-deps --user "$(id -u):$(id -g)" \
+     -e CHART_GOLDENS_OUT=/goldens -v /tmp/chart-check:/goldens \
+     web pytest -q tests/chart/test_goldens.py
+   ```
+
+   `/tmp/chart-check` then holds `sample-uk.png`, `sample-en.png`, `sample-ru.png`,
+   `dst-2026-10-25-en.png` and `dst-2027-03-28-en.png`.
+2. From the Telegram app, send the five images to the private test channel as photos
+   (compressed, as the bot sends them), each with its file name as the caption.
+3. View each one on a phone, at about 400 px wide, in Telegram's light theme and then in
+   its dark theme. The title, legend, day labels, totals and caption must be readable,
+   the today row and the now marker must stand out, and both DST rows must end at 24:00
+   (2026-10-25: the repeated hour drawn once; 2027-03-28: 03:00 to 04:00 empty).
+4. Run each image through a colour-vision-deficiency simulator (deuteranopia,
+   protanopia and grayscale). On, off and not monitored must stay easy to tell apart
+   (the target is `docs/assets/chart-mock-en-cvd.png`).
+5. Compare them with the mocks `docs/assets/chart-mock-uk.png`, `chart-mock-en.png` and
+   `chart-mock-uk-phone.png`.
+
+Record: "approved", or the list of fixes. A rejection means the renderer is fixed and the
+goldens are regenerated on purpose (the same command with
+`-v <absolute checkout path>/tests/chart/goldens:/goldens`), then checked again.
+
+### (b) Pin service message
+
+1. Watch the test channel while a chart is pinned: at a location's first heartbeat
+   (section 6) or at local midnight.
+2. Look at the channel on a phone.
+
+Record: whether a "pinned a photo" service message appears in the channel, whether the
+phone showed a notification for it, and that the chart is pinned (the pinned-message bar
+at the top shows it) with no `📌 Can't pin …` notice in the ops chat.
+
+### (c) DoD 1, chart part: an outage shows within 15 minutes
+
+1. Unplug a device whose location is on, and note the time.
+2. Wait for its OFF alert in the test channel (within its period plus grace) and note the
+   time.
+3. Watch the pinned chart (open it again to see an edit).
+
+Expected: within 15 minutes of the OFF alert, today's row shows the outage in red, from
+the last heartbeat (the outage start) to the now marker, and the caption's off time and
+outage count include it.
+
+Record: the unplug time, the OFF alert time and the time the chart first showed the
+outage. Undo: plug the device back in (one ON follows; the next edit ends the red span).
+
+### (d) DoD 2, chart part: a 10-minute stack downtime is hatched
+
+This can run together with section 11's DoD 2 drill.
+
+1. Note the time, then stop everything: `docker compose -f docker-compose.prod.yml stop`
+2. After 10 minutes, deploy: `docker compose -f docker-compose.prod.yml up -d --build --wait`
+3. Watch the pinned chart until it is edited, at most 15 minutes after the restart (open
+   it again to see an edit).
+
+Expected: from the first edit after the restart on, today's row shows the 10-minute
+window hatched (not monitored), never red and never green, and the caption's off time
+does not include it. The ops chat gets one `⏸ Monitoring gap …` notice for the same
+window.
+
+Record: the stop and start times, the time of the first edit after the restart, and
+whether the window was hatched on it.
+
+### (e) INV-14 #3: the midnight chart job on the VPS
+
+At local midnight every location's chart is posted, pinned, given its final render and
+unpinned, beside detection. This check measures render time and worker memory on the
+real VPS, and that detection did not pause.
+
+1. Before 23:55 local, start sampling the worker's CPU and memory into a file, in a
+   shell on the VPS that stays open until after 00:10. Stop it with Ctrl-C after 00:10:
+
+   ```sh
+   while true; do
+     printf '%s ' "$(date +%T)"
+     docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}}' powermon-prod-worker-1
+     sleep 1
+   done > ~/worker-stats-midnight.txt
+   ```
+
+2. After 00:10, read the worker's chart lines from 23:55 on. `--since` takes the UTC time
+   of 23:55 local on the evening's date: `20:55:00Z` while Kyiv is on summer time,
+   `21:55:00Z` in winter. Replace `<date>` with that date (`YYYY-MM-DD`):
+
+   ```sh
+   docker compose -f docker-compose.prod.yml logs --since <date>T20:55:00Z worker | grep -E 'chart (post|pin|finalize|unpin|refresh) for location'
+   docker compose -f docker-compose.prod.yml logs --since <date>T20:55:00Z worker | grep -o 'render_ms=[0-9]*' | sort -t= -k2 -n | tail -1
+   docker compose -f docker-compose.prod.yml logs --since <date>T20:55:00Z worker | grep -o 'call_ms=[0-9]*' | sort -t= -k2 -n | tail -1
+   ```
+
+3. Check that detection did not pause: no `⏸ Monitoring gap` notice in the ops chat
+   between 23:55 and 00:10, and no row from:
+
+   ```sh
+   docker compose -f docker-compose.prod.yml exec db psql -U <POSTGRES_USER> -d <POSTGRES_DB> -c "SELECT started_at, ended_at FROM ops_incident WHERE kind = 'monitoring_gap' AND ended_at >= '<date> 20:55:00+00'"
+   ```
+
+Expected: after 00:00 local every location has a `post`, a `pin`, a `finalize` and an
+`unpin` line, each `ok`; there is no monitoring gap; the worker's memory stays within its
+budget (about 110 MB steady, plus about 35 MB while a chart renders).
+
+Record: the largest `render_ms` and `call_ms`, the worker's peak memory in
+`~/worker-stats-midnight.txt`, and the result.
