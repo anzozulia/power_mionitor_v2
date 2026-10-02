@@ -153,7 +153,11 @@ def test_INV24_1_regeneration_kills_the_old_key_and_keeps_history(
     # History: an earlier closed piece, the open on piece from the heartbeats, a queued
     # alert and a chart record (posted with the location's own bot, 04-06's release rule).
     PowerInterval.objects.create(
-        location=location, state="off", start_at=_at(7, 0), end_at=_at(7, 30), outage_start_at=_at(7, 0)
+        location=location,
+        state="off",
+        start_at=_at(7, 0),
+        end_at=_at(7, 30),
+        outage_start_at=_at(7, 0),
     )
     assert _heartbeat(old_key, _at(8, 0)).status_code == 200
     assert _heartbeat(old_key, _at(8, 1)).status_code == 200
@@ -347,7 +351,7 @@ def test_regenerate_confirmation_blocks(
     page = response.content.decode()
     main = _main(page)
     assert "<title>Office · Regenerate key · Power Monitor</title>" in page
-    assert '<h1>Regenerate the device key?</h1>' in main
+    assert "<h1>Regenerate the device key?</h1>" in main
     assert f"<p>{LEAD}</p>" in main
     expected = {
         "warning": WARNING_BLOCK.format(off_after=65),
@@ -369,7 +373,9 @@ def test_regenerate_confirmation_blocks(
     assert "autofocus" not in page
     assert "btn--primary" not in page
     assert page.count("btn--danger") == 1
-    keep = f'<a class="btn btn--secondary" href="/locations/{location.pk}/setup/">Keep current key</a>'
+    keep = (
+        f'<a class="btn btn--secondary" href="/locations/{location.pk}/setup/">Keep current key</a>'
+    )
     assert keep in main
     assert main.index("btn--danger") < main.index(keep)
     assert "<script" not in page

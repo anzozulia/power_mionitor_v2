@@ -6,6 +6,7 @@ from powermon.web.location_views import (
     AlertsSwitchView,
     LocationDetailView,
     MaintenanceSwitchView,
+    RegenerateKeyView,
     RouterGraceSwitchView,
 )
 from powermon.web.views import (
@@ -34,6 +35,11 @@ urlpatterns = [
         name="location-router-grace",
     ),
     path("locations/<int:pk>/setup/", LocationSetupView.as_view(), name="location-setup"),
+    path(
+        "locations/<int:pk>/setup/regenerate/",
+        RegenerateKeyView.as_view(),
+        name="location-regenerate",
+    ),
     path("login/", SignInView.as_view(), name="login"),
     path("logout/", SignOutView.as_view(), name="logout"),
     path("healthz", healthz, name="healthz"),

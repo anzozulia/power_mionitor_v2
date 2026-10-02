@@ -50,6 +50,9 @@ written here. The bot token is shown only as its masked form. The meta line uses
 </div>
 <p>Anyone with this key can send heartbeats for this location. Keep it private.</p>
 {% endif %}
+{% comment %}Both key states (UI-SPEC screen E): the entry point only opens the confirmation page (UI-D5).{% endcomment %}
+<p>If the key has leaked, regenerate it. The old key stops working at once.</p>
+<p><a class="btn btn--secondary" href="{% url 'location-regenerate' location.pk %}">Regenerate key</a></p>
 
 <h2>Examples</h2>
 {% if not revealed %}

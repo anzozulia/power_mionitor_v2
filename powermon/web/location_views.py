@@ -1,9 +1,11 @@
-"""The Phase 4 location pages: the location page and its one-click switches (D-13, D-05).
+"""The Phase 4 location pages: the location page, its one-click switches and the key
+rotation (D-13, D-05, D-14).
 
 - Every view here needs the signed-in admin: LoginRequiredMiddleware denies by default and
   none of them is ``login_not_required``.
-- Every action is a POST with CSRF, answered POST -> redirect -> GET with a flash (UI-D4),
-  so a reload never repeats it.
+- Every switch is a POST with CSRF, answered POST -> redirect -> GET with a flash (UI-D4),
+  so a reload never repeats it. Regenerate key is a GET confirmation, then a POST answered
+  with the revealed setup page itself (D-14, D-17), guarded against a resubmit (UI-D7).
 - A switch posts its target value, never "toggle" (UI-D3): the same state again writes
   nothing and gets the "already" info flash, so a double click, a second tab or a stale page
   can never flip it back. Each switch changes exactly one flag (D-05).
@@ -12,6 +14,7 @@
 - Every location URL answers 404 for an unknown or deleted location (UI-SPEC screen H).
 """
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, ClassVar
@@ -19,16 +22,31 @@ from typing import Any, ClassVar
 from django.contrib import messages
 from django.http import HttpRequest, HttpResponse, HttpResponseBadRequest
 from django.shortcuts import get_object_or_404, redirect, render
+from django.utils.crypto import constant_time_compare, salted_hmac
+from django.utils.decorators import method_decorator
 from django.views import View
+from django.views.decorators.cache import never_cache
 
 from powermon.clock import Clock, SystemClock
 from powermon.engine import maintenance
 from powermon.locations import actions, validators
 from powermon.locations.models import LANGUAGE_CHOICES, Location
+from powermon.web import views
 from powermon.web.status import location_status
+
+log = logging.getLogger(__name__)
 
 LANGUAGE_LABELS = dict(LANGUAGE_CHOICES)
 SWITCH_VALUES = ("on", "off")
+
+# UI-D7: the regenerate form's marker is a salted HMAC (SECRET_KEY) of the key it replaces.
+REGENERATE_SALT = "powermon.regenerate-key"
+# UI-SPEC Copywriting › Device setup and key regeneration, verbatim.
+REGENERATED_MESSAGE = (
+    "New key saved. The old key no longer works. Copy the new key or an example below to "
+    "the device."
+)
+ALREADY_REGENERATED_MESSAGE = "The key was already regenerated. The key below is the current one."
 
 # UI-SPEC Copywriting › Switches, verbatim.
 MAINTENANCE_HELP = (
@@ -244,3 +262,69 @@ class LocationDetailView(View):
             **settings_context(location),
         }
         return render(request, self.template_name, context)
+
+
+def regenerate_marker(key: str) -> str:
+    """The UI-D7 marker of ``key``: a salted HMAC-SHA256 (hex), with no key characters.
+
+    The confirmation form carries it, and the POST regenerates only while it is still the
+    marker of the location's current key. It is exact (unlike the last 4 characters, which
+    two keys can share) and reveals nothing about the key (T-04-18).
+    """
+    return salted_hmac(REGENERATE_SALT, key, algorithm="sha256").hexdigest()
+
+
+def regenerate_block(location: Location) -> str:
+    """The one D-15 state block of the regenerate confirmation (UI-SPEC screen F).
+
+    "maintenance" whenever the flag is on; else by the stored status: "warning" (on: an
+    OFF can be recorded while the device has the old key), "off" or "waiting".
+    """
+    if location.maintenance:
+        return "maintenance"
+    power_key = location_status(location).power_key
+    return {"on": "warning", "off": "off"}.get(power_key, "waiting")
+
+
+@method_decorator(never_cache, name="dispatch")
+class RegenerateKeyView(View):
+    """``/locations/<pk>/setup/regenerate/``: rotate the device key (LOC-06, D-14, D-15, D-17).
+
+    GET is the confirmation page (UI-SPEC screen F): it changes nothing, shows exactly one
+    D-15 state block and one form, the destructive POST, and never the key, not even masked.
+    The form's hidden marker is ``regenerate_marker`` of the key it replaces (UI-D7).
+
+    POST regenerates only while the posted marker is the current key's
+    (``constant_time_compare``) and the conditional UPDATE still finds that key
+    (``actions.regenerate_key``). Either way it answers with the setup page revealed:
+    200, ``Cache-Control: no-store``, with the new key and the success flash, or, for a
+    resubmitted, stale or raced POST, with the current key and the UI-D7 info flash. So a
+    reload or a double click never replaces the key a second time, and the response is
+    the only one besides Reveal that carries the full key (SEC-04). No network I/O (KD2).
+    """
+
+    template_name = "web/location_regenerate.html"
+
+    def get(self, request: HttpRequest, pk: int) -> HttpResponse:
+        location = location_or_404(pk)
+        context = {
+            "location": location,
+            # Not "block": inside {% block %} the template engine binds that name itself.
+            "state_block": regenerate_block(location),
+            "off_after_s": location.period_s + location.grace_s,
+            "marker": regenerate_marker(location.device_key),
+        }
+        return render(request, self.template_name, context)
+
+    def post(self, request: HttpRequest, pk: int) -> HttpResponse:
+        current = location_or_404(pk).device_key
+        posted = request.POST.get("marker", "")
+        if constant_time_compare(posted, regenerate_marker(current)) and actions.regenerate_key(
+            pk, current
+        ):
+            # The id only: never a key (OPS-08).
+            log.info("device key regenerated for location %s", pk)
+            messages.success(request, REGENERATED_MESSAGE)
+        else:
+            messages.info(request, ALREADY_REGENERATED_MESSAGE)
+        return views.render_setup(request, pk, revealed=True)

@@ -1,8 +1,9 @@
-"""The admin's configuration writes on a location (D-05, LOC-09, LOC-10).
+"""The admin's configuration writes on a location (D-05, D-14; LOC-06, LOC-09, LOC-10).
 
 Each write is one explicit, column-limited conditional UPDATE, decided by its row count,
 and never ``Model.save()`` (INV-02 #3): a save writes every column from an instance read
-earlier, so a stale page could switch a toggle back. None of them does network I/O (KD2),
+earlier, so a stale page could switch a toggle back or bring a replaced device key back.
+None of them does network I/O (KD2),
 and none touches ``location_state``: they are configuration, not engine transitions. The
 maintenance switch is an engine transition and lives in ``powermon.engine.maintenance``
 (D-02).
@@ -10,6 +11,7 @@ maintenance switch is an engine transition and lives in ``powermon.engine.mainte
 
 from typing import Literal, get_args
 
+from powermon.locations import keys
 from powermon.locations.models import Location
 
 # The configuration-only switches (D-05). Maintenance is not one of them: it writes the
@@ -42,3 +44,23 @@ def set_flag(location_id: int, field: FlagField, value: bool) -> bool:
         .update(**{field: value})
     )
     return changed == 1
+
+
+def regenerate_key(location_id: int, current_key: str) -> bool:
+    """Replace the device key ``current_key`` with a new one: True if this call replaced it.
+
+    One UPDATE that stores a new 32-character key (``keys.generate_device_key``), only
+    while the location is not deleted and still has ``current_key`` (D-14). So a second
+    call with the same old key (a resubmitted form, a second tab) or a call that lost a
+    race with another regeneration finds no row and replaces nothing (UI-D7). The
+    heartbeat looks its location up by key, so the old key gets 401 from the moment this
+    commits, and the history is not touched (INV-24 #1).
+
+    ``device_key`` is UNIQUE, so the UPDATE takes the row's FOR UPDATE lock and waits
+    briefly for an in-flight heartbeat whose outbox insert holds KEY SHARE on it; it holds
+    no other lock, so it cannot deadlock (RESEARCH Pattern 7).
+    """
+    replaced = Location.objects.filter(
+        pk=location_id, deleted_at__isnull=True, device_key=current_key
+    ).update(device_key=keys.generate_device_key())
+    return replaced == 1
