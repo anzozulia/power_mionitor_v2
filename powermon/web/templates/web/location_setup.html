@@ -81,5 +81,6 @@ written here. The bot token is shown only as its masked form. The meta line uses
 
 <h2>Location settings</h2>
 {% include "web/_settings_panel.html" %}
-<p class="help">Settings cannot be changed yet. To fix a mistake, add a new location; an unused one stays in Waiting for first heartbeat and sends nothing.</p>
+{% comment %}UI-D10: the entry point to the edit form, a secondary link-button under the panel.{% endcomment %}
+<p><a class="btn btn--secondary" href="{% url 'location-edit' location.pk %}">Edit location</a></p>
 {% endblock %}

@@ -55,6 +55,10 @@ ALREADY_REGENERATED_MESSAGE = "The key was already regenerated. The key below is
 
 # UI-SPEC Copywriting › Edit form, verbatim.
 CHANGES_SAVED_MESSAGE = "Changes saved."
+CHANNEL_CHANGED_MESSAGE = (
+    "Changes saved. The weekly chart is posted again with the new bot or chat. The old one "
+    "is unpinned if this location's bot is an admin of the old channel."
+)
 
 # UI-SPEC Copywriting › Switches, verbatim.
 MAINTENANCE_HELP = (
@@ -290,7 +294,9 @@ class LocationEditView(View):
     help shows the current token masked (SEC-04). An invalid POST answers 200 with the
     form, every value kept except the token; the title and the breadcrumbs keep the stored
     name. A valid POST is one ``actions.update_config``, the view's only write, then a
-    redirect to the location page with "Changes saved." (UI-D4). No network I/O (KD2).
+    redirect to the location page with "Changes saved." (UI-D4), extended by the channel
+    sentence when the chat ID or the token changed (D-08): the save made that location's
+    queued alerts due, and the worker moves the chart. No network I/O (KD2).
     """
 
     template_name = "web/location_edit.html"
@@ -313,7 +319,9 @@ class LocationEditView(View):
             raise Http404
         # The id and a flag only: never a token or a chat ID (OPS-08).
         log.info("settings saved for location %s (channel changed: %s)", pk, result.channel_changed)
-        messages.success(request, CHANGES_SAVED_MESSAGE)
+        # A chat or token change also moves the chart: the flash says so (D-08).
+        flash = CHANNEL_CHANGED_MESSAGE if result.channel_changed else CHANGES_SAVED_MESSAGE
+        messages.success(request, flash)
         return redirect("location-detail", pk=pk)
 
     def _render(

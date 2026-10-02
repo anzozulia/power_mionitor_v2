@@ -1,10 +1,10 @@
 {% extends "base.html" %}
 {% load display_time %}
 {% comment %}
-UI-SPEC screen B (D-13): the location page. Sections in order: Status, Switches, Settings,
-Device setup (04-08 adds Test message after Switches and the Delivery row; 04-07 adds the
-Edit link and the Delete section). The switch rows come from location_views.switch_rows,
-in D-05 order: Maintenance, Alerts, Router grace.
+UI-SPEC screen B (D-13): the location page. Sections in order: Status, Switches, Settings
+(with the "Edit location" link-button, UI-D10), Device setup (04-08 adds Test message after
+Switches and the Delivery row; 04-07 adds the Delete section). The switch rows come from
+location_views.switch_rows, in D-05 order: Maintenance, Alerts, Router grace.
 Read-only except the switches, each a one-click POST form (CSRF) that posts its target value
 (UI-D3) and redirects back here (UI-D4). No script, no inline style.
 Secrets (SEC-04): no device key appears on this page, not even masked; the bot token only
@@ -61,6 +61,7 @@ in its masked form, in the settings panel.
 
 <h2>Settings</h2>
 {% include "web/_settings_panel.html" %}
+<p><a class="btn btn--secondary" href="{% url 'location-edit' location.pk %}">Edit location</a></p>
 
 <h2>Device setup</h2>
 <p>Heartbeat URL, device key and copy-paste examples for the device.</p>

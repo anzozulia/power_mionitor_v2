@@ -17,6 +17,7 @@ from typing import Any, Literal, get_args
 
 from django.db import transaction
 
+from powermon.alerts import outbox
 from powermon.locations import keys
 from powermon.locations.models import Location
 
@@ -57,6 +58,14 @@ def update_config(location_id: int, data: Mapping[str, Any], now: datetime) -> C
     lowering it below the current silence makes the next cycle record OFF from the last
     heartbeat (DATA-04, INV-06).
 
+    A new chat ID or a new token (one that differs from the stored one) is a channel
+    change (D-08): in the same transaction the location's pending subscriber alerts become
+    due at ``now`` (``outbox.make_due``), so a 15-minute backoff earned in the old channel
+    does not hold them; the relay renders them at send time with the current bot and chat,
+    so they go to the new channel. The chart moves on its own: the worker's chart planner
+    sees records whose chat or bot no longer match and releases them (04-06). A change of
+    only the name or the language needs neither: the next chart refresh shows it.
+
     ``found`` is False, with nothing written, for an unknown or deleted location (a
     delete that commits first is seen: the locking read re-checks ``deleted_at``). No
     network I/O (KD2): nothing is sent to Telegram on save.
@@ -80,6 +89,8 @@ def update_config(location_id: int, data: Mapping[str, Any], now: datetime) -> C
         channel_changed = fields["chat_id"] != stored["chat_id"] or (
             bool(new_token) and new_token != stored["bot_token"]
         )
+        if channel_changed:
+            outbox.make_due(location_id, now)
     return ConfigSaved(found=True, channel_changed=channel_changed)
 
 

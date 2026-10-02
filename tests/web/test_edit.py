@@ -839,9 +839,7 @@ def test_edit_escapes_the_name_and_has_no_script(
 
     for html in (page, invalid):
         assert f"<title>{ESCAPED_XSS_NAME} · Edit · Power Monitor</title>" in html
-        assert (
-            f'<a class="name" href="/locations/{location.pk}/">{ESCAPED_XSS_NAME}</a>' in html
-        )
+        assert f'<a class="name" href="/locations/{location.pk}/">{ESCAPED_XSS_NAME}</a>' in html
         assert f'value="{ESCAPED_XSS_NAME}"' in _input(html, "name")
         assert "<script" not in html
     assert "<h1>Edit location</h1>" in page
