@@ -11,24 +11,38 @@ incident.
 
 An open incident ends at the first of these heartbeats (D-04, refined after the wave-1
 audit):
-- one after its start from an active location (the Phase 2 rule: that heartbeat breaks
-  the silence itself);
-- one received after it was opened from a location in maintenance (monitored, not
-  deleted). Such a heartbeat proves the server and network path work, so the end
-  candidates are wider than the active set that starts it. It must come after the open,
-  not just after the start, because the start is backdated: a device in maintenance
-  usually beat between the start and the detection, and that beat says nothing about the
-  path now. In the INV-12 #1 shape (ingress down while the devices stay powered) counting
-  it closed the incident at the next evaluation with a false "Heartbeats are back" while
-  the outage went on, and one incident per silence (below) then swallowed the real
-  recovery notice.
+- one after its start from a location active since before the start (the Phase 2 rule:
+  that heartbeat breaks the silence itself);
+- one received after it was opened from any other end candidate (monitored, not
+  deleted): a location in maintenance, or one that left maintenance after the start.
+  Such a heartbeat proves the server and network path work, so the end candidates are
+  wider than the active set that starts it. It must come after the open, not just after
+  the start, because the start is backdated: a device in maintenance usually beat
+  between the start and the detection, and that beat says nothing about the path now.
+  In the INV-12 #1 shape (ingress down while the devices stay powered) counting it closed
+  the incident at the next evaluation with a false "Heartbeats are back" while the
+  outage went on, and one incident per silence (below) then swallowed the real recovery
+  notice.
+
+The maintenance flag is read when the check runs, not when the heartbeat came in, so a
+location the admin takes out of maintenance during the incident must not fall back to
+the start rule (wave-2 audit): its beat from before the open would end the incident
+falsely, and the next check would open a second incident for the same silence.
+``END_SQL`` therefore also reads the location's ``window_start_at``, which D-02 sets to
+the exit when maintenance ends with the location on, and whether the location is off.
+Maintenance that ends with the location off starts no window, but an off location's last
+heartbeat came before its outage, so it is never a fresh one; for an off location that
+was active at the open it lies before the start anyway. Only a location that is on, out
+of maintenance and whose window started no later than the start counts from the start
+(``_counts_after``).
 
 The open time is stored with the incident by the transaction that opens it, as integer
 microseconds ``opened_us`` in ``ops_incident.details`` (integers only, OPS-08). An
 incident without a valid ``opened_us`` (opened before this rule) gets the time of the
 first evaluation that sees it as its open time, stored the same way. That stand-in is
-never earlier than the real open, so it can only ignore more maintenance heartbeats, never
-end the incident falsely, and a device in maintenance that keeps beating still ends it.
+never earlier than the real open, so it can only ignore more heartbeats from locations
+outside the silence, never end the incident falsely, and a device in maintenance that
+keeps beating still ends it.
 
 No hold (D-01, Pitfall 11): subscriber alerts are untouched. Ukrainian queue blackouts
 really do take several locations off the grid at once, so silence everywhere is either an
@@ -99,11 +113,14 @@ SELECT s.location_id, l.period_s, s.last_heartbeat_at
 """
 
 # The end candidates (D-04): every monitored, non-deleted location, in maintenance or not.
-# ACTIVE_SQL's columns in the same order plus the maintenance flag, which decides whether
-# a heartbeat counts after the start (active) or only after the open (maintenance). One
-# statement, so a location toggled meanwhile is seen once, with one flag.
+# ACTIVE_SQL's columns in the same order, then what decides whether a heartbeat counts
+# after the start or only after the open (_counts_after): the maintenance flag, the start
+# of the location's detection window (D-02 writes it when maintenance ends with the
+# location on) and whether it is off. One statement, so a location toggled meanwhile is
+# seen once, in one state.
 END_SQL = """
-SELECT s.location_id, l.period_s, s.last_heartbeat_at, l.maintenance
+SELECT s.location_id, l.period_s, s.last_heartbeat_at, l.maintenance, s.window_start_at,
+       s.status = 'off'
   FROM location_state s
   JOIN location l ON l.id = s.location_id
  WHERE s.status IN ('on', 'off') AND l.deleted_at IS NULL
@@ -130,6 +147,12 @@ class Active:
     # Only an end candidate can be in maintenance (END_SQL); its heartbeat ends an
     # incident only if it came after the incident was opened (D-04).
     maintenance: bool = False
+    # END_SQL only: when the location's detection window started (D-02 sets it when
+    # maintenance ends with the location on) and whether it is off. A window started after
+    # the incident's start, or an off status, also makes a heartbeat count only after the
+    # open (_counts_after).
+    window_start_at: datetime | None = None
+    off: bool = False
 
 
 def _quiet_since(row: Active, lapse_end: datetime | None) -> datetime | None:
@@ -165,11 +188,31 @@ def first_back(
 ) -> Active | None:
     """The row whose heartbeat ends the incident first; the lowest id on a tie (pure, D-04).
 
-    An active row's heartbeat counts after ``since`` (the start); a row in maintenance
-    counts only with a heartbeat after ``opened_at`` (the open), and never without one.
+    A row active since before the start counts with a heartbeat after ``since`` (the
+    start); any other row (in maintenance, out of it since after the start, or off)
+    counts only with a heartbeat after ``opened_at`` (the open), and never without one
+    (``_counts_after``).
     """
     found = _first_heartbeat_after(rows, since, opened_at)
     return None if found is None else found[1]
+
+
+def _counts_after(row: Active, since: datetime, opened_at: datetime | None) -> datetime | None:
+    """After when the row's heartbeat ends the incident; None for never (pure, D-04).
+
+    ``since`` (the start) only for a location active since before the start: on, out of
+    maintenance, with no detection window started after the start. Its heartbeat breaks
+    the silence itself. Every other end candidate counts only after ``opened_at`` (the
+    open): one in maintenance; one that left it on after the start (D-02 started its
+    window at the exit); and one that is off, whose last heartbeat came before its outage
+    (maintenance that ends with the location off starts no window). A heartbeat of theirs
+    before the open came while they were outside the silence the incident reports, and
+    the evaluation that opened the incident had already seen it (wave-2 audit).
+    """
+    window_after_start = row.window_start_at is not None and row.window_start_at > since
+    if row.maintenance or row.off or window_after_start:
+        return opened_at
+    return since
 
 
 def _first_heartbeat_after(
@@ -177,7 +220,7 @@ def _first_heartbeat_after(
 ) -> tuple[datetime, Active] | None:
     back: list[tuple[datetime, int, Active]] = []
     for row in rows:
-        after = opened_at if row.maintenance else since
+        after = _counts_after(row, since, opened_at)
         at = row.last_heartbeat_at
         if after is not None and at is not None and at > after:
             back.append((at, row.location_id, row))
@@ -202,8 +245,8 @@ def evaluate(now: datetime) -> str | None:
     """Start or end all-silent at ``now``: "started", "ended" or None (D-01, D-04, D-11, D-12).
 
     One transaction. With an open all-silent incident, the first heartbeat that ends it
-    (``first_back`` over ``_end_candidates``: an active location's after its start, or a
-    location in maintenance's after its open) closes it at that heartbeat and queues (or
+    (``first_back`` over ``_end_candidates``: a location active since before the start
+    after its start, any other after its open) closes it at that heartbeat and queues (or
     logs) one end notice naming that location. An open incident without a stored open
     time gets ``now`` as its open time first (module docstring). With none open, a started
     silence among the active locations (``_active``) opens one at its start time, stores
