@@ -15,7 +15,20 @@ One process, three threads, all started at once and always running:
   ops bot, because the outbox lives in the database (D-11 #2, INV-13 #2). A process
   restarted during the outage counts from its container's last held cycle instead
   (``lease.HELD_MARKER``, WR-02).
+  With chart work on, each pass ends with the chart step (``powermon.chart.lifecycle``:
+  at most one chart call, after every due alert and the ops head, D-05, INV-14).
 - main: the watchdog (below), until SIGTERM or SIGINT.
+
+Chart work and the first-cycle gate (CHRT-05, INV-10 #1 chart part, DoD 2). ``serve``
+keeps one ``supervision.CarveGate`` shared by both loops. The detection loop marks a
+generation right after that generation's cycle returned; a new generation always forces
+the lapse carve, which commits before the cycle returns. The I/O thread runs the chart
+step only while the generation it serves is the marked one, so after a worker start, a
+DB restart or a reacquired lease no chart (not even one refresh or catch-up final edit)
+is drawn before the downtime is stored as not monitored: a downtime is never drawn as on.
+``manage.py run_worker`` turns chart work on (``Command.handle`` passes ``charts=True``);
+``serve``, ``io_thread`` and ``detection_loop`` keep it off by default, so a caller that
+does not ask for it (every Phase 2 test) runs exactly the Phase 2 passes.
 
 The lease is HELD, STANDBY or DB_DOWN, with a generation counter that rises on every
 successful acquisition (``powermon.worker.lease``). A lost lease session is reacquired in
@@ -96,6 +109,7 @@ from powermon.worker.supervision import (
     DETECTION_STALL_S,
     EXIT_STALL,
     IO_STALL_S,
+    CarveGate,
     DbOutageLog,
     HealthFile,
     Progress,
@@ -143,8 +157,13 @@ def detection_loop(
     lease: Lease,
     progress: Progress,
     health: HealthFile,
+    gate: CarveGate | None = None,
 ) -> None:
-    """Keep the lease and run a detection cycle every ``interval`` s until ``stop`` is set."""
+    """Keep the lease and run a detection cycle every ``interval`` s until ``stop`` is set.
+
+    After each completed cycle ``gate`` (if given) is marked with the cycle's lease
+    generation: that generation's lapse carve has committed, so chart work may start.
+    """
     outage = DbOutageLog(log, "detection", clock)
     # What the previous cycle of this process saw: the lapse carve's forced triggers.
     tracker = CycleTracker()
@@ -168,6 +187,9 @@ def detection_loop(
                         )
                         announced = status.generation
                     detection.run_detection(clock, status.generation, tracker, tick=tick)
+                    # The cycle, with the carve a new generation forces, is committed.
+                    if gate is not None:
+                        gate.mark(status.generation)
                     health.touch()
                     outage.ok()
                 elif status.state is LeaseState.STANDBY:
@@ -191,8 +213,15 @@ def io_thread(
     idle_wait: float,
     lease: Lease,
     progress: Progress,
+    gate: CarveGate | None = None,
+    charts: bool = False,
 ) -> None:
-    """Drain the outbox while HELD until ``stop`` is set; wait ``idle_wait`` s when idle."""
+    """Drain the outbox while HELD until ``stop`` is set; wait ``idle_wait`` s when idle.
+
+    With ``charts`` set, a pass also runs the chart step, but only once ``gate`` says the
+    detection cycle of the lease generation being served has completed (the first-cycle
+    gate). Without a gate there is no chart work at all.
+    """
     state = io_loop.RelayState()
     outage = DbOutageLog(log, "telegram-io", clock)
     activated = 0  # the last generation this loop activated
@@ -216,7 +245,12 @@ def io_thread(
                     # Every claim names the lease session: once it is gone, nothing more
                     # is claimed, even before the detection loop notices (C1).
                     state.lease_pid = status.pid
-                    busy = io_loop.run_iteration(clock, state, stop, tick=tick)
+                    if charts and gate is not None and gate.ready(status.generation):
+                        # This generation's carve has committed: chart work may draw.
+                        busy = io_loop.run_iteration(clock, state, stop, tick=tick, charts=True)
+                    else:
+                        # Exactly the Phase 2 pass: alerts and ops notices only.
+                        busy = io_loop.run_iteration(clock, state, stop, tick=tick)
                     outage.ok()
             except _DB_ERRORS as exc:
                 outage.failed(exc)
@@ -238,13 +272,16 @@ def serve(
     check_interval: float = WATCHDOG_CHECK_S,
     health: HealthFile | None = None,
     on_stall: Callable[[str], None] | None = None,
+    charts: bool = False,
 ) -> int:
     """Run both loops under the watchdog until ``stop`` is set (0).
 
-    Returns EXIT_STALL only when an injected ``on_stall`` returns; the default one exits
-    the process itself.
+    ``charts`` turns the chart lifecycle on in the Telegram I/O thread, behind the
+    first-cycle gate the two loops share. Returns EXIT_STALL only when an injected
+    ``on_stall`` returns; the default one exits the process itself.
     """
     progress = Progress(clock)
+    gate = CarveGate()
     health_file = HealthFile() if health is None else health
     try:
         threads = {
@@ -257,9 +294,18 @@ def serve(
                 lease,
                 progress,
                 health_file,
+                gate,
             ),
             "telegram-io": _start(
-                "telegram-io", io_thread, stop, clock, io_idle_wait, lease, progress
+                "telegram-io",
+                io_thread,
+                stop,
+                clock,
+                io_idle_wait,
+                lease,
+                progress,
+                gate,
+                charts,
             ),
         }
         watchdog = Watchdog(
@@ -323,7 +369,13 @@ class Command(BaseCommand):
             signal.signal(sig, request_stop)
         clock = SystemClock()
         # HELD_MARKER: a restart during a database outage still sends its notice (WR-02).
-        code = serve(stop, clock, Lease(connection.settings_dict, clock, held_marker=HELD_MARKER))
+        # charts=True: the production worker runs the chart lifecycle (CHRT-05, D-05).
+        code = serve(
+            stop,
+            clock,
+            Lease(connection.settings_dict, clock, held_marker=HELD_MARKER),
+            charts=True,
+        )
         if code != 0:
             # Exit at once with the code, so Docker's restart policy restarts the process;
             # os._exit skips interpreter shutdown, so flush the log lines first.

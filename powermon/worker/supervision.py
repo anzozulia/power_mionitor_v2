@@ -23,6 +23,9 @@ thread watches the loops (D-15, OPS-05):
   worker's compose healthcheck requires it to be under 30 s old.
 - ``DbOutageLog`` turns a run of database errors into one WARNING when the database goes
   away and one when it is back, with the error class only (D-16, OPS-08).
+- ``CarveGate`` tells the Telegram I/O thread which lease generation's first detection
+  cycle (lapse carve included) has completed, so chart work never draws a downtime as on
+  (INV-10 #1 chart part).
 
 Everything reads time from the injected ``Clock`` (monotonic time for every age), so
 tests drive it with ``FakeClock``. The health file's mtime is the one exception: the
@@ -74,6 +77,33 @@ class Progress:
         """The monotonic time of loop ``name``'s last stamp, or None if it never stamped."""
         with self._lock:
             return self._stamps.get(name)
+
+
+class CarveGate:
+    """The lease generation whose detection cycle, lapse carve included, has completed.
+
+    The first-cycle gate (03-CONTEXT, INV-10 #1 chart part, DoD 2). The detection loop
+    marks a generation right after that generation's cycle returned; a new generation
+    (a worker start, a DB restart, a reacquired lease) always forces the lapse carve, which
+    commits before the cycle returns. The Telegram I/O thread does chart work only while
+    the generation it serves is the marked one, so no chart, not even one refresh, is
+    drawn before the downtime it follows is stored as not monitored: a downtime is never
+    drawn as on. Generation 0 (no lease held yet) is never ready.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._generation = 0
+
+    def mark(self, generation: int) -> None:
+        """Record that ``generation``'s detection cycle has completed."""
+        with self._lock:
+            self._generation = generation
+
+    def ready(self, generation: int) -> bool:
+        """True if chart work may run for ``generation``: its cycle has completed."""
+        with self._lock:
+            return generation != 0 and self._generation == generation
 
 
 class Watchdog:
