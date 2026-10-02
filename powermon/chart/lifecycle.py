@@ -75,12 +75,33 @@ worker was down is simply due on the next pass.
   database, so after downtime exactly one catch-up refresh is made, not one per missed
   slot (INV-18). Midnight-class steps (post, pin, finalize, unpin) beat any refresh; among
   due refreshes the oldest render goes first, ties to the lower location id.
+- Release (D-08, D-09, INV-19 #2): a record is ``stale`` once its channel is no longer its
+  location's: the chat stored with it differs from the location's chat, the bot that
+  posted it (``bot_key``) differs from the location's current bot (a token change is a
+  channel change), or the location was deleted. A stale record gets one unpin by its own
+  message id in its stored chat, with the location's current bot, and is then retired
+  (``retired_at``, unpinned), so no final edit, pin or refresh ever targets it again. The
+  admin's save writes nothing to the chart: the condition is checked on every pass
+  (INV-18 style), so a chat changed and changed back before the worker acts moves nothing,
+  and a restart needs no extra state. Release is best effort and never loops: "ok",
+  "message to unpin not found" and any other permanent error retire the record. A
+  permanent error logs one WARNING with its short code and sends no ops notice: if the
+  current bot may not unpin in the old chat, the old pin stays (the accepted Open Edge 6
+  risk). A transient, rate-limited or unsent outcome backs the release off like any other
+  step. While any stale record of a location is active, that location makes no other step
+  (Pitfall 1): a post in the new chat while the old today-record is active would hit
+  ``chart_message_one_active_per_day`` and leave an untracked photo on every pass. Once
+  its stale records are retired, a moved location has no record for today, so today's
+  chart is posted and pinned in its new chat on the next passes. A change of only the name
+  or the language releases nothing: the next refresh shows it (D-14).
 
 Each step is its own condition, checked on every pass (D-02): after downtime across one
 or more midnights the passes post and pin one chart for today and finalize and unpin
-every older chart, and a day the worker missed gets no chart (D-03, INV-18, INV-19). When
-both are due, an older record's final edit goes before its unpin (D-02 order); a final
-edit not due yet (its day has not settled) never holds the unpin.
+every older chart, and a day the worker missed gets no chart (D-03, INV-18, INV-19). A
+location's stale records are released first, oldest first (local date, then id), before
+any other step of that location. When both are due, an older record's final edit goes
+before its unpin (D-02 order); a final edit not due yet (its day has not settled) never
+holds the unpin.
 
 Rendering runs inline in the I/O thread right before its call (D-05), with the location's
 current name and language and the display time zone read at render time (D-14). The
@@ -153,7 +174,7 @@ from powermon.worker.lease import LOCK_KEY
 
 log = logging.getLogger(__name__)
 
-Step = Literal["post", "pin", "finalize", "unpin", "refresh"]
+Step = Literal["post", "pin", "finalize", "unpin", "refresh", "release"]
 
 # The ops_incident kind of a location whose bot may post but not pin (D-07, INV-17 #1).
 KIND_CHART_PIN_FAILED = "chart_pin_failed"
@@ -190,7 +211,7 @@ SELECT l.id, l.name, l.language, l.bot_token, l.chat_id, l.period_s, l.grace_s, 
 # (whether or not they are known pinned, INV-19).
 ROWS_SQL = """
 SELECT id, location_id, local_date, chat_id, message_id, pinned, pin_failed_at,
-       last_rendered_at, finalized_at, unpinned_at
+       last_rendered_at, finalized_at, unpinned_at, bot_key
   FROM chart_message
  WHERE retired_at IS NULL
    AND (local_date = %(today)s
@@ -230,6 +251,8 @@ class ChartLocation:
     # How long after a day ends detection may still record an OFF that started in it
     # (``settle_time``): the day's final edit waits until the detection cursor passed it.
     settle: timedelta
+    # A deleted location (D-09): every record it still has is released, nothing else.
+    deleted: bool = False
 
 
 @dataclass(frozen=True)
@@ -247,6 +270,8 @@ class ChartRow:
     finalized_at: datetime | None
     # The older record's one unpin was made (INV-19); None until then.
     unpinned_at: datetime | None
+    # The bot that posted it: ``io_loop.bot_key`` of its token, never the token (D-08).
+    bot_key: str
 
 
 @dataclass(frozen=True)
@@ -262,6 +287,30 @@ def chart_key(location_id: int, step: Step, row_id: int | None = None) -> str:
     """A chart step's own backoff key in ``RelayState.not_before``: by location, never a token."""
     key = f"{_KEY_PREFIX}{location_id}:{step}"
     return key if row_id is None else f"{key}:{row_id}"
+
+
+def stale(location: ChartLocation, row: ChartRow) -> bool:
+    """True when the record's channel is no longer its location's: it is released (D-08).
+
+    The channel is the (bot, chat) pair the relay keys on too (``io_loop.chat_key``): the
+    record is stale when its stored chat differs from the location's chat, when the bot
+    that posted it differs from the location's current bot, or when the location was
+    deleted (D-09). A record whose ``bot_key`` is empty names no bot, so it is stale like
+    any other mismatch. Pure.
+    """
+    return (
+        location.deleted
+        or row.chat_id != location.chat_id
+        or row.bot_key != io_loop.bot_key(location.bot_token)
+    )
+
+
+def _stale_rows(location: ChartLocation, rows: list[ChartRow]) -> list[ChartRow]:
+    """The location's stale records, oldest first (local date, then id)."""
+    return sorted(
+        (row for row in rows if row.location_id == location.location_id and stale(location, row)),
+        key=lambda row: (row.local_date, row.id),
+    )
 
 
 def step_delay(failures: int) -> timedelta:
@@ -364,6 +413,7 @@ def read_snapshot(today: date) -> tuple[list[ChartLocation], list[ChartRow]]:
                 last_rendered_at=r[7],
                 finalized_at=r[8],
                 unpinned_at=r[9],
+                bot_key=r[10],
             )
             for r in cur.fetchall()
         ]
@@ -383,6 +433,10 @@ def plan(
 
     Midnight-class steps go first: locations by ascending id, and the first one with a due
     step wins, so one location's midnight work is done before the next one's starts.
+    A location with a ``stale`` record (its chat or bot changed, or it was deleted) makes
+    only releases, oldest record first, until every stale record is retired; its release
+    waiting for its own key or its channel makes no other step of that location either, so
+    nothing is posted while the old today-record is active (D-08, D-09, Pitfall 1).
     Within a location the steps go in D-02 order: post today's chart, pin it, give the
     oldest older record without one its final edit, unpin the oldest older record not
     unpinned yet, whatever ``pinned`` says (its pin may have taken effect unrecorded,
@@ -404,6 +458,12 @@ def plan(
     due_refreshes: list[tuple[datetime, int, Action]] = []
     for location in locations:
         if waiting(io_loop.bot_wide_key(location.bot_token)):
+            continue
+        stale_rows = _stale_rows(location, rows)
+        if stale_rows or location.deleted:
+            for row in stale_rows:
+                if _free(location, "release", row, waiting):
+                    return Action("release", location, row)
             continue
         today_row = _today_row(rows, location.location_id, today)
         action = _midnight_step(location, rows, today_row, today, waiting, settled)
@@ -628,8 +688,10 @@ def _call(client: TelegramClient, action: Action, content: tuple[bytes, str] | N
     if action.step in ("refresh", "finalize") and row is not None and content is not None:
         png, caption = content
         return client.edit_message_media(row.chat_id, row.message_id, png, caption)
-    if action.step == "unpin" and row is not None:
+    if action.step in ("unpin", "release") and row is not None:
         # By its message id, in its own chat: never the admin's own pins (D-04, INV-19).
+        # A release is made even when the record was unpinned already: unpinning a
+        # message that is not pinned answers "not modified" (ok) or "not found" (D-08).
         return client.unpin_chat_message(row.chat_id, row.message_id)
     raise ValueError(f"no call for the chart step {action.step!r}")
 
@@ -644,6 +706,9 @@ def _apply(
 ) -> None:
     """Write the step's outcome: its record on success, else its own backoff (``_fail``)."""
     row = action.row
+    if action.step == "release" and row is not None:
+        _released(action, row, key, result, answered, state)
+        return
     if result.kind == "ok" and action.step == "post" and result.message_id is None:
         # Cannot happen with the client (it answers no_message_id), and must not record.
         result = SendResult("maybe_delivered", code="no_message_id")
@@ -687,6 +752,38 @@ def _apply(
         # The bot may not pin here: tried again after the next render, not before (D-07).
         _pin_refused(action.location, row, result, answered)
     _fail(action, key, result, answered, state)
+
+
+def _released(
+    action: Action,
+    row: ChartRow,
+    key: str,
+    result: SendResult,
+    answered: datetime,
+    state: io_loop.RelayState,
+) -> None:
+    """A stale record's release ends, best effort, unless it may still succeed (D-08, D-09).
+
+    "ok" (unpinned, or it was not pinned), "message to unpin not found" and any other
+    permanent error retire the record, so no later call ever targets it and the release
+    never loops (INV-19). A permanent error logs one WARNING with its short code and sends
+    no ops notice: the old pin may stay (the accepted Open Edge 6 risk). Any other outcome
+    (transient, rate limited, not sent, maybe delivered) backs the release off like any
+    step (``_fail``); the location makes no other step meanwhile (Pitfall 1).
+    """
+    if result.kind != "ok" and result.kind not in _PERMANENT_KINDS:
+        _fail(action, key, result, answered, state)
+        return
+    _retire(row, answered)
+    if result.kind == "permanent":
+        log.warning(
+            "chart release for location %s: permanent error %s for record %s; it is retired "
+            "(best effort, the old pin may stay)",
+            action.location.location_id,
+            result.code,
+            row.id,
+        )
+    _step_done(key, state)
 
 
 def _pinned(location: ChartLocation, row: ChartRow, answered: datetime) -> None:
@@ -804,7 +901,10 @@ def _unpinned(row: ChartRow, answered: datetime) -> None:
 
 
 def _retire(row: ChartRow, answered: datetime) -> None:
-    """The record's message is gone: retired and unpinned, never called again (D-06)."""
+    """The record leaves the lifecycle: retired and unpinned, never called again.
+
+    Its message is gone (D-06), or its channel is no longer its location's (D-08, D-09).
+    """
     ChartMessage.objects.filter(pk=row.id, retired_at__isnull=True).update(
         retired_at=answered, pinned=False
     )
@@ -1066,7 +1166,7 @@ def _unwritten(
 ) -> None:
     """The call was made but its record UPDATE could not be written: the step waits.
 
-    For a refresh, pin, final edit or unpin, all idempotent: the call is simply made again
+    For a refresh, pin, final edit, unpin or release, all idempotent: the call is made again
     after ``step_delay``, so an UPDATE that keeps failing never turns into a call per pass.
     A post never gets here: its record is kept and written first (``_record_or_keep``).
     """

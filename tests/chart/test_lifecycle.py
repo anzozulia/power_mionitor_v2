@@ -167,11 +167,12 @@ def _seed(
     chat_id: int = DEFAULT_CHAT_ID,
     pinned: bool = True,
 ) -> ChartMessage:
-    """A record as an earlier post left it (pinned by default)."""
+    """A record as an earlier post left it (pinned by default), by the location's own bot."""
     return ChartMessage.objects.create(
         location=location,
         local_date=day,
         chat_id=chat_id,
+        bot_key=io_loop.bot_key(location.bot_token),
         message_id=message_id,
         pinned=pinned,
         last_rendered_at=rendered,
@@ -210,7 +211,9 @@ def _row(
     day: date = TODAY,
     pinned: bool = True,
     pin_failed_at: datetime | None = None,
+    token: str = DEFAULT_BOT_TOKEN,
 ) -> lifecycle.ChartRow:
+    """A record of location ``location_id`` posted by the bot ``token`` (its location's)."""
     return lifecycle.ChartRow(
         id=row_id,
         location_id=location_id,
@@ -222,6 +225,7 @@ def _row(
         last_rendered_at=rendered,
         finalized_at=None,
         unpinned_at=None,
+        bot_key=io_loop.bot_key(token),
     )
 
 
@@ -315,6 +319,7 @@ def test_kept_post_records_the_bot_that_posted_it(
     # The admin changes the token before the kept post is written: the record still
     # names the bot that posted the photo, not the location's current one.
     Location.objects.filter(pk=location.pk).update(bot_token=TOKEN_B)
+    start = len(fake_telegram.calls)
     _pass(clock, state)
 
     assert state.chart_posted == {}
@@ -322,6 +327,12 @@ def test_kept_post_records_the_bot_that_posted_it(
     assert (row.message_id, row.chat_id, row.bot_key) == (1001, DEFAULT_CHAT_ID, posting_bot)
     assert row.bot_key != io_loop.bot_key(TOKEN_B)
     assert fake_telegram.count(DEFAULT_BOT_TOKEN, "sendPhoto") == 1
+    # So that pass made the token change's release (D-08): one unpin through the new
+    # bot, in the stored chat, for the kept message id; the record is retired.
+    assert _requests(fake_telegram, start) == [("B", "unpinChatMessage")]
+    [unpin] = _chart_calls(fake_telegram, "unpinChatMessage")
+    assert unpin.fields == {"chat_id": DEFAULT_CHAT_ID, "message_id": 1001}
+    assert row.retired_at == NOON_05
 
 
 def test_record_without_a_bot_key_is_refused(location_factory: Callable[..., Any]) -> None:
@@ -417,21 +428,44 @@ def test_the_record_exists_before_the_pin(
     assert _rows()[0].pinned is True
 
 
-def test_pin_uses_the_recorded_chat(
+def test_D08_record_moved_before_its_pin_is_released_and_never_pinned_there(
     location_factory: Callable[..., Any], fake_telegram: Any
 ) -> None:
     location = _monitored(location_factory)
     fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
     clock = FakeClock(NOON_05)
     state = io_loop.RelayState()
-    _pass(clock, state)
+    assert _pass(clock, state) is True
+    [posted] = _rows()
+    assert (posted.message_id, posted.chat_id, posted.pinned) == (1001, DEFAULT_CHAT_ID, False)
 
-    # The location moves to another chat after the post (D-04: the record's chat wins).
+    # The location moves to another chat after the post, before its pin (D-08): the old
+    # record is unpinned in its stored chat and retired, never pinned there; then today's
+    # chart is posted and pinned in the new chat.
     Location.objects.filter(pk=location.pk).update(chat_id=OTHER_CHAT_ID)
-    _pass(clock, state)
+    for _ in range(3):
+        assert _pass(clock, state) is True
+    assert _pass(clock, state) is False
 
+    assert [
+        (call.method, int(call.fields["chat_id"]), call.fields.get("message_id"))
+        for call in fake_telegram.chart_calls
+    ] == [
+        ("sendPhoto", DEFAULT_CHAT_ID, None),
+        ("unpinChatMessage", DEFAULT_CHAT_ID, 1001),
+        ("sendPhoto", OTHER_CHAT_ID, None),
+        ("pinChatMessage", OTHER_CHAT_ID, 1002),
+    ]
     [pin] = _chart_calls(fake_telegram, "pinChatMessage")
-    assert (pin.fields["chat_id"], pin.fields["message_id"]) == (DEFAULT_CHAT_ID, 1001)
+    assert (pin.fields["chat_id"], pin.fields["message_id"]) == (OTHER_CHAT_ID, 1002)
+    old, new = _rows()
+    assert (old.message_id, old.retired_at, old.pinned) == (1001, NOON_05, False)
+    assert (new.message_id, new.chat_id, new.pinned, new.retired_at) == (
+        1002,
+        OTHER_CHAT_ID,
+        True,
+        None,
+    )
 
 
 def test_permanent_pin_failure_waits_for_the_next_refresh(
@@ -786,8 +820,14 @@ def test_settled_records_wait_for_the_detection_cursor() -> None:
     b = _location(2, TOKEN_B, router_grace=True)
     yesterday = TODAY - timedelta(days=1)
     older_a = _row(10, 1, rendered=NOON_05 - timedelta(days=1), day=yesterday)
-    older_b = _row(20, 2, rendered=NOON_05 - timedelta(days=1), day=yesterday)
-    rows = [older_a, older_b, _row(11, 1, rendered=NOON_05), _row(21, 2, rendered=NOON_05)]
+    # Location 2's records were posted by its own bot, B.
+    older_b = _row(20, 2, rendered=NOON_05 - timedelta(days=1), day=yesterday, token=TOKEN_B)
+    rows = [
+        older_a,
+        older_b,
+        _row(11, 1, rendered=NOON_05),
+        _row(21, 2, rendered=NOON_05, token=TOKEN_B),
+    ]
     # Yesterday ends at today's local midnight.
     end = kyiv("2026-10-01 00:00")
     assert model.next_midnight(yesterday, KYIV) == end

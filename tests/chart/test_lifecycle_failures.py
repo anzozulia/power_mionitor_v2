@@ -93,12 +93,13 @@ def _monitored(location_factory: Callable[..., Any], since: datetime = SINCE, **
 
 
 def _seed(location: Any, day: date, *, message_id: int, pinned: bool) -> ChartMessage:
-    """A record an earlier run left: posted 15 min before the end of ``day``."""
+    """A record an earlier run left: posted by its location's bot 15 min before ``day`` ends."""
     at = model.next_midnight(day, KYIV) - timedelta(minutes=15)
     return ChartMessage.objects.create(
         location=location,
         local_date=day,
         chat_id=DEFAULT_CHAT_ID,
+        bot_key=io_loop.bot_key(location.bot_token),
         message_id=message_id,
         pinned=pinned,
         last_rendered_at=at,
@@ -753,6 +754,7 @@ def test_INV19_pinned_chart_is_unpinned_exactly_once(
         location=location,
         local_date=TODAY,
         chat_id=DEFAULT_CHAT_ID,
+        bot_key=io_loop.bot_key(location.bot_token),
         message_id=900,
         pinned=True,
         last_rendered_at=kyiv("2026-10-02 00:00:02"),
@@ -786,6 +788,7 @@ def test_INV19_a_chart_pinned_again_after_its_unpin_owes_a_new_one(
         location=location,
         local_date=TODAY,
         chat_id=DEFAULT_CHAT_ID,
+        bot_key=io_loop.bot_key(location.bot_token),
         message_id=900,
         pinned=False,
         last_rendered_at=NOON_05,
