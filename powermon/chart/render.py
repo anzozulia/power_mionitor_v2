@@ -5,15 +5,17 @@ RGB PNG of chart-spec §2. It is a pure function of the week (built from the sto
 timeline, ``now`` and the display time zone), the language and the location name: the
 same inputs, font files and Pillow version give the same bytes (chart-spec §9, D-09). It
 draws exactly the model's wall-clock segments and real-time totals and recomputes no data.
+Today's row shows only what happened up to ``now``; after it the track stays empty.
 
 How it draws (D-09, STACK Gotcha 1, 03-RESEARCH Pattern 2):
 - Pillow with the bundled Inter 4.1 TTFs, loaded by file path from ``FONT_DIR`` with
   ``ImageFont.Layout.BASIC`` only, so no system font, fontconfig or RAQM shaping can
   change a render.
-- Each horizontal band (a row box or a zone of the plot) is cut from the 1× canvas,
-  scaled up 4× with NEAREST, drawn on with integer 4× coordinates, reduced with
-  ``Image.reduce(4)`` (a box filter, so shapes come out anti-aliased) and pasted back.
-  Untouched pixels round-trip exactly, and no full 4× canvas is ever allocated.
+- Each horizontal band (the legend, each row box, the pill zone above today's row, the
+  divider zone, the now pill) is cut from the 1× canvas, scaled up 4× with NEAREST, drawn
+  on with integer 4× coordinates, reduced with ``Image.reduce(4)`` (a box filter, so
+  shapes come out anti-aliased) and pasted back. Untouched pixels round-trip exactly, and
+  no full 4× canvas is ever allocated.
 - All text is drawn at 1× after every band is pasted, so no band can cover text.
 
 Pure: imports nothing from Django. The web process must never import this module (it
@@ -28,9 +30,10 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-from powermon.chart.model import DAY_US, Row, Week
+from powermon.chart.model import DAY_US, HOUR_US, Row, Week, wall_us
 from powermon.i18n import chart_texts
 from powermon.i18n.strings import resolve_language
+from powermon.i18n.times import hm
 
 RGB = tuple[int, int, int]
 
@@ -71,6 +74,32 @@ AXIS_GAP = 30  # from the grid bottom to the hour-axis baseline
 MIN_OFF_PX = 8
 SUBTITLE_MAX = W - 2 * PAD_X  # 1184
 
+# Legend (chart-spec §3, §7): four swatches in a fixed order.
+SWATCH_W = 38
+SWATCH_H = 24
+SWATCH_R = 5
+SWATCH_TOP = 165
+LEGEND_LABEL_GAP = 12
+LEGEND_ITEM_GAP = 34
+
+# Marks (chart-spec §6, §7).
+GRID_W = 1.5  # gridlines and the divider hairline
+SEPARATOR_W = 2  # hour separators
+SEPARATOR_ALPHA_3H = 230  # 90 % at 03, 06, … 21
+SEPARATOR_ALPHA = 140  # 55 % at the other hours
+TODAY_BAND_X0 = 30
+TODAY_BAND_X1 = 1250
+TODAY_BAND_PAD = 14  # above and below the bar
+TODAY_BAND_R = 12
+NOW_LINE_W = 3
+NOW_OVERHANG = 8  # the now line reaches this far above and below the bar
+PILL_H = 36
+PILL_PAD = 11  # horizontal padding around HH:MM
+PILL_GAP = 2  # between the pill's bottom and the line's top
+PILL_CLAMP = 8  # the pill stays within [bar_x0 - 8, bar_x1 + 8]
+DIVIDER_MID = 32  # the caption's centre and the hairline, below the zone top
+HAIRLINE_GAP = 16  # between the caption's end and the hairline
+
 # Font sizes (chart-spec §4).
 TITLE_SIZE = 48
 SUB_SIZE = 30
@@ -80,7 +109,7 @@ TOTAL_SIZE = 32
 HEAD_SIZE = 27
 AXIS_SIZE = 30
 NOW_SIZE = 28
-# Text sits on its bar: baseline = bar centre + 0.36 × font size (chart-spec §4).
+# Text sits on its mark: baseline = centre + 0.36 × font size (chart-spec §4).
 BASELINE = 0.36
 
 # Not-monitored hatch (chart-spec §5): 45° stripes every 14 px, each 6 px wide, measured
@@ -214,7 +243,11 @@ def _x(v: float) -> int:
 
 
 class _Band:
-    """A full-width strip ``[top, bottom)`` of the canvas, drawn on at S× and pasted back."""
+    """A full-width strip ``[top, bottom)`` of the canvas, drawn on at S× and pasted back.
+
+    Shape coordinates are canvas px; a box ``(x0, y0, x1, y1)`` covers ``[x0, x1)`` ×
+    ``[y0, y1)`` (Pillow boxes include their last pixel, hence the ``- 1``).
+    """
 
     def __init__(self, canvas: Image.Image, top: int, bottom: int) -> None:
         self.canvas = canvas
@@ -226,6 +259,14 @@ class _Band:
     def y(self, v: float) -> int:
         """Canvas y ``v`` in this band's S× pixels."""
         return _x(v - self.top)
+
+    def rect(self, x0: float, y0: float, x1: float, y1: float, fill: RGB) -> None:
+        self.draw.rectangle((_x(x0), self.y(y0), _x(x1) - 1, self.y(y1) - 1), fill=fill)
+
+    def rounded(self, x0: float, y0: float, x1: float, y1: float, radius: float, fill: RGB) -> None:
+        self.draw.rounded_rectangle(
+            (_x(x0), self.y(y0), _x(x1) - 1, self.y(y1) - 1), radius=_x(radius), fill=fill
+        )
 
     def paste(self) -> None:
         self.canvas.paste(self.img.reduce(S), (0, self.top))
@@ -258,8 +299,52 @@ def _hatch(w: int, h: int, x: float, y: float, base: RGB, ink: RGB) -> Image.Ima
     return tile
 
 
+def _rounded_mask(w: int, h: int, radius: int) -> Image.Image:
+    """An ``L`` mask of a ``w``×``h`` rounded rectangle: the clip of a bar or a swatch."""
+    mask = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, w - 1, h - 1), radius=radius, fill=255)
+    return mask
+
+
+def _draw_legend(canvas: Image.Image, lang: str) -> list[tuple[float, str]]:
+    """The four swatches (chart-spec §7); returns each label's x and text."""
+    band = _Band(canvas, SWATCH_TOP - 5, SWATCH_TOP + SWATCH_H + 5)
+    label_font = font("regular", LEGEND_SIZE)
+    labels: list[tuple[float, str]] = []
+    x: float = PAD_X
+    for fill, label in zip((ON, OFF, None, NO_DATA), chart_texts.LEGEND[lang], strict=True):
+        left = _x(x)
+        w, h = _x(x + SWATCH_W) - left, SWATCH_H * S
+        if fill is None:
+            swatch = _hatch(w, h, left / S, SWATCH_TOP, NM_BASE, NM_INK)
+        else:
+            swatch = Image.new("RGB", (w, h), fill)
+        band.img.paste(swatch, (left, band.y(SWATCH_TOP)), _rounded_mask(w, h, SWATCH_R * S))
+        labels.append((x + SWATCH_W + LEGEND_LABEL_GAP, label))
+        x += SWATCH_W + LEGEND_LABEL_GAP + label_font.getlength(label) + LEGEND_ITEM_GAP
+    band.paste()
+    return labels
+
+
+def _draw_gridlines(band: _Band, lay: Layout) -> None:
+    """The 3-hour gridlines through the whole band (chart-spec §6)."""
+    bottom = band.img.height - 1
+    for h in range(0, 25, 3):
+        x = lay.hx(h * HOUR_US)
+        band.draw.rectangle((_x(x - GRID_W / 2), 0, _x(x + GRID_W / 2) - 1, bottom), fill=GRID)
+
+
+def _off_span(lay: Layout, x0: float, x1: float) -> tuple[float, float]:
+    """An OFF span at least 8 px wide around its midpoint, kept inside the bar (§6)."""
+    if x1 - x0 >= MIN_OFF_PX:
+        return x0, x1
+    mid = (x0 + x1) / 2
+    x0 = min(max(mid - MIN_OFF_PX / 2, lay.bar_x0), lay.bar_x1 - MIN_OFF_PX)
+    return x0, x0 + MIN_OFF_PX
+
+
 def _draw_bar(band: _Band, lay: Layout, row: Row, bar_y: float) -> None:
-    """The row's track and segments, clipped to the rounded bar (chart-spec §6)."""
+    """The row's track, segments and hour cells, clipped to the rounded bar (chart-spec §6)."""
     pal = _DIMMED if row.dimmed else _CURRENT
     left = _x(lay.bar_x0)
     lw = _x(lay.bar_x1) - left
@@ -270,8 +355,10 @@ def _draw_bar(band: _Band, lay: Layout, row: Row, bar_y: float) -> None:
     hatch: Image.Image | None = None
     # Stable sort: segments of one state keep their start order.
     for seg in sorted(row.segments, key=lambda s: _ORDER[s.state]):
-        a = _x(lay.hx(seg.start_us)) - left
-        b = _x(lay.hx(seg.end_us)) - left
+        x0, x1 = lay.hx(seg.start_us), lay.hx(seg.end_us)
+        if seg.state == "off":
+            x0, x1 = _off_span(lay, x0, x1)
+        a, b = _x(x0) - left, _x(x1) - left
         if b <= a:
             continue
         if seg.state == "not_monitored":
@@ -279,11 +366,89 @@ def _draw_bar(band: _Band, lay: Layout, row: Row, bar_y: float) -> None:
                 hatch = _hatch(lw, lh, left / S, bar_y, pal.nm_base, pal.nm_ink)
             layer.paste(hatch.crop((a, 0, b, lh)), (a, 0))
         else:
-            fill = pal.off if seg.state == "off" else pal.on
-            draw.rectangle((a, 0, b - 1, lh - 1), fill=fill)
-    mask = Image.new("L", (lw, lh), 0)
-    ImageDraw.Draw(mask).rounded_rectangle((0, 0, lw - 1, lh - 1), radius=BAR_R * S, fill=255)
-    band.img.paste(layer, (left, band.y(bar_y)), mask)
+            draw.rectangle((a, 0, b - 1, lh - 1), fill=pal.off if seg.state == "off" else pal.on)
+    # Hour cells: a surface-coloured separator at every hour, over the segments.
+    blend = ImageDraw.Draw(layer, "RGBA")
+    half = SEPARATOR_W * S // 2
+    for h in range(1, 24):
+        cx = _x(lay.hx(h * HOUR_US)) - left
+        alpha = SEPARATOR_ALPHA_3H if h % 3 == 0 else SEPARATOR_ALPHA
+        blend.rectangle((cx - half, 0, cx + half - 1, lh - 1), fill=(*SURFACE, alpha))
+    band.img.paste(layer, (left, band.y(bar_y)), _rounded_mask(lw, lh, BAR_R * S))
+
+
+def _draw_plot(canvas: Image.Image, lay: Layout, week: Week, lang: str) -> None:
+    """Every zone from the plot top to the grid bottom, one band each, top to bottom.
+
+    A row box holds, in this order, today's band, the gridlines, the bar and the now
+    line; the pill zone above today's row and the divider zone hold the gridlines (and
+    the divider's hairline under them).
+    """
+    now_x = lay.hx(wall_us(week.now, week.tz, end=False)) if week.live else None
+    y = int(lay.grid_top)
+    for row, bar_y in zip(week.rows, lay.bar_ys, strict=True):
+        top = int(bar_y) - BAR_TOP
+        if top > y:
+            band = _Band(canvas, y, top)
+            if lay.divider_top == y:
+                caption = font("medium", HEAD_SIZE).getlength(chart_texts.DIVIDER[lang])
+                mid = y + DIVIDER_MID
+                band.rect(
+                    PAD_X + caption + HAIRLINE_GAP,
+                    mid - GRID_W / 2,
+                    W - PAD_X,
+                    mid + GRID_W / 2,
+                    GRID,
+                )
+            _draw_gridlines(band, lay)
+            band.paste()
+        band = _Band(canvas, top, top + ROW_PITCH)
+        if row.is_today:
+            band.rounded(
+                TODAY_BAND_X0,
+                bar_y - TODAY_BAND_PAD,
+                TODAY_BAND_X1,
+                bar_y + BAR_H + TODAY_BAND_PAD,
+                TODAY_BAND_R,
+                TODAY_BAND,
+            )
+        _draw_gridlines(band, lay)
+        _draw_bar(band, lay, row, bar_y)
+        if row.is_today and now_x is not None:
+            band.rounded(
+                now_x - NOW_LINE_W / 2,
+                bar_y - NOW_OVERHANG,
+                now_x + NOW_LINE_W / 2,
+                bar_y + BAR_H + NOW_OVERHANG,
+                NOW_LINE_W / 2,
+                INK_PRIMARY,
+            )
+        band.paste()
+        y = top + ROW_PITCH
+
+
+@dataclass(frozen=True)
+class _Pill:
+    x: float
+    y: float
+    w: float
+    text: str
+
+
+def _draw_pill(canvas: Image.Image, lay: Layout, week: Week) -> _Pill | None:
+    """The live now pill above today's line (chart-spec §7); None on a finished render."""
+    if not week.live:
+        return None
+    bar_y = lay.bar_ys[week.today.weekday()]
+    now_x = lay.hx(wall_us(week.now, week.tz, end=False))
+    text = hm(week.now, week.tz)
+    w = font("semibold", NOW_SIZE).getlength(text) + 2 * PILL_PAD
+    x = min(max(now_x - w / 2, lay.bar_x0 - PILL_CLAMP), lay.bar_x1 + PILL_CLAMP - w)
+    y = bar_y - NOW_OVERHANG - PILL_GAP - PILL_H
+    band = _Band(canvas, int(y) - 1, int(y) + PILL_H + 2)
+    band.rounded(x, y, x + w, y + PILL_H, PILL_H / 2, INK_PRIMARY)
+    band.paste()
+    return _Pill(x, y, w, text)
 
 
 def _row_text(draw: ImageDraw.ImageDraw, lay: Layout, row: Row, bar_y: float, lang: str) -> None:
@@ -330,23 +495,16 @@ def _row_text(draw: ImageDraw.ImageDraw, lay: Layout, row: Row, bar_y: float, la
     draw.text((right, total_y), main, font=total_font, fill=main_ink, anchor="rs")
 
 
-def render_png(week: Week, *, lang: str, name: str) -> bytes:
-    """The chart of ``week`` in ``lang`` for the location ``name``, as PNG bytes.
-
-    An unknown language falls back to en. ValueError when ``week`` does not have exactly
-    seven rows.
-    """
-    lang = resolve_language(lang)
-    if len(week.rows) != 7:
-        raise ValueError(f"a week has 7 rows, not {len(week.rows)}")
-    lay = layout(week, lang)
-    canvas = Image.new("RGB", (W, H), SURFACE)
-    for row, bar_y in zip(week.rows, lay.bar_ys, strict=True):
-        top = int(bar_y) - BAR_TOP
-        band = _Band(canvas, top, top + ROW_PITCH)
-        _draw_bar(band, lay, row, bar_y)
-        band.paste()
-
+def _draw_text(
+    canvas: Image.Image,
+    lay: Layout,
+    week: Week,
+    lang: str,
+    name: str,
+    legend: list[tuple[float, str]],
+    pill: _Pill | None,
+) -> None:
+    """Every text of the chart at 1×, after all bands (chart-spec §4, §7, §8)."""
     draw = ImageDraw.Draw(canvas)
     draw.text(
         (PAD_X, Y_TITLE),
@@ -359,9 +517,63 @@ def render_png(week: Week, *, lang: str, name: str) -> bytes:
     draw.text(
         (PAD_X, Y_SUB), subtitle, font=font("regular", SUB_SIZE), fill=INK_SECONDARY, anchor="ls"
     )
+    legend_font = font("regular", LEGEND_SIZE)
+    for x, label in legend:
+        draw.text((x, Y_LEGEND), label, font=legend_font, fill=INK_SECONDARY, anchor="ls")
+    head_font = font("medium", HEAD_SIZE)
+    draw.text(
+        (W - PAD_X, Y_COLHEAD),
+        chart_texts.TOTALS_HEADER[lang],
+        font=head_font,
+        fill=INK_MUTED,
+        anchor="rs",
+    )
+    if lay.divider_top is not None:
+        draw.text(
+            (PAD_X, lay.divider_top + DIVIDER_MID + BASELINE * HEAD_SIZE),
+            chart_texts.DIVIDER[lang],
+            font=head_font,
+            fill=INK_MUTED,
+            anchor="ls",
+        )
     for row, bar_y in zip(week.rows, lay.bar_ys, strict=True):
         _row_text(draw, lay, row, bar_y, lang)
+    axis_font = font("medium", AXIS_SIZE)
+    for h in range(0, 25, 3):
+        draw.text(
+            (lay.hx(h * HOUR_US), lay.axis_baseline),
+            f"{h:02d}",
+            font=axis_font,
+            fill=INK_MUTED,
+            anchor="ms",
+        )
+    if pill is not None:
+        draw.text(
+            (pill.x + pill.w / 2, pill.y + PILL_H / 2 + BASELINE * NOW_SIZE),
+            pill.text,
+            font=font("semibold", NOW_SIZE),
+            fill=SURFACE,
+            anchor="ms",
+        )
 
+
+def render_png(week: Week, *, lang: str, name: str) -> bytes:
+    """The chart of ``week`` in ``lang`` for the location ``name``, as PNG bytes.
+
+    A live week (``week.live``) gets the now line and pill; a finished one (the day's
+    final render, now = its end) keeps the today band without them (chart-spec §7, D-01).
+    An unknown language falls back to en. ValueError when ``week`` does not have exactly
+    seven rows.
+    """
+    lang = resolve_language(lang)
+    if len(week.rows) != 7:
+        raise ValueError(f"a week has 7 rows, not {len(week.rows)}")
+    lay = layout(week, lang)
+    canvas = Image.new("RGB", (W, H), SURFACE)
+    legend = _draw_legend(canvas, lang)
+    _draw_plot(canvas, lay, week, lang)
+    pill = _draw_pill(canvas, lay, week)
+    _draw_text(canvas, lay, week, lang, name, legend, pill)
     buf = io.BytesIO()
     canvas.save(buf, format="PNG")
     return buf.getvalue()

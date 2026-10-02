@@ -240,9 +240,14 @@ def test_live_today_row_has_band_line_and_pill() -> None:
     bar_y = lay.bar_ys[THU]
     assert _px(img, 35, bar_y + 22) == render.TODAY_BAND
     now_x = round(lay.hx(wall_us(week.now, KYIV, end=False)))
-    # The 3 px now line runs from bar top - 8 to bar bottom + 8, over the bar.
-    for y in range(int(bar_y) - 7, int(bar_y) + 52):
+    # The 3 px now line runs from bar top - 8 to bar bottom + 8, over the bar. Its ends are
+    # rounded (rx 1.5), so the first and last pixel rows are ink blended with the band.
+    for y in range(int(bar_y) - 6, int(bar_y) + 51):
         assert _px(img, now_x, y) == render.INK_PRIMARY, y
+    for y in (int(bar_y) - 8, int(bar_y) - 7, int(bar_y) + 51):
+        assert sum(_px(img, now_x, y)) < sum(render.TODAY_BAND) - 150, y
+    assert _px(img, now_x, bar_y - 9) == render.TODAY_BAND
+    assert _px(img, now_x, bar_y + 52) == render.TODAY_BAND
     # The pill above it is ink-primary with the time in surface ink.
     pill = _region(img, now_x - 20, bar_y - 46, now_x + 21, bar_y - 10)
     assert render.INK_PRIMARY in pill
