@@ -1,6 +1,7 @@
 """Telegram Bot API client: the calls the app makes.
 
-- ``send_message``: an alert or an ops notice (``sendMessage``, Telegram HTML).
+- ``send_message``: an alert or an ops notice (``sendMessage``, Telegram HTML), or the
+  admin's test message, sent silently (``disable_notification``, D-11).
 - ``send_photo``: post a chart silently (multipart ``sendPhoto`` with
   ``disable_notification``, D-01). The result carries the new message's id, which the chart
   lifecycle records before it pins (INV-17).
@@ -191,11 +192,19 @@ class TelegramClient:
     def __repr__(self) -> str:
         return "TelegramClient(<token hidden>)"
 
-    def send_message(self, chat_id: int, text: str) -> SendResult:
-        """Send ``text`` (Telegram HTML) to ``chat_id`` once and classify the outcome."""
-        result = self._call(
-            "sendMessage", json_body={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-        )
+    def send_message(
+        self, chat_id: int, text: str, *, disable_notification: bool = False
+    ) -> SendResult:
+        """Send ``text`` (Telegram HTML) to ``chat_id`` once and classify the outcome.
+
+        ``disable_notification`` sends it silently: the admin's test message uses it
+        (D-11). The flag is in the body only when set, so an alert's body stays exactly
+        ``chat_id``, ``text`` and ``parse_mode``.
+        """
+        body: dict[str, Any] = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+        if disable_notification:
+            body["disable_notification"] = True
+        result = self._call("sendMessage", json_body=body)
         if result.kind != "ok":
             log.warning("telegram sendMessage: %s (%s)", result.kind, result.code)
         return result

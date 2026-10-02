@@ -59,6 +59,7 @@ from powermon.alerts.models import OpsIncident, OutboxMessage
 from powermon.chart import lifecycle
 from powermon.engine.models import LocationState, PowerInterval, SystemState
 from powermon.locations.models import Location
+from powermon.telegram.client import SendResult
 from powermon.worker import io_loop
 
 TOKEN_A = DEFAULT_BOT_TOKEN
@@ -213,6 +214,33 @@ def test_next_successful_send_closes_failing_with_one_notice(
     assert _row(on).status == "sent"
     assert len(_ops_rows(outbox.KIND_OPS_DELIVERY_RESTORED)) == 1
     assert len(_ops_rows(outbox.KIND_OPS_DELIVERY_FAILING)) == 1
+
+
+@pytest.mark.django_db
+def test_a_refusal_written_again_by_the_flush_opens_failing_once(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    # _apply is also the WR-04 flush path: a kept outcome may be written after another
+    # claim of the row, or written twice. Neither opens a second incident or notice.
+    location = location_factory()
+    off = _queue(location)
+    assert outbox.claim(off.pk) is True
+    refused = SendResult("permanent", code="http_403")
+    state = io_loop.RelayState()
+    channel = io_loop.chat_key(TOKEN_A, DEFAULT_CHAT_ID)
+
+    # Another claim's attempt count: the reset is fenced off, so nothing opens (WR-01).
+    io_loop._apply(_row(off), 2, refused, T0, state, channel)
+    assert _row(off).status == "sending"
+    assert _incidents(location) == []
+    # This claim's outcome, written, then written again: one incident, one notice.
+    io_loop._apply(_row(off), 1, refused, T0, state, channel)
+    io_loop._apply(_row(off), 1, refused, T0 + _min(1), state, channel)
+
+    assert (_row(off).status, _row(off).attempts) == ("pending", 1)
+    assert _incidents(location) == [(T0, None, {"http_status": 403})]
+    assert len(_ops_rows(outbox.KIND_OPS_DELIVERY_FAILING)) == 1
+    assert state.failing == {location.pk: channel}
 
 
 @pytest.mark.django_db(transaction=True)

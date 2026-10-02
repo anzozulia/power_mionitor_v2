@@ -21,6 +21,17 @@ holds that channel in memory for 15 minutes after a refusal (``RelayState.failin
 lifts the hold in its next pass because the incident it holds for is no longer open, so
 the queued alerts go out within one pass, with their event times (ALRT-04).
 
+A deleted location never gets a new failing incident or notice (D-09): its delete closes
+its open incidents without a recovery notice, and a refusal answered for a send that was
+in flight at delete time must not open one again. So ``open_failing`` first reads the
+location row ``FOR SHARE`` in the caller's transaction and writes nothing for a
+tombstone. ``FOR SHARE`` waits for a concurrent delete's uncommitted UPDATE of that row:
+either the delete commits first and nothing opens, or this transaction commits first and
+the delete, which runs its incident UPDATE afterwards, closes the new incident itself.
+There is no deadlock: both transactions take the location row before they touch
+incidents, and the delete's pending-only outbox UPDATE skips the row this transaction
+holds, whose committed status is still "sending".
+
 Every function runs on the caller's connection, inside its transaction: the relay calls
 ``open_failing`` and ``close_failing`` in the transaction that writes the outbox row's
 outcome, so the incident and its notice commit with that outcome or not at all. Nothing
@@ -33,12 +44,14 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 
-from django.db import transaction
+from django.db import connection, transaction
 
 from powermon.alerts import ops, outbox
 from powermon.alerts.models import OpsIncident
 
 KIND_DELIVERY_FAILING = "delivery_failing"
+# A live location's row, held against a concurrent delete until the caller commits (D-09).
+LIVE_LOCATION_SQL = "SELECT 1 FROM location WHERE id = %s AND deleted_at IS NULL FOR SHARE"
 # The status a client code with no plausible HTTP status stands for (a notice needs one).
 _DEFAULT_STATUS = 400
 # A reported chat ID fits a signed 64-bit integer, as a location's chat_id does.
@@ -75,12 +88,17 @@ def open_failing(
     and, when Telegram reported one, the supergroup's new chat ID; the location's chat is
     never changed here (PITFALLS 6e). Only the opener that got an incident id back queues
     the notice, so a location refused again while its incident is open adds nothing
-    (INV-20 #1).
+    (INV-20 #1). A deleted location (or one that is being deleted) gets nothing: False,
+    and no write (D-09).
     """
     details = {"http_status": http_status}
     if migrate_to_chat_id is not None:
         details["migrate_to_chat_id"] = migrate_to_chat_id
     with transaction.atomic():
+        with connection.cursor() as cur:
+            cur.execute(LIVE_LOCATION_SQL, [location_id])
+            if cur.fetchone() is None:
+                return False
         opened = ops.open_incident(
             KIND_DELIVERY_FAILING, now, location_id=location_id, details=details
         )

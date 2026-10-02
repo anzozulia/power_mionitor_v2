@@ -21,7 +21,14 @@ during it:
     sending --recover_interrupted (worker activation)--> uncertain
     pending --expire_due (expires_at <= now)--> expired (never sent, ALRT-03)
     pending --mark_dropped (an ops notice that cannot be rendered)--> dropped (never sent)
+    pending --drop_deleted_pending (its location was deleted)--> dropped (never sent, D-09)
     pending --make_due (a recorded success or a channel change)--> pending, due now
+
+A deleted location's subscriber alerts are never sent (D-09, INV-19 #2): its rows are not
+heads (``subscriber_heads``), and the relay drops its pending rows on every pass, before
+expiry (``drop_deleted_pending``). That also catches a row whose send was in flight at
+delete time and came back to "pending" after a refusal: it is dropped, not resent, and
+never expires into a notice about the deleted location.
 
 ``make_due`` is the admin side's one write to a queued row: after a recorded test message
 success (D-12) or a chat or token change (D-08) a location's subscriber rows that wait for
@@ -98,6 +105,8 @@ OPS_KINDS = (
 )
 # The database column is varchar(64).
 MAX_ERROR_LENGTH = 64
+# ``last_error`` of a subscriber row dropped because its location was deleted (D-09).
+LOCATION_DELETED = "location_deleted"
 
 RECOVER_SQL = """
 UPDATE outbox_message SET status = 'uncertain', last_error = 'interrupted'
@@ -220,11 +229,16 @@ def subscriber_heads() -> list[OutboxMessage]:
 
     Only the head of a location may be sent, so OFF always goes before ON. A head in
     "sending" was left by an interrupted send; it holds its location's line until worker
-    activation turns it into "uncertain". PostgreSQL ``DISTINCT ON (location_id)``, served
-    by the partial index ``outbox_open_idx``.
+    activation turns it into "uncertain". A deleted location has no head: its alerts are
+    never sent (D-09, INV-19 #2). PostgreSQL ``DISTINCT ON (location_id)``, served by the
+    partial index ``outbox_open_idx``.
     """
     return list(
-        OutboxMessage.objects.filter(channel=CHANNEL_SUBSCRIBER, status__in=OPEN_STATUSES)
+        OutboxMessage.objects.filter(
+            channel=CHANNEL_SUBSCRIBER,
+            status__in=OPEN_STATUSES,
+            location__deleted_at__isnull=True,
+        )
         .select_related("location")
         .order_by("location_id", "id")
         .distinct("location_id")
@@ -329,6 +343,23 @@ def mark_retry(
         status="pending", next_attempt_at=next_attempt_at, last_error=_short(code)
     )
     return updated == 1
+
+
+def drop_deleted_pending() -> int:
+    """Drop every pending subscriber row of a deleted location; return how many (D-09).
+
+    Such a row is never sent (INV-19 #2). The delete itself drops the pending rows, but a
+    send in flight at that moment ("sending") is not pending yet and can come back to
+    "pending" after a refusal; this sweep, run by the relay on every pass before expiry,
+    drops it, so it is neither resent nor expired into a notice about a deleted location.
+    Rows in flight or finished, ops notices and live locations' rows are left alone. Runs
+    on the caller's connection, inside its transaction.
+    """
+    return OutboxMessage.objects.filter(
+        channel=CHANNEL_SUBSCRIBER,
+        status="pending",
+        location__deleted_at__isnull=False,
+    ).update(status="dropped", last_error=LOCATION_DELETED)
 
 
 def make_due(location_id: int, now: datetime) -> int:

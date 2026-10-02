@@ -104,12 +104,15 @@ from the backdated outage start (INV-15). Ops notices carry their own times and 
 this prefix.
 
 Expiry (ALRT-03, D-07, D-08) is the first work step of every pass, before any head is
-sent: in one transaction every pending row whose ``expires_at`` has come becomes
-"expired" (``outbox.expire_due``) and is never sent, and each expired subscriber alert
-queues one ``ops_expired`` notice; an expired ops row is only logged, so a broken admin
-chat cannot loop. The location's next alert (the ON after an expired OFF) is then its head
-and goes out in the same pass. A database error in this step ends the pass before any
-claim and reaches the caller (``run_worker`` logs it once per outage, by class name).
+sent: in one transaction the pending alerts of deleted locations are dropped first (D-09,
+INV-19 #2: never sent, never expired into a notice), then every pending row whose
+``expires_at`` has come becomes "expired" (``outbox.expire_due``) and is never sent, and
+each expired subscriber alert queues one ``ops_expired`` notice; an expired ops row is
+only logged, so a broken admin chat cannot loop. The location's next alert (the ON after
+an expired OFF) is then its head and goes out in the same pass. A deleted location has no
+head at all (``outbox.subscriber_heads``). A database error in this step ends the pass
+before any claim and reaches the caller (``run_worker`` logs it once per outage, by class
+name).
 
 WR-04 (D-13): an error after a row was claimed never blocks its queue (a location's line,
 or the ops queue) for the rest of a lease generation, and never turns a known send into an
@@ -427,12 +430,20 @@ def notify_db_down(status: LeaseStatus, clock: Clock, state: RelayState) -> bool
 def _expire(now: datetime) -> int:
     """Expire every pending row past its ``expires_at``; notify once per subscriber alert.
 
-    One transaction: the rows become "expired" and each subscriber row queues (or, with no
-    ops chat, logs) one ``ops_expired`` notice with them (D-08). An expired ops row is only
-    logged: a notice about a notice would loop on a broken admin chat. Returns how many
-    rows expired.
+    One transaction. First the pending subscriber rows of deleted locations are dropped
+    (``outbox.drop_deleted_pending``, D-09, INV-19 #2), so such a row is never expired and
+    never named in a notice, even one whose send was in flight at delete time. Pending ops
+    notices about a deleted location are left alone: they render from the tombstone's
+    name, and dropping them by location would also drop a global all-silent end notice
+    that names it. Then the rows past their age become "expired" and each subscriber row
+    queues (or, with no ops chat, logs) one ``ops_expired`` notice with them (D-08). An
+    expired ops row is only logged: a notice about a notice would loop on a broken admin
+    chat. Returns how many rows expired.
     """
     with transaction.atomic():
+        dropped = outbox.drop_deleted_pending()
+        if dropped:
+            log.info("relay: %d queued alert(s) of deleted locations dropped", dropped)
         rows = outbox.expire_due(now)
         for ref in rows:
             if ref.channel == outbox.CHANNEL_SUBSCRIBER:
