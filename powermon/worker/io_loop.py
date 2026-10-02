@@ -21,6 +21,12 @@ ops notice that cannot be rendered is dropped at once with one WARNING naming it
 kind: its payload holds integers only, so the error is permanent, and left in place it
 would hold the one-line queue and block every later notice (B2).
 
+The chart step (``powermon.chart.lifecycle.run_step``, D-05) is the last step of the pass
+and makes at most one Telegram call, so chart work delays an alert by at most one call
+(INV-14). It runs only when the caller passes ``charts=True``, which the worker does; it
+is off by default. A chart outcome never sets ``chat_key``: a chart's per-chat or
+permanent failure must not hold that channel's alerts.
+
 The result decides the row's next status, for both channels (D-14 policy):
 
 - ok: sent.
@@ -163,6 +169,8 @@ _DURATION_KEYS = {outbox.KIND_POWER_OFF: "was_on_us", outbox.KIND_POWER_ON: "was
 # Outcomes of a subscriber send that concern the whole bot, not the one chat (D1): Telegram
 # limits the bot (429), or the bot cannot be reached (5xx, a refused connection).
 _BOT_WIDE_KINDS = ("rate_limited", "transient", "not_sent")
+# The same kinds for the chart lifecycle, which holds a bot for them as an alert would.
+BOT_WIDE_KINDS = _BOT_WIDE_KINDS
 _BOT_WIDE_PREFIX = "bot:"
 
 
@@ -273,15 +281,18 @@ def run_iteration(
     state: RelayState,
     stop: threading.Event | None = None,
     tick: Callable[[], None] | None = None,
+    *,
+    charts: bool = False,
 ) -> bool:
     """One pass over each location's oldest open alert; True if any send was attempted.
 
     Returns early, before claiming another row, once ``stop`` is set. ``tick`` (the
     watchdog's progress stamp) runs after every subscriber head, whether it was sent,
-    skipped or failed, and after the ops step, so a long pass still shows progress. A
-    database error in the flush or in expiry ends the pass before any claim and
-    propagates to the caller. Every claim of the pass names ``state.lease_pid`` when it
-    is set (C1).
+    skipped or failed, after the ops step and after the chart step, so a long pass still
+    shows progress. A database error in the flush or in expiry ends the pass before any
+    claim and propagates to the caller. Every claim of the pass names ``state.lease_pid``
+    when it is set (C1). With ``charts`` the pass ends with at most one chart call
+    (``powermon.chart.lifecycle.run_step``); it is off unless the worker enables it.
     """
     close_old_connections()
     # Outcomes kept after a DB error are written before any new claim (WR-04).
@@ -307,6 +318,17 @@ def run_iteration(
             attempted = _deliver_ops(clock, state) or attempted
         except Exception as exc:
             log.error("relay failed for the ops chat: %s", type(exc).__name__)
+        if tick is not None:
+            tick()
+    # Chart work goes last, after every alert and the ops head: one call at most (D-05).
+    if charts and not (stop is not None and stop.is_set()):
+        # Imported here: the lifecycle imports this module, and only the worker needs it.
+        from powermon.chart import lifecycle
+
+        try:
+            attempted = lifecycle.run_step(clock, state, stop) or attempted
+        except Exception as exc:
+            log.error("chart step failed: %s", type(exc).__name__)
         if tick is not None:
             tick()
     return attempted
