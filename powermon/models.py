@@ -9,3 +9,4 @@ from powermon.alerts.models import OpsIncident, OutboxMessage  # noqa: F401
 from powermon.chart.models import ChartMessage  # noqa: F401
 from powermon.engine.models import LocationState, PowerInterval, SystemState  # noqa: F401
 from powermon.locations.models import Location  # noqa: F401
+from powermon.throttle.models import LoginFailure  # noqa: F401
