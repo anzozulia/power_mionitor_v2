@@ -62,6 +62,23 @@ ALERTS_COPY = {
     "already_on": "Alerts were already on. Nothing changed.",
     "already_off": "Alerts were already off. Nothing changed.",
 }
+ROUTER_GRACE_HELP = (
+    "While on, OFF waits 180 seconds longer when the last heartbeat came within 5 minutes "
+    "after power returned, so a router that restarts after a blackout is not reported as a "
+    "second outage. It changes only decisions made from now on."
+)
+# "off" names the location's plain timeout: {off_after_s} is period + grace, an integer.
+ROUTER_GRACE_COPY = {
+    "on": (
+        "Router grace is on. From now on, OFF waits 180 seconds longer right after power returns."
+    ),
+    "off": (
+        "Router grace is off. From now on, OFF is reported after {off_after_s} seconds "
+        "without a heartbeat."
+    ),
+    "already_on": "Router grace was already on. Nothing changed.",
+    "already_off": "Router grace was already off. Nothing changed.",
+}
 
 
 def location_or_404(pk: int) -> Location:
@@ -102,9 +119,10 @@ class SwitchRow:
 
 
 def switch_rows(location: Location) -> list[SwitchRow]:
-    """The location page's switches, in UI-SPEC order (D-05): Maintenance, Alerts."""
+    """The location page's switches, in UI-SPEC order (D-05): Maintenance, Alerts, Router grace."""
     maintenance_on = location.maintenance
     alerts_on = location.alerts_enabled
+    grace_on = location.router_grace
     return [
         SwitchRow(
             url_name="location-maintenance",
@@ -119,6 +137,13 @@ def switch_rows(location: Location) -> list[SwitchRow]:
             help=ALERTS_HELP,
             button="Turn alerts off" if alerts_on else "Turn alerts on",
             target="off" if alerts_on else "on",
+        ),
+        SwitchRow(
+            url_name="location-router-grace",
+            heading="Router grace is on" if grace_on else "Router grace is off",
+            help=ROUTER_GRACE_HELP,
+            button="Turn router grace off" if grace_on else "Turn router grace on",
+            target="off" if grace_on else "on",
         ),
     ]
 
@@ -140,15 +165,19 @@ class SwitchView(View):
         """Set the switch; True if it changed, False if it already had that value."""
         raise NotImplementedError
 
+    def flash(self, location: Location, key: str) -> str:
+        """The flash for ``key`` ("on", "off", "already_on", "already_off")."""
+        return self.copy[key]
+
     def post(self, request: HttpRequest, pk: int) -> HttpResponse:
         value = request.POST.get("value")
         if value not in SWITCH_VALUES:
             return HttpResponseBadRequest()
-        location_or_404(pk)
+        location = location_or_404(pk)
         if self.apply(pk, value == "on", self.clock.now()):
-            messages.success(request, self.copy[value])
+            messages.success(request, self.flash(location, value))
         else:
-            messages.info(request, self.copy[f"already_{value}"])
+            messages.info(request, self.flash(location, f"already_{value}"))
         return redirect("location-detail", pk=pk)
 
 
@@ -176,6 +205,25 @@ class AlertsSwitchView(SwitchView):
 
     def apply(self, pk: int, on: bool, now: datetime) -> bool:
         return actions.set_flag(pk, "alerts_enabled", on)
+
+
+class RouterGraceSwitchView(SwitchView):
+    """``/locations/<pk>/router-grace/``: the router-reconnect grace switch (LOC-09, D-05).
+
+    A configuration-only write (``actions.set_flag``): no state row lock and no
+    ``state_version`` bump, so a detector snapshot read before the click keeps its
+    decision, and every cycle after it reads the new setting (K-4). An OFF already
+    recorded keeps its start and its totals (INV-05, INV-06).
+    """
+
+    copy = ROUTER_GRACE_COPY
+
+    def apply(self, pk: int, on: bool, now: datetime) -> bool:
+        return actions.set_flag(pk, "router_grace", on)
+
+    def flash(self, location: Location, key: str) -> str:
+        # Integers only in a flash: the location's period + grace in seconds.
+        return self.copy[key].format(off_after_s=location.period_s + location.grace_s)
 
 
 class LocationDetailView(View):

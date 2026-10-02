@@ -6,6 +6,7 @@ from powermon.web.location_views import (
     AlertsSwitchView,
     LocationDetailView,
     MaintenanceSwitchView,
+    RouterGraceSwitchView,
 )
 from powermon.web.views import (
     HeartbeatView,
@@ -27,6 +28,11 @@ urlpatterns = [
         name="location-maintenance",
     ),
     path("locations/<int:pk>/alerts/", AlertsSwitchView.as_view(), name="location-alerts"),
+    path(
+        "locations/<int:pk>/router-grace/",
+        RouterGraceSwitchView.as_view(),
+        name="location-router-grace",
+    ),
     path("locations/<int:pk>/setup/", LocationSetupView.as_view(), name="location-setup"),
     path("login/", SignInView.as_view(), name="login"),
     path("logout/", SignOutView.as_view(), name="logout"),

@@ -212,8 +212,15 @@ def test_K4_router_grace_turned_on_from_the_page_keeps_off_back(
     assert _status(boundary) == ("on", None)
     assert detection.run_cycle(_at(12, 9, 31)) == 1
     assert _status(boundary) == ("off", _at(12, 5))
-    for location, start in ((within, _at(12, 4)), (outside, _at(12, 5, 30)), (boundary, _at(12, 5))):
-        assert _intervals(location) == [("on", _at(12, 0), start, None), ("off", start, None, start)]
+    for location, start in (
+        (within, _at(12, 4)),
+        (outside, _at(12, 5, 30)),
+        (boundary, _at(12, 5)),
+    ):
+        assert _intervals(location) == [
+            ("on", _at(12, 0), start, None),
+            ("off", start, None, start),
+        ]
     # The switch and the decisions make no Telegram call (KD2).
     assert len(fake_telegram.calls) == 0
 
@@ -292,7 +299,8 @@ def test_router_grace_toggle_between_snapshot_and_decision_affects_the_next_cycl
     [next_snap] = transitions.read_snapshots()
     assert next_snap.router_grace is True
     assert detection.run_cycle(_at(12, 13)) == 0
-    assert _status(location) == ("on", None)
+    assert LocationState.objects.get(location=location).status == "on"
+    assert _intervals(location)[-1] == ("on", _at(12, 10), None, None)
 
 
 # INV-05 #1, chart part: with alerts off the chart is posted, refreshed and re-pinned
@@ -367,7 +375,10 @@ def test_INV05_1_chart_keeps_working_with_alerts_off(
     # Alerts off never stops the chart: today's is posted silently and pinned.
     assert _pass(clock, state) is True
     assert _pass(clock, state) is True
-    assert _chart_steps(fake_telegram.chart_calls) == [("sendPhoto", None), ("pinChatMessage", 1001)]
+    assert _chart_steps(fake_telegram.chart_calls) == [
+        ("sendPhoto", None),
+        ("pinChatMessage", 1001),
+    ]
     assert _caption(fake_telegram.chart_calls[0]) == "No outages today\nUpdated 12:05"
 
     # An outage: silent after 12:05, OFF recorded at 12:06:31, power back at 12:15.
