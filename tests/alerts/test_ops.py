@@ -654,6 +654,8 @@ def test_enqueue_ops_queues_a_due_ops_row() -> None:
         "ops_uncertain",
         "ops_pin_failed",
         "ops_pin_restored",
+        "ops_delivery_failing",
+        "ops_delivery_restored",
     }
 
 

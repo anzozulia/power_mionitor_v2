@@ -35,7 +35,9 @@ step in ``RelayState.chart_failures``.
 
 The result decides the row's next status, for both channels (D-14 policy):
 
-- ok: sent.
+- ok: sent. For a subscriber row, in the same transaction, a failing location recovers:
+  its open ``delivery_failing`` incident closes with one ``ops_delivery_restored`` notice
+  (D-10, ``powermon.alerts.delivery``).
 - maybe_delivered (read timeout, connection dropped after sending): uncertain, never
   resent (at-most-once, INV-16, D-13). A subscriber row queues exactly one "may not have
   been delivered" ops notice in the same transaction (``ops.mark_uncertain``, D-11 #5); an
@@ -43,7 +45,13 @@ The result decides the row's next status, for both channels (D-14 policy):
 - not_sent (nothing left the client) or transient (5xx): retried after
   min(2 ** attempts, BACKOFF_CAP_S) seconds.
 - rate_limited (429): retried after retry_after seconds, capped at MAX_RETRY_AFTER_S.
-- permanent (400/401/403/404): retried after PERMANENT_BACKOFF, with one warning.
+- permanent (400/401/403/404): retried after PERMANENT_BACKOFF, with one warning. For a
+  subscriber row, in the same transaction, the location's delivery is marked failing: its
+  ``delivery_failing`` incident opens with one ``ops_delivery_failing`` notice to the
+  admin (D-10); a refusal while the incident is open adds nothing (INV-20 #1).
+
+Only those two outcomes of a subscriber send touch the incident: a 429, a 5xx, a refused
+connection, an ambiguous send, an ops row and every chart call leave it alone (D-10).
 
 Every retry of a subscriber row also backs off its channel in ``RelayState.not_before``
 (``chat_key``: the bot and the chat id), so that channel's rows wait (D-14). Two locations
@@ -148,7 +156,7 @@ from datetime import date, datetime, timedelta
 from django.conf import settings
 from django.db import Error, close_old_connections, transaction
 
-from powermon.alerts import ops, ops_texts, outbox
+from powermon.alerts import delivery, ops, ops_texts, outbox
 from powermon.alerts.models import OutboxMessage
 from powermon.alerts.texts import render_alert
 from powermon.clock import Clock
@@ -219,6 +227,9 @@ class RelayState:
     yet, by (location id, local date) -> (chat id, message id, answer time, bot key); the
     bot key (``bot_key``) is that of the token that posted it (D-08). The next chart step
     writes it first, so it is never posted a second time (WR-04 analogue).
+    ``failing``: the ``chat_key`` the relay holds for each location whose subscriber alert
+    was refused permanently, by location id; that channel's 15-minute hold lasts while the
+    location's ``delivery_failing`` incident is open, and goes once it closes (D-12).
     """
 
     not_before: dict[str, datetime] = field(default_factory=dict)
@@ -229,6 +240,7 @@ class RelayState:
     chart_posted: dict[tuple[int, date], tuple[int, int, datetime, str]] = field(
         default_factory=dict
     )
+    failing: dict[int, str] = field(default_factory=dict)
 
 
 def bot_key(token: str) -> str:
@@ -605,9 +617,26 @@ def _apply(
     key: str,
     bot_wide: str | None = None,
 ) -> None:
-    """Record a send's outcome on the claimed row (and on the chat or bot, for a retry)."""
+    """Record a send's outcome on the claimed row (and on the chat or bot, for a retry).
+
+    For a subscriber row an ok or a permanent outcome also closes or opens the location's
+    ``delivery_failing`` incident, in the transaction that writes the row (D-10). This is
+    also the WR-04 flush path, so every write here is idempotent: the reset is fenced by
+    the claim's attempt count, a second open gets no incident id and a second close
+    changes no row, so no notice is ever repeated.
+    """
+    # The location of a subscriber alert; None for an ops row, which never touches it.
+    location_id = row.location_id if row.channel == outbox.CHANNEL_SUBSCRIBER else None
     if result.kind == "ok":
-        outbox.mark_sent(row.pk, now)
+        if location_id is None:
+            outbox.mark_sent(row.pk, now)
+            return
+        with transaction.atomic():
+            outbox.mark_sent(row.pk, now)
+            # Telegram took the alert, so the channel works: a failing location recovers.
+            delivery.close_failing(location_id, now)
+        # After the commit: the incident is closed, so nothing holds the channel for it.
+        state.failing.pop(location_id, None)
         return
     if result.kind == "maybe_delivered":
         # Never resent; a subscriber row queues one notice, an ops row is only logged.
@@ -639,6 +668,16 @@ def _apply(
         # it waits, and so does a shared admin chat (D1). A 400/401/403 stays with this
         # channel (CR-01).
         state.not_before[bot_wide] = next_attempt_at
+    code = result.code or result.kind
+    if result.kind == "permanent" and location_id is not None:
+        # The row's reset and the failing incident (with its one notice) commit together.
+        with transaction.atomic():
+            # Only this claim's attempt (WR-01): a later claim's row is not this outcome's.
+            if outbox.mark_retry(row.pk, next_attempt_at, code, attempts=attempts):
+                delivery.open_failing(location_id, now, delivery.http_status(result.code))
+        # After the commit: the channel is held until the incident closes (D-12).
+        state.failing[location_id] = key
+        return
     # Only this claim's attempt: a kept outcome may be written after another worker claimed
     # the row again (WR-01).
-    outbox.mark_retry(row.pk, next_attempt_at, result.code or result.kind, attempts=attempts)
+    outbox.mark_retry(row.pk, next_attempt_at, code, attempts=attempts)

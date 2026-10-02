@@ -1247,15 +1247,18 @@ def test_D1_a_location_chat_refusal_on_a_shared_bot_never_holds_the_ops_notices(
     # D-14 for subscriber rows is unchanged: the location's channel backs off 15 min.
     assert (_row(off).status, _row(off).next_attempt_at) == ("pending", T0 + timedelta(minutes=15))
 
-    # A notice queued while the bot backs off for the location goes out when due.
+    # The refusal queued the D-10 failing notice behind the first one; it and a notice
+    # queued while the bot backs off for the location go out when due, one per pass.
     minute = T0 + _seconds(60)
     second = _gap_notice(T0, minute, at=minute)
     assert io_loop.run_iteration(FakeClock(minute), state) is True
+    assert io_loop.run_iteration(FakeClock(minute), state) is True
     assert (_row(second).status, _row(second).sent_at) == ("sent", minute)
-    assert chats == [DEFAULT_CHAT_ID, OPS_CHAT_ID, OPS_CHAT_ID]
+    assert chats == [DEFAULT_CHAT_ID, OPS_CHAT_ID, OPS_CHAT_ID, OPS_CHAT_ID]
 
     # The OFF is refused once more a minute before its maximum age (6 h), so the bot backs
-    # off for the location past that age; its "expired" notice is still sent at once.
+    # off for the location past that age; its "expired" notice is still sent at once. The
+    # incident is still open, so that refusal queues no second failing notice (INV-20 #1).
     expiry = T0 + timedelta(hours=6)
     assert io_loop.run_iteration(FakeClock(expiry - _seconds(60)), state) is True
     assert io_loop.run_iteration(FakeClock(expiry), state) is True
@@ -1263,12 +1266,20 @@ def test_D1_a_location_chat_refusal_on_a_shared_bot_never_holds_the_ops_notices(
     assert _row(off).status == "expired"
     assert [(r.kind, r.status) for r in _ops_rows()] == [
         (outbox.KIND_OPS_GAP, "sent"),
+        (outbox.KIND_OPS_DELIVERY_FAILING, "sent"),
         (outbox.KIND_OPS_GAP, "sent"),
         (outbox.KIND_OPS_EXPIRED, "sent"),
     ]
     assert _ops_rows()[-1].sent_at == expiry
     assert fake_telegram.sent[-1]["text"].startswith("⌛ OFF alert for ")
-    assert chats == [DEFAULT_CHAT_ID, OPS_CHAT_ID, OPS_CHAT_ID, DEFAULT_CHAT_ID, OPS_CHAT_ID]
+    assert chats == [
+        DEFAULT_CHAT_ID,
+        OPS_CHAT_ID,
+        OPS_CHAT_ID,
+        OPS_CHAT_ID,
+        DEFAULT_CHAT_ID,
+        OPS_CHAT_ID,
+    ]
 
 
 @pytest.mark.django_db(transaction=True)
@@ -1308,8 +1319,12 @@ def test_D1_a_bot_wide_failure_of_a_location_send_still_holds_the_ops_notices(
 
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.parametrize(
-    ("answer", "sent_after_s"),
-    [((403, KICKED), 301), ((429, _too_many_requests(600)), 600)],
+    ("answer", "sent_after_s", "first_pass"),
+    [
+        # The 403 queues the D-10 failing notice, which the admin chat gets in the same pass.
+        ((403, KICKED), 301, [DEFAULT_CHAT_ID, OPS_CHAT_ID]),
+        ((429, _too_many_requests(600)), 600, [DEFAULT_CHAT_ID]),
+    ],
     ids=["403", "429"],
 )
 def test_D1_the_db_down_notice_waits_only_for_a_bot_wide_backoff(
@@ -1318,6 +1333,7 @@ def test_D1_the_db_down_notice_waits_only_for_a_bot_wide_backoff(
     settings: Any,
     answer: Any,
     sent_after_s: int,
+    first_pass: list[int],
 ) -> None:
     settings.CFG = dataclasses.replace(settings.CFG, ops_bot_token=TOKEN_A, ops_chat_id=OPS_CHAT_ID)
     _queue(location_factory(bot_token=TOKEN_A))
@@ -1325,7 +1341,7 @@ def test_D1_the_db_down_notice_waits_only_for_a_bot_wide_backoff(
     clock = FakeClock(T0)
     state = io_loop.RelayState()
     assert io_loop.run_iteration(clock, state) is True
-    assert chats == [DEFAULT_CHAT_ID]
+    assert chats == first_pass
 
     # The lease is lost right after that pass, and the database stays unreachable.
     down = LeaseStatus(LeaseState.DB_DOWN, 1, clock.now(), clock.monotonic())
@@ -1339,7 +1355,7 @@ def test_D1_the_db_down_notice_waits_only_for_a_bot_wide_backoff(
 
     # A 403 for the location's channel never holds the admin chat (15 min for the location).
     assert io_loop.notify_db_down(down, clock, state) is True
-    assert chats == [DEFAULT_CHAT_ID, OPS_CHAT_ID]
+    assert chats == [*first_pass, OPS_CHAT_ID]
     assert fake_telegram.sent[-1]["text"].startswith("🛑 Database unreachable since ")
     assert state.db_down_notified is True
 

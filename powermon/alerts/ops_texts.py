@@ -15,6 +15,11 @@ notice says that subscriber alerts go on as normal.
 The chart pin texts (Phase 3 D-07) name the HTTP status of Telegram's refusal as a short
 ``http_NNN`` code only, never Telegram's description.
 
+The delivery texts (Phase 4 D-10) do the same for a refused subscriber alert. When
+Telegram reported that the group became a supergroup (``migrate_to_chat_id``), the failing
+text also gives the new chat ID, so the admin can paste it into the location's edit form;
+the chat is never changed automatically (PITFALLS 6e).
+
 Pure: imports nothing from Django.
 """
 
@@ -147,3 +152,41 @@ def pin_failed(status: int, name: str, *, escape: bool = True) -> str:
 def pin_restored(name: str, *, escape: bool = True) -> str:
     """D-07: a location's bot could pin today's chart again after a pin failure."""
     return f"📌 Pinning works again for {_name(name, escape)}."
+
+
+def delivery_failing(
+    status: int,
+    name: str,
+    max_age: timedelta,
+    migrate_to: int | None,
+    *,
+    escape: bool = True,
+) -> str:
+    """D-10: Telegram refused a location's subscriber alert; the alerts stay queued.
+
+    ``status`` is the HTTP status of the refusal, checked like ``pin_failed``'s (an int,
+    not a bool, from 100 to 599, else ValueError). ``max_age`` is how long a queued alert
+    waits before it expires. ``migrate_to`` is the supergroup's new chat ID when Telegram
+    reported one: the text names it for the admin, who updates the chat in the edit form.
+    """
+    if not isinstance(status, int) or isinstance(status, bool) or not 100 <= status <= 599:
+        raise ValueError("a delivery failure needs an HTTP status from 100 to 599")
+    if migrate_to is not None and (not isinstance(migrate_to, int) or isinstance(migrate_to, bool)):
+        raise ValueError("a migrated chat ID must be an integer")
+    text = (
+        f"🚫 Alerts for {_name(name, escape)} are failing (Telegram: http_{status}). "
+        "They stay queued and are retried every 15 min until they expire after "
+        f"{_duration(max_age)}. Check that the bot is an admin of the channel, then send a "
+        "test message from the admin panel."
+    )
+    if migrate_to is not None:
+        text += (
+            f" The group became a supergroup; its new chat ID is {migrate_to}. "
+            "Update the location's chat ID."
+        )
+    return text
+
+
+def delivery_restored(name: str, *, escape: bool = True) -> str:
+    """D-10: a location's subscriber alerts are delivered again after a failure."""
+    return f"✅ Alerts for {_name(name, escape)} are delivered again."

@@ -8,8 +8,9 @@ chat configured it writes no row and logs the rendered plain text once at WARNIN
 path holds a chat ID or token of its own.
 
 A notice's payload holds integers only: epoch microseconds (``instant_us``), a count, the
-id of the subscriber row it is about or the HTTP status of a refused chart pin (D-07).
-``render_text`` reads names and rows and builds
+id of the subscriber row it is about, the HTTP status of a refused chart pin (D-07) or of
+a refused subscriber alert, and the new chat ID Telegram reported for a group that became
+a supergroup (D-10). ``render_text`` reads names and rows and builds
 the English text (``ops_texts``) at send time, so no text and no secret is stored
 (OPS-08).
 
@@ -26,13 +27,16 @@ fact, not a code convention (D-11, ARCHITECTURE Pattern 10). Opening is
 counted as one value): a second opener gets no row back. Closing is an UPDATE conditional
 on the incident still being open: only the closer whose row count is 1 may send the
 recovery notice. The caller sends the notice in the same transaction, so a concurrent or
-repeated evaluation can neither add a second notice nor lose one.
+repeated evaluation can neither add a second notice nor lose one. An incident's
+``details`` hold integers only, like a payload: anything else raises TypeError before the
+INSERT (OPS-08).
 
 Every function runs inside the caller's transaction or opens its own. Nothing here does
 network I/O, and nothing here hides a database error: it reaches the caller, whose
 transaction then fails where its error handling can see it.
 """
 
+import json
 import logging
 from datetime import UTC, datetime, timedelta
 
@@ -52,7 +56,7 @@ _ONE_US = timedelta(microseconds=1)
 # index ops_incident_one_open, and then no row comes back (RESEARCH spike 8).
 OPEN_INCIDENT_SQL = """
 INSERT INTO ops_incident (kind, location_id, started_at, ended_at, details)
-VALUES (%s, %s, %s, NULL, '{}'::jsonb)
+VALUES (%s, %s, %s, NULL, %s::jsonb)
 ON CONFLICT DO NOTHING RETURNING id
 """
 # Only an open incident closes: a second close changes no row.
@@ -182,6 +186,17 @@ def render_text(
         )
     if kind == outbox.KIND_OPS_PIN_RESTORED:
         return ops_texts.pin_restored(_location_name(location_id), escape=escape)
+    if kind == outbox.KIND_OPS_DELIVERY_FAILING:
+        return ops_texts.delivery_failing(
+            _int(payload, "http_status"),
+            _location_name(location_id),
+            # The setting now: the queued alerts expire by it (D-07).
+            timedelta(hours=settings.CFG.alert_max_age_hours),
+            _optional_int(payload, "migrate_to_chat_id"),
+            escape=escape,
+        )
+    if kind == outbox.KIND_OPS_DELIVERY_RESTORED:
+        return ops_texts.delivery_restored(_location_name(location_id), escape=escape)
     raise ValueError(f"unknown ops notice kind: {kind!r}")
 
 
@@ -236,15 +251,27 @@ def recover_interrupted(now: datetime) -> int:
     return len(rows)
 
 
-def open_incident(kind: str, started_at: datetime, *, location_id: int | None = None) -> int | None:
+def open_incident(
+    kind: str,
+    started_at: datetime,
+    *,
+    location_id: int | None = None,
+    details: dict[str, int] | None = None,
+) -> int | None:
     """Open an incident ``[started_at, open)``; its id, or None if one is already open.
 
     Runs on the caller's connection, inside its transaction: send the start notice in the
     same transaction, and only when an id came back. A concurrent opener of the same kind
-    and location waits for this transaction and then gets None (D-11).
+    and location waits for this transaction and then gets None (D-11). ``details`` (stored
+    as JSON, ``{}`` when None) holds integers only: any other value, a bool included,
+    raises TypeError before the INSERT (OPS-08).
     """
+    values = dict(details or {})
+    for key, value in values.items():
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"incident detail {key!r} must be an integer")
     with connection.cursor() as cur:
-        cur.execute(OPEN_INCIDENT_SQL, [kind, location_id, started_at])
+        cur.execute(OPEN_INCIDENT_SQL, [kind, location_id, started_at, json.dumps(values)])
         row = cur.fetchone()
     return None if row is None else int(row[0])
 
@@ -267,6 +294,15 @@ def _int(payload: object, key: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         raise TypeError(f"ops payload {key!r} is not an integer")
     return value
+
+
+def _optional_int(payload: object, key: str) -> int | None:
+    """``_int`` for a key the payload may leave out: None when absent."""
+    if not isinstance(payload, dict):
+        raise TypeError("an ops payload is not an object")
+    if key not in payload:
+        return None
+    return _int(payload, key)
 
 
 def _instant(payload: object, key: str) -> datetime:
