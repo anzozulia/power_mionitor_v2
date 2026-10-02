@@ -21,6 +21,7 @@ import email.policy
 import json
 import logging
 import pathlib
+import re
 from collections.abc import Callable
 from email.parser import BytesParser
 from typing import Any
@@ -30,6 +31,7 @@ import requests
 import responses
 from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, TELEGRAM_API, parse_multipart
 from requests import PreparedRequest
+from urllib3.exceptions import MaxRetryError, NewConnectionError, ProtocolError
 
 from powermon.telegram import client as client_module
 from powermon.telegram.client import SendResult, TelegramClient
@@ -482,6 +484,78 @@ def test_client_has_no_unpin_all_call() -> None:
     assert "unpinchatmessage" in names  # the scan saw the real client
     assert not [name for name in names if "unpinall" in name]
     assert "unpinAll" not in CLIENT_SOURCE.read_text(encoding="utf-8")
+
+
+# Token-free result codes (INV-23, OPS-08)
+
+
+def _token_failures(method: str) -> list[tuple[str, dict[str, Any]]]:
+    """Every failure kind, each answer or exception text carrying the URL and so the token."""
+    path = f"/bot{TOKEN}/{method}"
+    url = _url(method)
+    refused = NewConnectionError(None, f"Failed to establish a new connection for {path}")
+    return [
+        ("429", RATE_LIMITED),
+        ("502", {"status": 502, "body": f"<html>Bad Gateway {url}</html>"}),
+        ("400", _bad_request(f"Bad Request: chat not found {url}")),
+        ("400-not-found", _bad_request(f"Bad Request: message to edit not found {url}")),
+        (
+            "401",
+            {"status": 401, "json_body": {"ok": False, "error_code": 401, "description": TOKEN}},
+        ),
+        ("403", FORBIDDEN),
+        ("error-code-is-url", {"status": 400, "json_body": {"ok": False, "error_code": url}}),
+        ("connect-timeout", {"exc": requests.ConnectTimeout(f"timed out: {url}")}),
+        ("refused", {"exc": requests.ConnectionError(MaxRetryError(None, path, refused))}),
+        ("read-timeout", {"exc": requests.ReadTimeout(f"read timed out: {url}")}),
+        (
+            "dropped",
+            {"exc": requests.ConnectionError(ProtocolError(f"Connection aborted. {url}"))},
+        ),
+        ("request-error", {"exc": requests.exceptions.ChunkedEncodingError(f"broken: {url}")}),
+        ("unexpected", {"exc": RuntimeError(f"boom at {url}")}),
+    ]
+
+
+TOKEN_FAILURES: list[tuple[str, str, dict[str, Any]]] = [
+    *(
+        (f"{method}-{case}", method, kwargs)
+        for method in METHODS
+        for case, kwargs in _token_failures(method)
+    ),
+    # An ok answer whose message_id is the token itself (a broken or hostile answer).
+    (
+        "sendPhoto-message-id-is-token",
+        "sendPhoto",
+        {"status": 200, "json_body": {"ok": True, "result": {"message_id": TOKEN}}},
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("method", "kwargs"),
+    [case[1:] for case in TOKEN_FAILURES],
+    ids=[case[0] for case in TOKEN_FAILURES],
+)
+def test_chart_result_codes_never_contain_the_token(
+    fake_telegram: Any, caplog: Any, method: str, kwargs: dict[str, Any]
+) -> None:
+    if "body" in kwargs:
+        fake_telegram.rsps.add(responses.POST, _url(method), **kwargs)
+    else:
+        fake_telegram.fail_method(TOKEN, method, **kwargs)
+    secret = TOKEN.split(":", 1)[1]
+
+    with caplog.at_level(logging.DEBUG):
+        result = CALLS[method](_client())
+
+    assert result.kind != "ok"
+    assert re.fullmatch(r"[a-z0-9_]{1,24}", result.code)
+    assert secret not in repr(result)
+    assert secret not in caplog.text
+    assert all(secret not in str(record.args) for record in caplog.records)
+    # Every failure is logged, by method, kind and code only.
+    assert f"telegram {method}: " in caplog.text
 
 
 # The fake's per-method helpers, which the chart lifecycle tests build on

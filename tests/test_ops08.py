@@ -8,12 +8,16 @@ The sinks a bot token or a device key could reach, each driven at the most verbo
   raw records of our own ``powermon`` loggers must not hold a secret either: they never
   put one into a message or a traceback in the first place;
 - the outbox and ops_incident rows (payloads, ``last_error``) after every relay outcome;
-- the text of every ops notice kind.
+- the text of every ops notice kind;
+- the chart calls: a chart is posted, edited, pinned or unpinned ("a chart is edited"),
+  through urllib3's request lines and the client's failure lines, which carry the method,
+  kind and code only (never Telegram's description or an exception's text).
 
 ``responses`` patches requests above urllib3, so with ``fake_telegram`` urllib3 never logs
-at all (RESEARCH Pitfall 10). The real-urllib3 case therefore runs without it: a plain HTTP
+at all (RESEARCH Pitfall 10). The real-urllib3 cases therefore run without it: a plain HTTP
 server on 127.0.0.1 (allowed by pytest-socket) answers like Telegram, and urllib3's own
-DEBUG line, which carries the ``/bot<token>/`` path, must come out redacted.
+DEBUG line, which carries the ``/bot<token>/`` path, must come out redacted, for
+sendMessage and for the multipart chart uploads alike.
 
 The adjacency cases check that a token or key glued to other text is still redacted, and
 that short digit:letter pairs below the token shape stay untouched.
@@ -47,7 +51,7 @@ from powermon.alerts.models import OpsIncident, OutboxMessage
 from powermon.engine import lapse
 from powermon.locations.keys import generate_device_key
 from powermon.logging_setup import RedactingFormatter
-from powermon.telegram.client import TelegramClient
+from powermon.telegram.client import SendResult, TelegramClient
 from powermon.worker import io_loop
 from powermon.worker.lease import Lease
 
@@ -67,6 +71,11 @@ TOKENS = (
 DEBUG_LOGGERS = ("", "powermon", "django", "django.db.backends", "urllib3", "requests")
 SHORT_CODE = re.compile(r"[a-z0-9_]{0,64}")
 TELEGRAM_OK = {"ok": True, "result": {"message_id": 1}}
+# A chart upload: fixed bytes (the client never looks inside) and a UTF-8 caption.
+CHART_PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 64
+CHART_CAPTION = "Сьогодні без світла: 4 год 10 хв · 2 відключення\nОновлено о 14:37"
+# Telegram's description is untrusted text that must never reach a log line.
+MARKER = "SECRETMARKER"
 
 
 def _secrets(*extra: str) -> list[str]:
@@ -150,17 +159,17 @@ def _queue_off(location: Any, at: datetime = T0) -> OutboxMessage:
         )
 
 
-def _refused(token: str) -> requests.ConnectionError:
+def _refused(token: str, method: str = "sendMessage") -> requests.ConnectionError:
     # A real connect-phase exception carries the URL, and so the token, in its text (P-12).
-    path = f"/bot{token}/sendMessage"
+    path = f"/bot{token}/{method}"
     reason = NewConnectionError(None, f"Failed to establish a new connection for {path}")
     return requests.ConnectionError(MaxRetryError(None, path, reason))
 
 
-def _read_timeout(token: str) -> requests.ReadTimeout:
+def _read_timeout(token: str, method: str = "sendMessage") -> requests.ReadTimeout:
     return requests.ReadTimeout(
         f"HTTPSConnectionPool(host='api.telegram.org', port=443): Read timed out. "
-        f"(read timeout=10) /bot{token}/sendMessage"
+        f"(read timeout=10) /bot{token}/{method}"
     )
 
 
@@ -299,6 +308,87 @@ def test_INV23_real_urllib3_debug_line_is_redacted(
     text = debug_capture.text
     assert '"POST /[REDACTED-TOKEN]/sendMessage HTTP/1.1" 200' in text
     _assert_secret_free(text, _secrets())
+
+
+def test_INV23_chart_calls_real_urllib3_debug_lines_are_redacted(
+    debug_capture: Capture, telegram_stub: str
+) -> None:
+    # "A chart is edited" (INV-23 #1): the multipart uploads and the pin calls go through
+    # the same urllib3 request lines as sendMessage, with the token in their path.
+    client = TelegramClient(DEFAULT_BOT_TOKEN, api_base=telegram_stub)
+
+    posted = client.send_photo(DEFAULT_CHAT_ID, CHART_PNG, CHART_CAPTION)
+    edited = client.edit_message_media(DEFAULT_CHAT_ID, 1, CHART_PNG, CHART_CAPTION)
+    pinned = client.pin_chat_message(DEFAULT_CHAT_ID, 1)
+    unpinned = client.unpin_chat_message(DEFAULT_CHAT_ID, 1)
+
+    assert posted == SendResult("ok", message_id=1)
+    assert [edited.kind, pinned.kind, unpinned.kind] == ["ok", "ok", "ok"]
+    # urllib3 really logged each request line, with the token in its path.
+    raw = [r.getMessage() for r in debug_capture.raw.records if r.name.startswith("urllib3")]
+    for method in ("sendPhoto", "editMessageMedia", "pinChatMessage", "unpinChatMessage"):
+        assert any(f"/bot{DEFAULT_BOT_TOKEN}/{method}" in line for line in raw)
+    # The redacting handler wrote every one of them without the token.
+    text = debug_capture.text
+    for line in (
+        '"POST /[REDACTED-TOKEN]/sendPhoto HTTP/1.1" 200',
+        '"POST /[REDACTED-TOKEN]/editMessageMedia HTTP/1.1" 200',
+        '"POST /[REDACTED-TOKEN]/pinChatMessage HTTP/1.1" 200',
+        '"POST /[REDACTED-TOKEN]/unpinChatMessage HTTP/1.1" 200',
+    ):
+        assert line in text
+    _assert_secret_free(text, _secrets())
+    _assert_secret_free(debug_capture.raw_text("powermon"), _secrets())
+
+
+def test_INV23_chart_failures_log_codes_only(debug_capture: Capture, fake_telegram: Any) -> None:
+    token = DEFAULT_BOT_TOKEN
+    fake_telegram.fail_method(
+        token,
+        "editMessageMedia",
+        status=400,
+        json_body={
+            "ok": False,
+            "error_code": 400,
+            "description": f"Bad Request: chat not found {MARKER}",
+        },
+    )
+    fake_telegram.fail_method(
+        token,
+        "pinChatMessage",
+        status=403,
+        json_body={"ok": False, "error_code": 403, "description": f"Forbidden: {MARKER}"},
+    )
+    fake_telegram.fail_method(
+        token, "unpinChatMessage", exc=_read_timeout(token, "unpinChatMessage")
+    )
+    fake_telegram.fail_method(token, "sendPhoto", exc=_refused(token, "sendPhoto"))
+    client = TelegramClient(token)
+
+    results = [
+        client.edit_message_media(DEFAULT_CHAT_ID, 1001, CHART_PNG, CHART_CAPTION),
+        client.pin_chat_message(DEFAULT_CHAT_ID, 1001),
+        client.unpin_chat_message(DEFAULT_CHAT_ID, 1001),
+        client.send_photo(DEFAULT_CHAT_ID, CHART_PNG, CHART_CAPTION),
+    ]
+
+    assert [(r.kind, r.code) for r in results] == [
+        ("permanent", "http_400"),
+        ("permanent", "http_403"),
+        ("maybe_delivered", "read_timeout"),
+        ("not_sent", "connect_error"),
+    ]
+    text = debug_capture.text
+    for line in (
+        "telegram editMessageMedia: permanent (http_400)",
+        "telegram pinChatMessage: permanent (http_403)",
+        "telegram unpinChatMessage: maybe_delivered (read_timeout)",
+        "telegram sendPhoto: not_sent (connect_error)",
+    ):
+        assert line in text
+    _assert_secret_free(text, _secrets(MARKER))
+    _assert_secret_free(debug_capture.raw_text("powermon"), _secrets(MARKER))
+    _assert_secret_free(repr(results), _secrets(MARKER))
 
 
 # DB columns and payloads (INV-23 #1, D-16: last_error stores short codes only)
