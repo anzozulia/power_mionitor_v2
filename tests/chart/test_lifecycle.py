@@ -18,22 +18,38 @@ keeps to a handful of them. The display time zone is Europe/Kyiv (UTC+3 until
 import dataclasses
 import io
 import json
+import logging
+import os
+import subprocess
+import sys
+import threading
 from collections.abc import Callable
 from datetime import date, datetime, timedelta
 from typing import Any
 
 import pytest
+import requests
 from chart_fixtures import KYIV, insert_pieces, kyiv, local_pieces, monitor, set_status
-from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, ChartCall, FakeClock
-from django.db import IntegrityError, transaction
+from conftest import (
+    DEFAULT_BOT_TOKEN,
+    DEFAULT_CHAT_ID,
+    OPS_BOT_TOKEN,
+    ChartCall,
+    FakeClock,
+)
+from django.db import IntegrityError, OperationalError, connection, transaction
 from PIL import Image
+from urllib3.exceptions import MaxRetryError, NewConnectionError
 
+from powermon.alerts import ops, outbox
+from powermon.alerts.models import OutboxMessage
 from powermon.chart import lifecycle, render
 from powermon.chart.model import Piece, Week
 from powermon.chart.models import ChartMessage
 from powermon.engine import transitions
 from powermon.locations.models import Location
 from powermon.worker import io_loop
+from powermon.worker.lease import Lease
 
 pytestmark = pytest.mark.django_db(transaction=True)
 
@@ -58,6 +74,18 @@ NOT_MODIFIED = {
         "markup are exactly the same as a current content and reply markup of the message"
     ),
 }
+FLOOD_30 = {
+    "ok": False,
+    "error_code": 429,
+    "description": "Too Many Requests: retry after 30",
+    "parameters": {"retry_after": 30},
+}
+BAD_GATEWAY = {"ok": False, "error_code": 502, "description": "Bad Gateway"}
+KICKED = {"ok": False, "error_code": 403, "description": "Forbidden: bot was kicked"}
+OFF_EN = "🔴 <b>POWER OFF</b>\n⚡ Power was ON for: <b>5m</b>"
+LIFECYCLE_LOGGER = lifecycle.__name__
+# Which bot a request went to, by a short label (a failing assert never prints a token).
+BOTS = {DEFAULT_BOT_TOKEN: "A", TOKEN_B: "B", OPS_BOT_TOKEN: "ops"}
 
 
 @pytest.fixture(autouse=True)
@@ -89,6 +117,45 @@ def _png_size(png: bytes) -> tuple[int, int]:
     with Image.open(io.BytesIO(png)) as image:
         assert image.format == "PNG"
         return image.size
+
+
+def _requests(fake: Any, start: int = 0) -> list[tuple[str, str]]:
+    """(bot label, Bot API method) of every request from index ``start`` on, in order."""
+    out = []
+    for call in list(fake.calls)[start:]:
+        token, method = call.request.url.split("/bot", 1)[1].split("/", 1)
+        out.append((BOTS[token], method))
+    return out
+
+
+def _seconds(n: float) -> timedelta:
+    return timedelta(seconds=n)
+
+
+def _queue_alert(location: Any, at: datetime = NOON_05) -> OutboxMessage:
+    """An OFF alert recorded (and so due) at ``at``, as a transition would queue it."""
+    with transaction.atomic():
+        return outbox.enqueue(
+            outbox.KIND_POWER_OFF,
+            location.pk,
+            event_at=at - _seconds(91),
+            recorded_at=at,
+            payload={"was_on_us": 300_000_000},
+        )
+
+
+def _refused(token: str, method: str) -> requests.ConnectionError:
+    # A real connect-phase exception, which the client classifies as not_sent (connect_error);
+    # its text carries the URL, and so the token (as tests/alerts/test_relay.py builds it).
+    path = f"/bot{token}/{method}"
+    reason = NewConnectionError(None, f"Failed to establish a new connection for {path}")
+    return requests.ConnectionError(MaxRetryError(None, path, reason))
+
+
+def _my_backend_pid() -> int:
+    with connection.cursor() as cur:
+        cur.execute("SELECT pg_backend_pid()")
+        return int(cur.fetchone()[0])
 
 
 def _seed(
@@ -596,3 +663,442 @@ def test_plan_nothing_due() -> None:
 
     assert lifecycle.plan([a], rows, today=TODAY, now=NOON_05, not_before={}) is None
     assert lifecycle.plan([], [], today=TODAY, now=NOON_05, not_before={}) is None
+
+
+def test_plan_skips_a_bot_or_channel_that_is_backing_off() -> None:
+    later = NOON_05 + timedelta(minutes=1)
+    a = _location(1)
+    b = _location(2, token=TOKEN_B)
+    unpinned = _row(10, 1, rendered=NOON_05 - timedelta(minutes=20), pinned=False)
+
+    # A's bot is held (a 429 or 5xx, by an alert or a chart): none of its steps goes.
+    held = {io_loop.bot_wide_key(DEFAULT_BOT_TOKEN): later}
+    assert lifecycle.plan([a, b], [unpinned], today=TODAY, now=NOON_05, not_before=held) == (
+        lifecycle.Action("post", b)
+    )
+    # A's channel backs off (the alert relay's chat_key): no pin, no refresh, no post.
+    channel = {io_loop.chat_key(DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID): later}
+    assert lifecycle.plan([a], [unpinned], today=TODAY, now=NOON_05, not_before=channel) is None
+    assert lifecycle.plan([a], [], today=TODAY, now=NOON_05, not_before=channel) is None
+    # At the key's own time the step is due again.
+    assert lifecycle.plan([a], [], today=TODAY, now=later, not_before=channel) == (
+        lifecycle.Action("post", a)
+    )
+
+
+# Chart work and alerts: one call per pass after alerts, chart-only keys, step backoff,
+# the lease fence, render errors (D-02, D-05, D-06, INV-14, C1)
+
+
+def test_INV14_one_chart_call_per_pass_after_alerts_and_ops(
+    location_factory: Callable[..., Any], fake_telegram: Any, ops_settings: Any
+) -> None:
+    a = _monitored(location_factory)
+    b = _monitored(location_factory, bot_token=TOKEN_B, chat_id=CHAT_B)
+    _queue_alert(a)
+    with transaction.atomic():
+        ops.notify(
+            outbox.KIND_OPS_PIN_RESTORED, payload={}, recorded_at=NOON_05, location_id=a.pk
+        )
+    fake_telegram.accept(DEFAULT_BOT_TOKEN)
+    fake_telegram.accept(OPS_BOT_TOKEN)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    fake_telegram.accept_chart(TOKEN_B)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+
+    passes = []
+    for _ in range(4):
+        start = len(fake_telegram.calls)
+        assert _pass(clock, state) is True
+        passes.append(_requests(fake_telegram, start))
+
+    assert passes == [
+        [("A", "sendMessage"), ("ops", "sendMessage"), ("A", "sendPhoto")],
+        [("A", "pinChatMessage")],
+        [("B", "sendPhoto")],
+        [("B", "pinChatMessage")],
+    ]
+
+
+def test_chart_failure_never_holds_the_channels_alerts(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    a = _monitored(location_factory)
+    _seed(a, rendered=NOON_05)
+    fake_telegram.fail_method(
+        DEFAULT_BOT_TOKEN, "editMessageMedia", status=400, json_body=CHAT_NOT_FOUND
+    )
+    fake_telegram.accept(DEFAULT_BOT_TOKEN)
+    clock = FakeClock(NOON_05 + timedelta(minutes=15))
+    state = io_loop.RelayState()
+
+    assert _pass(clock, state) is True
+
+    # Only the refresh's own key: neither the channel nor the bot waits for it.
+    assert state.not_before == {
+        lifecycle.chart_key(a.pk, "refresh"): clock.now() + timedelta(minutes=15)
+    }
+    off = _queue_alert(a, at=clock.now())
+    assert _pass(clock, state) is True
+    assert fake_telegram.sent == [{"chat_id": DEFAULT_CHAT_ID, "text": OFF_EN, "parse_mode": "HTML"}]
+    assert OutboxMessage.objects.get(pk=off.pk).status == "sent"
+
+
+def test_chart_429_backs_off_the_bot(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    a = _monitored(location_factory)
+    clock = FakeClock(NOON_05)
+    # Telegram answers the post after 3 s with a 429; every wait counts from the answer.
+    fake_telegram.answer_method(
+        DEFAULT_BOT_TOKEN,
+        "sendPhoto",
+        lambda: clock.advance(seconds=3),
+        status=429,
+        json_body=FLOOD_30,
+    )
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    fake_telegram.accept(DEFAULT_BOT_TOKEN)
+    state = io_loop.RelayState()
+
+    assert _pass(clock, state) is True
+
+    answer = NOON_05 + _seconds(3)
+    assert state.not_before == {
+        io_loop.bot_wide_key(DEFAULT_BOT_TOKEN): answer + _seconds(30),
+        lifecycle.chart_key(a.pk, "post"): answer + _seconds(30 + 30),
+    }
+    # The bot's alerts wait for the 429 like an alert's own 429 (ALRT-06), no longer.
+    off = _queue_alert(a, at=answer)
+    clock.set(answer + _seconds(29))
+    assert _pass(clock, state) is False
+    clock.set(answer + _seconds(30))
+    assert _pass(clock, state) is True
+    assert OutboxMessage.objects.get(pk=off.pk).status == "sent"
+    # The post itself waits for its own key.
+    clock.set(answer + _seconds(59))
+    assert _pass(clock, state) is False
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "sendPhoto") == 1
+    clock.set(answer + _seconds(60))
+    assert _pass(clock, state) is True
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "sendPhoto") == 2
+    assert len(_rows()) == 1
+
+
+def test_bot_wide_failure_lets_other_steps_go_first(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    a = _monitored(location_factory)
+    row = _seed(a, rendered=kyiv("2026-10-01 11:50"), pinned=False)
+    fake_telegram.fail_method(
+        DEFAULT_BOT_TOKEN, "pinChatMessage", status=502, json_body=BAD_GATEWAY
+    )
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+
+    # The pin goes before the refresh that is due too (D-02), and the bot answers 502.
+    assert _pass(clock, state) is True
+    answer = NOON_05
+    pin_key = lifecycle.chart_key(a.pk, "pin", row.pk)
+    assert state.not_before == {
+        io_loop.bot_wide_key(DEFAULT_BOT_TOKEN): answer + _seconds(2),
+        pin_key: answer + _seconds(2 + 30),
+    }
+    clock.set(answer + _seconds(1))
+    assert _pass(clock, state) is False
+    # Once the bot's hold ends, the refresh goes; the failed pin waits for its own key.
+    clock.set(answer + _seconds(2))
+    assert _pass(clock, state) is True
+    clock.set(answer + _seconds(31))
+    assert _pass(clock, state) is False
+    clock.set(answer + _seconds(32))
+    assert _pass(clock, state) is True
+
+    assert _requests(fake_telegram) == [
+        ("A", "pinChatMessage"),
+        ("A", "editMessageMedia"),
+        ("A", "pinChatMessage"),
+    ]
+    assert ChartMessage.objects.get(pk=row.pk).pinned is True
+    assert pin_key not in state.chart_failures
+
+
+def test_step_backoff_grows_and_is_capped(
+    location_factory: Callable[..., Any], fake_telegram: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    a = _monitored(location_factory)
+    waits = [30, 60, 120, 240, 480, 900, 900]
+    for _ in waits:
+        fake_telegram.fail_method(DEFAULT_BOT_TOKEN, "sendPhoto", exc=requests.ReadTimeout())
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    caplog.set_level(logging.WARNING, logger=LIFECYCLE_LOGGER)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+    key = lifecycle.chart_key(a.pk, "post")
+
+    for attempt, wait in enumerate(waits, start=1):
+        answered = clock.now()
+        assert _pass(clock, state) is True
+        # An ambiguous post: maybe delivered, never recorded, posted again after the wait.
+        assert fake_telegram.count(DEFAULT_BOT_TOKEN, "sendPhoto") == attempt
+        assert _rows() == []
+        assert state.chart_failures[key] == attempt
+        assert state.not_before == {key: answered + _seconds(wait)}
+        due = answered + _seconds(wait)
+        clock.set(due - _seconds(1))
+        assert _pass(clock, state) is False
+        clock.set(due)
+
+    assert _pass(clock, state) is True
+    [row] = _rows()
+    assert row.message_id == 1001
+    assert key not in state.chart_failures
+    warnings = [r.getMessage() for r in caplog.records if r.name == LIFECYCLE_LOGGER]
+    assert len(warnings) == len(waits)
+    assert all(str(a.pk) in line for line in warnings)
+    assert "attempt 7" in warnings[-1]
+
+
+def test_refused_post_holds_the_bot_briefly(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    a = _monitored(location_factory)
+    fake_telegram.fail_method(
+        DEFAULT_BOT_TOKEN, "sendPhoto", exc=_refused(DEFAULT_BOT_TOKEN, "sendPhoto")
+    )
+    state = io_loop.RelayState()
+
+    assert _pass(FakeClock(NOON_05), state) is True
+
+    assert _rows() == []
+    assert state.not_before == {
+        io_loop.bot_wide_key(DEFAULT_BOT_TOKEN): NOON_05 + _seconds(2),
+        lifecycle.chart_key(a.pk, "post"): NOON_05 + _seconds(2 + 30),
+    }
+    assert io_loop.chat_key(DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID) not in state.not_before
+
+
+def test_step_delay() -> None:
+    assert lifecycle.STEP_RETRY == _seconds(30)
+    assert lifecycle.STEP_RETRY_MAX == lifecycle.REFRESH_EVERY == timedelta(minutes=15)
+    assert lifecycle.step_delay(1) == _seconds(30)
+    assert lifecycle.step_delay(2) == _seconds(60)
+    assert lifecycle.step_delay(5) == _seconds(480)
+    assert lifecycle.step_delay(6) == lifecycle.step_delay(50) == _seconds(900)
+    assert lifecycle.step_delay(10**6) == _seconds(900)
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="failure"):
+            lifecycle.step_delay(bad)
+
+
+def test_chart_waits_for_the_relays_backoff(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    a = _monitored(location_factory)
+    _monitored(location_factory, bot_token=TOKEN_B, chat_id=CHAT_B)
+    _queue_alert(a)
+    # The alert relay finds A's channel refusing the bot (403): that channel waits 15 min.
+    fake_telegram.fail(DEFAULT_BOT_TOKEN, status=403, json_body=KICKED)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    fake_telegram.accept_chart(TOKEN_B)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+
+    assert _pass(clock, state) is True
+    assert state.not_before[io_loop.chat_key(DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID)] == (
+        NOON_05 + timedelta(minutes=15)
+    )
+    assert _requests(fake_telegram) == [("A", "sendMessage"), ("B", "sendPhoto")]
+    # While A's channel backs off, B's pin goes and A still gets nothing.
+    clock.set(NOON_05 + timedelta(minutes=14, seconds=59))
+    assert _pass(clock, state) is True
+    assert _pass(clock, state) is False
+
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "sendPhoto") == 0
+    assert [(row.chat_id, row.pinned) for row in _rows()] == [(CHAT_B, True)]
+
+
+def test_stale_lease_makes_no_chart_call(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    _monitored(location_factory)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    clock = FakeClock(NOON_05)
+    # A session that holds no worker lock: this test's own connection (C1).
+    state = io_loop.RelayState(lease_pid=_my_backend_pid())
+
+    assert _pass(clock, state) is False
+    assert len(fake_telegram.calls) == 0
+
+    lease = Lease(connection.settings_dict)
+    try:
+        assert lease.ensure_held().state == "held"
+        state.lease_pid = lease.pid
+        assert _pass(clock, state) is True
+    finally:
+        lease.close()
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "sendPhoto") == 1
+    assert len(_rows()) == 1
+
+
+def test_render_error_backs_off_that_step_only(
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    a = _monitored(location_factory, name="Broken")
+    _monitored(location_factory, bot_token=TOKEN_B, chat_id=CHAT_B)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    fake_telegram.accept_chart(TOKEN_B)
+    real = render.render_png
+
+    def failing(week: Week, *, lang: str, name: str) -> bytes:
+        if name == "Broken":
+            raise RuntimeError(f"cannot draw for bot {DEFAULT_BOT_TOKEN}")
+        return real(week, lang=lang, name=name)
+
+    monkeypatch.setattr(render, "render_png", failing)
+    caplog.set_level(logging.DEBUG)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+
+    assert _pass(clock, state) is False
+
+    assert len(fake_telegram.calls) == 0
+    assert state.not_before == {lifecycle.chart_key(a.pk, "post"): NOON_05 + timedelta(minutes=15)}
+    lines = [
+        r for r in caplog.records if r.name == LIFECYCLE_LOGGER and r.levelno >= logging.WARNING
+    ]
+    assert len(lines) == 1
+    assert "RuntimeError" in lines[0].getMessage()
+    assert str(a.pk) in lines[0].getMessage()
+    assert lines[0].exc_info is None
+    assert DEFAULT_BOT_TOKEN.split(":", 1)[1] not in caplog.text
+    # The other location's chart work goes on.
+    assert _pass(clock, state) is True
+    assert _requests(fake_telegram) == [("B", "sendPhoto")]
+
+
+def test_stop_set_makes_no_chart_call(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    _monitored(location_factory)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    stop = threading.Event()
+    stop.set()
+
+    assert io_loop.run_iteration(FakeClock(NOON_05), io_loop.RelayState(), stop, charts=True) is False
+
+    assert len(fake_telegram.calls) == 0
+
+
+def test_stop_during_the_render_makes_no_call(
+    location_factory: Callable[..., Any], fake_telegram: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _monitored(location_factory)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    stop = threading.Event()
+    real = render.render_png
+
+    def render_then_sigterm(week: Week, *, lang: str, name: str) -> bytes:
+        png = real(week, lang=lang, name=name)
+        stop.set()
+        return png
+
+    monkeypatch.setattr(render, "render_png", render_then_sigterm)
+
+    assert lifecycle.run_step(FakeClock(NOON_05), io_loop.RelayState(), stop) is False
+
+    assert len(fake_telegram.calls) == 0
+    assert _rows() == []
+
+
+def test_unwritable_record_backs_off_the_post(
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    a = _monitored(location_factory)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+
+    def refused(*args: Any) -> None:
+        raise OperationalError("could not extend file: No space left on device")
+
+    # The photo is accepted, but the database refuses the record (e.g. a full disk).
+    monkeypatch.setattr(lifecycle, "_record_post", refused)
+    caplog.set_level(logging.WARNING, logger=LIFECYCLE_LOGGER)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+    key = lifecycle.chart_key(a.pk, "post")
+
+    assert _pass(clock, state) is True
+
+    assert _rows() == []
+    assert state.not_before == {key: NOON_05 + _seconds(30)}
+    [line] = [r.getMessage() for r in caplog.records if r.name == LIFECYCLE_LOGGER]
+    assert "1001" in line and "OperationalError" in line
+    assert "No space" not in line
+    # No post every pass while the record cannot be written: the step backoff applies.
+    clock.set(NOON_05 + _seconds(29))
+    assert _pass(clock, state) is False
+    clock.set(NOON_05 + _seconds(30))
+    assert _pass(clock, state) is True
+    assert state.not_before == {key: NOON_05 + _seconds(30 + 60)}
+    monkeypatch.undo()
+    clock.set(NOON_05 + _seconds(90))
+    assert _pass(clock, state) is True
+    assert [row.message_id for row in _rows()] == [1003]
+    assert key not in state.chart_failures
+
+
+def test_web_process_never_imports_pillow() -> None:
+    script = (
+        "import sys, django; django.setup(); "
+        "import powermon.models, powermon.urls, powermon.chart.models; "
+        "print('PIL' in sys.modules, 'powermon.chart.render' in sys.modules, "
+        "'powermon.chart.lifecycle' in sys.modules)"
+    )
+    env = {**os.environ, "DJANGO_SETTINGS_MODULE": os.environ["DJANGO_SETTINGS_MODULE"]}
+
+    result = subprocess.run(
+        [sys.executable, "-c", script], check=True, capture_output=True, text=True, env=env
+    )
+
+    assert result.stdout.split() == ["False", "False", "False"]
+
+
+def test_chart_state_and_logs_hold_no_token(
+    location_factory: Callable[..., Any], fake_telegram: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    _monitored(location_factory)
+    _monitored(location_factory, bot_token=TOKEN_B, chat_id=CHAT_B)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    fake_telegram.fail_method(TOKEN_B, "sendPhoto", exc=_refused(TOKEN_B, "sendPhoto"))
+    caplog.set_level(logging.DEBUG)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+
+    for _ in range(3):
+        _pass(clock, state)
+
+    assert _requests(fake_telegram) == [
+        ("A", "sendPhoto"),
+        ("A", "pinChatMessage"),
+        ("B", "sendPhoto"),
+    ]
+    rows = repr(list(ChartMessage.objects.values()))
+    locations, _ = lifecycle.read_snapshot(TODAY)
+    assert len(locations) == 2
+    texts = (caplog.text, rows, repr(state), repr(locations), str(_rows()[0]))
+    for token in (DEFAULT_BOT_TOKEN, TOKEN_B):
+        prefix, secret = token.split(":", 1)
+        for text in texts:
+            assert secret not in text
+            assert f"{prefix}:" not in text
+        for record in caplog.records:
+            assert secret not in record.getMessage()
+    assert "render_ms=" in caplog.text and "call_ms=" in caplog.text
