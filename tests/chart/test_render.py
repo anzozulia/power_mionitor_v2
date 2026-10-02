@@ -372,6 +372,39 @@ def test_min_off_width_at_both_ends() -> None:
     assert _px(img, end + 1, y) == render.ON
 
 
+def test_off_over_not_monitored_sub_pixel_spans_and_repeated_hatch() -> None:
+    # chart-spec §6: OFF is drawn over not monitored; only OFF has a minimum width, so a
+    # one-second maintenance blip is not drawn at all; two not-monitored spans in one row
+    # are both hatched from the same canvas-anchored pattern.
+    pieces = local_pieces(
+        [
+            ("on", "2026-09-28 00:00", "2026-09-28 02:10"),
+            ("not_monitored", "2026-09-28 02:10", "2026-09-28 02:50"),
+            ("on", "2026-09-28 02:50", "2026-09-28 05:10"),
+            ("not_monitored", "2026-09-28 05:10", "2026-09-28 05:50"),
+            ("on", "2026-09-28 05:50", "2026-09-28 10:30:00"),
+            ("not_monitored", "2026-09-28 10:30:00", "2026-09-28 10:30:01"),
+            ("on", "2026-09-28 10:30:01", "2026-09-28 12:10"),
+            ("not_monitored", "2026-09-28 12:10", "2026-09-28 12:30"),
+            ("off", "2026-09-28 12:30", "2026-09-28 12:31"),
+            ("on", "2026-09-28 12:31", None),
+        ]
+    )
+    week = _week(pieces)
+    img = _render(week)
+    lay = render.layout(week, "uk")
+    y = lay.bar_ys[MON] + 22
+    for start, end in ((2 + 10 / 60, 2 + 50 / 60), (5 + 10 / 60, 5 + 50 / 60)):
+        span = set(_region(img, lay.hx(_hours(start)) + 2, y, lay.hx(_hours(end)) - 2, y + 1))
+        assert {render.NM_BASE, render.NM_INK} <= span, (start, end)
+    blip = lay.hx(_hours(10.5))
+    assert set(_region(img, blip - 3, y, blip + 4, y + 1)) == {render.ON}
+    ((start, end),) = _off_runs(img, lay, MON)
+    assert 7 <= end - start <= 8
+    # The widened OFF reaches back over the end of the not-monitored span.
+    assert start < lay.hx(_hours(12.5)) < end
+
+
 # --- Previous week, legend, grid and axis (chart-spec §5-§7, CHRT-07, CHRT-08, K-5) ---
 
 
@@ -553,7 +586,6 @@ def test_render_is_byte_identical() -> None:
 
 MEMORY_PROBE = textwrap.dedent(
     """
-    import resource
     import sys
     import time
     from datetime import UTC, date, datetime
@@ -564,6 +596,16 @@ MEMORY_PROBE = textwrap.dedent(
 
     def at(text):
         return datetime.fromisoformat(text).replace(tzinfo=UTC)
+
+
+    def peak_rss_kib():
+        # VmHWM is this process image's own peak. ru_maxrss would not do: Linux keeps the
+        # forking parent's (pytest's) high-water mark in it across fork and exec.
+        with open("/proc/self/status", encoding="ascii") as status:
+            for line in status:
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1])
+        raise RuntimeError("no VmHWM in /proc/self/status")
 
 
     sizes = (
@@ -585,11 +627,11 @@ MEMORY_PROBE = textwrap.dedent(
         pieces, today=date(2026, 10, 1), now=at("2026-10-01T11:37"), tz="Europe/Kyiv",
         live=True,
     )
-    before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    before = peak_rss_kib()
     start = time.perf_counter()
     png = render.render_png(week, lang="uk", name="Дім, Оболонь")
     seconds = time.perf_counter() - start
-    after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    after = peak_rss_kib()
     print(after - before, f"{seconds:.3f}", len(png), "django" in sys.modules)
     """
 )
@@ -597,7 +639,8 @@ MEMORY_PROBE = textwrap.dedent(
 
 def test_render_peak_memory_stays_within_the_band_budget() -> None:
     # D-09: per-band 4× layers keep a render's peak RSS growth to ~+25-35 MB; a full 4×
-    # canvas would need ~+180 MB. Measured in a fresh interpreter (Linux: ru_maxrss in KiB).
+    # canvas would need ~+180 MB. Measured in a fresh interpreter, in KiB, after every
+    # font is loaded (the container is Linux, so /proc/self/status is there).
     result = subprocess.run(
         [sys.executable, "-c", MEMORY_PROBE],
         cwd=REPO_ROOT,
@@ -609,7 +652,9 @@ def test_render_peak_memory_stays_within_the_band_budget() -> None:
     assert result.returncode == 0, result.stderr
     growth_kib, seconds, size, django_loaded = result.stdout.split()
     print(f"render peak RSS growth {growth_kib} KiB, {seconds} s, {size} bytes")
-    assert 0 <= int(growth_kib) < 80 * 1024
+    # Above zero: a render does allocate its bands, so 0 would mean the probe measured
+    # nothing.
+    assert 0 < int(growth_kib) < 80 * 1024
     assert int(size) > 10_000
     # The renderer pulls in nothing from Django, not even indirectly.
     assert django_loaded == "False"

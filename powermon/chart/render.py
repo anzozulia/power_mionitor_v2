@@ -30,6 +30,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
+from powermon.chart.glyphs import printable_name
 from powermon.chart.model import DAY_US, HOUR_US, Row, Week, wall_us
 from powermon.i18n import chart_texts
 from powermon.i18n.strings import resolve_language
@@ -235,6 +236,28 @@ def layout(week: Week, lang: str) -> Layout:
         grid_bottom=y,
         axis_baseline=y + AXIS_GAP,
     )
+
+
+def subtitle_text(name: str, week: Week, lang: str) -> str:
+    """The subtitle: ``{name} · {week range}`` (chart-spec §8, D-15).
+
+    The name goes through ``glyphs.printable_name`` first. When nothing printable is left
+    the subtitle is the week range alone. When the subtitle is wider than 1184 px at
+    Regular 30, whole code points are dropped from the end of the name (and the spaces
+    the cut leaves) until ``{name}… · {week range}`` fits; a name cut to nothing gives the
+    week range alone.
+    """
+    lang = resolve_language(lang)
+    week_range = chart_texts.week_range(week.monday, week.sunday, lang)
+    kept = printable_name(name)
+    if not kept:
+        return week_range
+    sub_font = font("regular", SUB_SIZE)
+    text = f"{kept}{chart_texts.DOT}{week_range}"
+    while kept and sub_font.getlength(text) > SUBTITLE_MAX:
+        kept = kept[:-1].rstrip()
+        text = f"{kept}…{chart_texts.DOT}{week_range}" if kept else week_range
+    return text
 
 
 def _x(v: float) -> int:
@@ -513,9 +536,12 @@ def _draw_text(
         fill=INK_PRIMARY,
         anchor="ls",
     )
-    subtitle = f"{name}{chart_texts.DOT}{chart_texts.week_range(week.monday, week.sunday, lang)}"
     draw.text(
-        (PAD_X, Y_SUB), subtitle, font=font("regular", SUB_SIZE), fill=INK_SECONDARY, anchor="ls"
+        (PAD_X, Y_SUB),
+        subtitle_text(name, week, lang),
+        font=font("regular", SUB_SIZE),
+        fill=INK_SECONDARY,
+        anchor="ls",
     )
     legend_font = font("regular", LEGEND_SIZE)
     for x, label in legend:
