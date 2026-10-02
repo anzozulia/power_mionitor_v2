@@ -43,11 +43,14 @@ worker was down is simply due on the next pass.
   (``system_state.last_cycle_completed_at``) is the location's ``settle`` past the
   midnight that ends it (``settle_time``, ``settled_records``). The cursor, not the wall
   clock, so a detection stall or a lapse across midnight holds the final edit too. This
-  covers every OFF unless detection's decisions fail in every cycle of that ``settle``
-  window. Detection moves the cursor before a cycle's decisions, and a failed decision
-  (a database error for one location, or for the whole cycle on a connection that
-  still works) does not hold it back. That rare residual is accepted (code review
-  WR-01): each failure is logged, and the finished chart is not redrawn (D-14).
+  covers every OFF unless detection's decisions fail in every cycle of the short margin
+  (one lapse threshold, a few cycles) between midnight + the location's timeout and the
+  settle point: no cycle before that margin can record an OFF whose last heartbeat came
+  just before midnight. Detection moves the cursor before a cycle's decisions, and a
+  failed decision (a database error for one location, or for the whole cycle on a
+  connection that still works) does not hold it back. That rare residual is accepted
+  (code review WR-01): each failure is logged, and the finished chart is not redrawn
+  (D-14).
 - Unpin: every older record gets exactly one unpin by its own message id in its own chat,
   oldest first, and nothing else is ever unpinned (D-04, INV-19). It is made whatever
   ``pinned`` says: a pin whose answer was ambiguous, whose outcome could not be written,
@@ -282,7 +285,8 @@ def settle_time(period_s: int, grace_s: int, router_grace: bool) -> timedelta:
     threshold and was carved as not monitored, which starts any outage found after it at
     the carve. A decision that failed in that cycle (a logged error) does not hold the
     cursor back, so the final chart misses an OFF whose decisions failed in every cycle
-    of the window (an accepted residual, code review WR-01).
+    of that last lapse-threshold margin after ``t`` + the timeout (a few cycles; an
+    accepted residual, code review WR-01).
     """
     return rules.longest_timeout(period_s, grace_s, router_grace) + lapse.LAPSE_THRESHOLD
 
@@ -308,8 +312,9 @@ def settled_records(
     least its location's ``settle`` past the local midnight that ends the day: every OFF
     that started in the day is then in the stored timeline (INV-03), including an outage
     that crosses midnight, which counts on both days (chart-spec §8). The exception is an
-    OFF whose decisions failed in every cycle of that window: each failure is logged, and
-    the finished chart is not redrawn (D-14), an accepted residual (code review WR-01).
+    OFF whose decisions failed in every cycle of the short margin (one lapse threshold, a
+    few cycles) just before the settle point: each failure is logged, and the finished
+    chart is not redrawn (D-14), an accepted residual (code review WR-01).
     The cursor, not the wall clock: while detection stalls, or across a lapse, the final
     edit waits too (a lapse carve commits before the cursor moves). With no cursor
     (detection has not run yet) no day has settled. Only records not finalized yet, of
