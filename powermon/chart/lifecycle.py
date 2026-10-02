@@ -16,6 +16,10 @@ worker was down is simply due on the next pass.
   (INV-17), with ``INSERT ... ON CONFLICT DO NOTHING`` on the partial unique index
   ``chart_message_one_active_per_day``, so two workers can never record two charts for a
   day (INV-17 #2).
+- Pin: a later pass pins the recorded message silently, in the chat stored with the
+  record, never the location's current chat (D-01, D-04). A permanent pin failure (the
+  bot may post but not pin, INV-17 #1) is stored as ``pin_failed_at``; the pin is tried
+  again only after the next successful render (D-07).
 
 Rendering runs inline in the I/O thread right before its call (D-05), with the location's
 current name and language and the display time zone read at render time (D-14). The
@@ -32,6 +36,7 @@ render_ms=<n> call_ms=<n>``, with no token and no Telegram description (OPS-08).
 
 import logging
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Literal
@@ -40,6 +45,7 @@ from django.conf import settings
 from django.db import connection
 
 from powermon.chart import model, source
+from powermon.chart.models import ChartMessage
 from powermon.clock import Clock
 from powermon.i18n import chart_texts, times
 from powermon.telegram.client import SendResult, TelegramClient
@@ -167,19 +173,49 @@ def plan(
 ) -> Action | None:
     """The one chart step due now, or None. Pure: reads nothing but its arguments.
 
-    Locations go by ascending id, and the first one with a due step wins.
+    Locations go by ascending id, and the first one with a due step wins; within a
+    location the steps go in D-02 order: post today's chart, then pin it. A step whose own
+    key in ``not_before`` is in the future is skipped, so the location's next due step
+    goes instead.
     """
 
     def waiting(key: str) -> bool:
         return not_before.get(key, now) > now
 
     for location in locations:
-        has_today = any(
-            r.location_id == location.location_id and r.local_date == today for r in rows
-        )
-        if not has_today and not waiting(chart_key(location.location_id, "post")):
-            return Action("post", location)
+        today_row = _today_row(rows, location.location_id, today)
+        action = _midnight_step(location, today_row, waiting)
+        if action is not None:
+            return action
     return None
+
+
+def _today_row(rows: list[ChartRow], location_id: int, today: date) -> ChartRow | None:
+    """The location's active record for today (the unique index allows at most one)."""
+    for row in rows:
+        if row.location_id == location_id and row.local_date == today:
+            return row
+    return None
+
+
+def _midnight_step(
+    location: ChartLocation, today_row: ChartRow | None, waiting: Callable[[str], bool]
+) -> Action | None:
+    """The location's first due step of D-02 (post, pin), or None."""
+    location_id = location.location_id
+    if today_row is None:
+        if not waiting(chart_key(location_id, "post")):
+            return Action("post", location)
+    elif _pin_due(today_row) and not waiting(chart_key(location_id, "pin", today_row.id)):
+        return Action("pin", location, today_row)
+    return None
+
+
+def _pin_due(row: ChartRow) -> bool:
+    """Not pinned, and no permanent pin failure since the last render (D-07)."""
+    if row.pinned:
+        return False
+    return row.pin_failed_at is None or row.pin_failed_at < row.last_rendered_at
 
 
 def chart_content(
@@ -216,21 +252,19 @@ def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | No
     if action is None or _stopped(stop):
         return False
     location = action.location
-    key = _key(action)
+    content: tuple[bytes, str] | None = None
     started = clock.monotonic()
-    png, caption = chart_content(location, today, now, live=True, tz=tz)
+    if action.step == "post":
+        content = chart_content(location, today, now, live=True, tz=tz)
     render_ms = _ms(clock.monotonic() - started)
     if not _lease_holds(state.lease_pid):
         return False
     client = TelegramClient(location.bot_token)
     called = clock.monotonic()
-    result = client.send_photo(location.chat_id, png, caption)
+    result = _call(client, action, content)
     call_ms = _ms(clock.monotonic() - called)
     answered = clock.now()
-    if result.kind == "ok" and result.message_id is not None:
-        _record_post(location, today, result.message_id, answered)
-    else:
-        _back_off(key, result, answered, state)
+    _apply(action, result, today, answered, state)
     log.info(
         "chart %s for location %s: %s (%s) render_ms=%d call_ms=%d",
         action.step,
@@ -243,8 +277,46 @@ def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | No
     return True
 
 
+def _call(client: TelegramClient, action: Action, content: tuple[bytes, str] | None) -> SendResult:
+    """The step's one Telegram call; a record's own chat is the one called (D-04)."""
+    row = action.row
+    if action.step == "post" and content is not None:
+        png, caption = content
+        return client.send_photo(action.location.chat_id, png, caption)
+    if action.step == "pin" and row is not None:
+        return client.pin_chat_message(row.chat_id, row.message_id)
+    raise ValueError(f"no call for the chart step {action.step!r}")
+
+
+def _apply(
+    action: Action,
+    result: SendResult,
+    today: date,
+    answered: datetime,
+    state: io_loop.RelayState,
+) -> None:
+    """Write the step's outcome: its record on success, else its own backoff key."""
+    key = _key(action)
+    row = action.row
+    if result.kind == "ok":
+        if action.step == "post" and result.message_id is not None:
+            _record_post(action.location, today, result.message_id, answered)
+        elif action.step == "pin" and row is not None:
+            ChartMessage.objects.filter(pk=row.id, pinned=False).update(
+                pinned=True, pin_failed_at=None
+            )
+        state.not_before.pop(key, None)
+        return
+    if result.kind == "permanent" and action.step == "pin" and row is not None:
+        # The bot may not pin here: tried again after the next render, not before (D-07).
+        ChartMessage.objects.filter(pk=row.id, pinned=False).update(pin_failed_at=answered)
+    _back_off(action, key, result, answered, state)
+
+
 def _key(action: Action) -> str:
-    return chart_key(action.location.location_id, action.step)
+    """The step's backoff key: by record for a step on one record, else by location."""
+    row_id = action.row.id if action.row is not None and action.step != "refresh" else None
+    return chart_key(action.location.location_id, action.step, row_id)
 
 
 def _stopped(stop: threading.Event | None) -> bool:
@@ -287,7 +359,17 @@ def _record_post(location: ChartLocation, day: date, message_id: int, answered: 
         )
 
 
-def _back_off(key: str, result: SendResult, answered: datetime, state: io_loop.RelayState) -> None:
+def _back_off(
+    action: Action, key: str, result: SendResult, answered: datetime, state: io_loop.RelayState
+) -> None:
     """A failed step waits under its own key; it never writes the channel's ``chat_key``."""
-    delay = io_loop.PERMANENT_BACKOFF if result.kind == "permanent" else STEP_RETRY
-    state.not_before[key] = answered + delay
+    if result.kind == "permanent":
+        state.not_before[key] = answered + io_loop.PERMANENT_BACKOFF
+        log.warning(
+            "chart %s for location %s: permanent error %s; the step waits 15 min",
+            action.step,
+            action.location.location_id,
+            result.code,
+        )
+        return
+    state.not_before[key] = answered + STEP_RETRY
