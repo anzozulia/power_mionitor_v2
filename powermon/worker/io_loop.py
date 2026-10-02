@@ -50,7 +50,9 @@ The result decides the row's next status, for both channels (D-14 policy):
 - permanent (400/401/403/404): retried after PERMANENT_BACKOFF, with one warning. For a
   subscriber row, in the same transaction, the location's delivery is marked failing: its
   ``delivery_failing`` incident opens with one ``ops_delivery_failing`` notice to the
-  admin (D-10); a refusal while the incident is open adds nothing (INV-20 #1).
+  admin (D-10). A refusal while the incident is open opens no incident and sends no
+  notice (INV-20 #1), but updates the open incident's details to that latest refusal
+  (its status and any ``migrate_to_chat_id``, W2-A2).
 
 Only those two outcomes of a subscriber send touch the incident: a 429, a 5xx, a refused
 connection, an ambiguous send, an ops row and every chart call leave it alone (D-10).
