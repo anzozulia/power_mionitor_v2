@@ -88,8 +88,12 @@ worker was down is simply due on the next pass.
   permanent error logs one WARNING with its short code and sends no ops notice: if the
   current bot may not unpin in the old chat, the old pin stays (the accepted Open Edge 6
   risk). A transient, rate-limited or unsent outcome backs the release off like any other
-  step. While any stale record of a location is active, that location makes no other step
-  (Pitfall 1): a post in the new chat while the old today-record is active would hit
+  step. A release waits for its own key and its bot's hold (``bot_wide_key``), never for
+  its stored chat's ``chat_key``: an alert refused in the old chat (the bot was removed
+  there, the usual reason to move) holds that chat for 15 min, and since the location
+  makes no other step meanwhile, the new chat would get no chart until then (D-08,
+  W3-A1). While any stale record of a location is active, that location makes no other
+  step (Pitfall 1): a post in the new chat while the old today-record is active would hit
   ``chart_message_one_active_per_day`` and leave an untracked photo on every pass. Once
   its stale records are retired, a moved location has no record for today, so today's
   chart is posted and pinned in its new chat on the next passes. A deleted location stays
@@ -116,7 +120,8 @@ worker makes no chart call (C1).
 
 Backoff (D-02, D-06, INV-14). Chart calls share the alert relay's per-bot and per-chat
 backoff, read only: a bot whose ``bot_wide_key`` or a channel whose ``chat_key`` is in
-the future gets no chart call. A chart outcome writes its own step key
+the future gets no chart call, except that a release waits for its bot only, never for
+its old chat's ``chat_key`` (Release above). A chart outcome writes its own step key
 (``chart_key``: ``chart:<location>:<step>[:<record>]``) and never ``chat_key``, so a
 chart's per-chat, permanent or render failure never holds the channel's alerts. Only a
 bot-wide outcome (429, 5xx, refused connection) also sets ``bot_wide_key``, for exactly the
@@ -460,7 +465,7 @@ def plan(
     step wins, so one location's midnight work is done before the next one's starts.
     A location with a ``stale`` record (its chat or bot changed, or it was deleted) makes
     only releases, oldest record first, until every stale record is retired; its release
-    waiting for its own key or its channel makes no other step of that location either, so
+    waiting for its own key or its bot makes no other step of that location either, so
     nothing is posted while the old today-record is active (D-08, D-09, Pitfall 1).
     Within a location the steps go in D-02 order: post today's chart, pin it, give the
     oldest older record without one its final edit, unpin the oldest older record not
@@ -474,7 +479,11 @@ def plan(
     failing post never blocks the older charts' cleanup (D-02, INV-19). The alert relay's
     backoff is respected, read only: a location whose bot waits (``bot_wide_key``) makes
     no step, and a step whose channel waits (``chat_key`` of the chat it would call) is
-    skipped (D-06).
+    skipped (D-06). A release is the exception: it never waits for its stored chat's
+    ``chat_key``. Without a ``bot_wide_key`` hold that key comes only from a permanent
+    refusal of an alert in the old chat, often the reason the location moved, and a
+    release is one best-effort call that retires its record on any permanent answer, so
+    it cannot loop (D-08, INV-19).
     """
 
     def waiting(key: str) -> bool:
@@ -487,7 +496,10 @@ def plan(
         stale_rows = _stale_rows(location, rows)
         if stale_rows or location.deleted:
             for row in stale_rows:
-                if _free(location, "release", row, waiting):
+                # One best-effort call that retires its record on any permanent answer: it
+                # waits for its own key and its bot (above), never for the stored chat's
+                # refusal hold, which is often why the location moved (D-08, W3-A1).
+                if not waiting(chart_key(location.location_id, "release", row.id)):
                     return Action("release", location, row)
             continue
         today_row = _today_row(rows, location.location_id, today)

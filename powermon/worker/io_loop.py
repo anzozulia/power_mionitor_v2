@@ -31,8 +31,9 @@ channel's alerts. Only a bot-wide outcome of a chart call (``BOT_WIDE_KINDS``: a
 5xx, a refused connection, which concern the whole bot) also sets ``bot_wide_key``, with
 the hold an alert's outcome of that kind would give (D-06); the bot's alerts then wait
 for it as for their own. The chart step in turn skips a bot whose ``bot_wide_key``, or a
-channel whose ``chat_key``, is in the future, and keeps its own consecutive failures per
-step in ``RelayState.chart_failures``.
+channel whose ``chat_key``, is in the future (except the release of a moved or deleted
+location's old chart, which waits for its bot only, D-08), and keeps its own consecutive
+failures per step in ``RelayState.chart_failures``.
 
 The result decides the row's next status, for both channels (D-14 policy):
 
