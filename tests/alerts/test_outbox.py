@@ -241,3 +241,62 @@ def test_WR01_a_relay_reset_moves_only_the_attempt_of_its_claim(
     assert outbox.mark_retry(row.pk, due, "y", attempts=1) is False
     assert outbox.mark_retry(row.pk, due, "y", attempts=2) is True
     assert _claim_state(row) == ("pending", 2)
+
+
+# D-08 / D-12: make a location's held subscriber alerts due at once
+
+
+def _held(location: Any, until: datetime, *, status: str = "pending") -> OutboxMessage:
+    """A subscriber row of ``location`` waiting until ``until`` (a backoff), in ``status``."""
+    row = _enqueue(location)
+    OutboxMessage.objects.filter(pk=row.pk).update(next_attempt_at=until, status=status)
+    return row
+
+
+def _due_at(row: OutboxMessage) -> datetime:
+    return OutboxMessage.objects.get(pk=row.pk).next_attempt_at
+
+
+@pytest.mark.django_db
+def test_make_due_moves_only_the_locations_held_pending_subscriber_rows(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = location_factory()
+    other = location_factory()
+    now = RECORDED_AT + timedelta(minutes=5)
+    later = now + timedelta(minutes=10)
+    held = [_held(location, later), _held(location, later)]
+    already_due = _held(location, now - timedelta(seconds=1))
+    at_now = _held(location, now)
+    sending = _held(location, later, status="sending")
+    sent = _held(location, later, status="sent")
+    other_location = _held(other, later)
+    with transaction.atomic():
+        notice = outbox.enqueue_ops(
+            outbox.KIND_OPS_GAP,
+            payload={"start_us": 1, "end_us": 2},
+            recorded_at=later,
+            location_id=location.pk,
+        )
+
+    assert outbox.make_due(location.pk, now) == 2
+
+    assert [_due_at(row) for row in held] == [now, now]
+    # Rows already due, not pending, of another location or of the ops queue: unchanged.
+    assert _due_at(already_due) == now - timedelta(seconds=1)
+    assert _due_at(at_now) == now
+    assert [_due_at(row) for row in (sending, sent, other_location, notice)] == [later] * 4
+    # Nothing left to move: a second call changes no row.
+    assert outbox.make_due(location.pk, now) == 0
+
+
+@pytest.mark.django_db
+def test_make_due_refuses_a_naive_time(location_factory: Callable[..., Any]) -> None:
+    location = location_factory()
+    later = RECORDED_AT + timedelta(minutes=15)
+    row = _held(location, later)
+
+    with pytest.raises(ValueError, match="naive"):
+        outbox.make_due(location.pk, datetime(2026, 10, 1, 10, 10))  # noqa: DTZ001
+
+    assert _due_at(row) == later

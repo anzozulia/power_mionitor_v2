@@ -423,3 +423,114 @@ def test_render_text_refuses_a_broken_pin_notice(location_factory: Callable[...,
         ops.render_text(outbox.KIND_OPS_PIN_FAILED, {"http_status": True}, location.pk, now=now)
     with pytest.raises(ValueError):
         ops.render_text(outbox.KIND_OPS_PIN_FAILED, {"http_status": 1000}, location.pk, now=now)
+
+
+# The delivery notices (Phase 4 D-10, 04-CONTEXT "Specific Ideas")
+
+DELIVERY_FAILING = (
+    "🚫 Alerts for Office are failing (Telegram: http_403). They stay queued and are retried "
+    "every 15 min until they expire after 6h. Check that the bot is an admin of the channel, "
+    "then send a test message from the admin panel."
+)
+SUPERGROUP = (
+    " The group became a supergroup; its new chat ID is -1009999999999. "
+    "Update the location's chat ID."
+)
+DELIVERY_RESTORED = "✅ Alerts for Office are delivered again."
+
+
+def test_delivery_failing() -> None:
+    text = ops_texts.delivery_failing(403, "Office", timedelta(hours=6), None)
+
+    assert text == DELIVERY_FAILING
+
+
+def test_delivery_failing_names_the_supergroup_chat_id() -> None:
+    text = ops_texts.delivery_failing(400, "Office", timedelta(hours=6), -1009999999999)
+
+    assert text == DELIVERY_FAILING.replace("http_403", "http_400") + SUPERGROUP
+
+
+def test_delivery_failing_shows_the_configured_maximum_age() -> None:
+    text = ops_texts.delivery_failing(403, "Office", timedelta(hours=12), None)
+
+    assert "until they expire after 12h. " in text
+
+
+def test_delivery_restored() -> None:
+    assert ops_texts.delivery_restored("Office") == DELIVERY_RESTORED
+
+
+def test_delivery_texts_escape_the_name_for_telegram_only() -> None:
+    texts = [
+        ops_texts.delivery_failing(403, RAW, timedelta(hours=6), None),
+        ops_texts.delivery_restored(RAW),
+    ]
+    raw = [
+        ops_texts.delivery_failing(403, RAW, timedelta(hours=6), None, escape=False),
+        ops_texts.delivery_restored(RAW, escape=False),
+    ]
+
+    assert all(ESCAPED in text and RAW not in text for text in texts)
+    assert all(RAW in text and ESCAPED not in text for text in raw)
+
+
+@pytest.mark.parametrize("status", [True, False, 99, 600, -403, "403", 403.0, None], ids=repr)
+def test_delivery_failing_refuses_a_status_that_is_not_a_short_http_code(status: Any) -> None:
+    with pytest.raises(ValueError, match="HTTP status"):
+        ops_texts.delivery_failing(status, "Office", timedelta(hours=6), None)
+
+
+@pytest.mark.parametrize("migrate_to", [True, "-1009999999999", -1009999999999.0], ids=repr)
+def test_delivery_failing_refuses_a_chat_id_that_is_not_an_integer(migrate_to: Any) -> None:
+    with pytest.raises(ValueError, match="chat ID"):
+        ops_texts.delivery_failing(400, "Office", timedelta(hours=6), migrate_to)
+
+
+@pytest.mark.django_db
+def test_render_text_delivery_notices_read_the_name_and_max_age_at_send_time(
+    location_factory: Callable[..., Any], settings: Any
+) -> None:
+    location = location_factory(name="Home")
+    now = _utc("2026-10-01T12:00:00")
+    # Renamed after the notices were queued: the payloads hold integers only.
+    Location.objects.filter(pk=location.pk).update(name="Office")
+    failing = outbox.KIND_OPS_DELIVERY_FAILING
+    migrated = {"http_status": 400, "migrate_to_chat_id": -1009999999999}
+
+    assert ops.render_text(failing, {"http_status": 403}, location.pk, now=now) == (
+        DELIVERY_FAILING
+    )
+    assert ops.render_text(failing, migrated, location.pk, now=now) == (
+        DELIVERY_FAILING.replace("http_403", "http_400") + SUPERGROUP
+    )
+    assert ops.render_text(outbox.KIND_OPS_DELIVERY_RESTORED, {}, location.pk, now=now) == (
+        DELIVERY_RESTORED
+    )
+    settings.CFG = dataclasses.replace(settings.CFG, alert_max_age_hours=3)
+    assert "expire after 3h. " in ops.render_text(
+        failing, {"http_status": 403}, location.pk, now=now
+    )
+
+
+@pytest.mark.django_db
+def test_render_text_refuses_a_broken_delivery_notice(location_factory: Callable[..., Any]) -> None:
+    location = location_factory()
+    now = _utc("2026-10-01T12:00:00")
+    failing = outbox.KIND_OPS_DELIVERY_FAILING
+
+    with pytest.raises(LookupError):
+        ops.render_text(failing, {"http_status": 403}, None, now=now)
+    with pytest.raises(LookupError):
+        ops.render_text(outbox.KIND_OPS_DELIVERY_RESTORED, {}, location.pk + 1000, now=now)
+    with pytest.raises(KeyError):
+        ops.render_text(failing, {"migrate_to_chat_id": -100}, location.pk, now=now)
+    # The optional chat ID is still an integer, or the payload is broken.
+    for bad in (True, "-100", -100.0, None):
+        payload = {"http_status": 400, "migrate_to_chat_id": bad}
+        with pytest.raises(TypeError):
+            ops.render_text(failing, payload, location.pk, now=now)
+    with pytest.raises(TypeError):
+        ops.render_text(failing, ["http_status"], location.pk, now=now)
+    with pytest.raises(ValueError):
+        ops.render_text(failing, {"http_status": 1000}, location.pk, now=now)

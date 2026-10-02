@@ -50,7 +50,7 @@ from urllib3.exceptions import MaxRetryError, NewConnectionError
 
 import powermon
 from powermon.alerts import ops, outbox
-from powermon.alerts.models import OutboxMessage
+from powermon.alerts.models import OpsIncident, OutboxMessage
 from powermon.worker import io_loop
 
 TOKEN_A = DEFAULT_BOT_TOKEN
@@ -1232,3 +1232,40 @@ def test_the_hard_coded_chat_scan_catches_planted_literals() -> None:
         "planted.py:2",
         "planted.py:3",
     ]
+
+
+# An incident's details hold integers only (OPS-08, Phase 4 D-10)
+
+
+@pytest.mark.django_db
+def test_open_incident_stores_integer_details(location_factory: Callable[..., Any]) -> None:
+    location = location_factory()
+    details = {"http_status": 400, "migrate_to_chat_id": -1009999999999}
+
+    with transaction.atomic():
+        with_details = ops.open_incident(
+            "delivery_failing", T0, location_id=location.pk, details=details
+        )
+        without = ops.open_incident("all_silent", T0)
+
+    assert with_details is not None and without is not None
+    assert OpsIncident.objects.get(pk=with_details).details == details
+    assert OpsIncident.objects.get(pk=without).details == {}
+    # A second open incident of the kind and location: no id, the first one's details stay.
+    assert ops.open_incident("delivery_failing", T0, location_id=location.pk, details={}) is None
+    assert OpsIncident.objects.get(pk=with_details).details == details
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("value", ["400", True, 400.0, None, [400]], ids=repr)
+def test_open_incident_refuses_a_detail_that_is_not_an_integer(
+    location_factory: Callable[..., Any], value: Any
+) -> None:
+    location = location_factory()
+
+    with pytest.raises(TypeError, match="must be an integer"):
+        ops.open_incident(
+            "delivery_failing", T0, location_id=location.pk, details={"http_status": value}
+        )
+
+    assert not OpsIncident.objects.exists()
