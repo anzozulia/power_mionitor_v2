@@ -41,6 +41,10 @@ class ChartMessage(models.Model):
     local_date = models.DateField()
     # The chat the message was sent to; edits, pins and unpins use this one (D-04).
     chat_id = models.BigIntegerField()
+    # The bot that posted the message: io_loop.bot_key of its token, never the token
+    # (D-08). A record whose bot or chat differs from its location's current ones is
+    # released by the channel-change cleanup (04-06).
+    bot_key = models.CharField(max_length=12)
     message_id = models.BigIntegerField()
     # Set once the pin succeeded; the record exists before any pin (INV-17).
     pinned = models.BooleanField(default=False)

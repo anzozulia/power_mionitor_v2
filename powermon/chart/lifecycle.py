@@ -12,13 +12,16 @@ worker was down is simply due on the next pass.
 - Post: a monitored location (status on or off, not deleted; ``alerts_enabled`` and
   ``maintenance`` never matter, INV-05) with no active record for today's local date gets
   its chart posted silently (D-01, D-03). The record (location, date, the chat it was sent
-  to, the message id) is written right after Telegram accepts the photo and before any pin
-  (INV-17), with ``INSERT ... ON CONFLICT DO NOTHING`` on the partial unique index
+  to, the bot that sent it, the message id) is written right after Telegram accepts the
+  photo and before any pin (INV-17). The bot is named by ``io_loop.bot_key`` of the token
+  that posted, never the token (D-08), so a later chat or token change shows on the record.
+  The write is ``INSERT ... ON CONFLICT DO NOTHING`` on the partial unique index
   ``chart_message_one_active_per_day``, so two workers can never record two charts for a
   day (INV-17 #2).
   If that write raises a database error, the post Telegram accepted is kept in
-  ``RelayState.chart_posted`` and written first by the next chart step, before any step
-  is chosen, so it is never posted a second time (WR-04 analogue). A record that can
+  ``RelayState.chart_posted``, with the key of the bot that posted it, and written first by
+  the next chart step, before any step is chosen, so it is never posted a second time
+  (WR-04 analogue) and names its bot even if the token changed meanwhile. A record that can
   never be written (its location is gone) leaves the photo untracked, with one WARNING.
 - Pin: a later pass pins the recorded message silently, in the chat stored with the
   record, never the location's current chat (D-01, D-04). A permanent pin failure (the
@@ -197,10 +200,10 @@ SELECT id, location_id, local_date, chat_id, message_id, pinned, pin_failed_at,
 # The record of a posted chart, written right after the send succeeded (INV-17). A second
 # active record for the same day is refused by chart_message_one_active_per_day.
 INSERT_SQL = """
-INSERT INTO chart_message (location_id, local_date, chat_id, message_id, pinned,
+INSERT INTO chart_message (location_id, local_date, chat_id, bot_key, message_id, pinned,
                            pin_failed_at, last_rendered_at, finalized_at, unpinned_at,
                            retired_at, created_at)
-VALUES (%(location_id)s, %(local_date)s, %(chat_id)s, %(message_id)s, false,
+VALUES (%(location_id)s, %(local_date)s, %(chat_id)s, %(bot_key)s, %(message_id)s, false,
         NULL, %(answered)s, NULL, NULL, NULL, %(answered)s)
 ON CONFLICT DO NOTHING RETURNING id
 """
@@ -831,10 +834,16 @@ def _lease_holds(pid: int | None) -> bool:
 
 
 def _record_post(
-    location_id: int, day: date, chat_id: int, message_id: int, answered: datetime
+    location_id: int,
+    day: date,
+    chat_id: int,
+    message_id: int,
+    answered: datetime,
+    bot_key: str,
 ) -> None:
     """Record the posted chart before any pin (INV-17); a second record for the day is refused.
 
+    ``bot_key`` names the bot that posted it (``io_loop.bot_key`` of its token, D-08).
     A record that can never be written (an IntegrityError: the location row is gone)
     leaves the photo untracked, as a refused second record does, with one WARNING. Any
     other database error propagates: the caller keeps the post and writes it later.
@@ -847,6 +856,7 @@ def _record_post(
                     "location_id": location_id,
                     "local_date": day,
                     "chat_id": chat_id,
+                    "bot_key": bot_key,
                     "message_id": message_id,
                     "answered": answered,
                 },
@@ -874,13 +884,21 @@ def _record_or_keep(
     """Record an accepted post now, or keep it for the next chart step (WR-04 analogue).
 
     Telegram answered with the message id, so the photo exists: it must be recorded, never
-    posted again. A database error keeps (location, date) -> (chat, message, answer time)
-    in ``state.chart_posted``; ``_flush_posted`` writes it before the next step is chosen.
+    posted again. ``location`` is the step's snapshot, so its token is the one that posted
+    the photo (D-08). A database error keeps (location, date) -> (chat, message, answer
+    time, bot key) in ``state.chart_posted``; ``_flush_posted`` writes it before the next
+    step is chosen, with that bot key even if the location's token changed meanwhile.
     """
+    posted_by = io_loop.bot_key(location.bot_token)
     try:
-        _record_post(location.location_id, day, location.chat_id, message_id, answered)
+        _record_post(location.location_id, day, location.chat_id, message_id, answered, posted_by)
     except Error as exc:
-        state.chart_posted[(location.location_id, day)] = (location.chat_id, message_id, answered)
+        state.chart_posted[(location.location_id, day)] = (
+            location.chat_id,
+            message_id,
+            answered,
+            posted_by,
+        )
         log.warning(
             "chart post for location %s: message %s was posted, but its record was not "
             "written (%s); it is written before the next chart step",
@@ -897,8 +915,9 @@ def _flush_posted(state: io_loop.RelayState) -> None:
     The kept date is the one the photo was posted for, even after midnight: a post kept
     at 23:59 becomes that day's record, which the next steps finalize.
     """
-    for (location_id, day), (chat_id, message_id, answered) in list(state.chart_posted.items()):
-        _record_post(location_id, day, chat_id, message_id, answered)
+    for (location_id, day), posted in list(state.chart_posted.items()):
+        chat_id, message_id, answered, posted_by = posted
+        _record_post(location_id, day, chat_id, message_id, answered, posted_by)
         del state.chart_posted[(location_id, day)]
 
 
@@ -1015,9 +1034,10 @@ def _step_crashed(
     and no other location's chart would move. Only the step's own key is set, never
     ``chat_key`` or ``bot_wide_key``: neither the channel's alerts nor the bot's other
     steps wait for it. A post Telegram accepted (``result``) is kept in ``chart_posted``,
-    as after a database error, so the next chart step records it and it is never posted
-    again. One ERROR line with the traceback; the worker's redacting formatter scrubs any
-    token in it (OPS-08). Called from an ``except`` block only.
+    as after a database error, with the key of the bot that posted it (D-08), so the next
+    chart step records it and it is never posted again. One ERROR line with the traceback;
+    the worker's redacting formatter scrubs any token in it (OPS-08). Called from an
+    ``except`` block only.
     """
     location = action.location
     if (
@@ -1026,7 +1046,7 @@ def _step_crashed(
         and result.kind == "ok"
         and result.message_id is not None
     ):
-        posted = (location.chat_id, result.message_id, at)
+        posted = (location.chat_id, result.message_id, at, io_loop.bot_key(location.bot_token))
         state.chart_posted.setdefault((location.location_id, today), posted)
     state.not_before[key] = at + io_loop.PERMANENT_BACKOFF
     log.exception(
