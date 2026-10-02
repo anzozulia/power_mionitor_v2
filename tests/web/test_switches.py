@@ -4,6 +4,10 @@ A switch is a POST form (CSRF) that posts its target value, never "toggle" (UI-D
 answered POST -> redirect -> GET with a flash (UI-D4). The maintenance switch calls the
 engine transition (``maintenance.set_maintenance``), stamped from the view's injected
 clock. No switch makes a Telegram call (KD2).
+
+Edges (UI-SPEC screen H, E3 error): the same state again writes nothing and gets the
+"already" info flash; GET and other methods answer 405; a missing or unknown value answers
+400 with an empty body; a POST without a CSRF token is refused; an unknown location is 404.
 """
 
 import re
@@ -29,6 +33,11 @@ MAINTENANCE_ON_FLASH = (
     "Maintenance is on. OFF is not detected and no OFF alert is sent; the chart shows this "
     "time as not monitored."
 )
+MAINTENANCE_OFF_FLASH = (
+    "Maintenance is off. OFF detection starts again now; silence during maintenance does not count."
+)
+ALREADY_ON_FLASH = "Maintenance was already on. Nothing changed."
+ALREADY_OFF_FLASH = "Maintenance was already off. Nothing changed."
 
 
 @pytest.fixture
@@ -135,3 +144,92 @@ def test_switch_for_an_unknown_location_is_404_and_writes_nothing(
     assert LocationState.objects.get(location=location).state_version == version
     assert _open_state(location) == "on"
     assert len(fake_telegram.calls) == 0
+
+
+@pytest.mark.django_db
+def test_maintenance_off_from_the_location_page(
+    admin: Client, location_factory: Callable[..., Any], fake_telegram: FakeTelegram
+) -> None:
+    location = _on_since_8(location_factory)
+    assert admin.post(_switch(location), {"value": "on"}).status_code == 302
+    page = admin.get(_page(location)).content.decode()
+    assert '<input type="hidden" name="value" value="off">' in _maintenance_form(page, location)
+
+    response = admin.post(_switch(location), {"value": "off"})
+
+    assert (response.status_code, response.url) == (302, _page(location))
+    followed = admin.get(response.url).content.decode()
+    assert re.findall(r'role="status">([^<]*)<', followed) == [MAINTENANCE_OFF_FLASH]
+    assert "<h3>Maintenance is off</h3>" in followed
+    assert Location.objects.get(pk=location.pk).maintenance is False
+    assert _open_state(location) == "on"
+    assert len(fake_telegram.calls) == 0
+
+
+@pytest.mark.django_db
+def test_switch_already_on_shows_the_info_flash(
+    admin: Client, location_factory: Callable[..., Any], fake_telegram: FakeTelegram
+) -> None:
+    location = _on_since_8(location_factory)
+    admin.post(_switch(location), {"value": "on"})
+    admin.get(_page(location))
+    intervals = list(PowerInterval.objects.filter(location=location).values_list("id", "end_at"))
+    version = LocationState.objects.get(location=location).state_version
+
+    again = admin.post(_switch(location), {"value": "on"}, follow=True).content.decode()
+
+    # UI-D3: a second click (a double click, a second tab, a stale page) writes nothing.
+    assert re.findall(r'role="status">([^<]*)<', again) == [ALREADY_ON_FLASH]
+    assert '<p class="callout" role="status">' in again
+    assert (
+        list(PowerInterval.objects.filter(location=location).values_list("id", "end_at"))
+        == intervals
+    )
+    assert LocationState.objects.get(location=location).state_version == version
+
+    other = location_factory(name="Other")
+    off = admin.post(_switch(other), {"value": "off"}, follow=True).content.decode()
+
+    assert re.findall(r'role="status">([^<]*)<', off) == [ALREADY_OFF_FLASH]
+    assert Location.objects.get(pk=other.pk).maintenance is False
+    assert len(fake_telegram.calls) == 0
+
+
+@pytest.mark.django_db
+def test_switch_get_is_405(admin: Client, location_factory: Callable[..., Any]) -> None:
+    location = _on_since_8(location_factory)
+
+    for method in (admin.get, admin.put, admin.delete):
+        assert method(_switch(location)).status_code == 405
+
+    assert Location.objects.get(pk=location.pk).maintenance is False
+
+
+@pytest.mark.django_db
+def test_switch_bad_value_is_400_and_writes_nothing(
+    admin: Client, location_factory: Callable[..., Any], fake_telegram: FakeTelegram
+) -> None:
+    location = _on_since_8(location_factory)
+    version = LocationState.objects.get(location=location).state_version
+
+    for data in ({}, {"value": "toggle"}, {"value": "ON"}, {"value": ""}):
+        response = admin.post(_switch(location), data)
+        assert response.status_code == 400
+        assert response.content == b""
+
+    assert Location.objects.get(pk=location.pk).maintenance is False
+    assert LocationState.objects.get(location=location).state_version == version
+    assert _open_state(location) == "on"
+    assert len(fake_telegram.calls) == 0
+
+
+@pytest.mark.django_db
+def test_switch_without_a_csrf_token_is_refused(location_factory: Callable[..., Any]) -> None:
+    location = _on_since_8(location_factory)
+    browser = Client(enforce_csrf_checks=True)
+    browser.force_login(User.objects.create_user("admin", password="not-used-here"))
+
+    response = browser.post(_switch(location), {"value": "on"})
+
+    assert response.status_code == 403
+    assert Location.objects.get(pk=location.pk).maintenance is False
