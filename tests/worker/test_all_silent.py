@@ -14,10 +14,15 @@ What these scenarios prove:
 - the edges: silence is strict at exactly one period; only active locations count; the end
   names the earliest heartbeat, the lowest id on a tie; a lapse carve never ends it; a
   restarted worker sends no second start;
-- D-04: the start still counts only active locations, but the end is the first heartbeat
-  after the start from any monitored, non-deleted location, in maintenance or not; putting
-  locations into maintenance or deleting them never ends it by itself (Pitfall 7: a
-  location in maintenance whose device keeps beating ends it at the next evaluation);
+- D-04 (refined after the wave-1 audit): the start still counts only active locations; the
+  end is the first heartbeat after the start from an active location, or the first one
+  received after the incident was opened (detected) from a location in maintenance
+  (monitored, not deleted). A maintenance beat between the backdated start and the
+  detection ends nothing (in the INV-12 #1 shape it sent a false "Heartbeats are back"
+  during the outage and swallowed the real recovery notice). Putting locations into
+  maintenance or deleting them never ends it by itself. An incident with no stored open
+  time (opened before the rule) counts maintenance beats from the first evaluation that
+  sees it;
 - exactly once (D-11): two evaluations at once open one incident and send one notice, and
   two at once close it with one notice (the partial unique index and the conditional
   close, not a code convention);
@@ -33,7 +38,7 @@ so each test writes the row it needs.
 import dataclasses
 import logging
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -197,11 +202,17 @@ def _inv12_locations(location_factory: Callable[..., Any]) -> dict[str, Any]:
     return locations
 
 
-def _run_inv12(locations: dict[str, Any], *, evaluate: bool) -> dict[datetime, str]:
+def _run_inv12(
+    locations: dict[str, Any],
+    *,
+    evaluate: bool,
+    maintenance_beats: Mapping[datetime, int] | None = None,
+) -> dict[datetime, str]:
     """A cycle (and the all-silent check) every 5 s from 11:10:05 to 11:14:00 UTC.
 
-    A heartbeat at a step's time arrives just after that step's cycle. Returns the
-    non-None results of the check by step.
+    A heartbeat at a step's time arrives just after that step's cycle; so does a beat in
+    ``maintenance_beats`` (step -> id of a location in maintenance). Returns the non-None
+    results of the check by step.
     """
     outcomes: dict[datetime, str] = {}
     for at in _steps(_at(11, 10, 5), _at(11, 14), timedelta(seconds=5)):
@@ -210,6 +221,8 @@ def _run_inv12(locations: dict[str, Any], *, evaluate: bool) -> dict[datetime, s
             result = all_silent.evaluate(at)
             if result is not None:
                 outcomes[at] = result
+        if maintenance_beats is not None and at in maintenance_beats:
+            assert transitions.record_heartbeat(maintenance_beats[at], at) == "plain"
         if at in RESUMES:
             assert transitions.record_heartbeat(locations[RESUMES[at]].pk, at) == "restored"
     return outcomes
@@ -253,6 +266,36 @@ def test_INV12_subscriber_alerts_are_the_same_without_the_check(
 
     assert _subscriber_alerts() == INV12_ALERTS
     assert (_ops_rows(), _incidents()) == ([], [])
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV12_real_recovery_after_maintenance_beat_gets_one_end_notice(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    """INV-12 #1 with a fourth, powered device in maintenance (D-04, wave-1 audit).
+
+    M's device beat at 14:10:30 Kyiv: after the silence start (14:10:00, backdated) and
+    before the detection (14:11:05). Then the ingress outage silenced it as well. That beat
+    says nothing about the path after the detection, so the incident stays open until A's
+    heartbeat at 14:13:00, which ends it with exactly one end notice naming A. Counting M's
+    beat sent a false "Heartbeats are back (first: M)" at 14:11:10, and one incident per
+    silence then swallowed the real recovery.
+    """
+    locations = _inv12_locations(location_factory)
+    m = _silent(location_factory, "M", _at(11, 0), maintenance=True)
+
+    outcomes = _run_inv12(locations, evaluate=True, maintenance_beats={_at(11, 10, 30): m.pk})
+
+    assert outcomes == {_at(11, 11, 5): "started", _at(11, 13, 5): "ended"}
+    [start] = _starts()
+    assert _render(start) == START_3_SINCE_14_10
+    [end] = _ends()
+    assert (end.recorded_at, end.location_id) == (_at(11, 13, 5), locations["A"].pk)
+    assert _render(end) == END_FIRST_A_14_13
+    assert [row.pk for row in _ops_rows()] == [start.pk, end.pk]
+    assert _incidents() == [(None, _at(11, 10), _at(11, 13))]
+    # M is in maintenance: no subscriber alert for it, the others' alerts are unchanged.
+    assert _subscriber_alerts() == INV12_ALERTS
 
 
 # INV-12 #2 and #3: not every active location silent, or only one active location
@@ -357,6 +400,26 @@ def test_first_back_is_the_earliest_heartbeat_after_the_start() -> None:
     assert all_silent.first_back([], since) is None
 
 
+def test_D04_first_back_counts_a_maintenance_heartbeat_only_after_the_open() -> None:
+    since, opened = _at(11, 0), _at(11, 2)
+    early_m = all_silent.Active(1, 60, _at(11, 1, 30), maintenance=True)
+    at_open_m = all_silent.Active(2, 60, opened, maintenance=True)
+    late_m = all_silent.Active(3, 60, _at(11, 3), maintenance=True)
+    late_a = all_silent.Active(4, 60, _at(11, 3))
+    early_a = all_silent.Active(5, 60, _at(11, 0, 30))
+
+    # A heartbeat from a location in maintenance counts only strictly after the open.
+    assert all_silent.first_back([early_m, at_open_m], since, opened) is None
+    assert all_silent.first_back([early_m, at_open_m, late_m], since, opened) == late_m
+    # An active location's heartbeat still counts from the start, even before the open.
+    assert all_silent.first_back([early_m, late_m, early_a], since, opened) == early_a
+    # The same instant from both kinds: the lowest id.
+    assert all_silent.first_back([late_a, late_m], since, opened) == late_m
+    # Without an open time no maintenance heartbeat counts; the active rule is unchanged.
+    assert all_silent.first_back([early_m, late_m], since, None) is None
+    assert all_silent.first_back([early_m, late_m, late_a], since) == late_a
+
+
 # Which locations count, and who is named first back (integration)
 
 
@@ -404,10 +467,13 @@ def test_all_silent_end_tie_breaks_by_lowest_id(
     assert _render(end) == "✅ Heartbeats are back (first: A, 14:03:00); all-silent lasted 3m."
 
 
-# D-04 (Phase 4): maintenance and deletion. The start still counts only active locations;
-# the end is the first heartbeat after the start from any monitored, non-deleted location,
-# in maintenance or not, because a heartbeat proves the server and network path work.
-# Putting locations into maintenance or deleting them never closes the incident by itself.
+# D-04 (Phase 4, refined after the wave-1 audit): maintenance and deletion. The start still
+# counts only active locations. The end is the first heartbeat after the start from an
+# active location (the Phase 2 rule), or the first heartbeat received after the incident
+# was opened (detected) from a location in maintenance (monitored, not deleted). The start
+# is backdated to the moment the last active location fell quiet, so a maintenance beat
+# before the detection proves nothing about the server and network path now. Putting
+# locations into maintenance or deleting them never closes the incident by itself.
 
 
 def _started_with_a_and_b(location_factory: Callable[..., Any]) -> tuple[Any, Any]:
@@ -425,8 +491,8 @@ def test_D04_a_heartbeat_from_a_location_in_maintenance_ends_all_silent(
 ) -> None:
     """C is in maintenance: it never counts for the start, but its heartbeat ends it.
 
-    Pitfall 7, D-04 taken literally: a heartbeat from a location in maintenance proves the
-    server and network path work, so it ends the incident like any other heartbeat.
+    D-04: a heartbeat from a location in maintenance received after the incident was opened
+    (11:02) proves the server and network path work, so it ends the incident.
     """
     _system(cursor=None, resumed=_at(9, 0))
     a = _silent(location_factory, "A", _at(11, 0))
@@ -452,14 +518,17 @@ def test_D04_a_heartbeat_from_a_location_in_maintenance_ends_all_silent(
 
 
 @pytest.mark.django_db(transaction=True)
-def test_D04_pitfall7_a_beating_location_in_maintenance_ends_all_silent_at_once(
+def test_D04_maintenance_heartbeat_before_detection_does_not_end_all_silent(
     location_factory: Callable[..., Any], ops_settings: Any
 ) -> None:
-    """Pitfall 7: the admin gets a start and an end notice one evaluation apart.
+    """A maintenance beat between the backdated start and the detection ends nothing.
 
-    D-04 is applied literally (a locked decision, T-04-14 accepted): C is in maintenance
-    and its device keeps beating, so its last heartbeat already lies after the start when
-    the incident opens, and the next evaluation ends it at that heartbeat.
+    The INV-12 #1 shape: A and B fell quiet at 11:00, so all-silent is detected at 11:02 and
+    starts at 11:00. C's device (in maintenance) beat at 11:01:30, after the start but
+    before the detection, and then the ingress outage silenced it too. Counting that beat
+    closed the incident at the next evaluation with a false "Heartbeats are back (first: C)"
+    while the outage went on (the literal D-04 reading, replaced by the maintainer's
+    refinement).
     """
     _system(cursor=None, resumed=_at(9, 0))
     _silent(location_factory, "A", _at(11, 0))
@@ -468,16 +537,115 @@ def test_D04_pitfall7_a_beating_location_in_maintenance_ends_all_silent_at_once(
     assert transitions.record_heartbeat(c.pk, _at(11, 1, 30)) == "plain"
 
     assert all_silent.evaluate(_at(11, 2)) == "started"
-    assert all_silent.evaluate(_at(11, 2, 5)) == "ended"
+    for at in (_at(11, 2, 5), _at(11, 3), _at(11, 30)):
+        assert all_silent.evaluate(at) is None
+
+    assert _incidents() == [(None, _at(11, 0), None)]
+    assert (len(_starts()), _ends()) == (1, [])
+    # The detection time is stored with the incident (integers only, OPS-08).
+    assert OpsIncident.objects.get().details == {"opened_us": ops.instant_us(_at(11, 2))}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_D04_maintenance_heartbeat_after_detection_ends_all_silent(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    """Pitfall 7, refined: a beating device in maintenance ends it at its first beat after the open.
+
+    C's 11:01 beat predates the 11:02 detection and is ignored. Its 11:03 beat is fresh
+    proof that the server and network path work, so it ends the incident at 11:03 with one
+    end notice naming C. The admin gets the start and the end notice about one beat apart.
+    """
+    _system(cursor=None, resumed=_at(9, 0))
+    a = _silent(location_factory, "A", _at(11, 0))
+    _silent(location_factory, "B", _at(11, 0))
+    c = _silent(location_factory, "C", _at(11, 0), maintenance=True)
+    assert transitions.record_heartbeat(c.pk, _at(11, 1)) == "plain"
+    assert all_silent.evaluate(_at(11, 2)) == "started"
+    assert all_silent.evaluate(_at(11, 2, 5)) is None
+
+    assert transitions.record_heartbeat(c.pk, _at(11, 3)) == "plain"
+    assert all_silent.evaluate(_at(11, 3, 5)) == "ended"
+    assert all_silent.evaluate(_at(11, 3, 10)) is None
 
     [end] = _ends()
-    assert end.location_id == c.pk
-    assert end.payload["first_us"] == ops.instant_us(_at(11, 1, 30))
-    assert _incidents() == [(None, _at(11, 0), _at(11, 1, 30))]
+    assert end.location_id == c.pk != a.pk
+    assert end.payload == {
+        "since_us": ops.instant_us(_at(11, 0)),
+        "first_us": ops.instant_us(_at(11, 3)),
+    }
+    assert _render(end) == "✅ Heartbeats are back (first: C, 14:03:00); all-silent lasted 3m."
+    assert _incidents() == [(None, _at(11, 0), _at(11, 3))]
     assert [row.kind for row in _ops_rows()] == [
         outbox.KIND_OPS_ALL_SILENT_START,
         outbox.KIND_OPS_ALL_SILENT_END,
     ]
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    "details",
+    [{}, {"opened_us": "14:02"}, {"opened_us": True}, {"opened_us": 10**30}],
+    ids=["missing", "not-an-integer", "boolean", "out-of-range"],
+)
+def test_D04_incident_without_an_open_time_counts_maintenance_beats_from_its_first_evaluation(
+    location_factory: Callable[..., Any], ops_settings: Any, details: dict[str, Any]
+) -> None:
+    """The fallback for an incident opened before the open time was stored (or a bad one).
+
+    Its real open time is unknown: it lies after the start and before the first evaluation
+    that sees the incident. That evaluation stores its own time as the open time, so a
+    maintenance beat before it (it may predate the detection) is ignored and a later one
+    ends the incident. The stand-in is never earlier than the real open, so it can only
+    ignore more beats (never a false end), and a beating device in maintenance still ends
+    the incident (it never stays open for good).
+    """
+    _system(cursor=None, resumed=_at(9, 0))
+    _silent(location_factory, "A", _at(11, 0))
+    _silent(location_factory, "B", _at(11, 0))
+    c = _silent(location_factory, "C", _at(11, 0), maintenance=True)
+    legacy = OpsIncident.objects.create(
+        kind=all_silent.KIND_ALL_SILENT, started_at=_at(11, 0), details=details
+    )
+    assert transitions.record_heartbeat(c.pk, _at(11, 4)) == "plain"
+
+    # The first evaluation that sees it (11:05) stands in for its open time; later ones
+    # keep that time.
+    assert all_silent.evaluate(_at(11, 5)) is None
+    assert all_silent.evaluate(_at(11, 6)) is None
+    legacy.refresh_from_db()
+    assert (legacy.ended_at, legacy.details) == (None, {"opened_us": ops.instant_us(_at(11, 5))})
+
+    # C's next beat ends it, once, with the incident's real start.
+    assert transitions.record_heartbeat(c.pk, _at(11, 7)) == "plain"
+    assert all_silent.evaluate(_at(11, 7, 5)) == "ended"
+    assert all_silent.evaluate(_at(11, 7, 10)) is None
+    [end] = _ends()
+    assert (end.location_id, end.payload) == (
+        c.pk,
+        {"since_us": ops.instant_us(_at(11, 0)), "first_us": ops.instant_us(_at(11, 7))},
+    )
+    assert _incidents() == [(None, _at(11, 0), _at(11, 7))]
+    assert _starts() == []
+
+
+@pytest.mark.django_db(transaction=True)
+def test_D04_incident_without_an_open_time_still_ends_at_an_active_heartbeat(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    """The open-time stand-in never applies to an active location (Phase 2 rule unchanged)."""
+    _system(cursor=None, resumed=_at(9, 0))
+    a = _silent(location_factory, "A", _at(11, 0))
+    _silent(location_factory, "B", _at(11, 0))
+    OpsIncident.objects.create(kind=all_silent.KIND_ALL_SILENT, started_at=_at(11, 0))
+    assert transitions.record_heartbeat(a.pk, _at(11, 4)) == "plain"
+
+    # A's heartbeat after the start ends it, though it came before the first evaluation.
+    assert all_silent.evaluate(_at(11, 5)) == "ended"
+
+    [end] = _ends()
+    assert (end.location_id, end.payload["first_us"]) == (a.pk, ops.instant_us(_at(11, 4)))
+    assert _incidents() == [(None, _at(11, 0), _at(11, 4))]
 
 
 @pytest.mark.django_db(transaction=True)
