@@ -254,7 +254,9 @@ def test_INV18_1_worker_down_across_midnight(
         ("unpinChatMessage", DEFAULT_CHAT_ID, 501),
     ]
     photo, _pin, final, unpin = fake_telegram.chart_calls
-    assert _caption(photo) == "No outages today\nUpdated 00:07"
+    # Today so far (00:00-00:07) is all downtime, not monitored: no on or off time, so the
+    # caption says so instead of "No outages today" (D-03).
+    assert _caption(photo) == "Today: not monitored\nUpdated 00:07"
     # The finished day: line 1 only, no "Updated" line (D-13).
     assert _caption(final) == "No outages on Thu 01.10"
     assert "\n" not in _caption(final)

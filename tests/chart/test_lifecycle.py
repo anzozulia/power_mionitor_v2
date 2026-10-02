@@ -623,6 +623,36 @@ def test_INV05_chart_ignores_alerts_enabled_and_maintenance(
     assert (row.pinned, row.last_rendered_at) == (True, clock.now())
 
 
+def test_D03_maintenance_all_day_caption(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    # Monitored since yesterday; in maintenance since yesterday 20:00, so today has no on
+    # or off time at all: its row shows "—", and the caption no longer claims "no
+    # outages" but says "not monitored" (D-03, Phase 3 IN-05).
+    location = location_factory(maintenance=True)
+    set_status(location, "on", at=kyiv("2026-09-30 08:00"))
+    insert_pieces(
+        location,
+        local_pieces(
+            [
+                ("on", "2026-09-30 08:00", "2026-09-30 20:00"),
+                ("not_monitored", "2026-09-30 20:00", None),
+            ]
+        ),
+    )
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+
+    assert _pass(FakeClock(NOON_05), io_loop.RelayState()) is True
+
+    [photo] = _chart_calls(fake_telegram, "sendPhoto")
+    assert photo.fields["caption"] == "Today: not monitored\nUpdated 12:05"
+    # The day's finished render: line 1 only, in the neutral form too (D-13).
+    _, finished = lifecycle.chart_content(
+        _location(location.pk), TODAY, kyiv("2026-10-02 00:00"), live=False, tz=KYIV
+    )
+    assert finished == "Thu 01.10: not monitored"
+
+
 def test_INV17_2_a_second_run_the_same_day_posts_nothing(
     location_factory: Callable[..., Any], fake_telegram: Any
 ) -> None:

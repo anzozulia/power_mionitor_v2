@@ -1,7 +1,8 @@
 """Chart caption and labels, snapshot-tested in uk, en and ru (CHRT-03, CHRT-04, CHRT-08).
 
-docs/chart-spec.md section 8 fixes every string, and D-13 the finished-day caption (line 1
-only, the weekday and date in place of "Today"). docs/v1-lessons.md section 4: snapshot
+docs/chart-spec.md section 8 fixes every string, D-13 the finished-day caption (line 1
+only, the weekday and date in place of "Today"), and Phase 4 D-03 the neutral caption of a
+day with no on or off time ("not monitored"). docs/v1-lessons.md section 4: snapshot
 every caption and label in all three languages, so each expected string is written out
 literally. The module is pure, so these tests need no database or settings.
 
@@ -45,6 +46,19 @@ FINISHED_WITHOUT_OUTAGES = {
     "uk": "Чт 01.10 відключень не було",
     "en": "No outages on Thu 01.10",
     "ru": "Чт 01.10 отключений не было",
+}
+
+# D-03 (chart-spec §8 amendment): a day with no on or off time at all gets the neutral form,
+# the legend's "Not monitored"; the live chart keeps line 2, a finished day has line 1 only.
+LIVE_UNMONITORED = {
+    "uk": "Сьогодні: не відстежувалось\nОновлено о 12:05",
+    "en": "Today: not monitored\nUpdated 12:05",
+    "ru": "Сегодня: не отслеживалось\nОбновлено в 12:05",
+}
+FINISHED_UNMONITORED = {
+    "uk": "Чт 01.10: не відстежувалось",
+    "en": "Thu 01.10: not monitored",
+    "ru": "Чт 01.10: не отслеживалось",
 }
 
 # Every image label of chart-spec section 8, per language.
@@ -223,7 +237,15 @@ def test_tables_have_identical_shapes() -> None:
         assert len(chart_texts.MONTHS[lang]) == 12
         assert len(chart_texts.LEGEND[lang]) == 4
     # Captions: the same keys and the same placeholders in every language.
-    caption_keys = {"today_off", "today_none", "updated", "day_off", "day_none"}
+    caption_keys = {
+        "today_off",
+        "today_none",
+        "today_unmonitored",
+        "updated",
+        "day_off",
+        "day_none",
+        "day_unmonitored",
+    }
     for lang in LANGUAGES:
         assert set(chart_texts.CAPTIONS[lang]) == caption_keys
         for key in caption_keys:
@@ -387,6 +409,59 @@ def test_finished_caption(lang: str) -> None:
     assert without == FINISHED_WITHOUT_OUTAGES[lang]
     assert "\n" not in with_outages
     assert "\n" not in without
+
+
+# --- Neutral caption for a day with no monitored time (D-03, Phase 3 IN-05) ---------------
+
+
+@pytest.mark.parametrize("lang", ["uk", "en", "ru"])
+def test_D03_live_caption_for_an_unmonitored_today(lang: str) -> None:
+    caption = chart_texts.live_caption(0, 0, "12:05", lang, monitored=False)
+    assert caption == LIVE_UNMONITORED[lang]
+
+
+@pytest.mark.parametrize("lang", ["uk", "en", "ru"])
+def test_D03_finished_caption_for_an_unmonitored_day(lang: str) -> None:
+    caption = chart_texts.finished_caption(0, 0, date(2026, 10, 1), lang, monitored=False)
+    assert caption == FINISHED_UNMONITORED[lang]
+    assert "\n" not in caption
+
+
+@pytest.mark.parametrize("lang", ["uk", "en", "ru"])
+def test_D03_monitored_day_keeps_the_existing_forms(lang: str) -> None:
+    day = date(2026, 10, 1)
+    off = 4 * H + 10 * MIN
+    assert (
+        chart_texts.live_caption(off, 2, "14:37", lang, monitored=True) == (LIVE_WITH_OUTAGES[lang])
+    )
+    assert (
+        chart_texts.live_caption(0, 0, "14:37", lang, monitored=True)
+        == (LIVE_WITHOUT_OUTAGES[lang])
+    )
+    assert (
+        chart_texts.finished_caption(off, 2, day, lang, monitored=True)
+        == (FINISHED_WITH_OUTAGES[lang])
+    )
+    assert (
+        chart_texts.finished_caption(0, 0, day, lang, monitored=True)
+        == (FINISHED_WITHOUT_OUTAGES[lang])
+    )
+
+
+def test_D03_neutral_caption_is_the_legends_not_monitored() -> None:
+    # The words are the legend's "Not monitored" in each language (D-03).
+    for lang in LANGUAGES:
+        words = chart_texts.LEGEND[lang][2].lower()
+        assert chart_texts.CAPTIONS[lang]["today_unmonitored"].endswith(f": {words}")
+        assert chart_texts.CAPTIONS[lang]["day_unmonitored"] == "{day}: " + words
+
+
+@pytest.mark.parametrize("monitored", [0, 1, None], ids=["zero", "one", "none"])
+def test_D03_monitored_must_be_a_bool(monitored: Any) -> None:
+    with pytest.raises(TypeError, match="monitored must be a bool"):
+        chart_texts.live_caption(0, 0, "12:05", "en", monitored=monitored)
+    with pytest.raises(TypeError, match="monitored must be a bool"):
+        chart_texts.finished_caption(0, 0, date(2026, 10, 1), "en", monitored=monitored)
 
 
 # --- Plurals (CHRT-04) --------------------------------------------------------------------
