@@ -7,8 +7,9 @@ token to that chat only, after every subscriber alert of the pass (INV-20). With
 chat configured it writes no row and logs the rendered plain text once at WARNING. No code
 path holds a chat ID or token of its own.
 
-A notice's payload holds integers only: epoch microseconds (``instant_us``), a count or
-the id of the subscriber row it is about. ``render_text`` reads names and rows and builds
+A notice's payload holds integers only: epoch microseconds (``instant_us``), a count, the
+id of the subscriber row it is about or the HTTP status of a refused chart pin (D-07).
+``render_text`` reads names and rows and builds
 the English text (``ops_texts``) at send time, so no text and no secret is stored
 (OPS-08).
 
@@ -175,6 +176,12 @@ def render_text(
             tz=tz,
             escape=escape,
         )
+    if kind == outbox.KIND_OPS_PIN_FAILED:
+        return ops_texts.pin_failed(
+            _int(payload, "http_status"), _location_name(location_id), escape=escape
+        )
+    if kind == outbox.KIND_OPS_PIN_RESTORED:
+        return ops_texts.pin_restored(_location_name(location_id), escape=escape)
     raise ValueError(f"unknown ops notice kind: {kind!r}")
 
 

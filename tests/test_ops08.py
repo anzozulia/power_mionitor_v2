@@ -467,6 +467,9 @@ def test_INV23_ops_notice_texts_secret_free(location_factory: Callable[..., Any]
         ),
         outbox.KIND_OPS_EXPIRED: ({"message_id": alert.pk}, location.pk),
         outbox.KIND_OPS_UNCERTAIN: ({"message_id": alert.pk}, location.pk),
+        # The chart pin notices (Phase 3 D-07): an HTTP status, or nothing at all.
+        outbox.KIND_OPS_PIN_FAILED: ({"http_status": 400}, location.pk),
+        outbox.KIND_OPS_PIN_RESTORED: ({}, location.pk),
     }
     assert set(notices) == set(outbox.OPS_KINDS)
     texts = [

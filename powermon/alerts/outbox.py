@@ -74,12 +74,16 @@ KIND_OPS_ALL_SILENT_START = "ops_all_silent_start"  # {since_us, count}
 KIND_OPS_ALL_SILENT_END = "ops_all_silent_end"  # {since_us, first_us}; location = first
 KIND_OPS_EXPIRED = "ops_expired"  # {message_id}; location = the alert's
 KIND_OPS_UNCERTAIN = "ops_uncertain"  # {message_id}; location = the alert's
+KIND_OPS_PIN_FAILED = "ops_pin_failed"  # {http_status}; location = the chart's
+KIND_OPS_PIN_RESTORED = "ops_pin_restored"  # {}; location = the chart's
 OPS_KINDS = (
     KIND_OPS_GAP,
     KIND_OPS_ALL_SILENT_START,
     KIND_OPS_ALL_SILENT_END,
     KIND_OPS_EXPIRED,
     KIND_OPS_UNCERTAIN,
+    KIND_OPS_PIN_FAILED,
+    KIND_OPS_PIN_RESTORED,
 )
 # The database column is varchar(64).
 MAX_ERROR_LENGTH = 64
@@ -182,7 +186,8 @@ def enqueue_ops(
 
     Use ``powermon.alerts.ops.notify``, which decides whether the notice is queued or,
     with no ops chat configured, logged (D-09). ``payload`` holds integers only (epoch
-    microseconds, a count, a message id); names and texts are read at send time (OPS-08).
+    microseconds, a count, a message id, an HTTP status); names and texts are read at send
+    time (OPS-08).
     The kind and payload are checked before any write.
     """
     check_ops_notice(kind, payload)
