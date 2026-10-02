@@ -1,10 +1,12 @@
 """The ops notice texts: exact English strings in the display TZ (D-10, D-11, D-12).
 
-The expected strings are the D-11/D-12 samples (02-CONTEXT "Specific Ideas"), with times
-computed by hand for Europe/Kyiv (UTC+3 on 2026-10-01). Durations come from the shared
-alert formatter, which prints an exact 3-minute span as "3m". Every text that names a
-location HTML-escapes the name by default and leaves it raw with ``escape=False`` (the log
-form, D-09). The all-silent texts stay neutral (D-12, Pitfall 11).
+The expected strings are the D-11/D-12 samples (02-CONTEXT "Specific Ideas") and the
+chart pin notices of Phase 3 D-07 (03-CONTEXT "Specific Ideas"), with times computed by
+hand for Europe/Kyiv (UTC+3 on 2026-10-01). Durations come from the shared alert
+formatter, which prints an exact 3-minute span as "3m". Every text that names a location
+HTML-escapes the name by default and leaves it raw with ``escape=False`` (the log form,
+D-09). The all-silent texts stay neutral (D-12, Pitfall 11). A pin failure shows only a
+short HTTP code, never Telegram's description.
 
 ``ops_texts`` is pure. The ``ops.render_text`` cases at the end read the payload's integers
 and the names from the database at call time, so they carry ``django_db``.
@@ -45,6 +47,13 @@ UNCERTAIN = (
     "(Telegram timed out after the request was sent). It will not be resent; "
     "please check the channel."
 )
+# The chart pin notices (Phase 3 D-07, 03-CONTEXT "Specific Ideas").
+PIN_FAILED = (
+    "📌 Can't pin today's chart for Office (Telegram: http_400). "
+    "The chart is still posted and refreshed; pinning is retried every 15 min. "
+    "Check that the bot may pin messages in the chat."
+)
+PIN_RESTORED = "📌 Pinning works again for Office."
 
 
 def _utc(text: str) -> datetime:
@@ -136,6 +145,21 @@ def test_uncertain_after_an_interrupted_send_names_the_worker_stop() -> None:
     )
 
 
+def test_pin_failed() -> None:
+    assert ops_texts.pin_failed(400, "Office") == PIN_FAILED
+
+
+def test_pin_failed_shows_the_status_it_is_given() -> None:
+    assert "(Telegram: http_403)" in ops_texts.pin_failed(403, "Office")
+    # The ends of the accepted range.
+    assert "(Telegram: http_100)" in ops_texts.pin_failed(100, "Office")
+    assert "(Telegram: http_599)" in ops_texts.pin_failed(599, "Office")
+
+
+def test_pin_restored() -> None:
+    assert ops_texts.pin_restored("Office") == PIN_RESTORED
+
+
 # Names are escaped for Telegram HTML, and raw for the log (D-09, D-10)
 
 
@@ -147,6 +171,8 @@ def _named_texts(name: str, escape: bool) -> list[str]:
         ops_texts.uncertain(
             "power_off", at, name, interrupted=False, now=now, tz=KYIV, escape=escape
         ),
+        ops_texts.pin_failed(400, name, escape=escape),
+        ops_texts.pin_restored(name, escape=escape),
     ]
 
 
@@ -156,6 +182,8 @@ def test_every_name_is_escaped_by_default() -> None:
         ops_texts.all_silent_end(at, now, RAW, KYIV),
         ops_texts.expired("power_off", at, timedelta(hours=6), RAW, now, KYIV),
         ops_texts.uncertain("power_off", at, RAW, interrupted=False, now=now, tz=KYIV),
+        ops_texts.pin_failed(400, RAW),
+        ops_texts.pin_restored(RAW),
     ]
 
     for text in texts:
@@ -216,6 +244,13 @@ def test_a_naive_datetime_raises(render: Callable[[datetime, datetime], str]) ->
 def test_a_gap_that_ends_before_it_starts_raises() -> None:
     with pytest.raises(ValueError, match="negative"):
         ops_texts.gap(_utc("2026-10-01T07:10:40"), _utc("2026-10-01T07:00:12"), KYIV)
+
+
+@pytest.mark.parametrize("status", [True, False, 99, 600, 1000, -400, "400", 400.0, None], ids=repr)
+def test_pin_failed_refuses_a_status_that_is_not_a_short_http_code(status: Any) -> None:
+    # Only a short "http_NNN" code may reach the text (OPS-08, D-07).
+    with pytest.raises(ValueError, match="HTTP status"):
+        ops_texts.pin_failed(status, "Office")
 
 
 # ops.render_text: integers from the payload, names read at call time
@@ -349,3 +384,42 @@ def test_render_text_refuses_unknown_kinds_and_missing_rows(
         ops.render_text(
             outbox.KIND_OPS_ALL_SILENT_START, {"since_us": 0, "count": "3"}, None, now=now
         )
+
+
+@pytest.mark.django_db
+def test_render_text_reads_the_pin_location_name_at_send_time(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = location_factory(name="Home")
+    now = _utc("2026-10-01T12:00:00")
+    failed: dict[str, Any] = {"http_status": 400}
+    # Renamed after the notices were queued: the payloads hold no name.
+    Location.objects.filter(pk=location.pk).update(name="Office")
+
+    assert ops.render_text(outbox.KIND_OPS_PIN_FAILED, failed, location.pk, now=now) == (PIN_FAILED)
+    assert ops.render_text(outbox.KIND_OPS_PIN_RESTORED, {}, location.pk, now=now) == (PIN_RESTORED)
+    Location.objects.filter(pk=location.pk).update(name=RAW)
+    for kind, payload in ((outbox.KIND_OPS_PIN_FAILED, failed), (outbox.KIND_OPS_PIN_RESTORED, {})):
+        escaped = ops.render_text(kind, payload, location.pk, now=now)
+        raw = ops.render_text(kind, payload, location.pk, now=now, escape=False)
+        assert ESCAPED in escaped and RAW not in escaped
+        assert RAW in raw and ESCAPED not in raw
+
+
+@pytest.mark.django_db
+def test_render_text_refuses_a_broken_pin_notice(location_factory: Callable[..., Any]) -> None:
+    location = location_factory()
+    now = _utc("2026-10-01T12:00:00")
+
+    # The chart's location must exist.
+    with pytest.raises(LookupError):
+        ops.render_text(outbox.KIND_OPS_PIN_FAILED, {"http_status": 400}, None, now=now)
+    with pytest.raises(LookupError):
+        ops.render_text(outbox.KIND_OPS_PIN_RESTORED, {}, location.pk + 1000, now=now)
+    # A missing, non-integer or implausible status is a broken payload.
+    with pytest.raises(KeyError):
+        ops.render_text(outbox.KIND_OPS_PIN_FAILED, {}, location.pk, now=now)
+    with pytest.raises(TypeError):
+        ops.render_text(outbox.KIND_OPS_PIN_FAILED, {"http_status": True}, location.pk, now=now)
+    with pytest.raises(ValueError):
+        ops.render_text(outbox.KIND_OPS_PIN_FAILED, {"http_status": 1000}, location.pk, now=now)

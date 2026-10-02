@@ -74,6 +74,7 @@ PIN_FAILED = (
     "The chart is still posted and refreshed; pinning is retried every 15 min. "
     "Check that the bot may pin messages in the chat."
 )
+PIN_RESTORED = "📌 Pinning works again for Test location."
 
 
 @pytest.fixture(autouse=True)
@@ -526,6 +527,102 @@ def test_enqueue_ops_refuses_a_pin_status_that_is_not_an_integer(
         )
 
     assert not OutboxMessage.objects.exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_pin_restored_notice_reaches_the_ops_chat(
+    location_factory: Callable[..., Any], fake_telegram: Any, ops_settings: Any
+) -> None:
+    location = location_factory()
+    with transaction.atomic():
+        ops.notify(
+            outbox.KIND_OPS_PIN_RESTORED, payload={}, recorded_at=T0, location_id=location.pk
+        )
+    # A subscriber alert queued after the notice still goes first (INV-20).
+    alert = _queue(location)
+    [notice] = _ops_rows()
+    assert (notice.kind, notice.payload, notice.location_id) == (
+        "ops_pin_restored",
+        {},
+        location.pk,
+    )
+    fake_telegram.accept(TOKEN_A)
+    fake_telegram.accept(OPS_BOT_TOKEN)
+
+    assert io_loop.run_iteration(FakeClock(T0), io_loop.RelayState()) is True
+
+    assert _bots(fake_telegram) == ["A", "ops"]
+    assert fake_telegram.sent == [
+        _body(OFF_EN, DEFAULT_CHAT_ID),
+        _body(PIN_RESTORED, OPS_CHAT_ID),
+    ]
+    assert (_row(alert).status, _row(notice).status, _row(notice).sent_at) == ("sent", "sent", T0)
+
+
+@pytest.mark.django_db
+def test_pin_notice_is_logged_when_the_ops_chat_is_not_configured(
+    location_factory: Callable[..., Any], no_ops_chat: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    location = location_factory()
+    markup = location_factory(name="<b>A&B</b>", chat_id=CHAT_B)
+    caplog.set_level(logging.WARNING, logger=OPS_LOGGER)
+
+    with transaction.atomic():
+        ops.notify(
+            outbox.KIND_OPS_PIN_FAILED,
+            payload={"http_status": 400},
+            recorded_at=T0,
+            location_id=location.pk,
+        )
+        ops.notify(outbox.KIND_OPS_PIN_RESTORED, payload={}, recorded_at=T0, location_id=markup.pk)
+
+    # No row is written; each notice is one WARNING with the plain (unescaped) text (D-09).
+    assert not OutboxMessage.objects.exists()
+    records = [r for r in caplog.records if r.name == OPS_LOGGER]
+    assert [r.levelno for r in records] == [logging.WARNING, logging.WARNING]
+    assert [r.getMessage() for r in records] == [
+        f"ops notice (ops chat not configured): {PIN_FAILED}",
+        "ops notice (ops chat not configured): 📌 Pinning works again for <b>A&B</b>.",
+    ]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_unrenderable_pin_notice_is_dropped_not_stuck(
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    ops_settings: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    location = location_factory()
+    with transaction.atomic():
+        # An integer, so the payload check passes, but not an HTTP status: render raises.
+        broken = outbox.enqueue_ops(
+            outbox.KIND_OPS_PIN_FAILED,
+            payload={"http_status": 1000},
+            recorded_at=T0,
+            location_id=location.pk,
+        )
+        later = outbox.enqueue_ops(
+            outbox.KIND_OPS_PIN_RESTORED, payload={}, recorded_at=T0, location_id=location.pk
+        )
+    fake_telegram.accept(OPS_BOT_TOKEN)
+    state = io_loop.RelayState()
+    caplog.set_level(logging.WARNING, logger=RELAY_LOGGER)
+
+    assert io_loop.run_iteration(FakeClock(T0), state) is False
+
+    row = _row(broken)
+    assert (row.status, row.attempts, row.last_error) == ("dropped", 0, "render_error")
+    assert len(fake_telegram.calls) == 0
+    assert state.not_before == {}
+    assert [r.getMessage() for r in caplog.records if r.name == RELAY_LOGGER] == [
+        f"relay: ops notice {broken.pk} (ops_pin_failed) cannot be rendered; it is dropped"
+    ]
+
+    # The ops queue is not held: the next notice goes out in the next pass.
+    assert io_loop.run_iteration(FakeClock(T0 + _seconds(1)), state) is True
+    assert fake_telegram.sent == [_body(PIN_RESTORED, OPS_CHAT_ID)]
+    assert _row(later).status == "sent"
 
 
 # The outbox functions for the ops channel
