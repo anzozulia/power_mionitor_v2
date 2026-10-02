@@ -210,6 +210,13 @@ def test_location_page_settings_and_setup_sections(
     assert _settings_rows(page) == expected
     assert _settings_rows(setup) == expected
     assert re.findall(r"<h2>(.*?)</h2>", page) == ["Status", "Switches", "Settings", "Device setup"]
+    # UI-D10: "Edit location" is a secondary link-button under the settings panel.
+    settings_section = page[page.index("<h2>Settings</h2>") : page.index("<h2>Device setup</h2>")]
+    assert settings_section.index("</dl>") < settings_section.index("Edit location")
+    assert (
+        f'<p><a class="btn btn--secondary" href="/locations/{location.pk}/edit/">'
+        "Edit location</a></p>"
+    ) in settings_section
     device = page[page.index("<h2>Device setup</h2>") :]
     assert f"<p>{DEVICE_SETUP_SENTENCE}</p>" in device
     assert (
@@ -319,8 +326,9 @@ def test_location_page_has_one_accent_button_at_most(
 
     page = admin.get(_page(location)).content.decode()
 
-    # With only the Maintenance switch, the page has no accent and no destructive button:
-    # the one accent button is "Send test message" (04-08), and Delete is a link (04-07).
+    # The switches, "Edit location", "Open device setup" and the "Delete location" entry are
+    # all secondary: the page's one accent button is "Send test message" (04-08), and the
+    # destructive style is used only on the delete confirmation page (UI-D5, UI-D15).
     assert "btn--primary" not in page
     assert "btn--danger" not in page
 

@@ -407,10 +407,14 @@ def test_setup_guidance_copy(admin: Client, location_factory: Callable[..., Any]
         ("Channel chat ID", "-1009876543210"),
         ("Bot token", "123456789:••••••••"),
     ]
+    # UI-D10: the Phase 1 note is replaced by the "Edit location" link-button under the panel.
+    assert "Settings cannot be changed yet" not in page
+    settings_section = page[page.index("<h2>Location settings</h2>") :]
+    assert settings_section.index("</dl>") < settings_section.index("Edit location")
     assert (
-        "Settings cannot be changed yet. To fix a mistake, add a new location; an unused one "
-        "stays in Waiting for first heartbeat and sends nothing."
-    ) in page
+        f'<p><a class="btn btn--secondary" href="/locations/{location.pk}/edit/">'
+        "Edit location</a></p>"
+    ) in settings_section
 
 
 @pytest.mark.django_db
