@@ -477,6 +477,7 @@ BAD_INPUTS = [
     ("row_date", (None,), TypeError),
     ("worst_total", (None,), TypeError),
     ("live_caption", (0, 0, "14:37", None), TypeError),
+    ("live_caption", (0, 0, 1437, "uk"), TypeError),
 ]
 BAD_INPUT_IDS = [
     "plural_form-negative",
@@ -498,6 +499,7 @@ BAD_INPUT_IDS = [
     "row_date-none",
     "worst_total-none-lang",
     "live_caption-none-lang",
+    "live_caption-int-time",
 ]
 
 
