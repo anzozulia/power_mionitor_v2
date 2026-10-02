@@ -1,13 +1,28 @@
 """Subscriber alert text (ALRT-01, ALRT-02), snapshot-tested in uk, en and ru.
 
 docs/v1-lessons.md section 4: snapshot every alert string in all three languages
-(v1 shipped "Света не было : 3ч", with a stray space before the colon).
+(v1 shipped "Света не было : 3ч", with a stray space before the colon). The admin's test
+message (LOC-07, D-11) has the same three languages and the same en fallback.
 """
 
 import pytest
 
 from powermon.alerts.texts import render_alert
-from powermon.i18n.strings import ALERTS, LANGUAGES, SEP, UNITS
+from powermon.i18n.strings import (
+    ALERTS,
+    LANGUAGES,
+    SEP,
+    TEST_MESSAGE,
+    UNITS,
+    telegram_test_text,
+)
+
+# The test message texts, verbatim from 04-CONTEXT.md D-11.
+D11_TEST_TEXTS = {
+    "uk": "🔧 Тестове повідомлення Power Monitor: бот може публікувати тут.",
+    "en": "🔧 Power Monitor test message: the bot can post here.",
+    "ru": "🔧 Тестовое сообщение Power Monitor: бот может публиковать здесь.",
+}
 
 S = 1_000_000
 MIN = 60 * S
@@ -184,6 +199,23 @@ def test_unknown_language_falls_back_to_en() -> None:
     assert render_alert("power_off", "de", 300_000_000) == (
         "🔴 <b>POWER OFF</b>\n⚡ Power was ON for: <b>5m</b>"
     )
+
+
+def test_TEST_MESSAGE_key_set_and_texts() -> None:
+    # One non-empty text per language, the D-11 string exactly (emoji and Cyrillic
+    # compared as str code points).
+    assert set(TEST_MESSAGE) == set(LANGUAGES)
+    for lang in LANGUAGES:
+        assert TEST_MESSAGE[lang] == D11_TEST_TEXTS[lang]
+        assert telegram_test_text(lang) == D11_TEST_TEXTS[lang]
+        assert TEST_MESSAGE[lang].startswith("🔧 ")
+        # Sent with parse_mode HTML, like every message: nothing in it needs escaping.
+        assert not set("<>&") & set(TEST_MESSAGE[lang])
+
+
+@pytest.mark.parametrize("lang", ["de", "", "EN", "en-GB"])
+def test_test_message_in_an_unknown_language_is_en(lang: str) -> None:
+    assert telegram_test_text(lang) == D11_TEST_TEXTS["en"]
 
 
 def test_unknown_kind_raises() -> None:
