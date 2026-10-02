@@ -7,6 +7,15 @@ block is a string from powermon.locations.examples (the generator the INV-24 #3 
 verbatim); none is written here. The bot token is shown only as its masked form.
 {% endcomment %}
 {% block title %}{{ location.name }} · Device setup{% endblock %}
+{% block crumbs %}
+<nav aria-label="Breadcrumb">
+  <ol class="crumbs">
+    <li><a href="{% url 'location-list' %}">Locations</a></li>
+    <li><a class="name" href="{% url 'location-detail' location.pk %}">{{ location.name }}</a></li>
+    <li aria-current="page">Device setup</li>
+  </ol>
+</nav>
+{% endblock %}
 {% block content %}
 <h1 class="name">{{ location.name }}</h1>
 <p class="meta"><span class="status status--{{ status }}">{{ status_label }}</span> · Last heartbeat: <span class="num">{{ last_heartbeat_at|display_time }}</span></p>
@@ -66,20 +75,6 @@ verbatim); none is written here. The bot token is shown only as its masked form.
 <p>A working heartbeat gets HTTP 200 with the body ok. HTTP 401 means the key is missing or wrong, and nothing is recorded. After the first heartbeat this location shows On; the first heartbeat sends no alert.</p>
 
 <h2>Location settings</h2>
-{% comment %}"name" adds overflow-wrap: anywhere, which the values inherit (UI-SPEC E7).{% endcomment %}
-<dl class="panel settings name">
-  <dt>Language</dt>
-  <dd>{{ language_label }}</dd>
-  <dt>Heartbeat period</dt>
-  <dd>{{ period_s }} s</dd>
-  <dt>Grace period</dt>
-  <dd>{{ grace_s }} s</dd>
-  <dt>Reported OFF after</dt>
-  <dd>{{ off_after_s }} s without a heartbeat</dd>
-  <dt>Channel chat ID</dt>
-  <dd>{{ location.chat_id }}</dd>
-  <dt>Bot token</dt>
-  <dd>{{ masked_token }}</dd>
-</dl>
+{% include "web/_settings_panel.html" %}
 <p class="help">Settings cannot be changed yet. To fix a mistake, add a new location; an unused one stays in Waiting for first heartbeat and sends nothing.</p>
 {% endblock %}

@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% load display_time %}
+{% comment %}
+UI-SPEC screen B (D-13): the location page. Sections in order: Status, Switches, Settings,
+Device setup (04-08 adds Test message after Switches and the Delivery row; 04-07 adds the
+Edit link and the Delete section; 04-04 adds the Alerts and Router grace switches).
+Read-only except the switches, each a one-click POST form (CSRF) that posts its target value
+(UI-D3) and redirects back here (UI-D4). No script, no inline style.
+Secrets (SEC-04): no device key appears on this page, not even masked; the bot token only
+in its masked form, in the settings panel.
+{% endcomment %}
+{% block title %}{{ location.name }}{% endblock %}
+{% block crumbs %}
+<nav aria-label="Breadcrumb">
+  <ol class="crumbs">
+    <li><a href="{% url 'location-list' %}">Locations</a></li>
+    <li class="name" aria-current="page">{{ location.name }}</li>
+  </ol>
+</nav>
+{% endblock %}
+{% block content %}
+<h1 class="name">{{ location.name }}</h1>
+
+<h2>Status</h2>
+{% comment %}Rows that do not apply are left out (UI-SPEC E2).{% endcomment %}
+<dl class="panel settings">
+  <dt>Status</dt>
+  <dd><span class="status status--{{ status.key }}">{{ status.label }}</span></dd>
+  {% if status.key == "maintenance" %}
+  <dt>Power state</dt>
+  <dd><span class="status status--{{ status.power_key }}">{{ status.power_label }}</span>{% if status.power_key == "on" %}<p class="help">OFF is not detected during maintenance.</p>{% elif status.power_key == "off" %}<p class="help">The outage goes on. When power returns, the ON alert is sent as usual.</p>{% endif %}</dd>
+  {% endif %}
+  {% if status.power_key == "on" %}
+  <dt>On since</dt>
+  <dd><span class="num">{{ status.on_since|display_time }}</span></dd>
+  {% elif status.power_key == "off" %}
+  <dt>Outage since</dt>
+  <dd><span class="num">{{ status.outage_started_at|display_time }}</span></dd>
+  {% endif %}
+  <dt>Last heartbeat</dt>
+  <dd><span class="num">{{ status.last_heartbeat_at|display_time }}</span></dd>
+</dl>
+
+<h2>Switches</h2>
+<ul class="switches">
+  {% for row in switch_rows %}
+  <li class="switch">
+    <div class="switch__text">
+      <h3>{{ row.heading }}</h3>
+      <p class="help">{{ row.help }}</p>
+    </div>
+    <form method="post" action="{% url row.url_name location.pk %}">
+      {% csrf_token %}
+      <input type="hidden" name="value" value="{{ row.target }}">
+      <button class="btn btn--secondary" type="submit">{{ row.button }}</button>
+    </form>
+  </li>
+  {% endfor %}
+</ul>
+
+<h2>Settings</h2>
+{% include "web/_settings_panel.html" %}
+
+<h2>Device setup</h2>
+<p>Heartbeat URL, device key and copy-paste examples for the device.</p>
+<p><a class="btn btn--secondary" href="{% url 'location-setup' location.pk %}">Open device setup</a></p>
+{% endblock %}

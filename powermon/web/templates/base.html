@@ -27,6 +27,8 @@ URL to another host in any template. The CSP header enforces it in the browser.
 </header>
 {% endblock %}
 <main class="main flow{% block main_class %}{% endblock %}">
+{% comment %}Phase 4 UI-SPEC: breadcrumbs, then the flash messages, then the h1.{% endcomment %}
+{% block crumbs %}{% endblock %}
 {% if messages %}
 <div class="messages flow">
 {% for message in messages %}
