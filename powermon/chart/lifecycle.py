@@ -36,9 +36,17 @@ worker was down is simply due on the next pass.
   gets its finished-day render (chart-spec §7: now = the local midnight that ends its
   day, no now line, no pill, the caption's line 1 only, D-01, D-13), edited in the chat
   and message stored with it (D-04); oldest first. A finalized chart is never rendered
-  again (D-14).
+  again (D-14), so the final edit waits until the day's timeline has settled (INV-03):
+  OFF is recorded after the fact, backdated to the last heartbeat, so an outage that
+  started in the day's last minutes is in the timeline only a timeout after midnight.
+  The record's day has settled once the detection cursor
+  (``system_state.last_cycle_completed_at``) is the location's ``settle`` past the
+  midnight that ends it (``settle_time``, ``settled_records``). The cursor, not the wall
+  clock, so a detection stall or a lapse across midnight holds the final edit too.
 - Unpin: every older record still pinned is unpinned by its own message id in its own
-  chat, oldest first, and nothing else is ever unpinned (D-04, INV-19).
+  chat, oldest first, and nothing else is ever unpinned (D-04, INV-19). It does not wait
+  for the final edit: today's chart is pinned and the older one unpinned within seconds
+  (D-02), and the final edit follows once the day has settled.
 - Cleanup of older records never blocks and never loops (INV-19): a permanent error on a
   final edit or an unpin marks the record finalized or unpinned anyway (best effort, one
   WARNING); an older chart deleted in the channel ("not found") is retired with no
@@ -53,7 +61,9 @@ worker was down is simply due on the next pass.
 
 Each step is its own condition, checked on every pass (D-02): after downtime across one
 or more midnights the passes post and pin one chart for today and finalize and unpin
-every older chart, and a day the worker missed gets no chart (D-03, INV-18, INV-19).
+every older chart, and a day the worker missed gets no chart (D-03, INV-18, INV-19). When
+both are due, an older record's final edit goes before its unpin (D-02 order); a final
+edit not due yet (its day has not settled) never holds the unpin.
 
 Rendering runs inline in the I/O thread right before its call (D-05), with the location's
 current name and language and the display time zone read at render time (D-14). The
@@ -92,6 +102,7 @@ render_ms=<n> call_ms=<n>``, with no token and no Telegram description (OPS-08).
 import logging
 import threading
 from collections.abc import Callable
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Literal
@@ -104,6 +115,8 @@ from powermon.alerts.models import OpsIncident
 from powermon.chart import model, source
 from powermon.chart.models import ChartMessage
 from powermon.clock import Clock
+from powermon.engine import lapse, rules
+from powermon.engine.models import SystemState
 from powermon.i18n import chart_texts, times
 from powermon.telegram.client import DEFAULT_RETRY_AFTER_S, SendResult, TelegramClient
 from powermon.worker import io_loop
@@ -138,7 +151,7 @@ _CLEANUP: tuple[Step, ...] = ("finalize", "unpin")
 _TODAYS: tuple[Step, ...] = ("pin", "refresh")
 
 LOCATIONS_SQL = """
-SELECT l.id, l.name, l.language, l.bot_token, l.chat_id
+SELECT l.id, l.name, l.language, l.bot_token, l.chat_id, l.period_s, l.grace_s, l.router_grace
   FROM location l
   JOIN location_state s ON s.location_id = l.id
  WHERE s.status IN ('on', 'off') AND l.deleted_at IS NULL
@@ -183,6 +196,9 @@ class ChartLocation:
     language: str
     bot_token: str = field(repr=False)
     chat_id: int
+    # How long after a day ends detection may still record an OFF that started in it
+    # (``settle_time``): the day's final edit waits until the detection cursor passed it.
+    settle: timedelta
 
 
 @dataclass(frozen=True)
@@ -226,12 +242,72 @@ def step_delay(failures: int) -> timedelta:
     return min(STEP_RETRY * 2 ** min(failures - 1, _MAX_DOUBLINGS), STEP_RETRY_MAX)
 
 
+def settle_time(period_s: int, grace_s: int, router_grace: bool) -> timedelta:
+    """How long after an instant detection may still record an OFF that started before it.
+
+    OFF is recorded after the fact (INV-03): the first detection cycle more than the
+    effective timeout after the last heartbeat records it, backdated to that heartbeat. So
+    an OFF that started before ``t`` is recorded by the first cycle at or after ``t`` + the
+    location's longest timeout (``rules.longest_timeout``). Detection moves its cursor
+    before it makes that cycle's decisions, so one lapse threshold is added on top: a
+    cursor that far past ``t`` + the timeout means that an earlier cycle past it has
+    completed, or that the gap before the cursor's cycle was longer than the threshold and
+    was carved as not monitored, which starts any outage found after it at the carve.
+    """
+    return rules.longest_timeout(period_s, grace_s, router_grace) + lapse.LAPSE_THRESHOLD
+
+
+def detection_cursor() -> datetime | None:
+    """``system_state.last_cycle_completed_at``: None before detection's first cycle."""
+    return (
+        SystemState.objects.filter(pk=1).values_list("last_cycle_completed_at", flat=True).first()
+    )
+
+
+def settled_records(
+    locations: list[ChartLocation],
+    rows: list[ChartRow],
+    *,
+    today: date,
+    detected_until: datetime | None,
+    tz: str,
+) -> frozenset[int]:
+    """The ids of the older records whose day has settled: their final edit may be made.
+
+    An older record's day has settled once the detection cursor (``detected_until``) is at
+    least its location's ``settle`` past the local midnight that ends the day: every OFF
+    that started in the day is then in the stored timeline (INV-03), including an outage
+    that crosses midnight, which counts on both days (chart-spec §8). The cursor, not the
+    wall clock: while detection stalls, or across a lapse, the final edit waits too (a
+    lapse carve commits before the cursor moves). With no cursor (detection has not run
+    yet) no day has settled. Only records not finalized yet, of monitored locations.
+    """
+    if detected_until is None:
+        return frozenset()
+    settle = {location.location_id: location.settle for location in locations}
+    return frozenset(
+        row.id
+        for row in rows
+        if row.local_date < today
+        and row.finalized_at is None
+        and row.location_id in settle
+        and detected_until >= model.next_midnight(row.local_date, tz) + settle[row.location_id]
+    )
+
+
 def read_snapshot(today: date) -> tuple[list[ChartLocation], list[ChartRow]]:
     """The monitored locations by id, and the records ``plan`` may act on, oldest first."""
     with connection.cursor() as cur:
         cur.execute(LOCATIONS_SQL)
         locations = [
-            ChartLocation(location_id=r[0], name=r[1], language=r[2], bot_token=r[3], chat_id=r[4])
+            ChartLocation(
+                location_id=r[0],
+                name=r[1],
+                language=r[2],
+                bot_token=r[3],
+                chat_id=r[4],
+                settle=settle_time(r[5], r[6], r[7]),
+            )
             for r in cur.fetchall()
         ]
         cur.execute(ROWS_SQL, {"today": today})
@@ -259,6 +335,7 @@ def plan(
     today: date,
     now: datetime,
     not_before: dict[str, datetime],
+    settled: AbstractSet[int] = frozenset(),
 ) -> Action | None:
     """The one chart step due now, or None. Pure: reads nothing but its arguments.
 
@@ -266,13 +343,16 @@ def plan(
     step wins, so one location's midnight work is done before the next one's starts.
     Within a location the steps go in D-02 order: post today's chart, pin it, give the
     oldest older record without one its final edit, unpin the oldest older record still
-    pinned. Only when none is due anywhere, the refresh that has waited longest goes:
-    today's record with the oldest ``last_rendered_at`` at least ``REFRESH_EVERY`` ago,
-    ties to the lower location id (CHRT-02). A step whose own key in ``not_before`` is in
-    the future is skipped, so the next due step goes instead: a failing post never blocks
-    the older charts' cleanup (D-02, INV-19). The alert relay's backoff is respected, read
-    only: a location whose bot waits (``bot_wide_key``) makes no step, and a step whose
-    channel waits (``chat_key`` of the chat it would call) is skipped (D-06).
+    pinned. A final edit is due only for a record in ``settled`` (``settled_records``: its
+    day's timeline is complete, INV-03); one not due yet never holds the unpin, so two
+    charts are pinned for seconds only. Only when none is due anywhere, the refresh that
+    has waited longest goes: today's record with the oldest ``last_rendered_at`` at least
+    ``REFRESH_EVERY`` ago, ties to the lower location id (CHRT-02). A step whose own key
+    in ``not_before`` is in the future is skipped, so the next due step goes instead: a
+    failing post never blocks the older charts' cleanup (D-02, INV-19). The alert relay's
+    backoff is respected, read only: a location whose bot waits (``bot_wide_key``) makes
+    no step, and a step whose channel waits (``chat_key`` of the chat it would call) is
+    skipped (D-06).
     """
 
     def waiting(key: str) -> bool:
@@ -283,7 +363,7 @@ def plan(
         if waiting(io_loop.bot_wide_key(location.bot_token)):
             continue
         today_row = _today_row(rows, location.location_id, today)
-        action = _midnight_step(location, rows, today_row, today, waiting)
+        action = _midnight_step(location, rows, today_row, today, waiting, settled)
         if action is not None:
             return action
         if (
@@ -313,8 +393,12 @@ def _midnight_step(
     today_row: ChartRow | None,
     today: date,
     waiting: Callable[[str], bool],
+    settled: AbstractSet[int],
 ) -> Action | None:
-    """The location's first due step of D-02 (post, pin, finalize, unpin), or None."""
+    """The location's first due step of D-02 (post, pin, finalize, unpin), or None.
+
+    A final edit is due only once its record's day has settled (``settled``).
+    """
     location_id = location.location_id
     if today_row is None:
         if not waiting(chart_key(location_id, "post")) and not waiting(
@@ -328,7 +412,11 @@ def _midnight_step(
         key=lambda row: (row.local_date, row.id),
     )
     for row in older:
-        if row.finalized_at is None and _free(location, "finalize", row, waiting):
+        if (
+            row.finalized_at is None
+            and row.id in settled
+            and _free(location, "finalize", row, waiting)
+        ):
             return Action("finalize", location, row)
     for row in older:
         if row.pinned and _free(location, "unpin", row, waiting):
@@ -385,7 +473,8 @@ def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | No
     First the posts kept after a database error are written (``RelayState.chart_posted``);
     a database error there propagates before any step is chosen, so no call is made while
     a kept post is unwritten and no second photo is ever posted for it (WR-04 analogue).
-    Then the snapshot is read and the step keys it no longer needs are dropped.
+    Then the snapshot and the detection cursor are read (the cursor decides which older
+    days have settled for their final edit) and the step keys no longer needed are dropped.
 
     ``now`` is read once: today's date, the render, its now pill and the caption's update
     time all come from it (CHRT-04, Pitfall 8); the outcome counts from the answer time.
@@ -400,8 +489,13 @@ def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | No
     tz = settings.CFG.display_tz
     today = model.local_today(now, tz)
     locations, rows = read_snapshot(today)
+    settled = settled_records(
+        locations, rows, today=today, detected_until=detection_cursor(), tz=tz
+    )
     _prune(state, locations, rows, today)
-    action = plan(locations, rows, today=today, now=now, not_before=state.not_before)
+    action = plan(
+        locations, rows, today=today, now=now, not_before=state.not_before, settled=settled
+    )
     if action is None or _stopped(stop):
         return False
     location = action.location

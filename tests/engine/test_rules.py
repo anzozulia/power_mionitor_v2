@@ -108,6 +108,26 @@ def test_effective_timeout_defaults() -> None:
     )
 
 
+def test_longest_timeout_is_period_plus_grace() -> None:
+    assert rules.longest_timeout(60, 30, False) == timedelta(seconds=90)
+    assert rules.longest_timeout(10, 10, False) == timedelta(seconds=20)
+
+
+def test_longest_timeout_adds_the_router_grace_when_it_is_on() -> None:
+    assert rules.longest_timeout(60, 30, True) == timedelta(seconds=90) + rules.ROUTER_GRACE
+    # It is what effective_timeout gives while the reconnect window applies...
+    in_window = _snap(_at(12, 4), _at(12, 0), router_grace=True)
+    assert rules.effective_timeout(in_window) == rules.longest_timeout(60, 30, True)
+
+
+def test_longest_timeout_is_never_shorter_than_the_effective_timeout() -> None:
+    # ...and more than it once the window has passed: a final chart edit that waits for
+    # it never comes before an OFF that detection may still record (INV-03).
+    late = _snap(_at(12, 5, 30), _at(12, 0), router_grace=True)
+    assert rules.effective_timeout(late) == timedelta(seconds=90)
+    assert rules.longest_timeout(60, 30, True) > rules.effective_timeout(late)
+
+
 def test_was_on_is_zero_when_on_since_equals_last_heartbeat() -> None:
     # Only the first heartbeat ever arrived.
     snap = _snap(_at(10, 0), _at(10, 0))

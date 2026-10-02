@@ -284,9 +284,8 @@ def test_finalize_sends_the_finished_render(
     png = final.files["chart"]
     assert _png_size(png) == (1280, 1000)
     # The image is the finished day as of the midnight that ends it (chart-spec §7)...
-    snapshot = lifecycle.ChartLocation(
-        location.pk, location.name, location.language, location.bot_token, location.chat_id
-    )
+    [snapshot], _ = lifecycle.read_snapshot(TODAY)
+    assert snapshot.location_id == location.pk
     end_of_day = model.next_midnight(YESTERDAY, KYIV)
     finished, _ = lifecycle.chart_content(snapshot, YESTERDAY, end_of_day, live=False, tz=KYIV)
     assert png == finished

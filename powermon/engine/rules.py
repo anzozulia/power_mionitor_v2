@@ -62,10 +62,20 @@ class Decision:
 
 def effective_timeout(snap: Snapshot) -> timedelta:
     """Period + grace, plus the router-reconnect grace when it applies."""
-    timeout = timedelta(seconds=snap.period_s + snap.grace_s)
-    if snap.router_grace and snap.last_heartbeat_at - snap.on_since <= ROUTER_WINDOW:
-        timeout += ROUTER_GRACE
-    return timeout
+    applies = snap.router_grace and snap.last_heartbeat_at - snap.on_since <= ROUTER_WINDOW
+    return longest_timeout(snap.period_s, snap.grace_s, applies)
+
+
+def longest_timeout(period_s: int, grace_s: int, router_grace: bool) -> timedelta:
+    """The longest effective timeout a location can have.
+
+    Period + grace, plus ``ROUTER_GRACE`` when router-reconnect grace is on.
+    ``effective_timeout`` adds the router grace only while its window applies, so it is
+    never longer: an outage that started before ``t`` is recorded by the first detection
+    cycle after ``t`` + this (the chart's final edit waits for it, INV-03).
+    """
+    timeout = timedelta(seconds=period_s + grace_s)
+    return timeout + ROUTER_GRACE if router_grace else timeout
 
 
 def anchor(snap: Snapshot, anchors: Anchors) -> datetime:
