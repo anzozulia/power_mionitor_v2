@@ -463,6 +463,11 @@ def test_transitions_on_the_dst_days() -> None:
     assert model.transitions(fall - hour, fall, KYIV) == [
         (fall, timedelta(hours=3), timedelta(hours=2))
     ]
+    # A window that starts off the hour scans steps that straddle the change; the
+    # bisection still finds the exact second.
+    assert model.transitions(_utc("2026-10-25 00:20:07"), _utc("2026-10-25 02:00"), KYIV) == [
+        (fall, timedelta(hours=3), timedelta(hours=2))
+    ]
     with pytest.raises(ValueError, match="naive"):
         model.transitions(NAIVE, fall, KYIV)
 
