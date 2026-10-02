@@ -27,7 +27,7 @@ state and on the table.
   <tbody>
     {% for row in rows %}
     <tr>
-      <td><a class="name" href="{% url 'location-setup' row.pk %}">{{ row.name }}</a></td>
+      <td><a class="name" href="{% url 'location-detail' row.pk %}">{{ row.name }}</a></td>
       <td><span class="status status--{{ row.status }}">{{ row.status_label }}</span></td>
       <td class="num">{{ row.last_heartbeat_at|display_time }}</td>
       <td>{{ row.language_label }}</td>

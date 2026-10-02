@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% load display_time %}
+{% comment %}
+UI-SPEC screen B (D-13): the location page. Read-only except the switches, each a one-click
+POST form (CSRF) that posts its target value (UI-D3) and redirects back here (UI-D4).
+Secrets (SEC-04): no device key appears on this page, not even masked; the bot token only
+in its masked form.
+{% endcomment %}
+{% block title %}{{ location.name }}{% endblock %}
+{% block content %}
+<h1 class="name">{{ location.name }}</h1>
+
+<h2>Status</h2>
+<dl class="panel settings">
+  <dt>Status</dt>
+  <dd><span class="status status--{{ status.key }}">{{ status.label }}</span></dd>
+</dl>
+
+<h2>Switches</h2>
+<ul class="switches">
+  {% for row in switch_rows %}
+  <li class="switch">
+    <div class="switch__text">
+      <h3>{{ row.heading }}</h3>
+      <p class="help">{{ row.help }}</p>
+    </div>
+    <form method="post" action="{% url row.url_name location.pk %}">
+      {% csrf_token %}
+      <input type="hidden" name="value" value="{{ row.target }}">
+      <button class="btn btn--secondary" type="submit">{{ row.button }}</button>
+    </form>
+  </li>
+  {% endfor %}
+</ul>
+{% endblock %}

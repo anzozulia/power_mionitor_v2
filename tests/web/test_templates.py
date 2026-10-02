@@ -103,8 +103,10 @@ def test_list_rows_sorted_with_labels(
         ["Delta", "Waiting for first heartbeat", "Never", "English"],
         ["gamma", "Off", "2026-10-01 10:58:00 EEST", "Russian"],
     ]
+    # Each name opens the location's page (Phase 4 UI-SPEC screen A), not its setup page.
     for location in (alpha, beta, gamma, delta):
-        assert f'href="/locations/{location.pk}/setup/"' in html
+        assert f'<a class="name" href="/locations/{location.pk}/">' in html
+        assert f'href="/locations/{location.pk}/setup/"' not in html
     for heading in ("Name", "Status", "Last heartbeat", "Language"):
         assert f'<th scope="col">{heading}</th>' in html
     assert '<span class="status status--on">On</span>' in html
@@ -298,7 +300,7 @@ def test_long_name_has_the_wrapping_class(
     listing = admin.get("/").content.decode()
     setup = admin.get(f"/locations/{location.pk}/setup/").content.decode()
 
-    assert f'<a class="name" href="/locations/{location.pk}/setup/">{name}</a>' in listing
+    assert f'<a class="name" href="/locations/{location.pk}/">{name}</a>' in listing
     assert f'<h1 class="name">{name}</h1>' in setup
 
 
