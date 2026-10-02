@@ -754,6 +754,22 @@ def test_settled_records_end_a_25_hour_day_at_its_local_midnight() -> None:
     assert settled(end + timedelta(seconds=104)) == frozenset()
 
 
+def test_INV19_plan_unpins_an_older_record_not_known_to_be_pinned() -> None:
+    # Its pin may have taken effect (an ambiguous answer, an unwritten outcome): an older
+    # record gets its one unpin whatever ``pinned`` says (Wave 4 audit, fix 2).
+    a = _location(1)
+    yesterday = TODAY - timedelta(days=1)
+    older = _row(10, 1, rendered=NOON_05 - timedelta(days=1), day=yesterday, pinned=False)
+    rows = [older, _row(11, 1, rendered=NOON_05)]
+
+    assert lifecycle.plan([a], rows, today=TODAY, now=NOON_05, not_before={}) == (
+        lifecycle.Action("unpin", a, older)
+    )
+    # Its own key still holds it, as for any step.
+    held = {lifecycle.chart_key(1, "unpin", 10): NOON_05 + timedelta(seconds=30)}
+    assert lifecycle.plan([a], rows, today=TODAY, now=NOON_05, not_before=held) is None
+
+
 def test_plan_final_edit_waits_for_its_day_and_never_holds_the_unpin() -> None:
     a = _location(1)
     older = _row(10, 1, rendered=NOON_05 - timedelta(days=1), day=TODAY - timedelta(days=1))
