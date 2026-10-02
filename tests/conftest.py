@@ -7,6 +7,9 @@ router-reconnect grace off, language en, display TZ Europe/Kyiv.
   views get a ``FakeClock`` by constructor injection (``SomeView.as_view(clock=...)``).
   There is no freezegun and no monkeypatching of time.
 - Telegram is faked at the HTTP boundary (``responses``), and any unregistered URL raises.
+  ``FakeTelegram`` answers sendMessage (``accept``, ``fail``, ``answer``) and the chart
+  calls (``accept_chart``), and records what each accepted call carried (``sent``;
+  ``chart_calls`` with multipart bodies read back by ``parse_multipart``).
 - pytest-socket (``--allow-hosts`` in pyproject.toml) fails every real outbound connection
   except the database and localhost.
 - Races run on real PostgreSQL with the actor harness below (``Actor``, ``blocked_on_lock``,
@@ -23,13 +26,15 @@ Test modules import the helper classes directly: ``from conftest import FakeCloc
 """
 
 import dataclasses
+import email.policy
 import json
 import re
 import threading
 import time
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from email.parser import BytesParser
+from typing import Any, NamedTuple
 
 import pytest
 import responses
@@ -135,19 +140,58 @@ def _aware_utc(dt: datetime) -> datetime:
     return dt.astimezone(UTC)
 
 
+class ChartCall(NamedTuple):
+    """One chart call the fake accepted: the method, the bot, its fields and its files.
+
+    ``fields`` are the multipart text fields (str values) or the JSON body; ``files`` maps
+    a multipart file field name to its bytes (empty for a JSON call).
+    """
+
+    method: str
+    token: str
+    fields: dict[str, Any]
+    files: dict[str, bytes]
+
+
+def parse_multipart(request: PreparedRequest) -> tuple[dict[str, str], dict[str, bytes]]:
+    """The text fields (UTF-8) and the file contents of a multipart/form-data request."""
+    body = request.body
+    if not isinstance(body, bytes):
+        raise TypeError("parse_multipart() needs a multipart request with a bytes body")
+    content_type = request.headers["Content-Type"].encode("ascii")
+    message: Any = BytesParser(policy=email.policy.HTTP).parsebytes(
+        b"Content-Type: " + content_type + b"\r\n\r\n" + body
+    )
+    fields: dict[str, str] = {}
+    files: dict[str, bytes] = {}
+    for part in message.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        payload = part.get_payload(decode=True)
+        if part.get_filename() is None:
+            fields[name] = payload.decode("utf-8")
+        else:
+            files[name] = payload
+    return fields, files
+
+
 class FakeTelegram:
     """The Telegram Bot API, faked at the HTTP boundary with ``responses``.
 
     ``accept(token)`` answers that bot's sendMessage calls with ok and records each JSON
     body in ``sent``; ``fail(token, ...)`` answers them with an HTTP error or raises an
-    exception. A call to any bot that was not registered raises ``requests.ConnectionError``.
+    exception. ``accept_chart(token)`` answers that bot's chart calls with ok and records
+    each one in ``chart_calls``: sendPhoto answers the message ids 1001, 1002, ... A call
+    to any bot or method that was not registered raises ``requests.ConnectionError``.
     """
 
     API = TELEGRAM_API
+    FIRST_PHOTO_ID = 1001
 
     def __init__(self, rsps: responses.RequestsMock) -> None:
         self.rsps = rsps
         self.sent: list[dict[str, Any]] = []
+        self.chart_calls: list[ChartCall] = []
+        self._next_photo_id = self.FIRST_PHOTO_ID
 
     @property
     def calls(self) -> Any:
@@ -217,8 +261,36 @@ class FakeTelegram:
             content_type="application/json",
         )
 
-    def _url(self, token: str) -> str:
-        return f"{self.API}/bot{token}/sendMessage"
+    def accept_chart(self, token: str) -> None:
+        """Answer the bot's chart calls with ok and record each one in ``chart_calls``."""
+        for method in ("sendPhoto",):
+            self.rsps.add_callback(
+                responses.POST,
+                self._url(token, method),
+                callback=self._chart_callback(token, method),
+                content_type="application/json",
+            )
+
+    def _chart_callback(
+        self, token: str, method: str
+    ) -> Callable[[PreparedRequest], tuple[int, dict[str, str], str]]:
+        def callback(request: PreparedRequest) -> tuple[int, dict[str, str], str]:
+            return 200, {}, json.dumps(self._accept_chart_call(token, method, request))
+
+        return callback
+
+    def _accept_chart_call(
+        self, token: str, method: str, request: PreparedRequest
+    ) -> dict[str, Any]:
+        """Record one accepted chart call and return Telegram's ok body for it."""
+        fields, files = parse_multipart(request)
+        self.chart_calls.append(ChartCall(method, token, dict(fields), files))
+        message_id = self._next_photo_id
+        self._next_photo_id += 1
+        return {"ok": True, "result": {"message_id": message_id}}
+
+    def _url(self, token: str, method: str = "sendMessage") -> str:
+        return f"{self.API}/bot{token}/{method}"
 
 
 @pytest.fixture
