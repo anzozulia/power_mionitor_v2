@@ -8,17 +8,22 @@ second conftest would shadow the root one (03-PATTERNS).
   now = Thu 2026-10-01 14:37 local (11:37 UTC). Every off interval is its own outage.
 - Kyiv offsets: UTC+3 (EEST) until 2026-10-25 01:00 UTC, UTC+2 (EET) until 2027-03-28
   01:00 UTC, then UTC+3 again. The sample week has no DST day.
+- The DST weeks end on Kyiv's DST Sundays, built from UTC instants: 2026-10-25 (25 h,
+  03:00-04:00 happens twice) and 2027-03-28 (23 h, 03:00-04:00 does not exist), each
+  with outages at 10:00-12:00 local (and 23:30-23:50, and 03:30 EEST -> 03:30 EET, on
+  2026-10-25), as INV-08 and chart-spec §10 describe them.
 - The DB helpers write ``power_interval`` and ``location_state`` rows as the engine would
   leave them, for tests that read the chart through ``source.load_week``.
 """
 
 from datetime import UTC, date, datetime
+from itertools import pairwise
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from django.db.models import F
 
-from powermon.chart.model import Piece
+from powermon.chart.model import DAY_US, Piece, Row
 from powermon.engine.models import LocationState, PowerInterval
 
 KYIV = "Europe/Kyiv"
@@ -78,6 +83,71 @@ def local_pieces(rows: list[LocalRow]) -> list[Piece]:
 def sample_pieces() -> list[Piece]:
     """The chart-spec §10 sample week as pieces (the last one open)."""
     return local_pieces(SAMPLE_INTERVALS)
+
+
+def _utc(text: str) -> datetime:
+    return datetime.fromisoformat(text).replace(tzinfo=UTC)
+
+
+def _on(start: str, end: str) -> Piece:
+    return Piece("on", _utc(start), _utc(end), None)
+
+
+def _off(start: str, end: str) -> Piece:
+    return Piece("off", _utc(start), _utc(end), _utc(start))
+
+
+# Sun 2026-10-25, 25 h: local midnight is 2026-10-24 21:00 UTC (EEST) and the next one
+# 2026-10-25 22:00 UTC (EET); 03:00-04:00 happens twice (00:00-01:00 and 01:00-02:00 UTC).
+DST_FALL_TODAY = date(2026, 10, 25)
+
+
+def dst_fall_week(*, repeated_hour: bool = True) -> list[Piece]:
+    """Mon 19.10 to Sun 25.10, fully monitored; on the Sunday off 10:00-12:00 and 23:30-23:50.
+
+    08:00 UTC is 10:00 EET and 21:30 UTC is 23:30 EET. With ``repeated_hour`` an outage
+    also runs from 03:30 EEST (00:30 UTC) to 03:30 EET (01:30 UTC): one real hour.
+    """
+    # 2026-10-18 21:00 UTC is Mon 19.10 00:00 EEST.
+    if repeated_hour:
+        head = [
+            _on("2026-10-18 21:00", "2026-10-25 00:30"),
+            _off("2026-10-25 00:30", "2026-10-25 01:30"),
+            _on("2026-10-25 01:30", "2026-10-25 08:00"),
+        ]
+    else:
+        head = [_on("2026-10-18 21:00", "2026-10-25 08:00")]
+    return [
+        *head,
+        _off("2026-10-25 08:00", "2026-10-25 10:00"),
+        _on("2026-10-25 10:00", "2026-10-25 21:30"),
+        _off("2026-10-25 21:30", "2026-10-25 21:50"),
+        _on("2026-10-25 21:50", "2026-10-25 22:00"),
+    ]
+
+
+# Sun 2027-03-28, 23 h: local midnight is 2027-03-27 22:00 UTC (EET) and the next one
+# 2027-03-28 21:00 UTC (EEST); 03:00-04:00 local does not exist (01:00 UTC is 04:00 EEST).
+DST_SPRING_TODAY = date(2027, 3, 28)
+
+
+def dst_spring_week() -> list[Piece]:
+    """Mon 22.03 to Sun 28.03, fully monitored; on the Sunday off 10:00-12:00 EEST."""
+    # 2027-03-21 22:00 UTC is Mon 22.03 00:00 EET; 07:00 UTC on 28.03 is 10:00 EEST.
+    return [
+        _on("2027-03-21 22:00", "2027-03-28 07:00"),
+        _off("2027-03-28 07:00", "2027-03-28 09:00"),
+        _on("2027-03-28 09:00", "2027-03-28 21:00"),
+    ]
+
+
+def assert_partition(row: Row, *, day_length_us: int, no_data_us: int) -> None:
+    """INV-03 #2: on + off + not monitored + no data is the day's real length, no overlap."""
+    assert row.on_us + row.off_us + row.nm_us + no_data_us == day_length_us
+    for before, after in pairwise(row.segments):
+        assert after.start_us >= before.end_us, f"{after} overlaps {before}"
+    for segment in row.segments:
+        assert 0 <= segment.start_us < segment.end_us <= DAY_US, segment
 
 
 def insert_pieces(location: Any, pieces: list[Piece]) -> None:
