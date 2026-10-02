@@ -17,7 +17,9 @@
 - D-10: only a permanent refusal of a subscriber alert opens the incident (never a 5xx, a
   refused connection, a 429, an ambiguous send or a chart call), and a
   ``migrate_to_chat_id`` from Telegram is reported to the admin, never applied (PITFALLS
-  6e).
+  6e). A refusal while the incident is open (wave-2 audit) replaces its details with the
+  latest refusal's status and chat ID, silently: the location page shows a supergroup
+  reported after the first 403, and there is still one incident and one notice.
 - INV-19 #2 (relay part), D-09: a deleted location's queued alerts are never sent, not
   even one in flight at delete time that came back to pending; they are dropped before
   expiry, so no expiry notice names the deleted location. A deleted location never gets a
@@ -451,6 +453,119 @@ def test_migrate_to_chat_id_is_reported_never_applied(
     assert (_row(off).status, _row(off).location_id) == ("pending", location.pk)
     assert state.failing == {location.pk: io_loop.chat_key(TOKEN_A, DEFAULT_CHAT_ID)}
     assert [call for call in fake_telegram.sent if call["chat_id"] == MIGRATED_CHAT_ID] == []
+
+
+@pytest.mark.django_db(transaction=True)
+def test_migrate_to_chat_id_reported_while_failing_reaches_the_open_incident(
+    location_factory: Callable[..., Any], fake_telegram: Any, ops_settings: Any
+) -> None:
+    """D-10 after the first refusal (wave-2 audit): the open incident gets the new chat ID.
+
+    The bot is removed from the group: a 403 opens the incident, with one notice. While the
+    admin fixes the group, it is upgraded to a supergroup, and the 15-minute retry gets 400
+    with ``migrate_to_chat_id``. The badge and the location page read only the incident's
+    details, so they must now carry that chat ID. INV-20 #1 still holds: one incident and
+    one failing notice, the one sent at the open.
+    """
+    location = location_factory(name=NAME)
+    off = _queue(location)
+    fake_telegram.fail(TOKEN_A, status=403, json_body=KICKED)
+    fake_telegram.fail(TOKEN_A, status=400, json_body=UPGRADED)
+    fake_telegram.accept(OPS_BOT_TOKEN)
+    state = io_loop.RelayState()
+    assert io_loop.run_iteration(FakeClock(T0), state) is True
+    assert _incidents(location) == [(T0, None, {"http_status": 403})]
+
+    assert io_loop.run_iteration(FakeClock(T0 + _min(15)), state) is True
+
+    assert _calls_to(fake_telegram, TOKEN_A) == 2
+    assert _row(off).last_error == "http_400"
+    migrated = {"http_status": 400, "migrate_to_chat_id": MIGRATED_CHAT_ID}
+    assert _incidents(location) == [(T0, None, migrated)]
+    assert delivery.failing_incidents([location.pk]) == {
+        location.pk: delivery.Failing(T0, 400, MIGRATED_CHAT_ID)
+    }
+    [notice] = _ops_rows(outbox.KIND_OPS_DELIVERY_FAILING)
+    assert notice.payload == {"http_status": 403}
+    assert fake_telegram.sent == [_body(FAILING_403, OPS_CHAT_ID)]
+    # Reported only: the chat stays, and the alert waits for the old channel.
+    assert Location.objects.get(pk=location.pk).chat_id == DEFAULT_CHAT_ID
+    assert _row(off).status == "pending"
+
+
+@pytest.mark.django_db
+def test_open_failing_while_open_keeps_the_latest_refusal_only(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    """The open incident's details are the latest refusal's, the reported chat ID included.
+
+    Telegram repeats ``migrate_to_chat_id`` on every send to the old group, so the ID stays
+    shown while the location still points there. A later refusal without one replaces it:
+    once the admin has pasted the new chat ID, a refusal from the new chat (here the bot is
+    not an admin there) must show its own cause, not a hint to set a chat ID that is
+    already set. No refusal while the incident is open queues a notice (INV-20 #1).
+    """
+    location = location_factory()
+    with transaction.atomic():
+        pin = OpsIncident.objects.create(
+            kind=lifecycle.KIND_CHART_PIN_FAILED, location=location, started_at=T0
+        )
+        assert delivery.open_failing(location.pk, T0, 403) is True
+        assert delivery.open_failing(location.pk, T0 + _min(15), 400, MIGRATED_CHAT_ID) is False
+    migrated = {"http_status": 400, "migrate_to_chat_id": MIGRATED_CHAT_ID}
+    assert _incidents(location) == [(T0, None, migrated)]
+
+    # The same refusal again changes nothing.
+    with transaction.atomic():
+        assert delivery.open_failing(location.pk, T0 + _min(30), 400, MIGRATED_CHAT_ID) is False
+    assert _incidents(location) == [(T0, None, migrated)]
+
+    # The admin pasted the new chat ID; the supergroup refuses the bot (403, no chat ID).
+    Location.objects.filter(pk=location.pk).update(chat_id=MIGRATED_CHAT_ID)
+    with transaction.atomic():
+        assert delivery.open_failing(location.pk, T0 + _min(45), 403) is False
+
+    assert _incidents(location) == [(T0, None, {"http_status": 403})]
+    assert delivery.failing_incidents([location.pk]) == {
+        location.pk: delivery.Failing(T0, 403, None)
+    }
+    [notice] = _ops_rows(outbox.KIND_OPS_DELIVERY_FAILING)
+    assert notice.payload == {"http_status": 403}
+    # Only the delivery_failing incident is updated, never another kind.
+    pin.refresh_from_db()
+    assert (pin.ended_at, pin.details) == (None, {})
+
+
+@pytest.mark.django_db
+def test_a_refusal_never_updates_a_closed_incident_or_a_deleted_locations(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    closed, deleted = location_factory(), location_factory()
+    with transaction.atomic():
+        delivery.open_failing(closed.pk, T0, 403)
+        delivery.close_failing(closed.pk, T0 + _min(1))
+        delivery.open_failing(deleted.pk, T0, 403)
+    # Only the tombstone: 04-07's delete closes the incident itself.
+    _delete(deleted, T0 + _min(2))
+
+    with transaction.atomic():
+        # A closed incident keeps its details; the refusal opens a new one, with a notice.
+        assert delivery.open_failing(closed.pk, T0 + _min(3), 400, MIGRATED_CHAT_ID) is True
+        # A tombstone gets nothing, not even its open incident's details (D-09).
+        assert delivery.open_failing(deleted.pk, T0 + _min(3), 400, MIGRATED_CHAT_ID) is False
+
+    migrated = {"http_status": 400, "migrate_to_chat_id": MIGRATED_CHAT_ID}
+    assert _incidents(closed) == [
+        (T0, T0 + _min(1), {"http_status": 403}),
+        (T0 + _min(3), None, migrated),
+    ]
+    assert _incidents(deleted) == [(T0, None, {"http_status": 403})]
+    notices = _ops_rows(outbox.KIND_OPS_DELIVERY_FAILING)
+    assert [(row.location_id, row.payload) for row in notices] == [
+        (closed.pk, {"http_status": 403}),
+        (deleted.pk, {"http_status": 403}),
+        (closed.pk, migrated),
+    ]
 
 
 # D-10: transient errors, 429, ambiguous sends and chart calls never open the incident
