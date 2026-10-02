@@ -12,7 +12,11 @@ Exactly one failing notice and one restored notice per incident is the database'
 not a code convention: the partial unique index ``ops_incident_one_open`` lets a single
 opener get an id back, and the close is conditional on the incident still being open, so
 a single closer sees one changed row. Each of them queues its notice only then, in the
-same transaction (``powermon.alerts.ops``).
+same transaction (``powermon.alerts.ops``). A refusal while the incident is open adds no
+incident and no notice, but replaces the open incident's details with its own, by one
+conditional UPDATE in the same transaction (wave-2 audit). The details always describe
+the latest refusal, so a supergroup Telegram reports after the first refusal still
+reaches the location page (D-10).
 
 A recorded success (D-12): after the admin's test message went through, the web calls
 ``record_test_success``, one transaction that closes the incident (one recovery notice)
@@ -40,6 +44,7 @@ only (OPS-08). ``failing_incidents`` reads them back for the admin pages and nev
 on a malformed value.
 """
 
+import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
@@ -52,6 +57,14 @@ from powermon.alerts.models import OpsIncident
 KIND_DELIVERY_FAILING = "delivery_failing"
 # A live location's row, held against a concurrent delete until the caller commits (D-09).
 LIVE_LOCATION_SQL = "SELECT 1 FROM location WHERE id = %s AND deleted_at IS NULL FOR SHARE"
+# The open failing incident's details, replaced by the latest refusal's (status and
+# reported chat ID). Only an open incident of this kind and location: a closed one keeps
+# the details it ended with.
+LATEST_REFUSAL_SQL = """
+UPDATE ops_incident
+   SET details = %s::jsonb
+ WHERE kind = %s AND location_id = %s AND ended_at IS NULL
+"""
 # The status a client code with no plausible HTTP status stands for (a notice needs one).
 _DEFAULT_STATUS = 400
 # A reported chat ID fits a signed 64-bit integer, as a location's chat_id does.
@@ -87,9 +100,17 @@ def open_failing(
     The incident's details and the ``ops_delivery_failing`` notice carry the HTTP status
     and, when Telegram reported one, the supergroup's new chat ID; the location's chat is
     never changed here (PITFALLS 6e). Only the opener that got an incident id back queues
-    the notice, so a location refused again while its incident is open adds nothing
-    (INV-20 #1). A deleted location (or one that is being deleted) gets nothing: False,
-    and no write (D-09).
+    the notice, so a location refused again while its incident is open gets no second
+    incident and no second notice (INV-20 #1).
+
+    That refusal still replaces the open incident's details: they always describe the
+    latest refusal, which the admin pages show (D-10, D-13). So a supergroup reported
+    after the first refusal reaches the location page, and a refusal without a chat ID
+    clears an earlier one. Telegram repeats ``migrate_to_chat_id`` on every send to the
+    old group, so the ID stays while the location points there; once the admin has pasted
+    it, a refusal from the new chat shows its own cause, not a hint to set a chat ID that
+    is already set. A deleted location (or one that is being deleted) gets nothing: False,
+    and no write, not even to an incident still open (D-09).
     """
     details = {"http_status": http_status}
     if migrate_to_chat_id is not None:
@@ -99,10 +120,17 @@ def open_failing(
             cur.execute(LIVE_LOCATION_SQL, [location_id])
             if cur.fetchone() is None:
                 return False
+        # Checks that the details are integers (OPS-08) before it writes anything.
         opened = ops.open_incident(
             KIND_DELIVERY_FAILING, now, location_id=location_id, details=details
         )
         if opened is None:
+            # Already open: the details follow this refusal, and no notice is queued.
+            with connection.cursor() as cur:
+                cur.execute(
+                    LATEST_REFUSAL_SQL,
+                    [json.dumps(details), KIND_DELIVERY_FAILING, location_id],
+                )
             return False
         ops.notify(
             outbox.KIND_OPS_DELIVERY_FAILING,
