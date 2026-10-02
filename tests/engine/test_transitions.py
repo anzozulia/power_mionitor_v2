@@ -603,6 +603,64 @@ def test_record_heartbeat_for_an_unknown_location_writes_no_interval(
     assert not PowerInterval.objects.exists()
 
 
+# A deleted location is never revived by a heartbeat (LOC-04, D-09). The heartbeat lookup
+# already skips deleted locations; a heartbeat that looked up its key before the delete
+# reaches the gate and must change nothing. The race itself is in test_races.py.
+
+
+@pytest.mark.django_db(transaction=True)
+def test_heartbeat_for_a_deleted_location_is_ignored(location_factory: Callable[..., Any]) -> None:
+    location = _off_since_1005(location_factory)
+    sibling = _off_since_1005(location_factory, name="Not deleted")
+    Location.objects.filter(pk=location.pk).update(deleted_at=_at(10, 30))
+    before = LocationState.objects.filter(pk=location.pk).values().get()
+    stored = _intervals(location)
+    queued = _kinds()
+
+    assert transitions.record_heartbeat(location.pk, _at(11, 0)) == "ignored"
+
+    # Nothing changes: no restore, no interval, no ON alert for a deleted location.
+    assert LocationState.objects.filter(pk=location.pk).values().get() == before
+    assert before["status"] == "off"
+    assert _intervals(location) == stored
+    assert _kinds() == queued == ["power_off", "power_off"]
+    # A location that is not deleted still restores normally, with its ON alert.
+    assert transitions.record_heartbeat(sibling.pk, _at(11, 0)) == "restored"
+    assert _kinds() == ["power_off", "power_off", "power_on"]
+    assert OutboxMessage.objects.get(kind="power_on").location_id == sibling.pk
+
+
+@pytest.mark.django_db
+def test_heartbeat_for_a_deleted_waiting_location_opens_no_interval(
+    location_factory: Callable[..., Any], fixed_now: datetime
+) -> None:
+    # A location deleted before its first heartbeat reached the gate: monitoring never starts.
+    location = location_factory(deleted_at=fixed_now)
+
+    assert transitions.record_heartbeat(location.pk, _at(8, 1)) == "ignored"
+
+    state = LocationState.objects.get(pk=location.pk)
+    assert (state.status, state.on_since, state.last_heartbeat_at) == ("waiting", None, None)
+    assert not PowerInterval.objects.exists()
+    assert _kinds() == []
+
+
+@pytest.mark.django_db
+def test_heartbeat_for_a_deleted_location_that_is_on_changes_nothing(
+    location_factory: Callable[..., Any], fixed_now: datetime
+) -> None:
+    location = location_factory()
+    assert transitions.record_heartbeat(location.pk, fixed_now) == "started"
+    Location.objects.filter(pk=location.pk).update(deleted_at=_at(8, 30))
+    before = LocationState.objects.filter(pk=location.pk).values().get()
+
+    assert transitions.record_heartbeat(location.pk, _at(9, 0)) == "ignored"
+
+    # Not even the heartbeat time or the CAS token moves.
+    assert LocationState.objects.filter(pk=location.pk).values().get() == before
+    assert _intervals(location) == [("on", _at(8, 0), None, None)]
+
+
 @pytest.mark.django_db
 def test_config_row_reads_maintenance_and_alerts(location_factory: Callable[..., Any]) -> None:
     default = location_factory()

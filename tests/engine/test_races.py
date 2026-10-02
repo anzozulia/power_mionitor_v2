@@ -10,7 +10,9 @@ What the races prove:
   heartbeat, so one ON alert (a deterministic hook, plus a barrier stress run).
 - INV-02, overlapping cycles: two detection passes that read the same snapshot record one
   OFF; the second CAS changes 0 rows.
-- "ignored" means only that the location has no state row: nothing is written.
+- D-09 race 1: a heartbeat that waits on the row lock while the admin deletes the
+  location sees the delete once it gets the lock, and restores nothing (LOC-04).
+- "ignored" means the location has no state row or is deleted: nothing is written.
 
 Every writer of a location's state and timeline takes that location's ``location_state``
 row lock first (``SELECT ... FOR UPDATE`` in ``record_heartbeat``, the CAS UPDATE in
@@ -39,6 +41,7 @@ from typing import Any
 
 import pytest
 from conftest import Actor, FakeClock, blocked_on_lock, terminate_backends, wait_for
+from django.db import connection, transaction
 from django.db.backends.utils import CursorWrapper
 from django.test import RequestFactory
 
@@ -46,6 +49,7 @@ from powermon.alerts import texts
 from powermon.alerts.models import OutboxMessage
 from powermon.engine import rules, timeline, transitions
 from powermon.engine.models import LocationState, PowerInterval, SystemState
+from powermon.locations.models import Location
 from powermon.web.views import HeartbeatView
 from powermon.worker import detection
 
@@ -370,6 +374,61 @@ def test_INV02_overlapping_cycles_one_off(
         ("on", _at(10, 0), _at(10, 5), None),
         ("off", _at(10, 5), None, _at(10, 5)),
     ]
+
+
+# D-09 race 1 (RESEARCH Pattern 4, Pitfall 3): a delete commits while a heartbeat that
+# looked up its key earlier waits on the row lock
+
+
+@pytest.mark.django_db(transaction=True)
+def test_D09_heartbeat_waiting_on_the_lock_ignores_a_delete_committed_meanwhile(
+    location_factory: Callable[..., Any],
+) -> None:
+    # Off since 10:05 with its OFF alert queued. The admin's delete (simulated in raw SQL,
+    # in the lock order 04-07's delete_location uses: LOCK_SQL, then the tombstone) holds
+    # the row lock while a restoring heartbeat arrives and waits. After the delete commits,
+    # the heartbeat must not restore the location nor queue an ON alert for it.
+    location = _on_since_1000_silent_after_1005(location_factory)
+    assert detection.run_cycle(_at(10, 6, 31)) == 1
+    before = _state(location)
+    stored = _intervals(location)
+    locked, release = threading.Event(), threading.Event()
+
+    def delete_holding_the_lock() -> None:
+        with transaction.atomic(), connection.cursor() as cur:
+            cur.execute(transitions.LOCK_SQL, [location.pk])
+            cur.execute(
+                "UPDATE location SET deleted_at = %s WHERE id = %s", [_at(10, 59), location.pk]
+            )
+            locked.set()
+            if not release.wait(5):
+                raise AssertionError("the race hook was never released")
+
+    delete = Actor(delete_holding_the_lock)
+    hb = Actor(lambda: transitions.record_heartbeat(location.pk, _at(11, 0)))
+    try:
+        delete.start()
+        assert locked.wait(5)
+        hb.start()
+        assert wait_for(lambda: hb.pid is not None and blocked_on_lock(hb.pid))
+        release.set()
+        delete.join(5)
+        hb.join(5)
+    finally:
+        _finish(delete, hb, release=release)
+
+    assert delete.exc is None, delete.exc
+    assert hb.exc is None, hb.exc
+    assert hb.result == "ignored"
+    state = _state(location)
+    assert (state.status, state.outage_started_at, state.state_version) == (
+        "off",
+        _at(10, 5),
+        before.state_version,
+    )
+    assert _intervals(location) == stored
+    assert _kinds() == ["power_off"]
+    assert Location.objects.get(pk=location.pk).deleted_at == _at(10, 59)
 
 
 # "ignored": no state row, nothing written
