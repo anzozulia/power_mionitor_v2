@@ -152,12 +152,12 @@ def test_MON04_WR01_heartbeat_during_off_cas_restores(
     monkeypatch: pytest.MonkeyPatch, location_factory: Callable[..., Any]
 ) -> None:
     location = _on_since_1000_silent_after_1005(location_factory)
-    [(snap, _alerts_enabled)] = transitions.read_snapshots()
+    [snap] = transitions.read_snapshots()
     decision = rules.decide(snap, rules.Anchors(detection_resumed_at=_at(9, 0)), _at(10, 6, 31))
     assert (decision.off, decision.outage_start) == (True, _at(10, 5))
     inside, release = _pause_in_set_open_state(monkeypatch, "off")
 
-    off = Actor(lambda: transitions.mark_off(snap, decision, _at(10, 6, 31), True))
+    off = Actor(lambda: transitions.mark_off(snap, decision, _at(10, 6, 31)))
     hb = Actor(lambda: _beat(location, FakeClock(_at(10, 6, 32))))
     try:
         off.start()
@@ -315,11 +315,9 @@ def test_INV02_parallel_restores_stress_one_on_each(
         # Each round gets its own freshly OFF location; earlier ones are never touched again.
         location = location_factory(name=f"Stress {round_no}")
         assert transitions.record_heartbeat(location.pk, _at(10, 0)) == "started"
-        [(snap, alerts_enabled)] = [
-            pair for pair in transitions.read_snapshots() if pair[0].location_id == location.pk
-        ]
+        [snap] = [s for s in transitions.read_snapshots() if s.location_id == location.pk]
         decision = rules.decide(snap, rules.Anchors(detection_resumed_at=_at(9, 0)), _at(10, 1, 31))
-        assert transitions.mark_off(snap, decision, _at(10, 1, 31), alerts_enabled)
+        assert transitions.mark_off(snap, decision, _at(10, 1, 31))
 
         actors = _restore_together(location.pk, (_at(10, 30), _at(10, 30) + offset))
 
@@ -336,9 +334,9 @@ def _detection_pass(now: datetime) -> tuple[int, bool]:
 
     Returns the snapshot's CAS token and whether this pass recorded the OFF.
     """
-    [(snap, alerts_enabled)] = transitions.read_snapshots()
+    [snap] = transitions.read_snapshots()
     decision = rules.decide(snap, rules.Anchors(detection_resumed_at=_at(9, 0)), now)
-    return snap.state_version, transitions.mark_off(snap, decision, now, alerts_enabled)
+    return snap.state_version, transitions.mark_off(snap, decision, now)
 
 
 @pytest.mark.django_db(transaction=True)

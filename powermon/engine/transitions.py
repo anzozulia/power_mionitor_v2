@@ -78,13 +78,18 @@ UPDATE location_state
  WHERE location_id = %(id)s AND status = 'on'
 """
 
-# The settings a transition reads, inside the same transaction (INV-05).
+# Whether an alert is sent is decided when its transition is recorded, inside the
+# transition's own transaction (INV-05, D-06): a heartbeat gate reads the settings here,
+# under the row lock; the OFF transition reads alerts_enabled from its CAS row
+# (OFF_CAS_SQL's RETURNING). Neither uses a value read before the transaction began.
 CONFIG_SQL = "SELECT maintenance, alerts_enabled FROM location WHERE id = %s"
 
-# What the detector checks: monitored locations that are on, with their CAS token.
+# What the detector checks: monitored locations that are on, with their CAS token. No
+# alerts_enabled here: the snapshot is read outside the OFF transaction, and the admin may
+# toggle alerts before the CAS runs (WR-05).
 SNAPSHOT_SQL = """
 SELECT s.location_id, s.state_version, s.last_heartbeat_at, s.on_since, s.window_start_at,
-       l.period_s, l.grace_s, l.router_grace, l.alerts_enabled
+       l.period_s, l.grace_s, l.router_grace
   FROM location_state s
   JOIN location l ON l.id = s.location_id
  WHERE s.status = 'on' AND NOT l.maintenance AND l.deleted_at IS NULL
@@ -92,8 +97,9 @@ SELECT s.location_id, s.state_version, s.last_heartbeat_at, s.on_since, s.window
 """
 
 # on -> off, only if nothing changed since the snapshot: any heartbeat in between has
-# bumped state_version, and then 0 rows change (INV-01). Maintenance or deletion in
-# between also stops it. Verbatim from RESEARCH Pattern 4.
+# bumped state_version, and then no row comes back (INV-01). Maintenance or deletion in
+# between also stops it. The returned alerts_enabled is the location's setting at the
+# moment the OFF is recorded, which decides the OFF alert (INV-05, D-06; Phase 1 WR-05).
 OFF_CAS_SQL = """
 UPDATE location_state s
    SET status='off', outage_started_at=%(start)s, state_version=s.state_version+1
@@ -101,6 +107,7 @@ UPDATE location_state s
  WHERE s.location_id=%(id)s AND l.id=s.location_id
    AND s.status='on' AND s.state_version=%(v)s
    AND NOT l.maintenance AND l.deleted_at IS NULL
+RETURNING l.alerts_enabled
 """
 
 
@@ -210,41 +217,45 @@ def record_heartbeat(location_id: int, now: datetime) -> str:
         return "plain"
 
 
-def read_snapshots() -> list[tuple[rules.Snapshot, bool]]:
-    """Every monitored location that is on, as ``(snapshot, alerts_enabled)``, by id.
+def read_snapshots() -> list[rules.Snapshot]:
+    """Every monitored location that is on, as its snapshot, by id.
 
     Locations in maintenance, deleted locations and locations still waiting for their
-    first heartbeat are never candidates for OFF.
+    first heartbeat are never candidates for OFF. A snapshot carries no alerts setting:
+    ``mark_off`` reads it from its own CAS row (INV-05, D-06).
     """
     with connection.cursor() as cur:
         cur.execute(SNAPSHOT_SQL)
         rows = cur.fetchall()
     return [
-        (
-            rules.Snapshot(
-                location_id=row[0],
-                state_version=row[1],
-                last_heartbeat_at=row[2],
-                on_since=row[3],
-                window_start_at=row[4],
-                period_s=row[5],
-                grace_s=row[6],
-                router_grace=row[7],
-            ),
-            bool(row[8]),
+        rules.Snapshot(
+            location_id=row[0],
+            state_version=row[1],
+            last_heartbeat_at=row[2],
+            on_since=row[3],
+            window_start_at=row[4],
+            period_s=row[5],
+            grace_s=row[6],
+            router_grace=row[7],
         )
         for row in rows
     ]
 
 
-def mark_off(snap: rules.Snapshot, d: rules.Decision, now: datetime, alerts_enabled: bool) -> bool:
+def mark_off(snap: rules.Snapshot, d: rules.Decision, now: datetime) -> bool:
     """Record the OFF transition ``d`` for ``snap``, decided by the detector at ``now``.
 
     One transaction: the row lock (LOCK_SQL), the CAS UPDATE, then the timeline (on closed
     at the outage start, off opened from it), then the power_off outbox row when alerts
-    are on. Returns False and writes nothing when the CAS changes 0 rows: a heartbeat or
+    are on. Returns False and writes nothing when the CAS changes no row: a heartbeat or
     another writer got there first, so the decision is stale and is skipped quietly
     (INV-01).
+
+    Whether alerts are on comes from the CAS UPDATE's own row (``RETURNING
+    l.alerts_enabled``), never from the snapshot: the admin may toggle alerts between the
+    snapshot and this transaction, and the setting at the moment the OFF is recorded is
+    the one that counts (INV-05, D-06). An OFF recorded while alerts are off queues
+    nothing, and nothing is held for later: turning alerts back on never sends it.
 
     The outage starts at ``max(decided outage start, open interval start)`` (D2), read
     under the row lock, so a lapse carve that committed after the snapshot is seen. A
@@ -269,8 +280,10 @@ def mark_off(snap: rules.Snapshot, d: rules.Decision, now: datetime, alerts_enab
             "start": start,
         }
         cur.execute(OFF_CAS_SQL, params)
-        if cur.rowcount != 1:
+        row = cur.fetchone()
+        if row is None:
             return False
+        alerts_enabled = bool(row[0])
         timeline.set_open_state(cur, snap.location_id, start, "off", outage_start_at=start)
         if alerts_enabled:
             outbox.enqueue(

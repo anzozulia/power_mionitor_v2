@@ -504,7 +504,7 @@ def test_INV10_an_off_that_waits_on_a_carve_starts_where_the_carve_left_the_open
     assert transitions.record_heartbeat(location.pk, _at(9, 59)) == "plain"
     winner, loser = _at(10, 10), _at(10, 10, 0, 200_000)
     assert lapse.carve_if_needed(winner, force=True) == lapse.Gap(_at(10, 0), winner)
-    [(snap, alerts_enabled)] = transitions.read_snapshots()
+    [snap] = transitions.read_snapshots()
     decision = rules.decide(snap, rules.Anchors(detection_resumed_at=winner), _at(10, 11, 31))
     assert decision.outage_start == winner
     inside, release = threading.Event(), threading.Event()
@@ -522,7 +522,7 @@ def test_INV10_an_off_that_waits_on_a_carve_starts_where_the_carve_left_the_open
 
     monkeypatch.setattr(timeline, "overwrite", paused)
     carve = Actor(lambda: lapse.carve_window(_at(10, 0), loser))
-    off = Actor(lambda: transitions.mark_off(snap, decision, _at(10, 11, 31), alerts_enabled))
+    off = Actor(lambda: transitions.mark_off(snap, decision, _at(10, 11, 31)))
     try:
         carve.start()
         assert inside.wait(5)

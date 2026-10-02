@@ -70,13 +70,13 @@ def test_INV01_cas_loses_to_a_heartbeat_between_snapshot_and_write(
     location = location_factory()
     for minute in range(6):
         transitions.record_heartbeat(location.pk, _at(10, minute))
-    [(snap, alerts_enabled)] = transitions.read_snapshots()
+    [snap] = transitions.read_snapshots()
     decision = rules.decide(snap, rules.Anchors(detection_resumed_at=_at(9, 0)), _at(10, 6, 31))
     assert decision.off
 
     # The device reports between the detector's read and its write.
     assert transitions.record_heartbeat(location.pk, _at(10, 6, 32)) == "plain"
-    assert transitions.mark_off(snap, decision, _at(10, 6, 31), alerts_enabled) is False
+    assert transitions.mark_off(snap, decision, _at(10, 6, 31)) is False
 
     state = _state(location)
     assert (state.status, state.outage_started_at) == ("on", None)
