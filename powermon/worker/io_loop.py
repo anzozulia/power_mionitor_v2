@@ -143,7 +143,7 @@ import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from django.conf import settings
 from django.db import Error, close_old_connections, transaction
@@ -215,6 +215,9 @@ class RelayState:
     ``chart_failures``: consecutive failures per chart step key
     (``powermon.chart.lifecycle.chart_key``), which set that step's growing backoff; kept
     in memory like ``not_before``, so a restart starts again from the first delay.
+    ``chart_posted``: a chart photo Telegram accepted whose record could not be written
+    yet, by (location id, local date) -> (chat id, message id, answer time); the next
+    chart step writes it first, so it is never posted a second time (WR-04 analogue).
     """
 
     not_before: dict[str, datetime] = field(default_factory=dict)
@@ -222,6 +225,7 @@ class RelayState:
     db_down_notified: bool = False
     lease_pid: int | None = None
     chart_failures: dict[str, int] = field(default_factory=dict)
+    chart_posted: dict[tuple[int, date], tuple[int, int, datetime]] = field(default_factory=dict)
 
 
 def bot_key(token: str) -> str:

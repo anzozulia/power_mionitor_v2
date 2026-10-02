@@ -1124,43 +1124,57 @@ def test_stop_during_the_render_makes_no_call(
     assert _rows() == []
 
 
-def test_unwritable_record_backs_off_the_post(
+def test_unwritable_refresh_outcome_backs_off_the_step(
     location_factory: Callable[..., Any],
     fake_telegram: Any,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    # Replaces 03-08's interim repost test (Wave 3 audit fix A): a post whose record
+    # cannot be written is kept and never posted again (tests/chart/test_lifecycle_failures.py).
+    # An idempotent record UPDATE (refresh, pin, finalize, unpin) still backs its step off.
+    from types import SimpleNamespace
+
     a = _monitored(location_factory)
+    _seed(a, rendered=NOON_05)
     fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
 
-    def refused(*args: Any) -> None:
+    def refused(**values: Any) -> int:
         raise OperationalError("could not extend file: No space left on device")
 
-    # The photo is accepted, but the database refuses the record (e.g. a full disk).
-    monkeypatch.setattr(lifecycle, "_record_post", refused)
+    # The edit is accepted, but the database refuses every record UPDATE (a full disk).
+    unwritable = SimpleNamespace(update=refused)
+    monkeypatch.setattr(
+        lifecycle,
+        "ChartMessage",
+        SimpleNamespace(objects=SimpleNamespace(filter=lambda **where: unwritable)),
+    )
     caplog.set_level(logging.WARNING, logger=LIFECYCLE_LOGGER)
-    clock = FakeClock(NOON_05)
+    at = NOON_05 + timedelta(minutes=15)
+    clock = FakeClock(at)
     state = io_loop.RelayState()
-    key = lifecycle.chart_key(a.pk, "post")
+    key = lifecycle.chart_key(a.pk, "refresh")
 
     assert _pass(clock, state) is True
 
-    assert _rows() == []
-    assert state.not_before == {key: NOON_05 + _seconds(30)}
+    assert _rows()[0].last_rendered_at == NOON_05
+    assert state.not_before == {key: at + _seconds(30)}
     [line] = [r.getMessage() for r in caplog.records if r.name == LIFECYCLE_LOGGER]
     assert "1001" in line and "OperationalError" in line
     assert "No space" not in line
-    # No post every pass while the record cannot be written: the step backoff applies.
-    clock.set(NOON_05 + _seconds(29))
+    # No edit every pass while the outcome cannot be written: the step backoff applies.
+    clock.set(at + _seconds(29))
     assert _pass(clock, state) is False
-    clock.set(NOON_05 + _seconds(30))
+    clock.set(at + _seconds(30))
     assert _pass(clock, state) is True
-    assert state.not_before == {key: NOON_05 + _seconds(30 + 60)}
+    assert state.not_before == {key: at + _seconds(30 + 60)}
     monkeypatch.undo()
-    clock.set(NOON_05 + _seconds(90))
+    clock.set(at + _seconds(90))
     assert _pass(clock, state) is True
-    assert [row.message_id for row in _rows()] == [1003]
+    assert _rows()[0].last_rendered_at == at + _seconds(90)
     assert key not in state.chart_failures
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "editMessageMedia") == 3
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "sendPhoto") == 0
 
 
 def test_web_process_never_imports_pillow() -> None:

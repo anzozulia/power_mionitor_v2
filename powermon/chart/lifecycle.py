@@ -16,16 +16,44 @@ worker was down is simply due on the next pass.
   (INV-17), with ``INSERT ... ON CONFLICT DO NOTHING`` on the partial unique index
   ``chart_message_one_active_per_day``, so two workers can never record two charts for a
   day (INV-17 #2).
+  If that write raises a database error, the post Telegram accepted is kept in
+  ``RelayState.chart_posted`` and written first by the next chart step, before any step
+  is chosen, so it is never posted a second time (WR-04 analogue). A record that can
+  never be written (its location is gone) leaves the photo untracked, with one WARNING.
 - Pin: a later pass pins the recorded message silently, in the chat stored with the
   record, never the location's current chat (D-01, D-04). A permanent pin failure (the
   bot may post but not pin, INV-17 #1) is stored as ``pin_failed_at``; the pin is tried
-  again only after the next successful render (D-07).
+  again only after the next successful render (D-07). The first such failure opens the
+  location's ``chart_pin_failed`` incident and queues one ``ops_pin_failed`` notice; the
+  pin that works again closes it and queues one ``ops_pin_restored`` notice. Each goes
+  in the same transaction as the record's UPDATE, and only the opener (or closer) whose
+  write changed the database notifies, so a pin retried every 15 min never repeats a
+  notice (INV-20 shape).
+- Today's chart deleted in the channel ("message to edit / pin not found" on a refresh
+  or a pin): the record is retired (``retired_at``, unpinned) and never called again, and
+  the next pass posts exactly one replacement, records it and pins it (INV-17 #3, D-06).
+- Finalize: every older record (``local_date`` before today) that has no final edit yet
+  gets its finished-day render (chart-spec §7: now = the local midnight that ends its
+  day, no now line, no pill, the caption's line 1 only, D-01, D-13), edited in the chat
+  and message stored with it (D-04); oldest first. A finalized chart is never rendered
+  again (D-14).
+- Unpin: every older record still pinned is unpinned by its own message id in its own
+  chat, oldest first, and nothing else is ever unpinned (D-04, INV-19).
+- Cleanup of older records never blocks and never loops (INV-19): a permanent error on a
+  final edit or an unpin marks the record finalized or unpinned anyway (best effort, one
+  WARNING); an older chart deleted in the channel ("not found") is retired with no
+  repost, or simply marked unpinned. Every record transition is a conditional UPDATE
+  decided by row count, so a repeated or concurrent outcome changes nothing twice.
 - Refresh: today's chart is due ``REFRESH_EVERY`` (15 min) after its last successful
   render (``last_rendered_at``, the answer time), and is edited in place in its recorded
   chat; "message is not modified" counts as rendered (D-05, CHRT-02). The state is in the
   database, so after downtime exactly one catch-up refresh is made, not one per missed
-  slot (INV-18). Midnight-class steps (post, pin) beat any refresh; among due refreshes
-  the oldest render goes first, ties to the lower location id.
+  slot (INV-18). Midnight-class steps (post, pin, finalize, unpin) beat any refresh; among
+  due refreshes the oldest render goes first, ties to the lower location id.
+
+Each step is its own condition, checked on every pass (D-02): after downtime across one
+or more midnights the passes post and pin one chart for today and finalize and unpin
+every older chart, and a day the worker missed gets no chart (D-03, INV-18, INV-19).
 
 Rendering runs inline in the I/O thread right before its call (D-05), with the location's
 current name and language and the display time zone read at render time (D-14). The
@@ -47,7 +75,15 @@ hold the relay gives an alert's outcome of that kind. On top of that hold, the s
 doubling, at most 15 min. So a failed step's key always outlives its bot's hold, and the
 location's other due steps go first (D-02); and an ambiguous post, which is posted again
 (D-06), slows down to at most 4 untracked photos an hour. Permanent errors and render
-errors wait a fixed 15 min. Nothing here sleeps.
+errors wait a fixed 15 min. A step whose call was made but whose record UPDATE raised a
+database error (refresh, pin, finalize, unpin: all idempotent) waits ``step_delay(n)``
+too, so a write that keeps failing never turns into a call per pass. Nothing here sleeps.
+
+The step keys stay bounded (``RelayState`` lives as long as the worker): each chart step
+first drops every ``chart:`` key that no longer guards a step, i.e. one of a location
+that is not monitored, a post key once today's record exists, a refresh key while it
+does not, a pin key of a record that is pinned or no longer today's, a finalize or unpin
+key of a record that is done or retired. The alert relay's keys are never touched.
 
 Each call logs one INFO line, ``chart <step> for location <id>: <kind> (<code>)
 render_ms=<n> call_ms=<n>``, with no token and no Telegram description (OPS-08).
@@ -61,8 +97,10 @@ from datetime import date, datetime, timedelta
 from typing import Literal
 
 from django.conf import settings
-from django.db import Error, connection
+from django.db import Error, IntegrityError, connection, transaction
 
+from powermon.alerts import ops, outbox
+from powermon.alerts.models import OpsIncident
 from powermon.chart import model, source
 from powermon.chart.models import ChartMessage
 from powermon.clock import Clock
@@ -75,6 +113,13 @@ log = logging.getLogger(__name__)
 
 Step = Literal["post", "pin", "finalize", "unpin", "refresh"]
 
+# The ops_incident kind of a location whose bot may post but not pin (D-07, INV-17 #1).
+KIND_CHART_PIN_FAILED = "chart_pin_failed"
+# Every chart step key starts with this (``chart_key``); no other key does.
+_KEY_PREFIX = "chart:"
+# The HTTP status a pin-failure notice names when the result code carries none.
+_DEFAULT_PIN_STATUS = 400
+
 # Today's chart is due for a refresh this long after its last successful render (D-05).
 REFRESH_EVERY = timedelta(minutes=15)
 # A failed step's own wait: STEP_RETRY after its first consecutive failure, doubling with
@@ -84,10 +129,13 @@ STEP_RETRY_MAX = REFRESH_EVERY
 # Doublings after which STEP_RETRY is past STEP_RETRY_MAX (30 s * 2**5 = 16 min).
 _MAX_DOUBLINGS = 5
 # The steps that render a chart right before their call.
-_RENDERED: tuple[Step, ...] = ("post", "refresh")
-# Outcomes that end a step's tries for now with the fixed 15-min wait. "message to edit
-# not found" waits too until 03-09 retires the record.
+_RENDERED: tuple[Step, ...] = ("post", "refresh", "finalize")
+# Outcomes no retry will change: the message is refused or gone.
 _PERMANENT_KINDS = ("permanent", "edit_target_missing")
+# The cleanup of older records (INV-19): a permanent outcome ends the step for good.
+_CLEANUP: tuple[Step, ...] = ("finalize", "unpin")
+# The steps on today's record: its message gone means today's chart is posted again.
+_TODAYS: tuple[Step, ...] = ("pin", "refresh")
 
 LOCATIONS_SQL = """
 SELECT l.id, l.name, l.language, l.bot_token, l.chat_id
@@ -163,7 +211,7 @@ class Action:
 
 def chart_key(location_id: int, step: Step, row_id: int | None = None) -> str:
     """A chart step's own backoff key in ``RelayState.not_before``: by location, never a token."""
-    key = f"chart:{location_id}:{step}"
+    key = f"{_KEY_PREFIX}{location_id}:{step}"
     return key if row_id is None else f"{key}:{row_id}"
 
 
@@ -215,14 +263,16 @@ def plan(
     """The one chart step due now, or None. Pure: reads nothing but its arguments.
 
     Midnight-class steps go first: locations by ascending id, and the first one with a due
-    step wins; within a location the steps go in D-02 order (post today's chart, then pin
-    it). Only when none is due anywhere, the refresh that has waited longest goes: today's
-    record with the oldest ``last_rendered_at`` at least ``REFRESH_EVERY`` ago, ties to
-    the lower location id (CHRT-02). A step whose own key in ``not_before`` is in the
-    future is skipped, so the next due step goes instead (D-02). The alert relay's
-    backoff is respected, read only: a location whose bot waits (``bot_wide_key``) makes
-    no step, and a step whose channel waits (``chat_key`` of the chat it would call)
-    is skipped (D-06).
+    step wins, so one location's midnight work is done before the next one's starts.
+    Within a location the steps go in D-02 order: post today's chart, pin it, give the
+    oldest older record without one its final edit, unpin the oldest older record still
+    pinned. Only when none is due anywhere, the refresh that has waited longest goes:
+    today's record with the oldest ``last_rendered_at`` at least ``REFRESH_EVERY`` ago,
+    ties to the lower location id (CHRT-02). A step whose own key in ``not_before`` is in
+    the future is skipped, so the next due step goes instead: a failing post never blocks
+    the older charts' cleanup (D-02, INV-19). The alert relay's backoff is respected, read
+    only: a location whose bot waits (``bot_wide_key``) makes no step, and a step whose
+    channel waits (``chat_key`` of the chat it would call) is skipped (D-06).
     """
 
     def waiting(key: str) -> bool:
@@ -233,7 +283,7 @@ def plan(
         if waiting(io_loop.bot_wide_key(location.bot_token)):
             continue
         today_row = _today_row(rows, location.location_id, today)
-        action = _midnight_step(location, today_row, waiting)
+        action = _midnight_step(location, rows, today_row, today, waiting)
         if action is not None:
             return action
         if (
@@ -258,23 +308,44 @@ def _today_row(rows: list[ChartRow], location_id: int, today: date) -> ChartRow 
 
 
 def _midnight_step(
-    location: ChartLocation, today_row: ChartRow | None, waiting: Callable[[str], bool]
+    location: ChartLocation,
+    rows: list[ChartRow],
+    today_row: ChartRow | None,
+    today: date,
+    waiting: Callable[[str], bool],
 ) -> Action | None:
-    """The location's first due step of D-02 (post, pin), or None."""
+    """The location's first due step of D-02 (post, pin, finalize, unpin), or None."""
     location_id = location.location_id
-    token = location.bot_token
     if today_row is None:
         if not waiting(chart_key(location_id, "post")) and not waiting(
-            io_loop.chat_key(token, location.chat_id)
+            io_loop.chat_key(location.bot_token, location.chat_id)
         ):
             return Action("post", location)
-    elif (
-        _pin_due(today_row)
-        and not waiting(chart_key(location_id, "pin", today_row.id))
-        and not waiting(io_loop.chat_key(token, today_row.chat_id))
-    ):
+    elif _pin_due(today_row) and _free(location, "pin", today_row, waiting):
         return Action("pin", location, today_row)
+    older = sorted(
+        (row for row in rows if row.location_id == location_id and row.local_date < today),
+        key=lambda row: (row.local_date, row.id),
+    )
+    for row in older:
+        if row.finalized_at is None and _free(location, "finalize", row, waiting):
+            return Action("finalize", location, row)
+    for row in older:
+        if row.pinned and _free(location, "unpin", row, waiting):
+            return Action("unpin", location, row)
     return None
+
+
+def _free(
+    location: ChartLocation, step: Step, row: ChartRow, waiting: Callable[[str], bool]
+) -> bool:
+    """Neither the step's own key nor the record's channel (the relay's ``chat_key``) waits.
+
+    The channel is the chat stored with the record, which the call goes to (D-04).
+    """
+    return not waiting(chart_key(location.location_id, step, row.id)) and not waiting(
+        io_loop.chat_key(location.bot_token, row.chat_id)
+    )
 
 
 def _pin_due(row: ChartRow) -> bool:
@@ -311,17 +382,25 @@ def chart_content(
 def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | None = None) -> bool:
     """Make the one chart call due now, if any; True if a Telegram call was made.
 
+    First the posts kept after a database error are written (``RelayState.chart_posted``);
+    a database error there propagates before any step is chosen, so no call is made while
+    a kept post is unwritten and no second photo is ever posted for it (WR-04 analogue).
+    Then the snapshot is read and the step keys it no longer needs are dropped.
+
     ``now`` is read once: today's date, the render, its now pill and the caption's update
     time all come from it (CHRT-04, Pitfall 8); the outcome counts from the answer time.
     ``stop`` is checked before the render and again before the call. A render error backs
     off that step only, for 15 min, and makes no call (INV-13 pattern). A database error
-    propagates, except one writing the outcome of a call that was made: that step then
-    waits ``step_delay``, so a write that keeps failing never turns into a call per pass.
+    propagates, except one writing the outcome of a call that was made: a post's is kept,
+    and any other step waits ``step_delay``, so a write that keeps failing never turns
+    into a call per pass.
     """
+    _flush_posted(state)
     now = clock.now()
     tz = settings.CFG.display_tz
     today = model.local_today(now, tz)
     locations, rows = read_snapshot(today)
+    _prune(state, locations, rows, today)
     action = plan(locations, rows, today=today, now=now, not_before=state.not_before)
     if action is None or _stopped(stop):
         return False
@@ -331,7 +410,7 @@ def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | No
     started = clock.monotonic()
     if action.step in _RENDERED:
         try:
-            content = chart_content(location, today, now, live=True, tz=tz)
+            content = _content(action, today, now, tz)
         except Error:
             raise  # the database, not the chart: the pass ends and is retried (MON-06)
         except Exception as exc:
@@ -368,6 +447,20 @@ def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | No
     return True
 
 
+def _content(action: Action, today: date, now: datetime, tz: str) -> tuple[bytes, str]:
+    """The step's render: today's live chart, or an older record's finished day (D-01, D-13).
+
+    A finished day is drawn as of the local midnight that ends it (chart-spec §7), never as
+    of the time the final edit happens to run, so a catch-up after downtime draws the same
+    day as a final edit made at midnight.
+    """
+    row = action.row
+    if action.step == "finalize" and row is not None:
+        end_of_day = model.next_midnight(row.local_date, tz)
+        return chart_content(action.location, row.local_date, end_of_day, live=False, tz=tz)
+    return chart_content(action.location, today, now, live=True, tz=tz)
+
+
 def _call(client: TelegramClient, action: Action, content: tuple[bytes, str] | None) -> SendResult:
     """The step's one Telegram call; a record's own chat is the one called (D-04)."""
     row = action.row
@@ -376,9 +469,12 @@ def _call(client: TelegramClient, action: Action, content: tuple[bytes, str] | N
         return client.send_photo(action.location.chat_id, png, caption)
     if action.step == "pin" and row is not None:
         return client.pin_chat_message(row.chat_id, row.message_id)
-    if action.step == "refresh" and row is not None and content is not None:
+    if action.step in ("refresh", "finalize") and row is not None and content is not None:
         png, caption = content
         return client.edit_message_media(row.chat_id, row.message_id, png, caption)
+    if action.step == "unpin" and row is not None:
+        # By its message id, in its own chat: never the admin's own pins (D-04, INV-19).
+        return client.unpin_chat_message(row.chat_id, row.message_id)
     raise ValueError(f"no call for the chart step {action.step!r}")
 
 
@@ -397,24 +493,149 @@ def _apply(
         result = SendResult("maybe_delivered", code="no_message_id")
     if result.kind == "ok":
         if action.step == "post" and result.message_id is not None:
-            _record_post(action.location, today, result.message_id, answered)
+            _record_or_keep(action.location, today, result.message_id, answered, state)
         elif action.step == "pin" and row is not None:
-            ChartMessage.objects.filter(pk=row.id, pinned=False).update(
-                pinned=True, pin_failed_at=None
-            )
+            _pinned(action.location, row, answered)
         elif action.step == "refresh" and row is not None:
             # "message is not modified" is ok too: the chart shows this render (D-05).
             ChartMessage.objects.filter(pk=row.id, retired_at__isnull=True).update(
                 last_rendered_at=answered
             )
-        # The step is done: its failures and its spent key are forgotten.
-        state.chart_failures.pop(key, None)
-        state.not_before.pop(key, None)
+        elif action.step == "finalize" and row is not None:
+            # Conditional: a repeated or concurrent final edit changes nothing twice.
+            ChartMessage.objects.filter(pk=row.id, finalized_at__isnull=True).update(
+                finalized_at=answered
+            )
+        elif action.step == "unpin" and row is not None:
+            ChartMessage.objects.filter(pk=row.id, pinned=True).update(pinned=False)
+        _step_done(key, state)
+        return
+    if action.step in _CLEANUP and row is not None and result.kind in _PERMANENT_KINDS:
+        _end_cleanup(action, row, result, answered)
+        _step_done(key, state)
+        return
+    if action.step in _TODAYS and row is not None and result.kind == "edit_target_missing":
+        # Today's chart was deleted in the channel: the next pass posts one replacement.
+        _retire(row, answered)
+        log.warning(
+            "chart %s for location %s: record %s is gone from the chat; it is retired and "
+            "today's chart is posted again",
+            action.step,
+            action.location.location_id,
+            row.id,
+        )
+        _step_done(key, state)
         return
     if result.kind == "permanent" and action.step == "pin" and row is not None:
         # The bot may not pin here: tried again after the next render, not before (D-07).
-        ChartMessage.objects.filter(pk=row.id, pinned=False).update(pin_failed_at=answered)
+        _pin_refused(action.location, row, result, answered)
     _fail(action, key, result, answered, state)
+
+
+def _pinned(location: ChartLocation, row: ChartRow, answered: datetime) -> None:
+    """Today's chart is pinned; a pin failure of the location ends with one notice (D-07).
+
+    One transaction: the record's UPDATE, the incident's close and the recovery notice.
+    Only the closer whose UPDATE closed the open incident notifies (INV-20 shape).
+    """
+    location_id = location.location_id
+    with transaction.atomic():
+        ChartMessage.objects.filter(pk=row.id, pinned=False).update(pinned=True, pin_failed_at=None)
+        incident = (
+            OpsIncident.objects.filter(
+                kind=KIND_CHART_PIN_FAILED, location_id=location_id, ended_at__isnull=True
+            )
+            .values_list("id", flat=True)
+            .first()
+        )
+        if incident is not None and ops.close_incident(incident, answered):
+            ops.notify(
+                outbox.KIND_OPS_PIN_RESTORED,
+                payload={},
+                recorded_at=answered,
+                location_id=location_id,
+            )
+
+
+def _pin_refused(
+    location: ChartLocation, row: ChartRow, result: SendResult, answered: datetime
+) -> None:
+    """The bot may post but not pin (INV-17 #1): one notice when pinning starts failing.
+
+    One transaction: ``pin_failed_at``, the incident's open and the start notice. Only
+    the opener that got an incident id back notifies, so a pin refused again after every
+    refresh never repeats the notice (D-07). The channel's alerts are never held.
+    """
+    location_id = location.location_id
+    with transaction.atomic():
+        ChartMessage.objects.filter(pk=row.id, pinned=False).update(pin_failed_at=answered)
+        if ops.open_incident(KIND_CHART_PIN_FAILED, answered, location_id=location_id) is not None:
+            ops.notify(
+                outbox.KIND_OPS_PIN_FAILED,
+                payload={"http_status": _http_status(result.code)},
+                recorded_at=answered,
+                location_id=location_id,
+            )
+
+
+def _http_status(code: str) -> int:
+    """The HTTP status in a client code such as ``http_400``; 400 when it holds none."""
+    digits = code.removeprefix("http_")
+    if digits.isascii() and digits.isdecimal() and 100 <= int(digits) <= 599:
+        return int(digits)
+    return _DEFAULT_PIN_STATUS
+
+
+def _step_done(key: str, state: io_loop.RelayState) -> None:
+    """The step is over: its failure count and its spent key are forgotten."""
+    state.chart_failures.pop(key, None)
+    state.not_before.pop(key, None)
+
+
+def _end_cleanup(action: Action, row: ChartRow, result: SendResult, answered: datetime) -> None:
+    """An older record's final edit or unpin that cannot succeed ends here (INV-19, D-06).
+
+    The message is gone ("message to edit / unpin not found"): a final edit retires the
+    record, with no repost, as it is not today's; an unpin marks it unpinned. Any other
+    permanent error is best effort: the record is marked finalized or unpinned, with one
+    WARNING, so cleanup never loops and never blocks the next step.
+    """
+    location_id = action.location.location_id
+    if action.step == "finalize" and result.kind == "edit_target_missing":
+        _retire(row, answered)
+        log.warning(
+            "chart finalize for location %s: record %s is gone from the chat; it is retired",
+            location_id,
+            row.id,
+        )
+    elif action.step == "finalize":
+        ChartMessage.objects.filter(pk=row.id, finalized_at__isnull=True).update(
+            finalized_at=answered
+        )
+        log.warning(
+            "chart finalize for location %s: permanent error %s for record %s; "
+            "it is marked finalized (best effort)",
+            location_id,
+            result.code,
+            row.id,
+        )
+    else:
+        ChartMessage.objects.filter(pk=row.id, pinned=True).update(pinned=False)
+        if result.kind == "permanent":
+            log.warning(
+                "chart unpin for location %s: permanent error %s for record %s; "
+                "it is marked unpinned (best effort)",
+                location_id,
+                result.code,
+                row.id,
+            )
+
+
+def _retire(row: ChartRow, answered: datetime) -> None:
+    """The record's message is gone: retired and unpinned, never called again (D-06)."""
+    ChartMessage.objects.filter(pk=row.id, retired_at__isnull=True).update(
+        retired_at=answered, pinned=False
+    )
 
 
 def _key(action: Action) -> str:
@@ -440,27 +661,117 @@ def _lease_holds(pid: int | None) -> bool:
         return cur.fetchone() is not None
 
 
-def _record_post(location: ChartLocation, day: date, message_id: int, answered: datetime) -> None:
-    """Record the posted chart before any pin (INV-17); a second record for the day is refused."""
-    with connection.cursor() as cur:
-        cur.execute(
-            INSERT_SQL,
-            {
-                "location_id": location.location_id,
-                "local_date": day,
-                "chat_id": location.chat_id,
-                "message_id": message_id,
-                "answered": answered,
-            },
-        )
-        inserted = cur.fetchone()
+def _record_post(
+    location_id: int, day: date, chat_id: int, message_id: int, answered: datetime
+) -> None:
+    """Record the posted chart before any pin (INV-17); a second record for the day is refused.
+
+    A record that can never be written (an IntegrityError: the location row is gone)
+    leaves the photo untracked, as a refused second record does, with one WARNING. Any
+    other database error propagates: the caller keeps the post and writes it later.
+    """
+    try:
+        with connection.cursor() as cur:
+            cur.execute(
+                INSERT_SQL,
+                {
+                    "location_id": location_id,
+                    "local_date": day,
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "answered": answered,
+                },
+            )
+            inserted = cur.fetchone()
+    except IntegrityError:
+        inserted = None
     if inserted is None:
         log.warning(
-            "chart post for location %s on %s: a record exists; message %s stays untracked",
-            location.location_id,
+            "chart post for location %s on %s: a record exists or the location is gone; "
+            "message %s stays untracked",
+            location_id,
             day,
             message_id,
         )
+
+
+def _record_or_keep(
+    location: ChartLocation,
+    day: date,
+    message_id: int,
+    answered: datetime,
+    state: io_loop.RelayState,
+) -> None:
+    """Record an accepted post now, or keep it for the next chart step (WR-04 analogue).
+
+    Telegram answered with the message id, so the photo exists: it must be recorded, never
+    posted again. A database error keeps (location, date) -> (chat, message, answer time)
+    in ``state.chart_posted``; ``_flush_posted`` writes it before the next step is chosen.
+    """
+    try:
+        _record_post(location.location_id, day, location.chat_id, message_id, answered)
+    except Error as exc:
+        state.chart_posted[(location.location_id, day)] = (location.chat_id, message_id, answered)
+        log.warning(
+            "chart post for location %s: message %s was posted, but its record was not "
+            "written (%s); it is written before the next chart step",
+            location.location_id,
+            message_id,
+            type(exc).__name__,
+        )
+
+
+def _flush_posted(state: io_loop.RelayState) -> None:
+    """Write every kept post, oldest first; a database error stops and propagates.
+
+    Each entry is removed once written, so a flush cut short resumes where it stopped.
+    The kept date is the one the photo was posted for, even after midnight: a post kept
+    at 23:59 becomes that day's record, which the next steps finalize.
+    """
+    for (location_id, day), (chat_id, message_id, answered) in list(state.chart_posted.items()):
+        _record_post(location_id, day, chat_id, message_id, answered)
+        del state.chart_posted[(location_id, day)]
+
+
+def _prune(
+    state: io_loop.RelayState,
+    locations: list[ChartLocation],
+    rows: list[ChartRow],
+    today: date,
+) -> None:
+    """Drop the ``chart:`` keys no step needs any more, so both maps stay bounded.
+
+    ``RelayState`` lives as long as the worker. Without this, every record whose step
+    failed and was then left behind (a pin refused all day, INV-17 #1) would leave a key
+    in ``not_before`` and ``chart_failures`` for good. Only keys that guard no step are
+    dropped (``_live_keys``), so the plan never changes; other keys are never touched.
+    """
+    live = _live_keys(locations, rows, today)
+    for keys in (state.not_before, state.chart_failures):
+        for key in [k for k in keys if k.startswith(_KEY_PREFIX) and k not in live]:
+            del keys[key]
+
+
+def _live_keys(locations: list[ChartLocation], rows: list[ChartRow], today: date) -> set[str]:
+    """Every key that can still guard a step: the steps the snapshot may still make."""
+    monitored = {location.location_id for location in locations}
+    live: set[str] = set()
+    for location_id in monitored:
+        today_row = _today_row(rows, location_id, today)
+        if today_row is None:
+            live.add(chart_key(location_id, "post"))
+            continue
+        live.add(chart_key(location_id, "refresh"))
+        if not today_row.pinned:
+            live.add(chart_key(location_id, "pin", today_row.id))
+    for row in rows:
+        if row.location_id not in monitored or row.local_date >= today:
+            continue
+        if row.finalized_at is None:
+            live.add(chart_key(row.location_id, "finalize", row.id))
+        if row.pinned:
+            live.add(chart_key(row.location_id, "unpin", row.id))
+    return live
 
 
 def _fail(
@@ -470,7 +781,8 @@ def _fail(
 
     With n = the step's consecutive failures, this one included:
 
-    - permanent (and, until 03-09, edit_target_missing): the fixed PERMANENT_BACKOFF;
+    - permanent: the fixed PERMANENT_BACKOFF (a refused pin waits for the next render
+      anyway, D-07; a refused post or refresh for its next try);
     - rate_limited, transient, not_sent (``BOT_WIDE_KINDS``): the bot is held as an
       alert's outcome would hold it (retry_after capped at MAX_RETRY_AFTER_S, or
       min(2**n, BACKOFF_CAP_S) s), and the step waits ``step_delay(n)`` longer, so the
@@ -528,11 +840,11 @@ def _unwritten(
     state: io_loop.RelayState,
     exc: Error,
 ) -> None:
-    """The call was made but its outcome could not be written: the step waits.
+    """The call was made but its record UPDATE could not be written: the step waits.
 
-    A posted photo then stays untracked (never pinned or edited), as after an ambiguous
-    post, and is posted again after ``step_delay``; so a record that keeps failing to be
-    written gives at most a few photos per hour, never one per pass (D-06).
+    For a refresh, pin, final edit or unpin, all idempotent: the call is simply made again
+    after ``step_delay``, so an UPDATE that keeps failing never turns into a call per pass.
+    A post never gets here: its record is kept and written first (``_record_or_keep``).
     """
     failures = state.chart_failures.get(key, 0) + 1
     state.chart_failures[key] = failures
