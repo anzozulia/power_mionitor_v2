@@ -8,6 +8,9 @@ rows come from location_views.switch_rows, in D-05 order: Maintenance, Alerts, R
 Read-only except the switches, each a one-click POST form (CSRF) that posts its target value
 (UI-D3) and redirects back here (UI-D4), and the test message, a one-click POST form whose
 button is the page's only accent button (UI-D15, D-11). No script, no inline style.
+The status panel's last row is Delivery (D-13): "OK" with its help, or the failing indicator
+with the full display_time of the incident's start, the cause line (or the supergroup line)
+and the retry line, from location_views.delivery_row.
 Secrets (SEC-04): no device key appears on this page, not even masked; the bot token only
 in its masked form, in the settings panel.
 {% endcomment %}
@@ -41,6 +44,8 @@ in its masked form, in the settings panel.
   {% endif %}
   <dt>Last heartbeat</dt>
   <dd><span class="num">{{ status.last_heartbeat_at|display_time }}</span></dd>
+  <dt>Delivery</dt>
+  <dd>{% if delivery.failing_since %}<span class="status status--failing">Failing since {{ delivery.failing_since|display_time }} ({{ delivery.code }})</span>{% else %}OK{% endif %}{% for line in delivery.lines %}<p class="help">{{ line }}</p>{% endfor %}</dd>
 </dl>
 
 <h2>Switches</h2>

@@ -3,10 +3,12 @@
 {% comment %}
 Phase 4 UI-SPEC screen A (D-13): read-only, no live refresh. Times go through display_time
 only (P-3: Django's date filter loses the zone name in the repeated DST hour).
-Columns Name, Status, Last heartbeat (UI-D1: no Language column; 04-08 adds Delivery).
+Columns Name, Status, Last heartbeat, Delivery (D-13; UI-D1: no Language column).
 The Status cell holds the status indicator in the Phase 4 vocabulary (Maintenance whenever
 the flag is on), then the tags "Alerts off" and "Router grace", in that order. The flex
 wrapper (.status-cell) is a div inside the cell, so the td stays a real table cell.
+The Delivery cell is "OK" as plain text (no dot), or, while the location's delivery-failing
+incident is open, the failing indicator "Failing since {time} ({code})" (UI-D6 time).
 Phase 2 D-09 (INV-20): while the ops chat is not configured, a warning shows on the empty
 state and on the table.
 {% endcomment %}
@@ -25,6 +27,7 @@ state and on the table.
       <th scope="col">Name</th>
       <th scope="col">Status</th>
       <th scope="col">Last heartbeat</th>
+      <th scope="col">Delivery</th>
     </tr>
   </thead>
   <tbody>
@@ -33,6 +36,7 @@ state and on the table.
       <td><a class="name" href="{% url 'location-detail' row.pk %}">{{ row.name }}</a></td>
       <td><div class="status-cell"><span class="status status--{{ row.status }}">{{ row.status_label }}</span>{% if row.alerts_off %}<span class="tag">Alerts off</span>{% endif %}{% if row.router_grace %}<span class="tag">Router grace</span>{% endif %}</div></td>
       <td class="num">{{ row.last_heartbeat_at|display_time }}</td>
+      <td>{% if row.delivery %}<span class="status status--failing">{{ row.delivery }}</span>{% else %}OK{% endif %}</td>
     </tr>
     {% endfor %}
   </tbody>
