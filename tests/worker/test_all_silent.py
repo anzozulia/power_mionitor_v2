@@ -481,6 +481,55 @@ def test_D04_pitfall7_a_beating_location_in_maintenance_ends_all_silent_at_once(
 
 
 @pytest.mark.django_db(transaction=True)
+def test_D04_a_silence_ended_by_a_heartbeat_never_starts_again(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    """One incident per silence: Pitfall 7 costs one start and one end notice, not a flood.
+
+    After C (in maintenance) ends the incident, A and B are still silent, so the start rule
+    holds again at once, with the same start. Reopening it there would let C's stored
+    heartbeat end it on the next evaluation, then reopen it, and so on: a start and an end
+    notice every detection cycle for as long as A and B stay silent. A silence that was
+    already reported (it starts no later than the last incident) never opens another one;
+    a new silence (an active location beat and fell quiet again) does.
+    """
+    _system(cursor=None, resumed=_at(9, 0))
+    a = _silent(location_factory, "A", _at(11, 0))
+    b = _silent(location_factory, "B", _at(11, 0))
+    c = _silent(location_factory, "C", _at(11, 0), maintenance=True)
+    assert all_silent.evaluate(_at(11, 2)) == "started"
+
+    # C's device keeps beating every 60 s, just before that step's check; the check runs
+    # every 5 s for 10 minutes.
+    outcomes: dict[datetime, str] = {}
+    for at in _steps(_at(11, 2, 5), _at(11, 12), timedelta(seconds=5)):
+        if at.second == 30:
+            assert transitions.record_heartbeat(c.pk, at) == "plain"
+        result = all_silent.evaluate(at)
+        if result is not None:
+            outcomes[at] = result
+
+    assert outcomes == {_at(11, 2, 30): "ended"}
+    assert _incidents() == [(None, _at(11, 0), _at(11, 2, 30))]
+    assert (len(_starts()), len(_ends())) == (1, 1)
+
+    # A new silence is a new incident: A and B beat, then fall quiet again.
+    assert transitions.record_heartbeat(a.pk, _at(11, 12)) == "plain"
+    assert transitions.record_heartbeat(b.pk, _at(11, 12, 10)) == "plain"
+    assert all_silent.evaluate(_at(11, 13, 10)) is None  # B quiet for exactly its period
+    assert all_silent.evaluate(_at(11, 13, 11)) == "started"
+    assert transitions.record_heartbeat(c.pk, _at(11, 13, 30)) == "plain"
+    assert all_silent.evaluate(_at(11, 13, 35)) == "ended"
+
+    assert _incidents() == [
+        (None, _at(11, 0), _at(11, 2, 30)),
+        (None, _at(11, 12, 10), _at(11, 13, 30)),
+    ]
+    assert [row.payload["count"] for row in _starts()] == [2, 2]
+    assert [row.location_id for row in _ends()] == [c.pk, c.pk]
+
+
+@pytest.mark.django_db(transaction=True)
 def test_D04_maintenance_alone_never_closes_all_silent(
     location_factory: Callable[..., Any], ops_settings: Any
 ) -> None:
