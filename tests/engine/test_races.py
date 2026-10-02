@@ -10,7 +10,9 @@ What the races prove:
   heartbeat, so one ON alert (a deterministic hook, plus a barrier stress run).
 - INV-02, overlapping cycles: two detection passes that read the same snapshot record one
   OFF; the second CAS changes 0 rows.
-- "ignored" means only that the location has no state row: nothing is written.
+- D-09 race 1: a heartbeat that waits on the row lock while the admin deletes the
+  location sees the delete once it gets the lock, and restores nothing (LOC-04).
+- "ignored" means the location has no state row or is deleted: nothing is written.
 
 Every writer of a location's state and timeline takes that location's ``location_state``
 row lock first (``SELECT ... FOR UPDATE`` in ``record_heartbeat``, the CAS UPDATE in
@@ -39,6 +41,7 @@ from typing import Any
 
 import pytest
 from conftest import Actor, FakeClock, blocked_on_lock, terminate_backends, wait_for
+from django.db import connection, transaction
 from django.db.backends.utils import CursorWrapper
 from django.test import RequestFactory
 
@@ -46,6 +49,7 @@ from powermon.alerts import texts
 from powermon.alerts.models import OutboxMessage
 from powermon.engine import rules, timeline, transitions
 from powermon.engine.models import LocationState, PowerInterval, SystemState
+from powermon.locations.models import Location
 from powermon.web.views import HeartbeatView
 from powermon.worker import detection
 
@@ -152,12 +156,12 @@ def test_MON04_WR01_heartbeat_during_off_cas_restores(
     monkeypatch: pytest.MonkeyPatch, location_factory: Callable[..., Any]
 ) -> None:
     location = _on_since_1000_silent_after_1005(location_factory)
-    [(snap, _alerts_enabled)] = transitions.read_snapshots()
+    [snap] = transitions.read_snapshots()
     decision = rules.decide(snap, rules.Anchors(detection_resumed_at=_at(9, 0)), _at(10, 6, 31))
     assert (decision.off, decision.outage_start) == (True, _at(10, 5))
     inside, release = _pause_in_set_open_state(monkeypatch, "off")
 
-    off = Actor(lambda: transitions.mark_off(snap, decision, _at(10, 6, 31), True))
+    off = Actor(lambda: transitions.mark_off(snap, decision, _at(10, 6, 31)))
     hb = Actor(lambda: _beat(location, FakeClock(_at(10, 6, 32))))
     try:
         off.start()
@@ -315,11 +319,9 @@ def test_INV02_parallel_restores_stress_one_on_each(
         # Each round gets its own freshly OFF location; earlier ones are never touched again.
         location = location_factory(name=f"Stress {round_no}")
         assert transitions.record_heartbeat(location.pk, _at(10, 0)) == "started"
-        [(snap, alerts_enabled)] = [
-            pair for pair in transitions.read_snapshots() if pair[0].location_id == location.pk
-        ]
+        [snap] = [s for s in transitions.read_snapshots() if s.location_id == location.pk]
         decision = rules.decide(snap, rules.Anchors(detection_resumed_at=_at(9, 0)), _at(10, 1, 31))
-        assert transitions.mark_off(snap, decision, _at(10, 1, 31), alerts_enabled)
+        assert transitions.mark_off(snap, decision, _at(10, 1, 31))
 
         actors = _restore_together(location.pk, (_at(10, 30), _at(10, 30) + offset))
 
@@ -336,9 +338,9 @@ def _detection_pass(now: datetime) -> tuple[int, bool]:
 
     Returns the snapshot's CAS token and whether this pass recorded the OFF.
     """
-    [(snap, alerts_enabled)] = transitions.read_snapshots()
+    [snap] = transitions.read_snapshots()
     decision = rules.decide(snap, rules.Anchors(detection_resumed_at=_at(9, 0)), now)
-    return snap.state_version, transitions.mark_off(snap, decision, now, alerts_enabled)
+    return snap.state_version, transitions.mark_off(snap, decision, now)
 
 
 @pytest.mark.django_db(transaction=True)
@@ -372,6 +374,61 @@ def test_INV02_overlapping_cycles_one_off(
         ("on", _at(10, 0), _at(10, 5), None),
         ("off", _at(10, 5), None, _at(10, 5)),
     ]
+
+
+# D-09 race 1 (RESEARCH Pattern 4, Pitfall 3): a delete commits while a heartbeat that
+# looked up its key earlier waits on the row lock
+
+
+@pytest.mark.django_db(transaction=True)
+def test_D09_heartbeat_waiting_on_the_lock_ignores_a_delete_committed_meanwhile(
+    location_factory: Callable[..., Any],
+) -> None:
+    # Off since 10:05 with its OFF alert queued. The admin's delete (simulated in raw SQL,
+    # in the lock order 04-07's delete_location uses: LOCK_SQL, then the tombstone) holds
+    # the row lock while a restoring heartbeat arrives and waits. After the delete commits,
+    # the heartbeat must not restore the location nor queue an ON alert for it.
+    location = _on_since_1000_silent_after_1005(location_factory)
+    assert detection.run_cycle(_at(10, 6, 31)) == 1
+    before = _state(location)
+    stored = _intervals(location)
+    locked, release = threading.Event(), threading.Event()
+
+    def delete_holding_the_lock() -> None:
+        with transaction.atomic(), connection.cursor() as cur:
+            cur.execute(transitions.LOCK_SQL, [location.pk])
+            cur.execute(
+                "UPDATE location SET deleted_at = %s WHERE id = %s", [_at(10, 59), location.pk]
+            )
+            locked.set()
+            if not release.wait(5):
+                raise AssertionError("the race hook was never released")
+
+    delete = Actor(delete_holding_the_lock)
+    hb = Actor(lambda: transitions.record_heartbeat(location.pk, _at(11, 0)))
+    try:
+        delete.start()
+        assert locked.wait(5)
+        hb.start()
+        assert wait_for(lambda: hb.pid is not None and blocked_on_lock(hb.pid))
+        release.set()
+        delete.join(5)
+        hb.join(5)
+    finally:
+        _finish(delete, hb, release=release)
+
+    assert delete.exc is None, delete.exc
+    assert hb.exc is None, hb.exc
+    assert hb.result == "ignored"
+    state = _state(location)
+    assert (state.status, state.outage_started_at, state.state_version) == (
+        "off",
+        _at(10, 5),
+        before.state_version,
+    )
+    assert _intervals(location) == stored
+    assert _kinds() == ["power_off"]
+    assert Location.objects.get(pk=location.pk).deleted_at == _at(10, 59)
 
 
 # "ignored": no state row, nothing written

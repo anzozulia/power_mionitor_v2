@@ -210,10 +210,10 @@ def test_INV13_error_in_one_location_does_not_stop_others(
     healthy = _silent_since_1005(location_factory)
     real_mark_off = transitions.mark_off
 
-    def mark_off(snap: rules.Snapshot, d: rules.Decision, now: datetime, alerts: bool) -> bool:
+    def mark_off(snap: rules.Snapshot, d: rules.Decision, now: datetime) -> bool:
         if snap.location_id == broken.pk:
             raise RuntimeError("simulated failure for one location")
-        return real_mark_off(snap, d, now, alerts)
+        return real_mark_off(snap, d, now)
 
     monkeypatch.setattr(transitions, "mark_off", mark_off)
     caplog.set_level(logging.ERROR, logger="powermon.worker.detection")
@@ -256,13 +256,11 @@ def test_read_snapshots_lists_only_monitored_on_locations(
     _silent_since_1005(location_factory, maintenance=True)
     location_factory()
 
-    pairs = transitions.read_snapshots()
+    snaps = transitions.read_snapshots()
 
-    assert [(snap.location_id, alerts) for snap, alerts in pairs] == [
-        (quiet.pk, False),
-        (loud.pk, True),
-    ]
-    snap = pairs[1][0]
+    # A snapshot carries no alerts setting: mark_off reads it from its CAS row (D-06).
+    assert [snap.location_id for snap in snaps] == [quiet.pk, loud.pk]
+    snap = snaps[1]
     assert snap == rules.Snapshot(
         location_id=loud.pk,
         state_version=_state(loud).state_version,
@@ -273,7 +271,7 @@ def test_read_snapshots_lists_only_monitored_on_locations(
         grace_s=45,
         router_grace=False,
     )
-    assert pairs[0][0].router_grace is True
+    assert snaps[0].router_grace is True
 
 
 @pytest.mark.django_db(transaction=True)
@@ -281,10 +279,10 @@ def test_mark_off_rejects_a_decision_that_is_not_off(
     location_factory: Callable[..., Any],
 ) -> None:
     location = _silent_since_1005(location_factory)
-    [(snap, _alerts)] = transitions.read_snapshots()
+    [snap] = transitions.read_snapshots()
 
     with pytest.raises(ValueError, match="OFF decision"):
-        transitions.mark_off(snap, rules.Decision(off=False), _at(10, 6, 31), True)
+        transitions.mark_off(snap, rules.Decision(off=False), _at(10, 6, 31))
 
     assert _state(location).status == "on"
     assert _outbox() == []

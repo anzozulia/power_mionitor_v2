@@ -703,10 +703,10 @@ def test_run_cycle_ticks_after_every_location_and_aborts_on_a_dead_connection(
     # location's problem: it is logged and the cycle goes on.
     real_mark_off = transitions.mark_off
 
-    def timing_out(snap: Any, d: Any, now: datetime, alerts_enabled: bool) -> bool:
+    def timing_out(snap: Any, d: Any, now: datetime) -> bool:
         if snap.location_id == first.pk:
             raise OperationalError("canceling statement due to statement timeout")
-        return real_mark_off(snap, d, now, alerts_enabled)
+        return real_mark_off(snap, d, now)
 
     monkeypatch.setattr(transitions, "mark_off", timing_out)
     caplog.set_level(logging.ERROR, logger=detection.__name__)
@@ -720,7 +720,7 @@ def test_run_cycle_ticks_after_every_location_and_aborts_on_a_dead_connection(
     # way, so the loop logs one WARNING instead of one traceback per location.
     fourth = _on_since(location_factory, T0)
 
-    def dying(snap: Any, d: Any, now: datetime, alerts_enabled: bool) -> bool:
+    def dying(snap: Any, d: Any, now: datetime) -> bool:
         _kill_my_session()
         with connection.cursor() as cur:
             cur.execute("SELECT 1")

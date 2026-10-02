@@ -5,9 +5,11 @@ or off, not in maintenance, not deleted) and each of them has gone longer than i
 heartbeat period without a heartbeat, counted from max(last heartbeat, end of the last
 lapse). ``system_state.detection_resumed_at`` is that lapse end. Silence is strict: at
 exactly its period a location is not silent yet. The incident starts at the latest of
-those counting points, the moment the last location fell quiet. It ends when any active
-location's heartbeat arrives after that start. The admin gets exactly one start notice
-and one end notice per incident.
+those counting points, the moment the last location fell quiet. It ends at the first
+heartbeat after that start from any monitored, non-deleted location (status on or off),
+in maintenance or not (D-04): a heartbeat proves the server and network path work, so the
+end candidates are wider than the active set that starts it. The admin gets exactly one
+start notice and one end notice per incident.
 
 No hold (D-01, Pitfall 11): subscriber alerts are untouched. Ukrainian queue blackouts
 really do take several locations off the grid at once, so silence everywhere is either an
@@ -20,7 +22,20 @@ makes every location "not silent" for a period: an end rule of "nobody is silent
 close the incident on every worker restart and open a new one a minute later. Off
 locations stay in the active set because they are monitored; without them the set would
 empty itself as the silent locations time out. When the active set drops below 2 while an
-incident is open, only a heartbeat ends it (Phase 2; Phase 4 decides about maintenance).
+incident is open, only a heartbeat ends it. Putting locations into maintenance or deleting
+them never ends it by itself (D-04), and a deleted or waiting location's heartbeat time
+never ends it. Taken literally, D-04 means a location in maintenance whose device keeps
+beating ends an incident at the next evaluation after its start (Pitfall 7, T-04-14
+accepted): the admin then gets the start and the end notice one evaluation apart.
+
+One incident per silence. Before D-04 an end always came from an active location, whose
+heartbeat broke the silence. A heartbeat from a location in maintenance leaves the active
+locations silent, so the start rule would hold again at once, with the same start, and
+the stored heartbeat would end that incident too: a start and an end notice every cycle
+for as long as the silence lasts. So a silence that starts no later than the latest
+all-silent incident (already reported) opens no second one. A new silence opens one: an
+active location that beat after it, a lapse end or a location that joined the active set
+moves the start later.
 
 Exactly one notice per incident is the database's job (D-11, ARCHITECTURE Pattern 10):
 ``ops.open_incident`` is ``INSERT ... ON CONFLICT DO NOTHING RETURNING id`` against the
@@ -40,6 +55,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from django.db import connection, transaction
+from django.db.models import Max
 
 from powermon.alerts import ops, outbox
 from powermon.alerts.models import OpsIncident
@@ -58,6 +74,17 @@ SELECT s.location_id, l.period_s, s.last_heartbeat_at
   FROM location_state s
   JOIN location l ON l.id = s.location_id
  WHERE s.status IN ('on', 'off') AND NOT l.maintenance AND l.deleted_at IS NULL
+ ORDER BY s.location_id
+"""
+
+# The end candidates (D-04): every monitored, non-deleted location, in maintenance or not.
+# ACTIVE_SQL's columns in the same order, without the maintenance filter: a heartbeat from
+# a location in maintenance ends an open incident, while ACTIVE_SQL still drives the start.
+END_SQL = """
+SELECT s.location_id, l.period_s, s.last_heartbeat_at
+  FROM location_state s
+  JOIN location l ON l.id = s.location_id
+ WHERE s.status IN ('on', 'off') AND l.deleted_at IS NULL
  ORDER BY s.location_id
 """
 
@@ -124,14 +151,15 @@ def evaluate(now: datetime) -> str | None:
     """Start or end all-silent at ``now``: "started", "ended" or None (D-01, D-11, D-12).
 
     One transaction. With an open all-silent incident, the first heartbeat after its start
-    closes it at that heartbeat and queues (or logs) one end notice naming that location.
-    With none open, a started silence opens one at its start time and queues one start
-    notice with the number of active locations. The notice is sent only by the evaluation
-    whose open or close changed the database, so concurrent or repeated evaluations give
-    at most one notice each way.
+    from any end candidate (``_end_candidates``: monitored and not deleted, maintenance
+    included, D-04) closes it at that heartbeat and queues (or logs) one end notice naming
+    that location. With none open, a started silence among the active locations
+    (``_active``: not in maintenance either) opens one at its start time and queues one
+    start notice with the number of active locations. The notice is sent only by the
+    evaluation whose open or close changed the database, so concurrent or repeated
+    evaluations give at most one notice each way.
     """
     with transaction.atomic():
-        rows = _active()
         incident = (
             OpsIncident.objects.filter(
                 kind=KIND_ALL_SILENT, location__isnull=True, ended_at__isnull=True
@@ -140,17 +168,32 @@ def evaluate(now: datetime) -> str | None:
             .first()
         )
         if incident is not None:
-            return _end(incident[0], incident[1], rows, now)
+            return _end(incident[0], incident[1], _end_candidates(), now)
         lapse_end = (
             SystemState.objects.filter(pk=1).values_list("detection_resumed_at", flat=True).first()
         )
-        return _start(rows, lapse_end, now)
+        reported = OpsIncident.objects.filter(
+            kind=KIND_ALL_SILENT, location__isnull=True
+        ).aggregate(latest=Max("started_at"))["latest"]
+        return _start(_active(), lapse_end, now, reported)
 
 
-def _start(rows: Sequence[Active], lapse_end: datetime | None, now: datetime) -> str | None:
-    """Open the incident at the silence's start, with one notice, if silence has started."""
+def _start(
+    rows: Sequence[Active],
+    lapse_end: datetime | None,
+    now: datetime,
+    reported: datetime | None = None,
+) -> str | None:
+    """Open the incident at the silence's start, with one notice, if a new silence started.
+
+    ``reported`` is the start of the latest all-silent incident. A silence that starts no
+    later than that was already reported, and its incident has ended: it opens no second
+    one (one incident per silence, D-04).
+    """
     since = silence_since(rows, lapse_end, now)
-    if since is None or ops.open_incident(KIND_ALL_SILENT, since) is None:
+    if since is None or (reported is not None and since <= reported):
+        return None
+    if ops.open_incident(KIND_ALL_SILENT, since) is None:
         return None
     ops.notify(
         outbox.KIND_OPS_ALL_SILENT_START,
@@ -184,6 +227,14 @@ def _end(incident_id: int, since: datetime, rows: Sequence[Active], now: datetim
 
 
 def _active() -> list[Active]:
+    """The active locations, which start an incident (ACTIVE_SQL)."""
     with connection.cursor() as cur:
         cur.execute(ACTIVE_SQL)
+        return [Active(*row) for row in cur.fetchall()]
+
+
+def _end_candidates() -> list[Active]:
+    """The locations whose heartbeat ends an incident, maintenance included (END_SQL, D-04)."""
+    with connection.cursor() as cur:
+        cur.execute(END_SQL)
         return [Active(*row) for row in cur.fetchall()]

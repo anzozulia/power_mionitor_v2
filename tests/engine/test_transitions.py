@@ -10,6 +10,12 @@ heartbeat's receive time, so the relay can send it at once (audit A2). An OFF is
 recorded from the open interval's start when a lapse carve moved that start past the
 decided outage start (D2), so it never closes an interval before its start.
 
+Whether an alert is sent is decided when its transition is recorded (INV-05, D-06): the
+OFF reads alerts_enabled from its own CAS UPDATE (Phase 1 WR-05), never from the
+detector's snapshot, and a transition recorded while alerts are off queues nothing, for
+good ("suppressed, not queued"). INV-05 #2 runs end to end, through detection, the
+heartbeat gate, the outbox and the relay.
+
 Tests that reach OFF through ``detection.run_cycle`` are ``django_db(transaction=True)``:
 the cycle calls ``close_old_connections()``, which would close the connection inside
 pytest-django's per-test transaction.
@@ -21,13 +27,14 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from conftest import DEFAULT_BOT_TOKEN, FakeClock
+from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, FakeClock
 from django.db import IntegrityError, connection, transaction
 
 from powermon.alerts import texts
 from powermon.alerts.models import OutboxMessage
 from powermon.engine import lapse, rules, timeline, transitions
 from powermon.engine.models import LocationState, PowerInterval, SystemState
+from powermon.locations.models import Location
 from powermon.worker import detection, io_loop
 
 Interval = tuple[str, datetime, datetime | None, datetime | None]
@@ -151,6 +158,149 @@ def test_restore_with_alerts_off_queues_nothing(location_factory: Callable[..., 
         ("off", _at(10, 5), _at(11, 0), _at(10, 5)),
         ("on", _at(11, 0), None, None),
     ]
+
+
+# Alerts on or off is decided when the transition is recorded (INV-05, D-06; Phase 1
+# WR-05). The OFF reads alerts_enabled from its own CAS row, never from the detector's
+# snapshot, and a transition recorded while alerts are off queues nothing, for good.
+
+
+def _silent_after_1005(location_factory: Callable[..., Any], **overrides: Any) -> Any:
+    """K-2: heartbeats every 60 s from 10:00:00 to 10:05:00, detection resumed at 09:00."""
+    SystemState.objects.update_or_create(
+        pk=1, defaults={"detection_resumed_at": _at(9, 0), "web_started_at": None}
+    )
+    location = location_factory(**overrides)
+    for minute in range(6):
+        transitions.record_heartbeat(location.pk, _at(10, minute))
+    return location
+
+
+def _set_alerts(location: Any, enabled: bool) -> None:
+    """The admin's alerts toggle: one configuration column, nothing else (D-05)."""
+    assert Location.objects.filter(pk=location.pk).update(alerts_enabled=enabled) == 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV05_2_alerts_off_at_off_and_on_before_restore_sends_only_on(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    # INV-05 #2: alerts are off when the OFF is recorded and back on before power returns.
+    location = _silent_after_1005(location_factory)
+    _set_alerts(location, False)
+
+    assert detection.run_cycle(_at(10, 6, 31)) == 1
+    # The OFF is recorded (state and timeline), but with alerts off it queues nothing.
+    assert LocationState.objects.get(pk=location.pk).status == "off"
+    assert _kinds() == []
+
+    _set_alerts(location, True)
+    assert transitions.record_heartbeat(location.pk, _at(11, 0)) == "restored"
+
+    [on] = OutboxMessage.objects.all()
+    assert (on.kind, on.payload) == ("power_on", {"was_off_us": 3_300_000_000})
+    fake_telegram.accept(DEFAULT_BOT_TOKEN)
+    assert io_loop.run_iteration(FakeClock(_at(11, 0, 5)), io_loop.RelayState()) is True
+    # Exactly one Telegram call in total, and it is the ON alert: the OFF is never sent.
+    assert len(fake_telegram.calls) == 1
+    assert fake_telegram.sent == [
+        {
+            "chat_id": DEFAULT_CHAT_ID,
+            "text": "🟢 <b>POWER ON</b>\n⚡ Power was OFF for: <b>55m</b>",
+            "parse_mode": "HTML",
+        }
+    ]
+    assert OutboxMessage.objects.get(pk=on.pk).status == "sent"
+    assert _intervals(location) == [
+        ("on", _at(10, 0), _at(10, 5), None),
+        ("off", _at(10, 5), _at(11, 0), _at(10, 5)),
+        ("on", _at(11, 0), None, None),
+    ]
+
+
+@pytest.mark.django_db
+def test_WR05_alert_decision_comes_from_the_cas_not_the_snapshot(
+    location_factory: Callable[..., Any],
+) -> None:
+    # The detector reads its snapshot while alerts are on; the admin turns them off before
+    # the OFF transaction runs. The OFF is recorded with the setting of that moment: off.
+    location = _silent_after_1005(location_factory)
+    [snap] = transitions.read_snapshots()
+    decision = rules.decide(snap, rules.Anchors(detection_resumed_at=_at(9, 0)), _at(10, 6, 31))
+    _set_alerts(location, False)
+
+    assert transitions.mark_off(snap, decision, _at(10, 6, 31)) is True
+
+    state = LocationState.objects.get(pk=location.pk)
+    assert (state.status, state.outage_started_at) == ("off", _at(10, 5))
+    assert _kinds() == []
+    assert _intervals(location)[-1] == ("off", _at(10, 5), None, _at(10, 5))
+
+
+@pytest.mark.django_db
+def test_WR05_alerts_turned_on_after_the_snapshot_queue_the_off_alert(
+    location_factory: Callable[..., Any],
+) -> None:
+    # The mirror case: the snapshot is read while alerts are off, the admin turns them on,
+    # then the OFF is recorded. Alerts are on at that moment, so the OFF alert is queued.
+    location = _silent_after_1005(location_factory, alerts_enabled=False)
+    [snap] = transitions.read_snapshots()
+    decision = rules.decide(snap, rules.Anchors(detection_resumed_at=_at(9, 0)), _at(10, 6, 31))
+    _set_alerts(location, True)
+
+    assert transitions.mark_off(snap, decision, _at(10, 6, 31)) is True
+
+    [off] = OutboxMessage.objects.all()
+    assert (off.kind, off.location_id, off.event_at, off.recorded_at) == (
+        "power_off",
+        location.pk,
+        _at(10, 5),
+        _at(10, 6, 31),
+    )
+    assert off.payload == {"was_on_us": 300_000_000}
+
+
+@pytest.mark.django_db
+def test_WR05_a_lost_cas_writes_nothing_whatever_the_alerts_setting(
+    location_factory: Callable[..., Any],
+) -> None:
+    # A heartbeat between the snapshot and the CAS bumps state_version: the CAS returns no
+    # row, so the stale OFF is skipped and its alerts setting is never read (INV-01).
+    location = _silent_after_1005(location_factory, alerts_enabled=False)
+    [snap] = transitions.read_snapshots()
+    decision = rules.decide(snap, rules.Anchors(detection_resumed_at=_at(9, 0)), _at(10, 6, 31))
+    _set_alerts(location, True)
+    assert transitions.record_heartbeat(location.pk, _at(10, 6, 32)) == "plain"
+
+    assert transitions.mark_off(snap, decision, _at(10, 6, 31)) is False
+
+    state = LocationState.objects.get(pk=location.pk)
+    assert (state.status, state.outage_started_at) == ("on", None)
+    assert _kinds() == []
+    assert _intervals(location) == [("on", _at(10, 0), None, None)]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV05_alerts_turned_back_on_never_replay_a_suppressed_off(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    # "Suppressed, not queued" (PROJECT.md, D-06): an OFF recorded while alerts are off is
+    # never held for later. Turning alerts back on sends nothing for it, on any later pass.
+    location = _silent_after_1005(location_factory, alerts_enabled=False)
+    assert detection.run_cycle(_at(10, 6, 31)) == 1
+
+    _set_alerts(location, True)
+    # Later cycles see an off location: there is nothing to decide, nothing to queue.
+    assert detection.run_cycle(_at(10, 7, 31)) == 0
+    fake_telegram.accept(DEFAULT_BOT_TOKEN)
+    state = io_loop.RelayState()
+
+    assert io_loop.run_iteration(FakeClock(_at(10, 7, 32)), state) is False
+    assert io_loop.run_iteration(FakeClock(_at(11, 0)), state) is False
+
+    assert LocationState.objects.get(pk=location.pk).status == "off"
+    assert not OutboxMessage.objects.exists()
+    assert len(fake_telegram.calls) == 0
 
 
 @pytest.mark.django_db(transaction=True)
@@ -309,7 +459,7 @@ def _on_since_0800_carved_until_1010(location: Any) -> None:
 
 
 def _decided(resumed: datetime, now: datetime) -> tuple[rules.Snapshot, rules.Decision]:
-    [(snap, _alerts_enabled)] = transitions.read_snapshots()
+    [snap] = transitions.read_snapshots()
     decision = rules.decide(snap, rules.Anchors(detection_resumed_at=resumed), now)
     assert decision.off
     return snap, decision
@@ -339,7 +489,7 @@ def test_D2_mark_off_keeps_the_decided_outage_start_in_the_normal_case(
     assert decision.outage_start == start
     caplog.set_level(logging.WARNING, logger=transitions.__name__)
 
-    assert transitions.mark_off(snap, decision, _at(10, 11, 31), True) is True
+    assert transitions.mark_off(snap, decision, _at(10, 11, 31)) is True
 
     assert LocationState.objects.get(pk=location.pk).outage_started_at == start
     assert _intervals(location)[-2:] == [previous, ("off", start, None, start)]
@@ -362,7 +512,7 @@ def test_D2_mark_off_starts_the_off_where_a_later_carve_moved_the_open_piece(
     caplog.set_level(logging.WARNING, logger=transitions.__name__)
 
     # Before D2 this closed the open piece before its start: power_interval_end_after_start.
-    assert transitions.mark_off(snap, decision, _at(10, 11, 31), True) is True
+    assert transitions.mark_off(snap, decision, _at(10, 11, 31)) is True
 
     state = LocationState.objects.get(pk=location.pk)
     assert (state.status, state.outage_started_at) == ("off", moved)
@@ -451,6 +601,64 @@ def test_record_heartbeat_for_an_unknown_location_writes_no_interval(
     assert transitions.record_heartbeat(10**9, fixed_now) == "ignored"
 
     assert not PowerInterval.objects.exists()
+
+
+# A deleted location is never revived by a heartbeat (LOC-04, D-09). The heartbeat lookup
+# already skips deleted locations; a heartbeat that looked up its key before the delete
+# reaches the gate and must change nothing. The race itself is in test_races.py.
+
+
+@pytest.mark.django_db(transaction=True)
+def test_heartbeat_for_a_deleted_location_is_ignored(location_factory: Callable[..., Any]) -> None:
+    location = _off_since_1005(location_factory)
+    sibling = _off_since_1005(location_factory, name="Not deleted")
+    Location.objects.filter(pk=location.pk).update(deleted_at=_at(10, 30))
+    before = LocationState.objects.filter(pk=location.pk).values().get()
+    stored = _intervals(location)
+    queued = _kinds()
+
+    assert transitions.record_heartbeat(location.pk, _at(11, 0)) == "ignored"
+
+    # Nothing changes: no restore, no interval, no ON alert for a deleted location.
+    assert LocationState.objects.filter(pk=location.pk).values().get() == before
+    assert before["status"] == "off"
+    assert _intervals(location) == stored
+    assert _kinds() == queued == ["power_off", "power_off"]
+    # A location that is not deleted still restores normally, with its ON alert.
+    assert transitions.record_heartbeat(sibling.pk, _at(11, 0)) == "restored"
+    assert _kinds() == ["power_off", "power_off", "power_on"]
+    assert OutboxMessage.objects.get(kind="power_on").location_id == sibling.pk
+
+
+@pytest.mark.django_db
+def test_heartbeat_for_a_deleted_waiting_location_opens_no_interval(
+    location_factory: Callable[..., Any], fixed_now: datetime
+) -> None:
+    # A location deleted before its first heartbeat reached the gate: monitoring never starts.
+    location = location_factory(deleted_at=fixed_now)
+
+    assert transitions.record_heartbeat(location.pk, _at(8, 1)) == "ignored"
+
+    state = LocationState.objects.get(pk=location.pk)
+    assert (state.status, state.on_since, state.last_heartbeat_at) == ("waiting", None, None)
+    assert not PowerInterval.objects.exists()
+    assert _kinds() == []
+
+
+@pytest.mark.django_db
+def test_heartbeat_for_a_deleted_location_that_is_on_changes_nothing(
+    location_factory: Callable[..., Any], fixed_now: datetime
+) -> None:
+    location = location_factory()
+    assert transitions.record_heartbeat(location.pk, fixed_now) == "started"
+    Location.objects.filter(pk=location.pk).update(deleted_at=_at(8, 30))
+    before = LocationState.objects.filter(pk=location.pk).values().get()
+
+    assert transitions.record_heartbeat(location.pk, _at(9, 0)) == "ignored"
+
+    # Not even the heartbeat time or the CAS token moves.
+    assert LocationState.objects.filter(pk=location.pk).values().get() == before
+    assert _intervals(location) == [("on", _at(8, 0), None, None)]
 
 
 @pytest.mark.django_db

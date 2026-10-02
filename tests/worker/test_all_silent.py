@@ -14,6 +14,10 @@ What these scenarios prove:
 - the edges: silence is strict at exactly one period; only active locations count; the end
   names the earliest heartbeat, the lowest id on a tie; a lapse carve never ends it; a
   restarted worker sends no second start;
+- D-04: the start still counts only active locations, but the end is the first heartbeat
+  after the start from any monitored, non-deleted location, in maintenance or not; putting
+  locations into maintenance or deleting them never ends it by itself (Pitfall 7: a
+  location in maintenance whose device keeps beating ends it at the next evaluation);
 - exactly once (D-11): two evaluations at once open one incident and send one notice, and
   two at once close it with one notice (the partial unique index and the conditional
   close, not a code convention);
@@ -40,7 +44,7 @@ from django.db import InterfaceError, OperationalError, connection
 from powermon.alerts import ops, outbox
 from powermon.alerts.models import OpsIncident, OutboxMessage
 from powermon.engine import all_silent, lapse, transitions
-from powermon.engine.models import SystemState
+from powermon.engine.models import LocationState, SystemState
 from powermon.locations.models import Location
 from powermon.worker import detection
 
@@ -398,6 +402,205 @@ def test_all_silent_end_tie_breaks_by_lowest_id(
     assert a.pk < b.pk
     assert end.location_id == a.pk
     assert _render(end) == "✅ Heartbeats are back (first: A, 14:03:00); all-silent lasted 3m."
+
+
+# D-04 (Phase 4): maintenance and deletion. The start still counts only active locations;
+# the end is the first heartbeat after the start from any monitored, non-deleted location,
+# in maintenance or not, because a heartbeat proves the server and network path work.
+# Putting locations into maintenance or deleting them never closes the incident by itself.
+
+
+def _started_with_a_and_b(location_factory: Callable[..., Any]) -> tuple[Any, Any]:
+    """A and B active, last heartbeats at 11:00; all-silent started at the 11:02 check."""
+    _system(cursor=None, resumed=_at(9, 0))
+    a = _silent(location_factory, "A", _at(11, 0))
+    b = _silent(location_factory, "B", _at(11, 0))
+    assert all_silent.evaluate(_at(11, 2)) == "started"
+    return a, b
+
+
+@pytest.mark.django_db(transaction=True)
+def test_D04_a_heartbeat_from_a_location_in_maintenance_ends_all_silent(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    """C is in maintenance: it never counts for the start, but its heartbeat ends it.
+
+    Pitfall 7, D-04 taken literally: a heartbeat from a location in maintenance proves the
+    server and network path work, so it ends the incident like any other heartbeat.
+    """
+    _system(cursor=None, resumed=_at(9, 0))
+    a = _silent(location_factory, "A", _at(11, 0))
+    _silent(location_factory, "B", _at(11, 0))
+    c = _silent(location_factory, "C", _at(11, 0), maintenance=True)
+    assert all_silent.evaluate(_at(11, 2)) == "started"
+    [start] = _starts()
+    assert start.payload == {"since_us": ops.instant_us(_at(11, 0)), "count": 2}
+
+    assert transitions.record_heartbeat(c.pk, _at(11, 3)) == "plain"
+    assert all_silent.evaluate(_at(11, 3, 5)) == "ended"
+
+    [end] = _ends()
+    assert end.location_id == c.pk != a.pk
+    assert end.payload == {
+        "since_us": ops.instant_us(_at(11, 0)),
+        "first_us": ops.instant_us(_at(11, 3)),
+    }
+    assert _render(end) == "✅ Heartbeats are back (first: C, 14:03:00); all-silent lasted 3m."
+    assert _incidents() == [(None, _at(11, 0), _at(11, 3))]
+    assert all_silent.evaluate(_at(11, 3, 10)) is None
+    assert len(_ends()) == 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_D04_pitfall7_a_beating_location_in_maintenance_ends_all_silent_at_once(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    """Pitfall 7: the admin gets a start and an end notice one evaluation apart.
+
+    D-04 is applied literally (a locked decision, T-04-14 accepted): C is in maintenance
+    and its device keeps beating, so its last heartbeat already lies after the start when
+    the incident opens, and the next evaluation ends it at that heartbeat.
+    """
+    _system(cursor=None, resumed=_at(9, 0))
+    _silent(location_factory, "A", _at(11, 0))
+    _silent(location_factory, "B", _at(11, 0))
+    c = _silent(location_factory, "C", _at(11, 0), maintenance=True)
+    assert transitions.record_heartbeat(c.pk, _at(11, 1, 30)) == "plain"
+
+    assert all_silent.evaluate(_at(11, 2)) == "started"
+    assert all_silent.evaluate(_at(11, 2, 5)) == "ended"
+
+    [end] = _ends()
+    assert end.location_id == c.pk
+    assert end.payload["first_us"] == ops.instant_us(_at(11, 1, 30))
+    assert _incidents() == [(None, _at(11, 0), _at(11, 1, 30))]
+    assert [row.kind for row in _ops_rows()] == [
+        outbox.KIND_OPS_ALL_SILENT_START,
+        outbox.KIND_OPS_ALL_SILENT_END,
+    ]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_D04_a_silence_ended_by_a_heartbeat_never_starts_again(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    """One incident per silence: Pitfall 7 costs one start and one end notice, not a flood.
+
+    After C (in maintenance) ends the incident, A and B are still silent, so the start rule
+    holds again at once, with the same start. Reopening it there would let C's stored
+    heartbeat end it on the next evaluation, then reopen it, and so on: a start and an end
+    notice every detection cycle for as long as A and B stay silent. A silence that was
+    already reported (it starts no later than the last incident) never opens another one;
+    a new silence (an active location beat and fell quiet again) does.
+    """
+    _system(cursor=None, resumed=_at(9, 0))
+    a = _silent(location_factory, "A", _at(11, 0))
+    b = _silent(location_factory, "B", _at(11, 0))
+    c = _silent(location_factory, "C", _at(11, 0), maintenance=True)
+    assert all_silent.evaluate(_at(11, 2)) == "started"
+
+    # C's device keeps beating every 60 s, just before that step's check; the check runs
+    # every 5 s for 10 minutes.
+    outcomes: dict[datetime, str] = {}
+    for at in _steps(_at(11, 2, 5), _at(11, 12), timedelta(seconds=5)):
+        if at.second == 30:
+            assert transitions.record_heartbeat(c.pk, at) == "plain"
+        result = all_silent.evaluate(at)
+        if result is not None:
+            outcomes[at] = result
+
+    assert outcomes == {_at(11, 2, 30): "ended"}
+    assert _incidents() == [(None, _at(11, 0), _at(11, 2, 30))]
+    assert (len(_starts()), len(_ends())) == (1, 1)
+
+    # A new silence is a new incident: A and B beat, then fall quiet again.
+    assert transitions.record_heartbeat(a.pk, _at(11, 12)) == "plain"
+    assert transitions.record_heartbeat(b.pk, _at(11, 12, 10)) == "plain"
+    assert all_silent.evaluate(_at(11, 13, 10)) is None  # B quiet for exactly its period
+    assert all_silent.evaluate(_at(11, 13, 11)) == "started"
+    assert transitions.record_heartbeat(c.pk, _at(11, 13, 30)) == "plain"
+    assert all_silent.evaluate(_at(11, 13, 35)) == "ended"
+
+    assert _incidents() == [
+        (None, _at(11, 0), _at(11, 2, 30)),
+        (None, _at(11, 12, 10), _at(11, 13, 30)),
+    ]
+    assert [row.payload["count"] for row in _starts()] == [2, 2]
+    assert [row.location_id for row in _ends()] == [c.pk, c.pk]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_D04_maintenance_alone_never_closes_all_silent(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    a, b = _started_with_a_and_b(location_factory)
+
+    # The admin puts both silent locations into maintenance: no heartbeat, no end.
+    Location.objects.filter(pk__in=[a.pk, b.pk]).update(maintenance=True)
+    assert all_silent.evaluate(_at(11, 3)) is None
+    assert all_silent.evaluate(_at(11, 30)) is None
+    assert _incidents() == [(None, _at(11, 0), None)]
+    assert _ends() == []
+
+    # Only a heartbeat ends it, and one from a location in maintenance does (D-04).
+    assert transitions.record_heartbeat(b.pk, _at(11, 31)) == "plain"
+    assert all_silent.evaluate(_at(11, 31, 5)) == "ended"
+    [end] = _ends()
+    assert (end.location_id, end.payload["first_us"]) == (b.pk, ops.instant_us(_at(11, 31)))
+
+
+@pytest.mark.django_db(transaction=True)
+def test_D04_deletion_alone_never_closes_all_silent(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    a, b = _started_with_a_and_b(location_factory)
+    # A beats after the start, then the admin deletes it before the next check.
+    assert transitions.record_heartbeat(a.pk, _at(11, 2, 30)) == "plain"
+    Location.objects.filter(pk=a.pk).update(deleted_at=_at(11, 2, 40))
+
+    # A deleted location's heartbeat never ends it, and the delete closes nothing by
+    # itself, even though only one active location is left.
+    assert all_silent.evaluate(_at(11, 3)) is None
+    assert all_silent.evaluate(_at(11, 30)) is None
+    assert _incidents() == [(None, _at(11, 0), None)]
+    assert _ends() == []
+
+    assert transitions.record_heartbeat(b.pk, _at(11, 31)) == "plain"
+    assert all_silent.evaluate(_at(11, 31, 5)) == "ended"
+    [end] = _ends()
+    assert end.location_id == b.pk
+
+
+@pytest.mark.django_db(transaction=True)
+def test_D04_waiting_location_never_ends_all_silent(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    _started_with_a_and_b(location_factory)
+    # A waiting location is not monitored yet: even with a heartbeat time on its row (none
+    # is ever written while it waits), it is not an end candidate.
+    waiting = location_factory(name="W")
+    LocationState.objects.filter(pk=waiting.pk).update(last_heartbeat_at=_at(11, 3))
+
+    assert all_silent.evaluate(_at(11, 3, 5)) is None
+    assert _incidents() == [(None, _at(11, 0), None)]
+    assert _ends() == []
+
+
+@pytest.mark.django_db(transaction=True)
+def test_D04_start_rule_unchanged(location_factory: Callable[..., Any], ops_settings: Any) -> None:
+    _system(cursor=None, resumed=_at(9, 0))
+    _silent(location_factory, "A", _at(11, 0))
+    m = _silent(location_factory, "M", _at(11, 0), maintenance=True)
+    # One active silent location and one in maintenance: maintenance never counts.
+    assert all_silent.evaluate(_at(11, 2)) is None
+
+    _silent(location_factory, "B", _at(11, 0))
+    assert all_silent.evaluate(_at(11, 2)) == "started"
+
+    [start] = _starts()
+    assert start.payload == {"since_us": ops.instant_us(_at(11, 0)), "count": 2}
+    assert _render(start).startswith("⚠️ All 2 active locations silent since 14:00")
+    assert LocationState.objects.get(pk=m.pk).status == "on"
 
 
 # Exactly one notice each way, enforced by the database (D-11)

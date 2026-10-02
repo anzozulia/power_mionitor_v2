@@ -137,10 +137,11 @@ def run_cycle(now: datetime, tick: Callable[[], None] | None = None) -> int:
         web_started_at=system.web_started_at,
     )
     recorded = 0
-    for snap, alerts_enabled in transitions.read_snapshots():
+    for snap in transitions.read_snapshots():
         try:
             decision = rules.decide(snap, anchors, now)
-            if decision.off and transitions.mark_off(snap, decision, now, alerts_enabled):
+            # mark_off decides the OFF alert from its own CAS row, not from the snapshot.
+            if decision.off and transitions.mark_off(snap, decision, now):
                 recorded += 1
         except OperationalError, InterfaceError:
             if not connection.is_usable():
