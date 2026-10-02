@@ -201,6 +201,8 @@ def test_INV24_1_regeneration_kills_the_old_key_and_keeps_history(
     assert f'<a class="btn btn--secondary" href="/locations/{location.pk}/setup/">Hide key</a>' in (
         page
     )
+    # E7 loading: the regenerated page is server-rendered, with no script.
+    assert "<script" not in page
     # Only that location's key changed.
     assert _key(other) == other.device_key
 

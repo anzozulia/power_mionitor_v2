@@ -486,3 +486,19 @@ def test_router_grace_switch_refuses_a_bad_value_a_get_and_an_unknown_location(
     assert _ctid(location) == row
     assert not Location.objects.filter(router_grace=True).exists()
     assert len(fake_telegram.calls) == 0
+
+
+@pytest.mark.django_db
+def test_alerts_and_router_grace_switches_need_the_signed_in_admin(
+    client: Client, location_factory: Callable[..., Any]
+) -> None:
+    # T-04-20: LoginRequiredMiddleware denies by default; neither switch is login-exempt.
+    location = location_factory()
+    row = _ctid(location)
+
+    for url, value in ((_alerts(location), "off"), (_router_grace(location), "on")):
+        response = client.post(url, {"value": value})
+        assert response.status_code == 302
+        assert response.url == f"/login/?next={url}"
+
+    assert _ctid(location) == row
