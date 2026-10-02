@@ -221,6 +221,7 @@ def _row(
         pin_failed_at=pin_failed_at,
         last_rendered_at=rendered,
         finalized_at=None,
+        unpinned_at=None,
     )
 
 
@@ -768,6 +769,12 @@ def test_INV19_plan_unpins_an_older_record_not_known_to_be_pinned() -> None:
     # Its own key still holds it, as for any step.
     held = {lifecycle.chart_key(1, "unpin", 10): NOON_05 + timedelta(seconds=30)}
     assert lifecycle.plan([a], rows, today=TODAY, now=NOON_05, not_before=held) is None
+    # Once its unpin was made, it gets no second one, pinned flag or not.
+    for pinned in (False, True):
+        done = dataclasses.replace(older, pinned=pinned, unpinned_at=NOON_05)
+        assert lifecycle.plan([a], [done, rows[1]], today=TODAY, now=NOON_05, not_before={}) is (
+            None
+        )
 
 
 def test_plan_final_edit_waits_for_its_day_and_never_holds_the_unpin() -> None:
@@ -784,7 +791,7 @@ def test_plan_final_edit_waits_for_its_day_and_never_holds_the_unpin() -> None:
         [a], rows, today=TODAY, now=NOON_05, not_before={}, settled={10}
     ) == lifecycle.Action("finalize", a, older)
     # A settled id of a record that is not older (today's) changes nothing.
-    done = dataclasses.replace(older, pinned=False, finalized_at=NOON_05)
+    done = dataclasses.replace(older, pinned=False, finalized_at=NOON_05, unpinned_at=NOON_05)
     assert (
         lifecycle.plan([a], [done, rows[1]], today=TODAY, now=NOON_05, not_before={}, settled={11})
         is None

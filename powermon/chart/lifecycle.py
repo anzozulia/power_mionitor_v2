@@ -43,10 +43,16 @@ worker was down is simply due on the next pass.
   (``system_state.last_cycle_completed_at``) is the location's ``settle`` past the
   midnight that ends it (``settle_time``, ``settled_records``). The cursor, not the wall
   clock, so a detection stall or a lapse across midnight holds the final edit too.
-- Unpin: every older record still pinned is unpinned by its own message id in its own
-  chat, oldest first, and nothing else is ever unpinned (D-04, INV-19). It does not wait
-  for the final edit: today's chart is pinned and the older one unpinned within seconds
-  (D-02), and the final edit follows once the day has settled.
+- Unpin: every older record gets exactly one unpin by its own message id in its own chat,
+  oldest first, and nothing else is ever unpinned (D-04, INV-19). It is made whatever
+  ``pinned`` says: a pin whose answer was ambiguous, whose outcome could not be written,
+  or that a crash cut off may have taken effect while the record says "not pinned", and
+  the record must not leave the lifecycle with its pin in place (T-03-27). Unpinning a
+  message that is not pinned is "not modified" (ok) or "not found", so it costs at most
+  one call per location and day. ``unpinned_at`` records that it was made. It does not
+  wait for the final edit: today's chart is pinned and the older one unpinned within
+  seconds (D-02), and the final edit follows once the day has settled. An older record
+  leaves the lifecycle once it is finalized and unpinned (or retired).
 - Cleanup of older records never blocks and never loops (INV-19): a permanent error on a
   final edit or an unpin marks the record finalized or unpinned anyway (best effort, one
   WARNING); an older chart deleted in the channel ("not found") is retired with no
@@ -92,8 +98,9 @@ too, so a write that keeps failing never turns into a call per pass. Nothing her
 The step keys stay bounded (``RelayState`` lives as long as the worker): each chart step
 first drops every ``chart:`` key that no longer guards a step, i.e. one of a location
 that is not monitored, a post key once today's record exists, a refresh key while it
-does not, a pin key of a record that is pinned or no longer today's, a finalize or unpin
-key of a record that is done or retired. The alert relay's keys are never touched.
+does not, a pin key of a record that is pinned or no longer today's (an older record's
+pin is never retried: its one unpin follows instead), a finalize or unpin key of a record
+that is done or retired. The alert relay's keys are never touched.
 
 Each call logs one INFO line, ``chart <step> for location <id>: <kind> (<code>)
 render_ms=<n> call_ms=<n>``, with no token and no Telegram description (OPS-08).
@@ -157,23 +164,25 @@ SELECT l.id, l.name, l.language, l.bot_token, l.chat_id, l.period_s, l.grace_s, 
  WHERE s.status IN ('on', 'off') AND l.deleted_at IS NULL
  ORDER BY l.id
 """
-# Today's active records, and older ones that still need their final edit or an unpin.
+# Today's active records, and older ones that still need their final edit or their unpin
+# (whether or not they are known pinned, INV-19).
 ROWS_SQL = """
 SELECT id, location_id, local_date, chat_id, message_id, pinned, pin_failed_at,
-       last_rendered_at, finalized_at
+       last_rendered_at, finalized_at, unpinned_at
   FROM chart_message
  WHERE retired_at IS NULL
-   AND (local_date = %(today)s OR (local_date < %(today)s AND (finalized_at IS NULL OR pinned)))
+   AND (local_date = %(today)s
+        OR (local_date < %(today)s AND (finalized_at IS NULL OR unpinned_at IS NULL)))
  ORDER BY local_date, id
 """
 # The record of a posted chart, written right after the send succeeded (INV-17). A second
 # active record for the same day is refused by chart_message_one_active_per_day.
 INSERT_SQL = """
 INSERT INTO chart_message (location_id, local_date, chat_id, message_id, pinned,
-                           pin_failed_at, last_rendered_at, finalized_at, retired_at,
-                           created_at)
+                           pin_failed_at, last_rendered_at, finalized_at, unpinned_at,
+                           retired_at, created_at)
 VALUES (%(location_id)s, %(local_date)s, %(chat_id)s, %(message_id)s, false,
-        NULL, %(answered)s, NULL, NULL, %(answered)s)
+        NULL, %(answered)s, NULL, NULL, NULL, %(answered)s)
 ON CONFLICT DO NOTHING RETURNING id
 """
 # The C1 fence: the lease session holds the worker lock right now (outbox.CLAIM_HELD_SQL).
@@ -214,6 +223,8 @@ class ChartRow:
     pin_failed_at: datetime | None
     last_rendered_at: datetime
     finalized_at: datetime | None
+    # The older record's one unpin was made (INV-19); None until then.
+    unpinned_at: datetime | None
 
 
 @dataclass(frozen=True)
@@ -322,6 +333,7 @@ def read_snapshot(today: date) -> tuple[list[ChartLocation], list[ChartRow]]:
                 pin_failed_at=r[6],
                 last_rendered_at=r[7],
                 finalized_at=r[8],
+                unpinned_at=r[9],
             )
             for r in cur.fetchall()
         ]
@@ -342,8 +354,9 @@ def plan(
     Midnight-class steps go first: locations by ascending id, and the first one with a due
     step wins, so one location's midnight work is done before the next one's starts.
     Within a location the steps go in D-02 order: post today's chart, pin it, give the
-    oldest older record without one its final edit, unpin the oldest older record still
-    pinned. A final edit is due only for a record in ``settled`` (``settled_records``: its
+    oldest older record without one its final edit, unpin the oldest older record not
+    unpinned yet, whatever ``pinned`` says (its pin may have taken effect unrecorded,
+    INV-19). A final edit is due only for a record in ``settled`` (``settled_records``: its
     day's timeline is complete, INV-03); one not due yet never holds the unpin, so two
     charts are pinned for seconds only. Only when none is due anywhere, the refresh that
     has waited longest goes: today's record with the oldest ``last_rendered_at`` at least
@@ -397,7 +410,8 @@ def _midnight_step(
 ) -> Action | None:
     """The location's first due step of D-02 (post, pin, finalize, unpin), or None.
 
-    A final edit is due only once its record's day has settled (``settled``).
+    A final edit is due only once its record's day has settled (``settled``). Every older
+    record gets its one unpin, pinned or not as far as the record knows (INV-19).
     """
     location_id = location.location_id
     if today_row is None:
@@ -419,7 +433,7 @@ def _midnight_step(
         ):
             return Action("finalize", location, row)
     for row in older:
-        if row.pinned and _free(location, "unpin", row, waiting):
+        if row.unpinned_at is None and _free(location, "unpin", row, waiting):
             return Action("unpin", location, row)
     return None
 
@@ -601,7 +615,8 @@ def _apply(
                 finalized_at=answered
             )
         elif action.step == "unpin" and row is not None:
-            ChartMessage.objects.filter(pk=row.id, pinned=True).update(pinned=False)
+            # Also "not modified": the message was not pinned (its pin never took effect).
+            _unpinned(row, answered)
         _step_done(key, state)
         return
     if action.step in _CLEANUP and row is not None and result.kind in _PERMANENT_KINDS:
@@ -630,11 +645,15 @@ def _pinned(location: ChartLocation, row: ChartRow, answered: datetime) -> None:
     """Today's chart is pinned; a pin failure of the location ends with one notice (D-07).
 
     One transaction: the record's UPDATE, the incident's close and the recovery notice.
-    Only the closer whose UPDATE closed the open incident notifies (INV-20 shape).
+    Only the closer whose UPDATE closed the open incident notifies (INV-20 shape). A
+    record pinned again after its unpin (the wall clock stepped back across midnight)
+    owes a new unpin, so ``unpinned_at`` is cleared (INV-19).
     """
     location_id = location.location_id
     with transaction.atomic():
-        ChartMessage.objects.filter(pk=row.id, pinned=False).update(pinned=True, pin_failed_at=None)
+        ChartMessage.objects.filter(pk=row.id, pinned=False).update(
+            pinned=True, pin_failed_at=None, unpinned_at=None
+        )
         incident = (
             OpsIncident.objects.filter(
                 kind=KIND_CHART_PIN_FAILED, location_id=location_id, ended_at__isnull=True
@@ -690,9 +709,10 @@ def _end_cleanup(action: Action, row: ChartRow, result: SendResult, answered: da
     """An older record's final edit or unpin that cannot succeed ends here (INV-19, D-06).
 
     The message is gone ("message to edit / unpin not found"): a final edit retires the
-    record, with no repost, as it is not today's; an unpin marks it unpinned. Any other
-    permanent error is best effort: the record is marked finalized or unpinned, with one
-    WARNING, so cleanup never loops and never blocks the next step.
+    record, with no repost, as it is not today's; an unpin marks it unpinned (its one
+    unpin is done; a final edit still due finds the message gone and retires it). Any
+    other permanent error is best effort: the record is marked finalized or unpinned, with
+    one WARNING, so cleanup never loops and never blocks the next step.
     """
     location_id = action.location.location_id
     if action.step == "finalize" and result.kind == "edit_target_missing":
@@ -714,7 +734,7 @@ def _end_cleanup(action: Action, row: ChartRow, result: SendResult, answered: da
             row.id,
         )
     else:
-        ChartMessage.objects.filter(pk=row.id, pinned=True).update(pinned=False)
+        _unpinned(row, answered)
         if result.kind == "permanent":
             log.warning(
                 "chart unpin for location %s: permanent error %s for record %s; "
@@ -723,6 +743,16 @@ def _end_cleanup(action: Action, row: ChartRow, result: SendResult, answered: da
                 result.code,
                 row.id,
             )
+
+
+def _unpinned(row: ChartRow, answered: datetime) -> None:
+    """The older record's one unpin is done (INV-19): not pinned, never unpinned again.
+
+    Conditional: a repeated or concurrent outcome changes nothing twice.
+    """
+    ChartMessage.objects.filter(pk=row.id, unpinned_at__isnull=True).update(
+        pinned=False, unpinned_at=answered
+    )
 
 
 def _retire(row: ChartRow, answered: datetime) -> None:
@@ -863,7 +893,7 @@ def _live_keys(locations: list[ChartLocation], rows: list[ChartRow], today: date
             continue
         if row.finalized_at is None:
             live.add(chart_key(row.location_id, "finalize", row.id))
-        if row.pinned:
+        if row.unpinned_at is None:
             live.add(chart_key(row.location_id, "unpin", row.id))
     return live
 

@@ -771,3 +771,39 @@ def test_INV19_pinned_chart_is_unpinned_exactly_once(
     assert not _in_play(older)
     pinned = ChartMessage.objects.filter(pinned=True).values_list("message_id", flat=True)
     assert list(pinned) == [900]
+
+
+def test_INV19_a_chart_pinned_again_after_its_unpin_owes_a_new_one(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    # The wall clock stepped back across midnight: a chart already unpinned is today's
+    # again, so it is pinned again, and then it must be unpinned again after midnight.
+    location = _monitored(location_factory)
+    record = ChartMessage.objects.create(
+        location=location,
+        local_date=TODAY,
+        chat_id=DEFAULT_CHAT_ID,
+        message_id=900,
+        pinned=False,
+        last_rendered_at=NOON_05,
+        unpinned_at=NOON_05,
+        created_at=NOON_05,
+    )
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+
+    assert _pass(clock, state) is True
+    record.refresh_from_db()
+    assert (record.pinned, record.unpinned_at) == (True, None)
+    clock.set(kyiv("2026-10-03 00:00:05"))
+    assert _run_until_idle(clock, state) == 3
+
+    assert _chart(fake_telegram) == [
+        ("pinChatMessage", 900),
+        ("sendPhoto", None),
+        ("pinChatMessage", 1001),
+        ("unpinChatMessage", 900),
+    ]
+    record.refresh_from_db()
+    assert (record.pinned, record.unpinned_at) == (False, kyiv("2026-10-03 00:00:05"))

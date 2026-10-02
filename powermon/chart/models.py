@@ -6,7 +6,9 @@ message id Telegram gave it. The worker writes the row right after a successful 
 before any pin (INV-17), so a pinned chart always has a record and a pin never leaves an
 orphan behind. ``pinned`` is a separate field, set only once the pin succeeded. Every
 later edit, pin and unpin targets the chat stored here, never the location's current
-chat (D-04).
+chat (D-04). A pin may take effect while ``pinned`` stays false (an ambiguous answer, an
+outcome that could not be written), so every older record gets one unpin whatever
+``pinned`` says, and ``unpinned_at`` records that it was made (INV-19, 03-09).
 
 The partial unique index ``chart_message_one_active_per_day`` allows at most one active
 (not retired) row per location and local date, so a second post for a day can never be
@@ -48,6 +50,8 @@ class ChartMessage(models.Model):
     last_rendered_at = models.DateTimeField()
     # The finished-day edit is done (03-09).
     finalized_at = models.DateTimeField(null=True)
+    # The older record's one unpin is done, pinned or not before it (INV-19, 03-09).
+    unpinned_at = models.DateTimeField(null=True)
     # The message is gone ("not found", 03-09); the day may get a new record.
     retired_at = models.DateTimeField(null=True)
     created_at = models.DateTimeField()
