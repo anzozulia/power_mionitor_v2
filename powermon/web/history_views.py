@@ -51,6 +51,12 @@ OUTAGE_GONE_MESSAGE = (
     "This outage is no longer in the history: it was already removed, or the history was "
     "reset. Nothing changed."
 )
+# 05-UI-SPEC Copywriting › Flashes › Removal deferred (amended 2026-10-03, wave-1 audit
+# W1-A1), verbatim: the outage's OFF alert is being sent; POST only.
+REMOVAL_DEFERRED_MESSAGE = (
+    "An alert about this outage is being sent to the channel right now. Nothing changed. "
+    "Try again in a minute."
+)
 # 05-UI-SPEC Copywriting › Flashes, verbatim.
 HISTORY_RESET_MESSAGE = (
     "History reset. The location waits for its next heartbeat, which restarts monitoring "
@@ -84,8 +90,10 @@ class OutageRemoveView(View):
     outage". It writes nothing; an outage that is gone or in progress redirects to the
     location page with the POST's flash (UI5-D7). POST runs ``history.remove_outage`` (one
     transaction under the row lock, no network I/O) and redirects to the location page
-    with the success, info or error flash for its result. The 14-day window limits the
-    list only: any ended outage of the location can be removed (UI5-D14).
+    with the success, info or error flash for its result. While the outage's OFF alert is
+    being sent the POST writes nothing and says so (info, "Removal deferred"); the GET does
+    not check this, because the attempt settles within seconds (W1-A1). The 14-day window
+    limits the list only: any ended outage of the location can be removed (UI5-D14).
     """
 
     template_name = "web/outage_remove.html"
@@ -123,6 +131,8 @@ class OutageRemoveView(View):
             messages.success(request, OUTAGE_REMOVED_MESSAGE.format(start=f"{day} {minute}"))
         elif result == "in_progress":
             messages.error(request, REMOVAL_REFUSED_MESSAGE)
+        elif result == "sending":
+            messages.info(request, REMOVAL_DEFERRED_MESSAGE)
         else:
             messages.info(request, OUTAGE_GONE_MESSAGE)
         return redirect("location-detail", pk=pk)
