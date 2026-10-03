@@ -518,6 +518,58 @@ def test_restart_after_restore_rejects_a_naive_now() -> None:
         restore.restart_after_restore(datetime(2026, 10, 1, 10, 20))  # noqa: DTZ001
 
 
+def test_post_restore_refuses_in_build_mode(
+    location_factory: Callable[..., Any], monkeypatch: pytest.MonkeyPatch, settings: Any
+) -> None:
+    _system(cursor=_at(10, 0), resumed=_at(7, 0))
+    _on_since_8(location_factory)
+    before = _snapshot()
+    settings.CFG = dataclasses.replace(settings.CFG, build=True)
+
+    with pytest.raises(CommandError, match="build mode"):
+        _post_restore(monkeypatch)
+
+    assert _snapshot() == before
+
+
+def test_D13_status_is_read_again_under_the_row_lock(
+    location_factory: Callable[..., Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # As if, after the ids were read, one location went back to waiting and another lost
+    # its state row: under the row lock both are skipped, with nothing written.
+    _system(cursor=_at(10, 0), resumed=_at(7, 0))
+    on = _on_since_8(location_factory, name="On location")
+    waiting = location_factory(name="Waiting location")
+    stateless = location_factory(name="No state row")
+    LocationState.objects.filter(pk=stateless.pk).delete()
+    monkeypatch.setattr(restore, "MONITORED_SQL", "SELECT id FROM location ORDER BY id")
+    waiting_before = LocationState.objects.filter(pk=waiting.pk).values().get()
+
+    assert restore.restart_after_restore(NOW) == restore.RestoreCounts(1, 0, 0)
+
+    assert LocationState.objects.filter(pk=waiting.pk).values().get() == waiting_before
+    assert not LocationState.objects.filter(pk=stateless.pk).exists()
+    assert not PowerInterval.objects.exclude(location=on).exists()
+    assert _state(on)[0] == "waiting"
+
+
+def test_D13_location_without_an_open_interval_only_waits(
+    location_factory: Callable[..., Any],
+) -> None:
+    # A monitored status with no open interval (nothing to mark as not monitored): the
+    # location only goes back to waiting, and no interval is written.
+    _system(cursor=_at(10, 0), resumed=_at(7, 0))
+    location = location_factory()
+    LocationState.objects.filter(pk=location.pk).update(
+        status="on", on_since=_at(8, 0), last_heartbeat_at=_at(10, 0)
+    )
+
+    assert restore.restart_after_restore(NOW) == restore.RestoreCounts(1, 0, 0)
+
+    assert _state(location) == ("waiting", None, None, None, None)
+    assert _intervals(location) == []
+
+
 # RESEARCH Pitfall 3: the FIRST gate after a restore
 
 
