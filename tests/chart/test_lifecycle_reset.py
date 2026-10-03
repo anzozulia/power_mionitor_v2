@@ -158,6 +158,61 @@ def _no_unpin_all(fake: Any) -> bool:
     return not any(call.request.url.endswith("/unpinAllChatMessages") for call in fake.calls)
 
 
+def _location(
+    location_id: int = 1,
+    token: str = DEFAULT_BOT_TOKEN,
+    chat_id: int = DEFAULT_CHAT_ID,
+    *,
+    deleted: bool = False,
+    awaiting_heartbeat: bool = False,
+) -> lifecycle.ChartLocation:
+    """A location as the planner sees it: period 60 s, grace 30 s."""
+    settle = lifecycle.settle_time(60, 30, False)
+    return lifecycle.ChartLocation(
+        location_id,
+        f"L{location_id}",
+        "en",
+        token,
+        chat_id,
+        settle,
+        deleted=deleted,
+        awaiting_heartbeat=awaiting_heartbeat,
+    )
+
+
+def _row(
+    row_id: int,
+    location_id: int = 1,
+    *,
+    day: date = TODAY,
+    chat_id: int = DEFAULT_CHAT_ID,
+    token: str = DEFAULT_BOT_TOKEN,
+    pinned: bool = True,
+    rendered: datetime = NOON_05,
+    history_reset_at: datetime | None = None,
+) -> lifecycle.ChartRow:
+    """A record of ``location_id`` in ``chat_id``, posted by the bot ``token``."""
+    return lifecycle.ChartRow(
+        id=row_id,
+        location_id=location_id,
+        local_date=day,
+        chat_id=chat_id,
+        message_id=1000 + row_id,
+        pinned=pinned,
+        pin_failed_at=None,
+        last_rendered_at=rendered,
+        finalized_at=None,
+        unpinned_at=None,
+        bot_key=io_loop.bot_key(token),
+        history_reset_at=history_reset_at,
+    )
+
+
+def _keys_of(location_id: int, keys: set[str]) -> set[str]:
+    """The chart step keys of one location."""
+    return {key for key in keys if key.startswith(f"chart:{location_id}:")}
+
+
 # INV-19 (reset), D-08: the old chart is unpinned in its own chat while the location waits
 # (tracer)
 
@@ -260,3 +315,225 @@ def test_unmarked_waiting_location_makes_no_chart_call(
     assert lifecycle.read_snapshot(TODAY)[0] == []
     record.refresh_from_db()
     assert (record.retired_at, record.pinned, record.history_reset_at) == (None, True, None)
+
+
+# stale(): a reset-marked record is released whatever its channel (D-08)
+
+
+def test_D08_stale_when_the_record_is_reset_marked() -> None:
+    location = _location()
+
+    # The location's own chat and bot: unmarked it is the location's, marked it is released.
+    assert lifecycle.stale(location, _row(10)) is False
+    assert lifecycle.stale(location, _row(10, history_reset_at=NOON_05)) is True
+    assert lifecycle.stale(location, _row(11, day=YESTERDAY, history_reset_at=NOON_05)) is True
+    # The marker alone decides: a waiting location's unmarked record is not stale.
+    waiting = _location(awaiting_heartbeat=True)
+    assert lifecycle.stale(waiting, _row(10)) is False
+    assert lifecycle.stale(waiting, _row(10, history_reset_at=NOON_05)) is True
+
+
+# plan(): a waiting location makes releases only, oldest first (D-08, Pitfall 1)
+
+
+def test_D08_plan_waiting_location_only_releases() -> None:
+    waiting = _location(awaiting_heartbeat=True)
+    # Today's record is not pinned and due for a refresh, yesterday's day has settled and
+    # it was never unpinned: a monitored location would pin, refresh, finalize and unpin.
+    today_row = _row(
+        10, pinned=False, rendered=NOON_05 - timedelta(hours=1), history_reset_at=NOON_05
+    )
+    older = _row(9, day=YESTERDAY, rendered=NOON_05 - timedelta(days=1), history_reset_at=NOON_05)
+    rows = [today_row, older]
+    later = NOON_05 + timedelta(seconds=30)
+    older_held = {lifecycle.chart_key(1, "release", 9): later}
+    both_held = {**older_held, lifecycle.chart_key(1, "release", 10): later}
+
+    # The older record first, though its final edit is due (no final edit, D-08).
+    assert lifecycle.plan(
+        [waiting], rows, today=TODAY, now=NOON_05, not_before={}, settled={9}
+    ) == lifecycle.Action("release", waiting, older)
+    # Its release backing off lets today's record go.
+    assert lifecycle.plan(
+        [waiting], rows, today=TODAY, now=NOON_05, not_before=older_held, settled={9}
+    ) == lifecycle.Action("release", waiting, today_row)
+    # Both backing off: no step at all for the location.
+    assert (
+        lifecycle.plan([waiting], rows, today=TODAY, now=NOON_05, not_before=both_held, settled={9})
+        is None
+    )
+    # Never a post, pin, refresh, final edit or unpin, whatever is left or held.
+    for not_before in ({}, older_held, both_held):
+        for left in (rows, [today_row], [older], []):
+            action = lifecycle.plan(
+                [waiting], left, today=TODAY, now=NOON_05, not_before=not_before, settled={9}
+            )
+            assert action is None or action.step == "release"
+
+
+def test_D08_plan_waiting_location_without_stale_rows_plans_nothing() -> None:
+    # RESEARCH Pitfall 1: the release retired the last marked record between the
+    # snapshot's two reads, so the waiting location comes without rows.
+    waiting = _location(awaiting_heartbeat=True)
+
+    assert lifecycle.plan([waiting], [], today=TODAY, now=NOON_05, not_before={}) is None
+    assert _keys_of(1, lifecycle._live_keys([waiting], [], TODAY)) == set()
+    # Pitfall 12: a post in flight at the reset was recorded unmarked. It is not stale, and
+    # the waiting location still makes no step: no pin, no refresh.
+    unmarked = _row(10, pinned=False, rendered=NOON_05 - timedelta(hours=1))
+    assert lifecycle.plan([waiting], [unmarked], today=TODAY, now=NOON_05, not_before={}) is None
+    assert _keys_of(1, lifecycle._live_keys([waiting], [unmarked], TODAY)) == set()
+    # Another location's chart work goes on meanwhile.
+    other = _location(2)
+    assert lifecycle.plan(
+        [waiting, other], [], today=TODAY, now=NOON_05, not_before={}
+    ) == lifecycle.Action("post", other)
+    assert lifecycle._live_keys([waiting, other], [], TODAY) == {lifecycle.chart_key(2, "post")}
+
+
+def test_D08_live_keys_keep_a_backing_off_release() -> None:
+    waiting = _location(awaiting_heartbeat=True)
+    marked = _row(10, history_reset_at=NOON_05)
+    release = lifecycle.chart_key(1, "release", 10)
+    post = lifecycle.chart_key(1, "post")
+    later = NOON_05 + timedelta(seconds=30)
+
+    assert lifecycle._live_keys([waiting], [marked], TODAY) == {release}
+    # The prune keeps the release's backoff and drops the location's other keys.
+    state = io_loop.RelayState()
+    state.not_before.update({release: later, post: later})
+    state.chart_failures.update({release: 1, post: 1})
+    lifecycle._prune(state, [waiting], [marked], TODAY)
+    assert (state.not_before, state.chart_failures) == ({release: later}, {release: 1})
+    # On again (the first heartbeat) with the marked record still active: the same.
+    on_again = _location()
+    assert lifecycle._live_keys([on_again], [marked], TODAY) == {release}
+    # Once the record is retired (it leaves the snapshot), today's post key is live.
+    assert lifecycle._live_keys([on_again], [], TODAY) == {post}
+
+
+def test_existing_lifecycle_rows_and_locations_build_with_the_new_defaults() -> None:
+    # The Phase 3/4 tests build both without the new fields: they default to "not reset"
+    # and "not waiting", and nothing changes for them.
+    settle = lifecycle.settle_time(60, 30, False)
+    location = lifecycle.ChartLocation(1, "L1", "en", DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, settle)
+    row = lifecycle.ChartRow(
+        id=10,
+        location_id=1,
+        local_date=TODAY,
+        chat_id=DEFAULT_CHAT_ID,
+        message_id=1010,
+        pinned=True,
+        pin_failed_at=None,
+        last_rendered_at=NOON_05 - timedelta(hours=1),
+        finalized_at=None,
+        unpinned_at=None,
+        bot_key=io_loop.bot_key(DEFAULT_BOT_TOKEN),
+    )
+
+    assert (location.deleted, location.awaiting_heartbeat) == (False, False)
+    assert row.history_reset_at is None
+    assert [f.name for f in dataclasses.fields(row)][-1] == "history_reset_at"
+    assert lifecycle.stale(location, row) is False
+    assert lifecycle.plan(
+        [location], [row], today=TODAY, now=NOON_05, not_before={}
+    ) == lifecycle.Action("refresh", location, row)
+
+
+# read_snapshot(): a waiting location is in it only while it has a marked record (D-08)
+
+
+@DB
+def test_D08_snapshot_keeps_a_waiting_location_only_while_it_has_a_marked_record(
+    location_factory: Callable[..., Any],
+) -> None:
+    live = _monitored(location_factory)
+    reset = _monitored(location_factory)
+    marked = _seed(reset, message_id=501)
+    _reset_by_hand(reset, NOON_05)
+    # Waiting after a restore (05-03): its record is not marked, so it is not in it.
+    restored = _monitored(location_factory)
+    _seed(restored, message_id=601)
+    _reset_by_hand(restored, NOON_05, mark=False)
+    # Waiting with no record at all (never monitored): not in it either.
+    location_factory()
+
+    locations, rows = lifecycle.read_snapshot(TODAY)
+
+    assert [(loc.location_id, loc.deleted, loc.awaiting_heartbeat) for loc in locations] == [
+        (live.pk, False, False),
+        (reset.pk, False, True),
+    ]
+    reset_rows = [row for row in rows if row.location_id == reset.pk]
+    assert [(row.id, row.history_reset_at) for row in reset_rows] == [(marked.pk, NOON_05)]
+    assert [row.history_reset_at for row in rows if row.location_id != reset.pk] == [None]
+    # The release retires the marked record: the waiting location leaves the snapshot.
+    ChartMessage.objects.filter(pk=marked.pk).update(retired_at=NOON_05, pinned=False)
+    locations, rows = lifecycle.read_snapshot(TODAY)
+    assert [(loc.location_id, loc.awaiting_heartbeat) for loc in locations] == [(live.pk, False)]
+    assert [row.location_id for row in rows] == [restored.pk]
+
+
+@DB
+def test_D08_snapshot_ignores_marked_records_outside_the_rows_predicate(
+    location_factory: Callable[..., Any],
+) -> None:
+    # A marked older record already finalized and unpinned is done: no release is owed.
+    finished = _monitored(location_factory)
+    done = _seed(finished, YESTERDAY, message_id=501, pinned=False)
+    ChartMessage.objects.filter(pk=done.pk).update(finalized_at=NOON_05, unpinned_at=NOON_05)
+    # A marked record already retired: gone.
+    retired = _monitored(location_factory)
+    gone = _seed(retired, message_id=601)
+    ChartMessage.objects.filter(pk=gone.pk).update(retired_at=NOON_05, pinned=False)
+    # A marked older record finalized but not unpinned yet: still owed its release.
+    unpinning = _monitored(location_factory)
+    owed = _seed(unpinning, YESTERDAY, message_id=701)
+    ChartMessage.objects.filter(pk=owed.pk).update(finalized_at=NOON_05)
+    for location in (finished, retired, unpinning):
+        _reset_by_hand(location, NOON_05)
+    ChartMessage.objects.update(history_reset_at=NOON_05)
+
+    locations, rows = lifecycle.read_snapshot(TODAY)
+
+    assert [(loc.location_id, loc.awaiting_heartbeat) for loc in locations] == [
+        (unpinning.pk, True)
+    ]
+    assert [row.message_id for row in rows] == [701]
+
+
+# An older marked record is released with one unpin and never finalized (D-08, INV-19)
+
+
+@DB
+def test_D08_older_marked_record_is_released_not_finalized(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    location = _monitored(location_factory)
+    # Yesterday's chart: pinned, not finalized, its day long settled (``_pass``).
+    yesterday = _seed(location, YESTERDAY, message_id=501, rendered=kyiv("2026-10-01 23:45"))
+    today = _seed(location, message_id=502)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    _reset_by_hand(location, NOON_05)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+
+    passes = []
+    while True:
+        start = len(fake_telegram.chart_calls)
+        if not _pass(clock, state):
+            break
+        passes.append(_calls(fake_telegram)[start:])
+        assert len(passes) < 10
+
+    # One unpin per pass, yesterday's first; no final edit, and nothing after them.
+    assert passes == [
+        [("unpinChatMessage", DEFAULT_CHAT_ID, 501)],
+        [("unpinChatMessage", DEFAULT_CHAT_ID, 502)],
+    ]
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "editMessageMedia") == 0
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "sendPhoto") == 0
+    for record in (yesterday, today):
+        record.refresh_from_db()
+        assert (record.retired_at, record.pinned, record.finalized_at) == (NOON_05, False, None)
+    assert _no_unpin_all(fake_telegram)
