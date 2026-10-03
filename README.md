@@ -139,8 +139,10 @@ Optional settings:
   the charts are posted, and of the DST change (section 14).
 - `BACKUP_KEEP`: how many nightly dumps are kept, 1 to 365 (default 14).
 
-A `BACKUP_TIME_UTC` or `BACKUP_KEEP` of the wrong shape stops the `backup` service, and its
-log names the variable (`docker compose -f docker-compose.prod.yml logs backup`).
+A `BACKUP_TIME_UTC` or `BACKUP_KEEP` of the wrong shape makes no dump and keeps the
+`backup` service restarting (`docker compose -f docker-compose.prod.yml ps` shows
+`Restarting`), and each attempt's log names the variable
+(`docker compose -f docker-compose.prod.yml logs backup`).
 
 ## 5. Deploy
 
