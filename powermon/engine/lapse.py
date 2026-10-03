@@ -62,8 +62,10 @@ LAPSE_THRESHOLD = timedelta(seconds=15)
 CLOCK_STEP_LIMIT_S = 5.0
 KIND_MONITORING_GAP = "monitoring_gap"
 
-# Every location whose timeline may hold monitored time: on or off and not deleted
-# ("waiting" has no intervals, and a location in maintenance is skipped by overwrite).
+# Every location whose timeline may hold monitored time: on or off and not deleted. A
+# waiting location is not carved: before its first heartbeat it has no monitored time.
+# After a restore it can hold an open not_monitored piece (D-13), which its first
+# heartbeat closes. A location in maintenance is skipped by overwrite.
 CARVE_LOCATIONS_SQL = """
 SELECT s.location_id
   FROM location_state s
