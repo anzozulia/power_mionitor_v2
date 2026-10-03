@@ -10,10 +10,12 @@ after the outage brings an ON alert. Each channel also gets a pinned weekly char
 power was on and off, with daily totals, that updates itself (section 10, Weekly chart).
 One admin manages the locations in a small web panel: add, edit and delete them, pause
 them for maintenance, switch their alerts off, rotate a device key, send a test message,
-and see which locations cannot deliver alerts (section 10, Location page).
+see which locations cannot deliver alerts (section 10, Location page), and remove a false
+outage or reset a location's history (section 10, History corrections).
 
 The stack is Django (web panel and heartbeat endpoint), one worker process (outage
-detection and Telegram delivery), PostgreSQL and Caddy (TLS), run with Docker Compose.
+detection and Telegram delivery), PostgreSQL, Caddy (TLS) and a nightly backup job
+(section 14), run with Docker Compose.
 
 **Test channel rule (current release).** Every location's chat ID must point at a
 **private** Telegram channel whose only member is the maintainer. The rule is lifted only
@@ -132,6 +134,13 @@ Optional settings:
 - `LOG_LEVEL`: `DEBUG`, `INFO` (the default), `WARNING` or `ERROR`. Bot tokens and device
   keys are redacted at every level. Log timestamps are UTC (for example
   `2026-10-01T11:31:06.452+00:00`), whatever `DISPLAY_TZ` is.
+- `BACKUP_TIME_UTC`: the time of the nightly database dump, in UTC, as `HH:MM` (default
+  `03:00`, which is 05:00 or 06:00 in Kyiv). The default is clear of local midnight, when
+  the charts are posted, and of the DST change (section 14).
+- `BACKUP_KEEP`: how many nightly dumps are kept, 1 to 365 (default 14).
+
+A `BACKUP_TIME_UTC` or `BACKUP_KEEP` of the wrong shape stops the `backup` service, and its
+log names the variable (`docker compose -f docker-compose.prod.yml logs backup`).
 
 ## 5. Deploy
 
@@ -145,14 +154,16 @@ docker compose -f docker-compose.prod.yml up -d --build --wait
 It builds the image, starts PostgreSQL, runs the one-shot `migrate` service (apply
 migrations, then sync the admin account from the env file), and starts `web` and
 `worker` only after `migrate` succeeded. `caddy` does not wait for `migrate`: it starts
-on its own and keeps running if a migration fails (section 8). Check the result:
+on its own and keeps running if a migration fails (section 8). `backup` starts once the
+database is up and dumps it every night (section 14). Check the result:
 
 ```sh
 docker compose -f docker-compose.prod.yml ps
 ```
 
-`db`, `web`, `worker` and `caddy` are `healthy`. `ps -a` also shows `migrate` as
-`Exited (0)`. `docker compose -f docker-compose.prod.yml logs worker` shows
+`db`, `web`, `worker`, `caddy` and `backup` are `healthy`. `backup` turns healthy once
+its first dump is written, which happens at once on a fresh install. `ps -a` also shows
+`migrate` as `Exited (0)`. `docker compose -f docker-compose.prod.yml logs worker` shows
 `worker active`. `curl -fsS https://DOMAIN/healthz` prints `ok`.
 
 **Every deploy or restart is a short monitoring gap, by design.** While the worker is
@@ -245,10 +256,11 @@ In `.env.docker_local`, set `APP_ENV=local` and `DEBUG=1`. Then:
 docker compose -f docker-compose.local.yml up -d --build --wait
 ```
 
-This runs `db`, `migrate`, `web` and `worker` (no Caddy). The app is on
+This runs `db`, `migrate`, `web`, `worker` and `backup` (no Caddy). The app is on
 `http://localhost:8000`; sign in with the admin account from `.env.docker_local`.
 Local alerts are real Telegram messages too, so use a private test channel here as well.
-Stop the stack with `docker compose -f docker-compose.local.yml down`.
+Local dumps go to `docker_data/local/backups/`, so a restore can be rehearsed locally
+(section 15 (a)). Stop the stack with `docker compose -f docker-compose.local.yml down`.
 
 Tests run inside the stack against its PostgreSQL:
 
@@ -259,7 +271,7 @@ docker compose -f docker-compose.local.yml run --build --rm web pytest
 The full check (lint, format, types, tests, coverage gate):
 
 ```sh
-docker compose -f docker-compose.local.yml run --build --rm web sh -c "ruff check . && ruff format --check . && mypy powermon && pytest -q --cov=powermon --cov-report=term-missing:skip-covered && coverage report --include='powermon/engine/*,powermon/alerts/*,powermon/i18n/*,powermon/telegram/*,powermon/worker/detection.py,powermon/worker/io_loop.py,powermon/worker/lease.py,powermon/worker/supervision.py' --fail-under=80"
+docker compose -f docker-compose.local.yml run --build --rm web sh -c "ruff check . && ruff format --check . && mypy powermon && pytest -q --cov=powermon --cov-report=term-missing:skip-covered && coverage report --include='powermon/engine/*,powermon/alerts/*,powermon/i18n/*,powermon/telegram/*,powermon/chart/*,powermon/worker/detection.py,powermon/worker/io_loop.py,powermon/worker/lease.py,powermon/worker/supervision.py' --fail-under=80"
 ```
 
 Dependencies are pinned in `uv.lock`, which only the pinned uv in the Dockerfile's
@@ -276,7 +288,7 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
 ## 10. Operations notes
 
 - **Logs:** `docker compose -f docker-compose.prod.yml logs <service>` (`db`, `migrate`,
-  `web`, `worker`, `caddy`). Each service keeps at most 3 files of 10 MB (Docker's
+  `web`, `worker`, `caddy`, `backup`). Each service keeps at most 3 files of 10 MB (Docker's
   size cap). App log lines start with a UTC ISO 8601 timestamp, and `LOG_LEVEL` sets
   their detail (section 4). Bot tokens and device keys are redacted from the app logs at
   every level, and Caddy writes no access log.
@@ -316,7 +328,8 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
   a frozen database): its container keeps `/tmp/powermon-worker.held`, the time it last
   held the lock. A worker container that is recreated (a deploy) starts without it.
 - **Health:** `docker compose -f docker-compose.prod.yml ps` shows `healthy` or
-  `unhealthy` for `db`, `web`, `worker` and `caddy`. The worker touches its health file
+  `unhealthy` for `db`, `web`, `worker`, `caddy` and `backup` (`backup` is healthy while
+  its newest dump is under 26 hours old, section 14). The worker touches its health file
   (`/tmp/powermon-worker.health` in the container) after every successful cycle and on
   every standby cycle, and the healthcheck wants it under 30 s old. It does not touch it
   while the database is down, so it shows `unhealthy` about 40 to 60 s into a database
@@ -460,6 +473,32 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
     stay in the channel). Its history stays in the database but is never shown. To
     monitor the place again, add a new location (a new key and an empty history). To
     pause a location instead, turn maintenance on or alerts off.
+- **History corrections:** two sections of the location page fix a wrong power history.
+  Each is a confirmation page, then the change. Neither sends a message to the channel,
+  and there is no undo.
+  - **Recent outages:** every outage of the last 14 local days, newest first, with its
+    start, end and off time (the chart's daily-total format). The outage in progress reads
+    "in progress" and has no Remove link. **Remove** turns a false outage that has ended
+    (for example the device or its internet connection was down while the power was on)
+    into power on: its off time no longer counts in the chart or the daily totals, and time inside it
+    that was not monitored stays not monitored. The pinned chart shows the change at its
+    next refresh, within 15 minutes; it draws the last 7 days, and charts already finished
+    for earlier days do not change. The live status stays as it is, so the next OFF
+    alert's "was ON for" still counts from the end of the removed outage. An outage in
+    progress cannot be removed: remove it after power returns. Alerts of the removed outage
+    that are still queued (for example while Telegram was unreachable) are dropped only if
+    its OFF alert never went out; if the OFF went out, its ON alert is still sent, so the
+    channel is not left at power off. If that OFF alert is being sent at that moment, the
+    page says so ("An alert about this outage is being sent to the channel right now.
+    Nothing changed. Try again in a minute.") and nothing changes: try again a minute later.
+  - **Reset history:** deletes the location's whole recorded power history. It is refused
+    while an outage is in progress (reset after power returns, or delete the location).
+    The location then shows **Waiting for first heartbeat**; its next heartbeat restarts
+    monitoring as On without an alert, and a new chart is posted and pinned that shows no
+    data before the restart. The worker unpins the old chart in its channel within a pass
+    or two where the bot still can; otherwise unpin it by hand (the posted messages stay
+    in the channel). Alerts already queued are still sent, because they report real
+    events. The settings, the device key, the switches and the Delivery status are kept.
 - **Device key rotation:** if a key has leaked, open the device setup page, click
   **Regenerate key** and confirm. The old key stops working at once (HTTP 401) and the
   history is kept. The page then shows the new key and the examples with it; a reload or
@@ -485,8 +524,10 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
   one end notice per silence), and putting locations into maintenance or deleting them
   never ends an incident by itself. The maintainer confirms this behaviour in section 13
   (d).
-- **Data:** everything lives in `docker_data/prod/` (PostgreSQL data and Caddy
-  certificates). Nightly backups are not part of this release yet.
+- **Data:** everything lives in `docker_data/prod/`: PostgreSQL data, Caddy certificates
+  and the nightly database dumps in `docker_data/prod/backups/` (section 14). The power
+  history is kept indefinitely; heartbeats themselves are never stored (only each
+  location's last heartbeat time), so there is nothing to prune.
 
 ## 11. Failure drills (Phase 2 verification)
 
@@ -630,8 +671,8 @@ rises by 1, and it comes back `healthy`.
 
 **(d) Health status.** Run `docker compose -f docker-compose.prod.yml ps`.
 
-Expected: every long-running service (`db`, `web`, `worker`, `caddy`) shows a health
-status.
+Expected: every long-running service (`db`, `web`, `worker`, `caddy` and, from Phase 5
+on, `backup`) shows a health status.
 
 ## 12. Chart checks (Phase 3 verification)
 
@@ -862,3 +903,298 @@ off. The subscribers of the two cut-off locations get their OFF alerts as usual.
 
 Record: "accepted", or the change wanted. Record the result in the phase verification
 file.
+
+## 14. Backups and restore
+
+### Nightly dumps
+
+The `backup` service dumps the database every night. It runs in its own container, on the
+same `postgres:18.6-trixie` image as `db`, so `pg_dump` has the server's version.
+
+- **When:** every night at `BACKUP_TIME_UTC` (section 4; default 03:00 UTC). Whenever the
+  newest dump is older than 24 hours, it dumps at once: on a fresh install, or after the
+  server was down over night. It checks once a minute. A failed dump is retried after 5
+  minutes, then at growing intervals of up to 1 hour.
+- **How:** `pg_dump` in PostgreSQL's custom format. Each dump is checked with
+  `pg_restore --list` before it replaces anything; only then are the dumps beyond the
+  newest `BACKUP_KEEP` (default 14) deleted. A failed dump deletes nothing.
+- **Where:** `docker_data/prod/backups/` (locally `docker_data/local/backups/`), outside
+  the PostgreSQL data directory. Each file is named by its UTC start time, for example
+  `powermon-20261003T030000Z.dump`. The directory is 0700 and every dump 0600, owned by
+  the container's postgres user (uid 999; the host may show another name for it). Dumps
+  hold every bot token and device key, so reading them needs `sudo`. There is no automated
+  off-site copy: copy dumps off the VPS by hand (below).
+- **Health:** `docker compose -f docker-compose.prod.yml ps backup` shows `healthy` while
+  the newest dump is under 26 hours old. A failing backup shows only there and in
+  `docker compose -f docker-compose.prod.yml logs backup`: each dump logs
+  `backup: dump powermon-….dump ok`, each failure one `backup: error: …` line. There is no
+  ops notice for it, so look at it after each deploy and now and then.
+
+### A dump on demand
+
+Before a risky change (a large update, a manual database edit), take a dump at once:
+
+```sh
+docker compose -f docker-compose.prod.yml exec backup bash /backup/backup.sh --dump-now
+```
+
+It logs `backup: dump powermon-….dump ok`. As after a nightly dump, only the newest
+`BACKUP_KEEP` dumps are kept.
+
+### Copying a dump off the VPS
+
+Nothing copies dumps off the VPS automatically. To keep a copy on your computer:
+
+1. On the VPS, in the clone, list the dumps and copy one to your home directory, owned by
+   you and readable only by you:
+
+   ```sh
+   sudo ls -l docker_data/prod/backups/
+   sudo install -m 600 -o "$USER" docker_data/prod/backups/<file> ~/<file>
+   ```
+
+2. On your computer: `scp <user>@<vps>:<file> .`
+3. Back on the VPS: `rm ~/<file>`
+
+Keep the copy as safe as the server: it holds every bot token and device key. Do not
+stream a dump through `ssh -t … sudo cat`: the terminal mangles binary output.
+
+### Restore from a backup
+
+A restore replaces the whole database with a dump. Everything recorded after the dump is
+lost. The restore works only into a new, empty database: `backup.sh --restore` refuses a
+database that already has tables, and it never drops or cleans one.
+
+**Same VPS** (the database is damaged, or a change must be undone). In the clone on the VPS
+(for example `cd ~/power-monitor`), choose the dump, then run:
+
+```sh
+sudo ls -l docker_data/prod/backups/
+F=powermon-20261003T030000Z.dump
+docker compose -f docker-compose.prod.yml stop web worker backup
+docker compose -f docker-compose.prod.yml stop db
+sudo mv docker_data/prod/postgres "docker_data/prod/postgres.before-restore-$(date -u +%Y%m%dT%H%M%SZ)"
+docker compose -f docker-compose.prod.yml up -d --wait db
+docker compose -f docker-compose.prod.yml run --rm --no-deps backup bash /backup/backup.sh --restore "$F"
+docker compose -f docker-compose.prod.yml run --rm --build migrate
+docker compose -f docker-compose.prod.yml run --rm --no-deps migrate python manage.py post_restore
+docker compose -f docker-compose.prod.yml up -d --build --wait
+```
+
+What each step does:
+
+1. `F` is the file name of the chosen dump (the newest one from before the problem).
+2. `stop web worker backup`, then `stop db`: nothing may write to the database, or dump
+   it, during the restore.
+3. `sudo mv …`: the old data directory is moved aside, never deleted. It is the way back
+   if the restore goes wrong.
+4. `up -d --wait db` starts a new, empty database with the `POSTGRES_*` values of the env
+   file.
+5. `--restore "$F"` restores the dump in one transaction. It logs
+   `backup: restore of … ok`, or an error, and then nothing was restored.
+6. `run --rm --build migrate` applies the migrations newer than the dump and syncs the
+   admin account from the env file (as on every deploy).
+7. `post_restore` restarts every location silently (see "What happens after a restore").
+   It prints
+   `post_restore: N location(s) now wait for their first heartbeat, N queued message(s) dropped, N open incident(s) closed`.
+   It refuses, and changes nothing, while a worker is running.
+8. `up -d --build --wait` starts everything, as a deploy does.
+
+Rules:
+
+- Never run a plain `up` (or the deploy command) before `post_restore`: it would start
+  web and worker on a database that is not ready for them, and the dump's queued alerts
+  and old states would reach subscribers.
+- If a step fails, stop there: nothing has reached subscribers yet. To try again, stop
+  `db`, move the new `docker_data/prod/postgres` aside as well, and start again from
+  `up -d --wait db`. To go back to the old database, stop `db`, move the new directory
+  aside and the `postgres.before-restore-…` directory back to `docker_data/prod/postgres`,
+  then run the deploy command.
+- Once the restored stack has run correctly for a day, delete the moved-aside data
+  directory by hand: `sudo rm -rf docker_data/prod/postgres.before-restore-…`.
+
+**A fresh VPS** (the old server is lost):
+
+1. Follow sections 2 to 4: the server prep, the clone and `.env.docker_production`. New
+   `POSTGRES_*` values are fine: the dump carries the data, and the restore makes the new
+   database user its owner.
+2. In the clone, create the backup directory:
+
+   ```sh
+   mkdir -p docker_data/prod/backups
+   chmod 700 docker_data/prod/backups
+   ```
+
+3. From your computer, copy the dump into it (here the clone is `~/power-monitor`):
+   `scp <file> <user>@<new-vps>:power-monitor/docker_data/prod/backups/`
+4. In the clone, run the same commands as above from `up -d --wait db` on:
+
+   ```sh
+   F=powermon-20261003T030000Z.dump
+   docker compose -f docker-compose.prod.yml up -d --wait db
+   docker compose -f docker-compose.prod.yml run --rm --no-deps backup bash /backup/backup.sh --restore "$F"
+   docker compose -f docker-compose.prod.yml run --rm --build migrate
+   docker compose -f docker-compose.prod.yml run --rm --no-deps migrate python manage.py post_restore
+   docker compose -f docker-compose.prod.yml up -d --build --wait
+   ```
+
+   The domain's DNS records must point at the new VPS before the last command: Caddy
+   requests the TLS certificate on first start (section 2). The devices keep their keys
+   and need no change.
+
+### What happens after a restore
+
+- Every location shows **Waiting for first heartbeat** and restarts monitoring at its
+  device's next heartbeat, as On and with no alert (as at a location's first heartbeat,
+  section 6). Its history up to the dump is kept. The hours from the dump to that
+  heartbeat are drawn as not monitored (hatched), never as an outage.
+- Subscribers get no message: the alerts the dump had queued are dropped, never sent.
+- The admin gets one monitoring-gap notice (`⏸ Monitoring gap …`, section 5) for the lost
+  hours. The problems the dump had open (all-silent, failing delivery, a chart that cannot
+  be pinned) are closed without a notice; a problem that persists is reported again.
+- An outage that was still in progress when the server was lost never gets its ON alert.
+  A location whose power is off after the restore is detected only after its device has
+  sent a heartbeat again.
+- After a location's first heartbeat its weekly chart carries on as usual. A chart posted
+  after the dump is unknown to the restored database: if it stays pinned, unpin it by hand
+  in Telegram.
+
+## 15. History and backup checks (Phase 5 verification)
+
+These three checks cover what the tests cannot: a real restore on real containers, the
+backup container on the real VPS, and a history reset seen in a real channel. Removing an
+outage, resetting a location's history, the backup script's schedule, rotation, health
+and restore refusal, the post-restore step, and that no new page shows a token or a key
+are covered by automated tests. No harness starts, stops or restarts containers for these
+checks. Run (a) on the dev machine, and (b) and (c) on the production VPS while alerts
+still go to the private test channel (section 1).
+
+### (a) INV-25 #2: a restore drill on the dev machine
+
+The drill restores a dump of the local stack (section 9) into a second Compose project,
+`pm05drill`, whose database lives in memory, then starts web and worker on the restored
+database. The local database is never touched. The local stack must have some history: at
+least one test location that has had heartbeats for a while (an outage too, if you can).
+
+1. Write an override file outside the repository, for example `/tmp/restore-drill.yml`.
+   It keeps the drill's database in memory and moves its web app to another port:
+
+   ```yaml
+   services:
+     db:
+       volumes: !override []
+       tmpfs:
+         - /var/lib/postgresql:size=2g
+     web:
+       ports: !override
+         - "127.0.0.1:8001:8000"
+   ```
+
+2. Stop the local web and worker, so the data stays still, and take a dump. Note the dump's
+   file name from its `backup: dump powermon-….dump ok` line:
+
+   ```sh
+   docker compose -f docker-compose.local.yml stop web worker
+   docker compose -f docker-compose.local.yml exec backup bash /backup/backup.sh --dump-now
+   ```
+
+3. Take the source's fingerprint (one line per table: name, row count, checksum):
+
+   ```sh
+   docker compose -f docker-compose.local.yml run --rm -T --no-deps migrate python manage.py history_fingerprint > /tmp/fp-source.txt
+   ```
+
+4. Restore the dump into the drill project and take its fingerprint, before
+   `post_restore`:
+
+   ```sh
+   F=powermon-20261003T120000Z.dump
+   docker compose -p pm05drill -f docker-compose.local.yml -f /tmp/restore-drill.yml up -d --wait db
+   docker compose -p pm05drill -f docker-compose.local.yml -f /tmp/restore-drill.yml run --rm --no-deps backup bash /backup/backup.sh --restore "$F"
+   docker compose -p pm05drill -f docker-compose.local.yml -f /tmp/restore-drill.yml run --rm --build migrate
+   docker compose -p pm05drill -f docker-compose.local.yml -f /tmp/restore-drill.yml run --rm -T --no-deps migrate python manage.py history_fingerprint > /tmp/fp-target.txt
+   diff /tmp/fp-source.txt /tmp/fp-target.txt
+   ```
+
+   Expected: `diff` prints nothing. Both files have the same three lines (`location`,
+   `power_interval`, `chart_message`).
+5. Run the post-restore step, note the outbox's highest id, then start the drill's web and
+   worker. Never start the drill's `backup` service: it would write into the local backup
+   directory.
+
+   ```sh
+   docker compose -p pm05drill -f docker-compose.local.yml -f /tmp/restore-drill.yml run --rm --no-deps migrate python manage.py post_restore
+   docker compose -p pm05drill -f docker-compose.local.yml -f /tmp/restore-drill.yml exec db psql -U <POSTGRES_USER> -d <POSTGRES_DB> -c "SELECT coalesce(max(id), 0) AS last_id, count(*) FILTER (WHERE status IN ('pending', 'sending')) AS queued FROM outbox_message"
+   docker compose -p pm05drill -f docker-compose.local.yml -f /tmp/restore-drill.yml up -d --wait web worker
+   ```
+
+   Expected: `post_restore` prints its counts line, and `queued` is 0.
+6. Wait about a minute, then check what the drill's worker queued and did (`N` is the
+   `last_id` from step 5):
+
+   ```sh
+   docker compose -p pm05drill -f docker-compose.local.yml -f /tmp/restore-drill.yml exec db psql -U <POSTGRES_USER> -d <POSTGRES_DB> -c "SELECT id, channel, kind, status FROM outbox_message WHERE id > N ORDER BY id"
+   docker compose -p pm05drill -f docker-compose.local.yml -f /tmp/restore-drill.yml logs worker | grep -E 'chart (post|pin|refresh)|ops chat not configured'
+   ```
+
+   Expected: exactly one new row, `ops | ops_gap`, and no `subscriber` row. If
+   `.env.docker_local` has no ops chat, there is no new row at all; the worker log then
+   has one `ops notice (ops chat not configured): ⏸ Monitoring gap …` WARNING instead. The
+   worker log has no `chart post`, `chart pin` or `chart refresh` line.
+7. Clean up: remove the drill project and its images, then start the local web and worker
+   again:
+
+   ```sh
+   docker compose -p pm05drill -f docker-compose.local.yml -f /tmp/restore-drill.yml down -v --rmi local
+   docker compose -f docker-compose.local.yml start web worker
+   ```
+
+Record: the `diff` result, the `post_restore` line, the new outbox rows (or the gap
+WARNING) and the grep result. Record the result in the phase verification file.
+
+### (b) The backup container on the VPS
+
+1. After this release is deployed (section 5), on the VPS:
+
+   ```sh
+   docker compose -f docker-compose.prod.yml ps backup
+   docker compose -f docker-compose.prod.yml logs backup
+   sudo ls -la docker_data/prod/backups
+   ```
+
+   Expected: `backup` is `healthy`. Its log has
+   `backup: started: a dump every night at 03:00 UTC, the newest 14 kept` and one
+   `backup: dump powermon-<deploy time>.dump ok`. The listing shows the directory (`.`) as
+   `drwx------` and one `-rw-------` dump named with the deploy time (UTC).
+2. The next day, after `BACKUP_TIME_UTC`, run the same three commands.
+
+   Expected: `backup` is still `healthy`, and there is a second dump, named with that
+   night's time (just after 03:00 UTC), with its `ok` line in the log.
+
+Record: the listings and the log lines of both days. Record the result in the phase
+verification file.
+
+### (c) A history reset on the private test channel
+
+1. Pick a test location whose alerts go to the private test channel, whose weekly chart is
+   pinned there and whose device is on.
+2. On its page, in "Reset history", click **Reset history**, then confirm.
+3. Watch the channel and the location page until the device's next heartbeat, then read
+   the worker's chart lines:
+
+   ```sh
+   docker compose -f docker-compose.prod.yml logs --since 15m worker | grep 'chart '
+   ```
+
+Expected: the page shows "History reset. …" and **Waiting for first heartbeat**. Within a
+pass or two (seconds) the pinned chart is unpinned; its message stays in the channel. The
+log has a `chart release for location <id>: ok` line. No alert is sent. At the device's
+next heartbeat the location shows **On**, with no alert, and a new chart is posted and
+pinned (`post` and `pin` lines in the log); its bars start at that heartbeat, with no data
+before it.
+
+Record: the times, whether the old chart was unpinned, the log lines and a screenshot of
+the new chart. Record the result in the phase verification file.
+
+DoD 7 (INV-26: a fresh VPS reaches a working deployment in at most 30 minutes by following
+this README, including one test message) is re-run at milestone close, not here.
