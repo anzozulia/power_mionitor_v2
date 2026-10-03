@@ -28,9 +28,11 @@ display TZ is pinned to Europe/Kyiv (UTC+3 that day).
 """
 
 import dataclasses
+import hashlib
 import logging
+import re
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from io import StringIO
 from typing import Any
 
@@ -38,14 +40,16 @@ import pytest
 from conftest import DEFAULT_BOT_TOKEN, OPS_BOT_TOKEN, OPS_CHAT_ID, FakeClock
 from django.core.management import call_command
 from django.core.management.base import CommandError
-from django.db import connection
-from django.db.models import Model, Value
+from django.db import DatabaseError, connection, transaction
+from django.db.models import F, Model, Value
 from django.db.models.functions import Greatest
+from django.test.utils import CaptureQueriesContext
 
 from powermon.alerts import outbox
 from powermon.alerts.delivery import KIND_DELIVERY_FAILING
 from powermon.alerts.models import OpsIncident, OutboxMessage
 from powermon.chart.lifecycle import KIND_CHART_PIN_FAILED
+from powermon.chart.models import ChartMessage
 from powermon.engine import all_silent, lapse, maintenance, restore, transitions
 from powermon.engine.models import LocationState, PowerInterval, SystemState
 from powermon.locations.models import Location
@@ -559,3 +563,170 @@ def test_first_gate_without_an_open_interval_is_unchanged(
     assert _state(location) == ("on", _at(8, 0), _at(8, 0), None, None)
     assert _intervals(location) == [("on", _at(8, 0), None, None)]
     assert not OutboxMessage.objects.exists()
+
+
+# D-16: the read-only history fingerprint of the restore drill
+
+FINGERPRINT_LINE = re.compile(r"^(location|power_interval|chart_message) (\d+) ([0-9a-f]{32})$")
+
+
+def _fingerprint_command() -> str:
+    """What ``manage.py history_fingerprint`` prints."""
+    out = StringIO()
+    call_command("history_fingerprint", stdout=out)
+    return out.getvalue()
+
+
+def _by_table() -> dict[str, tuple[int, str]]:
+    """``restore.fingerprint()`` as {table: (count, checksum)}."""
+    return {table: (count, checksum) for table, count, checksum in restore.fingerprint()}
+
+
+def _history(location_factory: Callable[..., Any]) -> Any:
+    """Rows in all three tables: an off location with a chart record, and an on one.
+
+    Three intervals (the off location's on and open off pieces, the other's open on
+    piece), two locations, one chart record. Returns the off location.
+    """
+    _system(cursor=_at(10, 0), resumed=_at(7, 0))
+    location = _off_since_9(location_factory, name="Office")
+    _on_since_8(location_factory, name="Home")
+    ChartMessage.objects.create(
+        location=location,
+        local_date=date(2026, 10, 1),
+        chat_id=location.chat_id,
+        bot_key="0123456789ab",
+        message_id=1001,
+        pinned=True,
+        last_rendered_at=_at(10, 0),
+        created_at=_at(8, 0),
+    )
+    return location
+
+
+def _chart_rows() -> list[dict[str, Any]]:
+    return list(ChartMessage.objects.order_by("pk").values())
+
+
+def test_D16_fingerprint_is_stable_for_equal_data(location_factory: Callable[..., Any]) -> None:
+    _history(location_factory)
+
+    first = _fingerprint_command()
+    second = _fingerprint_command()
+
+    assert first == second
+    lines = first.splitlines()
+    matches = [FINGERPRINT_LINE.match(line) for line in lines]
+    assert [m is not None for m in matches] == [True, True, True]
+    assert [line.split(" ")[0] for line in lines] == list(restore.FINGERPRINT_TABLES)
+    assert restore.FINGERPRINT_TABLES == ("location", "power_interval", "chart_message")
+    assert [int(line.split(" ")[1]) for line in lines] == [2, 3, 1]
+    # The command prints what fingerprint() returns, one line per table.
+    assert restore.fingerprint() == [
+        (table, int(count), checksum)
+        for table, count, checksum in (line.split(" ") for line in lines)
+    ]
+
+
+def test_D16_fingerprint_changes_when_any_row_changes(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = _history(location_factory)
+    before = _by_table()
+
+    # One interval ends one microsecond earlier: only power_interval's checksum moves.
+    piece = PowerInterval.objects.filter(location=location, end_at__isnull=False).get()
+    PowerInterval.objects.filter(pk=piece.pk).update(end_at=F("end_at") - timedelta(microseconds=1))
+    moved = _by_table()
+    assert moved["location"] == before["location"]
+    assert moved["chart_message"] == before["chart_message"]
+    assert moved["power_interval"][0] == before["power_interval"][0] == 3
+    assert moved["power_interval"][1] != before["power_interval"][1]
+
+    # A new bot token changes the location checksum (through its md5), nothing else.
+    Location.objects.filter(pk=location.pk).update(bot_token="987654321:" + "B" * 35)
+    rotated = _by_table()
+    assert rotated["location"][0] == 2
+    assert rotated["location"][1] != moved["location"][1]
+    assert (rotated["power_interval"], rotated["chart_message"]) == (
+        moved["power_interval"],
+        moved["chart_message"],
+    )
+
+    # Counts track inserts.
+    location_factory(name="New location")
+    assert _by_table()["location"][0] == 3
+
+
+def test_D16_fingerprint_is_read_only(
+    location_factory: Callable[..., Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _history(location_factory)
+    rows, charts = _snapshot(), _chart_rows()
+
+    _fingerprint_command()
+    restore.fingerprint()
+
+    assert (_snapshot(), _chart_rows()) == (rows, charts)
+    # READ ONLY ended with fingerprint()'s own transaction.
+    with connection.cursor() as cur:
+        cur.execute("SHOW transaction_read_only")
+        assert cur.fetchone() == ("off",)
+
+    # A statement that writes is refused inside the fingerprint's transaction.
+    monkeypatch.setitem(
+        restore.FINGERPRINT_SQL,
+        "power_interval",
+        "UPDATE power_interval SET end_at = end_at - interval '1 microsecond' "
+        "WHERE end_at IS NOT NULL RETURNING 1, ''",
+    )
+    with pytest.raises(DatabaseError, match="read-only transaction"):
+        restore.fingerprint()
+    assert (_snapshot(), _chart_rows()) == (rows, charts)
+
+
+def test_D16_fingerprint_refuses_to_run_inside_a_transaction(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = location_factory()
+
+    with transaction.atomic(), CaptureQueriesContext(connection) as queries:
+        with pytest.raises(RuntimeError, match="must run outside a transaction"):
+            restore.fingerprint()
+    # Refused before any statement ran, so no READ ONLY was set.
+    assert len(queries) == 0
+
+    # A write on the same connection still succeeds afterwards.
+    Location.objects.filter(pk=location.pk).update(name="Renamed")
+    assert Location.objects.get(pk=location.pk).name == "Renamed"
+    with connection.cursor() as cur:
+        cur.execute("SHOW transaction_read_only")
+        assert cur.fetchone() == ("off",)
+
+
+def test_D16_fingerprint_prints_no_secret(location_factory: Callable[..., Any]) -> None:
+    location = _history(location_factory)
+
+    out = _fingerprint_command()
+
+    token = location.bot_token
+    assert token == DEFAULT_BOT_TOKEN
+    secret = token.split(":", 1)[1]
+    for value in (token, secret, location.device_key):
+        assert value not in out
+    # Not even their md5: the hashes only enter the aggregate.
+    for value in (token, location.device_key):
+        assert hashlib.md5(value.encode(), usedforsecurity=False).hexdigest() not in out
+
+
+def test_D16_fingerprint_of_empty_tables() -> None:
+    assert restore.fingerprint() == [
+        ("location", 0, ""),
+        ("power_interval", 0, ""),
+        ("chart_message", 0, ""),
+    ]
+    assert _fingerprint_command().splitlines() == [
+        "location 0 ",
+        "power_interval 0 ",
+        "chart_message 0 ",
+    ]
