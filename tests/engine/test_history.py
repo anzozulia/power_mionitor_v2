@@ -12,7 +12,8 @@ location's ``location_state`` row lock first:
   it stays not monitored (D-02);
 - the outage's queued alerts are dropped only when its OFF alert never went out (D-04 as
   refined on 2026-10-03): an OFF that is sent or uncertain keeps its ON; while the OFF is
-  sending the removal is deferred with nothing written (wave-1 audit amendment, W1-A1);
+  sending the removal is deferred with nothing written (wave-1 audit amendment, W1-A1), and
+  so it is while the outage's own ON alert is sending (wave-2 audit, W2-A1);
 - live state (status, last heartbeat, on since, outage start, window start, state version)
   is never written, nothing is queued and nothing is sent (INV-07 #1).
 
@@ -660,6 +661,123 @@ def test_D04_on_alert_dropped_when_the_off_alert_expired_or_never_existed(
     assert _status(on) == ("dropped", history.OUTAGE_REMOVED)
     if case == "expired":
         assert _status(off) == ("expired", "expired")
+
+
+# D-04 wave-2 audit (W2-A1): when the OFF alert never went out (expired, or no OFF row
+# because alerts were off at the OFF), the outage's ON alert is its location's head and can
+# be "sending" itself. A failed attempt puts it back to pending, so a removal during that
+# attempt is deferred too; the next removal drops the ON (failed) or finds it sent.
+
+
+def _on_alert_sending(location_factory: Callable[..., Any], case: str) -> tuple[Any, OutboxMessage]:
+    """The 09:00-10:00 outage whose OFF alert never went out, its ON alert claimed."""
+    if case == "expired":
+        location = _two_outages(location_factory)
+        off = _row_of(location, "power_off", _at(9, 0))
+        OutboxMessage.objects.filter(pk=off.pk).update(status="expired", last_error="expired")
+    else:
+        location = _alerts_off_at_the_off(location_factory)
+    on = _row_of(location, "power_on", _at(10, 0))
+    # The ON alert is its location's head, and the relay claims it: an attempt is in flight.
+    assert [row.pk for row in outbox.subscriber_heads()] == [on.pk]
+    assert outbox.claim(on.pk) is True
+    return location, on
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("case", ["expired", "no_off_row"])
+def test_D04_W2_A1_removal_deferred_while_the_on_alert_is_sending(
+    location_factory: Callable[..., Any], case: str
+) -> None:
+    location, on = _on_alert_sending(location_factory, case)
+    before = (_intervals(location), _outbox(), _live(location))
+
+    assert history.remove_outage(location.pk, _at(9, 0)) == "sending"
+
+    # Nothing written: the timeline, every alert and the live state are unchanged.
+    assert (_intervals(location), _outbox(), _live(location)) == before
+    assert _status(on) == ("sending", "")
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("case", ["expired", "no_off_row"])
+def test_D04_W2_A1_failed_on_attempt_then_removal_drops_the_on(
+    location_factory: Callable[..., Any], case: str
+) -> None:
+    location, on = _on_alert_sending(location_factory, case)
+    assert history.remove_outage(location.pk, _at(9, 0)) == "sending"
+    # The attempt fails (e.g. a 502): the relay puts the ON back to pending.
+    assert outbox.mark_retry(on.pk, _at(10, 1), "http_502") is True
+    assert _status(on) == ("pending", "http_502")
+
+    assert history.remove_outage(location.pk, _at(9, 0)) == "removed"
+
+    # "Power is back" is never sent for an outage the subscribers never heard of.
+    assert _status(on) == ("dropped", history.OUTAGE_REMOVED)
+    assert _intervals(location)[1] == ("on", _at(9, 0), _at(10, 0), None)
+    if case == "expired":
+        assert _outbox() == [
+            ("power_off", _at(9, 0), "expired", "expired"),
+            ("power_on", _at(10, 0), "dropped", history.OUTAGE_REMOVED),
+            # The other outage's alerts are untouched.
+            ("power_off", _at(15, 0), "pending", ""),
+            ("power_on", _at(15, 30), "pending", ""),
+        ]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_D04_W2_A1_on_alert_sending_defers_even_when_the_off_alert_went_out(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = _two_outages(location_factory)
+    off = _row_of(location, "power_off", _at(9, 0))
+    on = _row_of(location, "power_on", _at(10, 0))
+    assert outbox.claim(off.pk) is True
+    assert outbox.mark_sent(off.pk, _at(9, 1, 32)) is True
+    assert outbox.claim(on.pk) is True
+    before = (_intervals(location), _outbox(), _live(location))
+
+    # The simplest rule: any alert of the outage in flight defers its removal.
+    assert history.remove_outage(location.pk, _at(9, 0)) == "sending"
+
+    assert (_intervals(location), _outbox(), _live(location)) == before
+    # The ON goes out: the next removal keeps both alerts and drops nothing.
+    assert outbox.mark_sent(on.pk, _at(10, 0, 1)) is True
+
+    assert history.remove_outage(location.pk, _at(9, 0)) == "removed"
+
+    assert _outbox() == [
+        ("power_off", _at(9, 0), "sent", ""),
+        ("power_on", _at(10, 0), "sent", ""),
+        ("power_off", _at(15, 0), "pending", ""),
+        ("power_on", _at(15, 30), "pending", ""),
+    ]
+    assert _intervals(location)[1] == ("on", _at(9, 0), _at(10, 0), None)
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("start", "restore", "other_restore"),
+    [(_at(9, 0), _at(10, 0), _at(15, 30)), (_at(15, 0), _at(15, 30), _at(10, 0))],
+    ids=["later_outage_sending", "earlier_outage_sending"],
+)
+def test_D04_W2_A1_another_outage_on_alert_sending_does_not_defer(
+    location_factory: Callable[..., Any],
+    start: datetime,
+    restore: datetime,
+    other_restore: datetime,
+) -> None:
+    location = _two_outages(location_factory)
+    other = _row_of(location, "power_on", other_restore)
+    assert outbox.claim(other.pk) is True
+
+    assert history.remove_outage(location.pk, start) == "removed"
+
+    # Only the ON alerts matched to this outage decide (``was_off_us``): the other
+    # outage's ON attempt is untouched, also when it is dated after this outage's start.
+    assert _status(_row_of(location, "power_off", start)) == ("dropped", history.OUTAGE_REMOVED)
+    assert _status(_row_of(location, "power_on", restore)) == ("dropped", history.OUTAGE_REMOVED)
+    assert _status(other) == ("sending", "")
 
 
 @pytest.mark.django_db(transaction=True)
