@@ -70,6 +70,18 @@ UPDATE location_state
  WHERE location_id = %(id)s AND status = 'waiting'
 """
 
+# Back to "waiting for first heartbeat" (MON-01): the history reset (DATA-03, D-05) and
+# the post-restore restart (D-13) run it under the row lock; the FIRST gate leaves it at
+# the next heartbeat. Status waiting with a NULL outage start keeps
+# location_state_off_needs_outage_start true.
+WAITING_SQL = """
+UPDATE location_state
+   SET status = 'waiting', last_heartbeat_at = NULL, on_since = NULL,
+       outage_started_at = NULL, window_start_at = NULL,
+       state_version = state_version + 1
+ WHERE location_id = %(id)s
+"""
+
 # on: a plain heartbeat. GREATEST keeps an older timestamp from moving it back (D-08).
 PLAIN_SQL = """
 UPDATE location_state
