@@ -100,6 +100,21 @@ worker was down is simply due on the next pass.
   in the snapshot (``ChartLocation.deleted``) only until its records are retired, and gets
   nothing but releases: no post, pin, refresh or final edit. A change of only the name or
   the language releases nothing: the next refresh shows it (D-14).
+  A history reset (DATA-03, D-08, INV-19) marks the location's active records
+  (``history_reset_at``), and a marked record is stale whatever its channel: it is
+  released the same way, with no final edit. The release runs promptly even while the
+  location waits for its first heartbeat after the reset: such a waiting location is in
+  the snapshot (``ChartLocation.awaiting_heartbeat``) only while it has an active marked
+  record, and gets nothing but releases, never a post, pin, refresh or final edit (Phase 3
+  D-03 keeps posting for monitored locations only). A waiting location with no marked
+  record (after a restore) is not in the snapshot at all. Once the location is on again,
+  its marked records still go first (Pitfall 1), and today's new chart is posted and
+  pinned only after they are retired. A reset can race with a chart step already chosen,
+  and that is accepted, with no extra locking (RESEARCH Pitfall 12): a refresh chosen just
+  before the reset commits may edit the old message once more before it is released, and
+  a post in flight may be recorded unmarked after the reset; that record then becomes the
+  location's today-record after the first heartbeat, and its next refresh shows the
+  history since the reset.
 
 Each step is its own condition, checked on every pass (D-02): after downtime across one
 or more midnights the passes post and pin one chart for today and finalize and unpin
@@ -211,28 +226,30 @@ _CLEANUP: tuple[Step, ...] = ("finalize", "unpin")
 # The steps on today's record: its message gone means today's chart is posted again.
 _TODAYS: tuple[Step, ...] = ("pin", "refresh")
 
-# The monitored locations (status on or off, not deleted), and the deleted ones that still
-# have an active record (ROWS_SQL's predicate): those only get their records released, and
-# leave the snapshot once every record is retired (D-09).
+# The monitored locations (status on or off, not deleted), and the ones that still have an
+# active record (ROWS_SQL's predicate) to release: a deleted location's (D-09), or a
+# record a history reset marked (D-08), which brings in a location that waits for its
+# first heartbeat after the reset. Those only get their records released, and leave the
+# snapshot once every such record is retired. The last column flags a waiting location.
 LOCATIONS_SQL = """
 SELECT l.id, l.name, l.language, l.bot_token, l.chat_id, l.period_s, l.grace_s, l.router_grace,
-       l.deleted_at IS NOT NULL
+       l.deleted_at IS NOT NULL, s.status = 'waiting'
   FROM location l
   JOIN location_state s ON s.location_id = l.id
  WHERE (s.status IN ('on', 'off') AND l.deleted_at IS NULL)
-    OR (l.deleted_at IS NOT NULL
-        AND EXISTS (SELECT 1 FROM chart_message c
-                     WHERE c.location_id = l.id AND c.retired_at IS NULL
-                       AND (c.local_date = %(today)s
-                            OR (c.local_date < %(today)s
-                                AND (c.finalized_at IS NULL OR c.unpinned_at IS NULL)))))
+    OR EXISTS (SELECT 1 FROM chart_message c
+                WHERE c.location_id = l.id AND c.retired_at IS NULL
+                  AND (l.deleted_at IS NOT NULL OR c.history_reset_at IS NOT NULL)
+                  AND (c.local_date = %(today)s
+                       OR (c.local_date < %(today)s
+                           AND (c.finalized_at IS NULL OR c.unpinned_at IS NULL))))
  ORDER BY l.id
 """
 # Today's active records, and older ones that still need their final edit or their unpin
 # (whether or not they are known pinned, INV-19).
 ROWS_SQL = """
 SELECT id, location_id, local_date, chat_id, message_id, pinned, pin_failed_at,
-       last_rendered_at, finalized_at, unpinned_at, bot_key
+       last_rendered_at, finalized_at, unpinned_at, bot_key, history_reset_at
   FROM chart_message
  WHERE retired_at IS NULL
    AND (local_date = %(today)s
@@ -274,6 +291,9 @@ class ChartLocation:
     settle: timedelta
     # A deleted location (D-09): every record it still has is released, nothing else.
     deleted: bool = False
+    # A location waiting for its first heartbeat after a history reset (D-08): it gets
+    # releases only.
+    awaiting_heartbeat: bool = False
 
 
 @dataclass(frozen=True)
@@ -293,6 +313,8 @@ class ChartRow:
     unpinned_at: datetime | None
     # The bot that posted it: ``io_loop.bot_key`` of its token, never the token (D-08).
     bot_key: str
+    # Set by a history reset of its location (DATA-03, D-08): the record is released.
+    history_reset_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -311,16 +333,19 @@ def chart_key(location_id: int, step: Step, row_id: int | None = None) -> str:
 
 
 def stale(location: ChartLocation, row: ChartRow) -> bool:
-    """True when the record's channel is no longer its location's: it is released (D-08).
+    """True when the record no longer belongs to its location's chart: it is released (D-08).
 
     The channel is the (bot, chat) pair the relay keys on too (``io_loop.chat_key``): the
     record is stale when its stored chat differs from the location's chat, when the bot
     that posted it differs from the location's current bot, or when the location was
     deleted (D-09). A record whose ``bot_key`` is empty names no bot, so it is stale like
-    any other mismatch. Pure.
+    any other mismatch. A record a history reset marked (``history_reset_at``) is stale
+    too, whatever its channel: it shows history that no longer exists (DATA-03, D-08).
+    Pure.
     """
     return (
         location.deleted
+        or row.history_reset_at is not None
         or row.chat_id != location.chat_id
         or row.bot_key != io_loop.bot_key(location.bot_token)
     )
@@ -392,7 +417,8 @@ def settled_records(
     edit waits too (a lapse carve commits before the cursor moves). With no cursor
     (detection has not run yet) no day has settled. Only records not finalized yet, of
     monitored locations: a deleted location's record, or one whose chat or bot is no
-    longer its location's (``stale``), is released and never finalized (D-08, D-09).
+    longer its location's or that a history reset marked (``stale``), is released and
+    never finalized (D-08, D-09).
     """
     if detected_until is None:
         return frozenset()
@@ -414,7 +440,10 @@ def read_snapshot(today: date) -> tuple[list[ChartLocation], list[ChartRow]]:
 
     The locations are the monitored ones plus the deleted ones that still have an active
     record, marked ``deleted``: a deleted location stays only until its records are
-    retired (D-09).
+    retired (D-09). A location waiting for its first heartbeat after a history reset is
+    in it, marked ``awaiting_heartbeat``, only while it has an active record the reset
+    marked (D-08). The two reads are separate statements, so a record retired between
+    them can leave such a location without rows (``plan`` handles that, Pitfall 1).
     """
     with connection.cursor() as cur:
         cur.execute(LOCATIONS_SQL, {"today": today})
@@ -427,6 +456,7 @@ def read_snapshot(today: date) -> tuple[list[ChartLocation], list[ChartRow]]:
                 chat_id=r[4],
                 settle=settle_time(r[5], r[6], r[7]),
                 deleted=r[8],
+                awaiting_heartbeat=r[9],
             )
             for r in cur.fetchall()
         ]
@@ -444,6 +474,7 @@ def read_snapshot(today: date) -> tuple[list[ChartLocation], list[ChartRow]]:
                 finalized_at=r[8],
                 unpinned_at=r[9],
                 bot_key=r[10],
+                history_reset_at=r[11],
             )
             for r in cur.fetchall()
         ]
@@ -463,10 +494,15 @@ def plan(
 
     Midnight-class steps go first: locations by ascending id, and the first one with a due
     step wins, so one location's midnight work is done before the next one's starts.
-    A location with a ``stale`` record (its chat or bot changed, or it was deleted) makes
-    only releases, oldest record first, until every stale record is retired; its release
-    waiting for its own key or its bot makes no other step of that location either, so
-    nothing is posted while the old today-record is active (D-08, D-09, Pitfall 1).
+    A location with a ``stale`` record (its chat or bot changed, it was deleted, or a
+    history reset marked the record) makes only releases, oldest record first, until every
+    stale record is retired; its release waiting for its own key or its bot makes no other
+    step of that location either, so nothing is posted while the old today-record is
+    active (D-08, D-09, Pitfall 1). A deleted location, or one waiting for its first
+    heartbeat after a history reset (``awaiting_heartbeat``), makes only releases too, and
+    no step at all once none is left: the snapshot's two reads are separate statements, so
+    it may come without rows, and it must never be posted or pinned (D-08, RESEARCH
+    Pitfall 1).
     Within a location the steps go in D-02 order: post today's chart, pin it, give the
     oldest older record without one its final edit, unpin the oldest older record not
     unpinned yet, whatever ``pinned`` says (its pin may have taken effect unrecorded,
@@ -494,7 +530,7 @@ def plan(
         if waiting(io_loop.bot_wide_key(location.bot_token)):
             continue
         stale_rows = _stale_rows(location, rows)
-        if stale_rows or location.deleted:
+        if stale_rows or location.deleted or location.awaiting_heartbeat:
             for row in stale_rows:
                 # One best-effort call that retires its record on any permanent answer: it
                 # waits for its own key and its bot (above), never for the stored chat's
@@ -1087,16 +1123,17 @@ def _prune(
 def _live_keys(locations: list[ChartLocation], rows: list[ChartRow], today: date) -> set[str]:
     """Every key that can still guard a step: the steps the snapshot may still make.
 
-    A location with a stale record (or a deleted one) makes only releases until every
-    stale record is retired (D-08, D-09): its live keys are those releases' keys, so a
-    release's backoff survives every pass and a transient error never turns into a call
-    per pass; none of its other keys is live.
+    A location with a stale record (or a deleted one, or one waiting for its first
+    heartbeat after a history reset) makes only releases until every stale record is
+    retired (D-08, D-09): its live keys are those releases' keys, so a release's backoff
+    survives every pass and a transient error never turns into a call per pass; none of
+    its other keys is live.
     """
     monitored: set[int] = set()
     live: set[str] = set()
     for location in locations:
         stale_rows = _stale_rows(location, rows)
-        if stale_rows or location.deleted:
+        if stale_rows or location.deleted or location.awaiting_heartbeat:
             live.update(chart_key(location.location_id, "release", row.id) for row in stale_rows)
         else:
             monitored.add(location.location_id)
