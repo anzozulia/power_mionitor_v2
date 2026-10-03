@@ -70,6 +70,18 @@ UPDATE location_state
  WHERE location_id = %(id)s AND status = 'waiting'
 """
 
+# Back to "waiting for first heartbeat" (MON-01): the history reset (DATA-03, D-05) and
+# the post-restore restart (D-13) run it under the row lock; the FIRST gate leaves it at
+# the next heartbeat. Status waiting with a NULL outage start keeps
+# location_state_off_needs_outage_start true.
+WAITING_SQL = """
+UPDATE location_state
+   SET status = 'waiting', last_heartbeat_at = NULL, on_since = NULL,
+       outage_started_at = NULL, window_start_at = NULL,
+       state_version = state_version + 1
+ WHERE location_id = %(id)s
+"""
+
 # on: a plain heartbeat. GREATEST keeps an older timestamp from moving it back (D-08).
 PLAIN_SQL = """
 UPDATE location_state
@@ -154,9 +166,9 @@ def _run_gate(cur: CursorWrapper, sql: str, params: dict[str, int | datetime]) -
 
 
 def _warn_restore_clamped(location_id: int, at: datetime) -> None:
-    """Log the first clamped restore of this process at WARNING; later ones stay silent.
+    """Log the first clamped restore or first heartbeat of this process; later ones stay silent.
 
-    The line names only the location id and the restore time: never the key or a token.
+    The line names only the location id and the gate time: never the key or a token.
     """
     global _restore_clamp_warned
     with _restore_clamp_lock:
@@ -164,8 +176,9 @@ def _warn_restore_clamped(location_id: int, at: datetime) -> None:
             return
         _restore_clamp_warned = True
     log.warning(
-        "heartbeat for location %s restored at %s, after its receive time: the server "
-        "clock stepped back or a lapse carve ran at the same time",
+        "heartbeat for location %s recorded at %s, after its receive time: the server "
+        "clock stepped back, a lapse carve ran at the same time, or a database restore "
+        "left the location's open interval starting later",
         location_id,
         at.isoformat(),
     )
@@ -194,6 +207,13 @@ def record_heartbeat(location_id: int, now: datetime) -> str:
     The ON alert is dated at ``at`` but recorded at ``now``: the outbox makes a row due at
     its recorded_at, so after a backward clock step the alert goes out at once instead of
     waiting until the wall clock reaches ``at`` again. Without a clamp ``at == now``.
+
+    The FIRST gate clamps the same way. Before Phase 5 a waiting location had no interval,
+    but after a database restore (``powermon.engine.restore``, D-13) it holds an open
+    ``not_monitored`` piece from the dump's last known moment. Its first heartbeat closes
+    that piece and opens "on" at ``max(now, open interval start)``; a server whose clock
+    is behind the dump would otherwise close the piece before its start and answer 500
+    on every heartbeat (RESEARCH Pitfall 3). The start is still silent.
     """
     params: dict[str, int | datetime] = {"id": location_id, "now": now}
     with transaction.atomic(), connection.cursor() as cur:
@@ -224,11 +244,18 @@ def record_heartbeat(location_id: int, now: datetime) -> str:
                 )
             return "restored"
         if status == "waiting":
-            _run_gate(cur, FIRST_SQL, params)
+            # After a restore the location may hold an open not_monitored piece (D-13):
+            # the gate is stamped at max(now, its start), never closing it before its
+            # start (RESEARCH Pitfall 3). Without an open piece ``first == now``.
+            open_start = timeline.open_start(cur, location_id)
+            first = now if open_start is None else max(now, open_start)
+            if first > now:
+                _warn_restore_clamped(location_id, first)
+            _run_gate(cur, FIRST_SQL, {"id": location_id, "now": first})
             # MON-01 stays silent: the timeline opens, no outbox row is written.
             maintenance, _alerts_enabled = _config_row(cur, location_id)
             timeline.set_open_state(
-                cur, location_id, now, rules.desired_open_state("on", maintenance)
+                cur, location_id, first, rules.desired_open_state("on", maintenance)
             )
             return "started"
         _run_gate(cur, PLAIN_SQL, params)
