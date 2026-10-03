@@ -335,6 +335,7 @@ def test_location_page_settings_and_setup_sections(
         "Recent outages",
         "Settings",
         "Device setup",
+        "Reset history",
         "Delete location",
     ]
     # UI-D10: "Edit location" is a secondary link-button under the settings panel.

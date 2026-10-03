@@ -16,8 +16,11 @@ that retires the last marked record between them leaves a waiting location with 
 before the reset commits may edit the old message once, and a post in flight may be
 recorded unmarked; that race is accepted and documented in the lifecycle module.
 
-No reset writer exists here: 05-05 adds ``history.reset_history`` and the end-to-end reset
-through the web view. ``_reset_by_hand`` writes what that reset writes, in one transaction.
+05-02's tests emulate the reset with ``_reset_by_hand``, which writes what
+``history.reset_history`` writes, in one transaction. 05-05's tests use the real reset: the
+location page's POST (``HistoryResetView`` on a RequestFactory request with an injected
+clock) or ``history.reset_history`` itself. No admin action calls Telegram: the unpin is
+the worker's, made in an I/O pass.
 
 Every test that runs ``io_loop.run_iteration`` (``_pass``) is ``django_db(transaction=True)``,
 because the pass calls ``close_old_connections()``. The pure ``stale`` and ``plan`` cases
@@ -35,9 +38,13 @@ from typing import Any
 import pytest
 from chart_fixtures import KYIV, kyiv, monitor
 from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, FakeClock
+from django.contrib.messages.storage.fallback import FallbackStorage
+from django.contrib.sessions.backends.db import SessionStore
 from django.db import connection, transaction
 from django.db.models import F, Value
 from django.db.models.functions import Greatest
+from django.http import HttpResponse
+from django.test import RequestFactory
 
 from powermon.alerts import outbox
 from powermon.alerts.models import OpsIncident, OutboxMessage
@@ -45,6 +52,7 @@ from powermon.chart import lifecycle
 from powermon.chart.models import ChartMessage
 from powermon.engine import transitions
 from powermon.engine.models import LocationState, PowerInterval, SystemState
+from powermon.web.history_views import HISTORY_RESET_MESSAGE, HistoryResetView
 from powermon.worker import io_loop
 
 # Fri 2026-10-02 12:05 local is "now"; the location has been monitored since 10-01 08:00.
@@ -157,6 +165,24 @@ def _reset_by_hand(location: Any, at: datetime, *, mark: bool = True) -> None:
             ChartMessage.objects.filter(
                 location_id=location.pk, retired_at__isnull=True, history_reset_at__isnull=True
             ).update(history_reset_at=at)
+
+
+def _reset_post(
+    rf: RequestFactory, location: Any, clock: FakeClock
+) -> tuple[HttpResponse, list[str]]:
+    """POST the reset to the location page's view with ``clock``; the response and flashes."""
+    request = rf.post(f"/locations/{location.pk}/reset/")
+    request.session = SessionStore()
+    request._messages = FallbackStorage(request)  # type: ignore[attr-defined]
+    response = HistoryResetView.as_view(clock=clock)(request, pk=location.pk)
+    return response, [str(m) for m in request._messages]  # type: ignore[attr-defined]
+
+
+def _state(location: Any) -> tuple[Any, ...]:
+    """The location's live state: status and the four times the reset clears."""
+    return LocationState.objects.filter(location_id=location.pk).values_list(
+        "status", "last_heartbeat_at", "on_since", "outage_started_at", "window_start_at"
+    )[0]
 
 
 def _rows() -> list[ChartMessage]:
@@ -324,6 +350,55 @@ def test_INV19_reset_unpins_the_old_chart_while_the_location_waits(
     assert _no_unpin_all(fake_telegram)
     assert lifecycle.read_snapshot(TODAY) == ([], [])
     assert state.not_before == {}
+
+
+# INV-19 (reset), DATA-03 end to end: the admin's reset POST, then the worker's next pass
+# (05-05 tracer)
+
+
+@DB
+def test_INV19_reset_from_the_location_page_unpins_the_old_chart(
+    location_factory: Callable[..., Any], fake_telegram: Any, rf: RequestFactory
+) -> None:
+    location = _monitored(location_factory)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+    # Today's chart is posted and pinned in the location's chat by earlier passes.
+    assert _pass(clock, state) is True
+    assert _pass(clock, state) is True
+    [old] = _rows()
+    assert (old.message_id, old.chat_id, old.pinned) == (1001, DEFAULT_CHAT_ID, True)
+    clock.advance(seconds=30)
+    calls = len(fake_telegram.calls)
+
+    response, flashes = _reset_post(rf, location, clock)
+
+    assert response.status_code == 302
+    assert response.url == f"/locations/{location.pk}/"
+    assert flashes == [HISTORY_RESET_MESSAGE]
+    # The timeline is gone and the location waits for its first heartbeat.
+    assert not PowerInterval.objects.filter(location_id=location.pk).exists()
+    assert _state(location) == ("waiting", None, None, None, None)
+    # The record is marked, never retired by the web: the worker releases it.
+    old.refresh_from_db()
+    assert (old.history_reset_at, old.retired_at, old.pinned) == (clock.now(), None, True)
+    # The POST made no Telegram call (KD2).
+    assert len(fake_telegram.calls) == calls
+
+    clock.advance(seconds=5)
+    assert _pass(clock, state) is True
+
+    # The next pass unpins the old chart by its own id, in its stored chat, with the
+    # location's bot, and retires its record.
+    assert _requests(fake_telegram, calls) == [("A", "unpinChatMessage")]
+    assert json.loads(fake_telegram.calls[calls].request.body) == {
+        "chat_id": DEFAULT_CHAT_ID,
+        "message_id": 1001,
+    }
+    old.refresh_from_db()
+    assert (old.retired_at, old.pinned, old.finalized_at) == (clock.now(), False, None)
+    assert _pass(clock, state) is False
 
 
 # Migration 0010: a nullable marker with no default; NULL means "not reset"
