@@ -2,9 +2,10 @@
 
 The script runs here as the backup container runs it, with bash, as a subprocess. Stub
 pg_dump, pg_restore and psql shims come first on PATH and append their argv to a log, so a
-test sees every tool call; an injected ``--now EPOCH`` stands in for the clock. No container
-is started and no database is touched (D-16: INV-25 #2, the restore drill, is a recorded
-check at /gsd-verify-work 5).
+test sees every tool call; an injected ``--now EPOCH`` stands in for the clock. The loop
+(the container's command) runs as a background process with second-scale knobs and is
+stopped with SIGTERM or SIGINT. No container is started and no database is touched (D-16:
+INV-25 #2, the restore drill, is a recorded check at /gsd-verify-work 5).
 
 Tests run as uid 10001 in the dev image, so the script's root branch (chown, then gosu
 postgres) is never reached here; the container runs it.
