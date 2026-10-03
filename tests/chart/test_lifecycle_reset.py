@@ -37,7 +37,7 @@ from typing import Any
 
 import pytest
 from chart_fixtures import KYIV, kyiv, monitor
-from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, FakeClock
+from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, OPS_BOT_TOKEN, FakeClock
 from django.contrib.messages.storage.fallback import FallbackStorage
 from django.contrib.sessions.backends.db import SessionStore
 from django.db import connection, transaction
@@ -48,9 +48,9 @@ from django.test import RequestFactory
 
 from powermon.alerts import outbox
 from powermon.alerts.models import OpsIncident, OutboxMessage
-from powermon.chart import lifecycle
+from powermon.chart import lifecycle, model, source
 from powermon.chart.models import ChartMessage
-from powermon.engine import transitions
+from powermon.engine import history, transitions
 from powermon.engine.models import LocationState, PowerInterval, SystemState
 from powermon.web.history_views import HISTORY_RESET_MESSAGE, HistoryResetView
 from powermon.worker import io_loop
@@ -61,7 +61,7 @@ YESTERDAY = date(2026, 10, 1)
 NOON_05 = kyiv("2026-10-02 12:05")
 SINCE = kyiv("2026-10-01 08:00")
 # Which bot a request went to, by a short label (a failing assert never prints a token).
-BOTS = {DEFAULT_BOT_TOKEN: "A"}
+BOTS = {DEFAULT_BOT_TOKEN: "A", OPS_BOT_TOKEN: "ops"}
 DB = pytest.mark.django_db(transaction=True)
 LIFECYCLE_LOGGER = lifecycle.__name__
 # The bot may not unpin in the channel any more (best effort: the record is retired).
@@ -919,3 +919,124 @@ def test_D08_release_never_calls_unpin_all(
         None,
         None,
     )
+
+
+# INV-19 reset scenario end to end (05-05): the reset POST, the release, nothing while the
+# location waits, then one new pinned chart that shows no data before the restart
+
+
+@DB
+def test_INV19_reset_scenario_end_to_end(
+    location_factory: Callable[..., Any], fake_telegram: Any, rf: RequestFactory
+) -> None:
+    location = _monitored(location_factory)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+    assert _pass(clock, state) is True
+    assert _pass(clock, state) is True
+    clock.advance(seconds=30)
+
+    response, flashes = _reset_post(rf, location, clock)
+
+    assert (response.status_code, flashes) == (302, [HISTORY_RESET_MESSAGE])
+    clock.advance(seconds=5)
+    assert _pass(clock, state) is True
+    assert _calls(fake_telegram)[-1] == ("unpinChatMessage", DEFAULT_CHAT_ID, 1001)
+    released = len(fake_telegram.calls)
+    # While the location waits, a pass every 5 minutes for 30 minutes makes no request:
+    # no photo, no pin, no edit of the old message.
+    for _ in range(6):
+        clock.advance(minutes=5)
+        assert _pass(clock, state) is False
+    assert len(fake_telegram.calls) == released
+
+    # The first heartbeat after the reset restarts monitoring silently (MON-01, K-1).
+    restart = clock.now()
+    assert transitions.record_heartbeat(location.pk, restart) == "started"
+    assert not OutboxMessage.objects.exists()
+
+    # The next passes post and pin one new chart in the location's chat.
+    assert _all_passes(clock, state, fake_telegram) == [
+        [("sendPhoto", DEFAULT_CHAT_ID, None)],
+        [("pinChatMessage", DEFAULT_CHAT_ID, 1002)],
+    ]
+    assert _requests(fake_telegram, released) == [("A", "sendPhoto"), ("A", "pinChatMessage")]
+    clock.advance(minutes=15)
+    assert _pass(clock, state) is True
+    assert _calls(fake_telegram)[-1] == ("editMessageMedia", DEFAULT_CHAT_ID, 1002)
+    # No request ever targets the old message after its unpin.
+    assert [call for call in _calls(fake_telegram) if call[2] == 1001] == [
+        ("pinChatMessage", DEFAULT_CHAT_ID, 1001),
+        ("unpinChatMessage", DEFAULT_CHAT_ID, 1001),
+    ]
+    assert [(row.message_id, row.retired_at is None, row.pinned) for row in _rows()] == [
+        (1001, False, False),
+        (1002, True, True),
+    ]
+    # chart-spec §9: no data before the restart. Every stored piece starts at or after it,
+    # and the new chart's today row has no segment before its wall-clock time.
+    starts = list(PowerInterval.objects.filter(location_id=location.pk).values_list("start_at"))
+    assert starts == [(restart,)]
+    week = source.load_week(location.pk, today=TODAY, now=clock.now(), tz=KYIV, live=True)
+    restart_us = model.wall_us(restart, KYIV, end=False)
+    segments = week.today_row.segments
+    assert segments and segments[0].start_us == restart_us
+    assert all(segment.start_us >= restart_us for segment in segments)
+    assert [row.segments for row in week.rows if not row.is_today] == [()] * 6
+
+
+def _pin_incidents(location: Any) -> list[tuple[datetime, datetime | None]]:
+    rows = OpsIncident.objects.filter(kind=lifecycle.KIND_CHART_PIN_FAILED, location=location)
+    return [(row.started_at, row.ended_at) for row in rows.order_by("id")]
+
+
+def _ops_rows(kind: str) -> list[OutboxMessage]:
+    rows = OutboxMessage.objects.filter(channel=outbox.CHANNEL_OPS, kind=kind)
+    return list(rows.order_by("id"))
+
+
+@DB
+def test_reset_keeps_an_open_pin_failed_incident_until_the_new_chart_pins(
+    location_factory: Callable[..., Any], fake_telegram: Any, ops_settings: Any
+) -> None:
+    # Planner's discretion (05-05, recorded): the reset leaves an open chart_pin_failed
+    # incident open; it closes with its usual notice when the new chart pins.
+    location = _monitored(location_factory)
+    record = _seed(location, message_id=501, pinned=False)
+    ChartMessage.objects.filter(pk=record.pk).update(pin_failed_at=NOON_05)
+    OpsIncident.objects.create(
+        kind=lifecycle.KIND_CHART_PIN_FAILED, location=location, started_at=NOON_05
+    )
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    fake_telegram.accept(OPS_BOT_TOKEN)
+    clock = FakeClock(NOON_05 + timedelta(seconds=30))
+    state = io_loop.RelayState()
+
+    assert history.reset_history(location.pk, clock.now()) == "reset"
+
+    assert _pin_incidents(location) == [(NOON_05, None)]
+    # The release retires the old record; the incident is still open.
+    assert _pass(clock, state) is True
+    record.refresh_from_db()
+    assert (record.retired_at, record.pinned) == (clock.now(), False)
+    assert _pin_incidents(location) == [(NOON_05, None)]
+    assert _ops_rows(outbox.KIND_OPS_PIN_RESTORED) == []
+
+    # The first heartbeat: the new chart is posted, then pinned, which closes the incident.
+    clock.advance(minutes=1)
+    assert transitions.record_heartbeat(location.pk, clock.now()) == "started"
+    assert _pass(clock, state) is True
+    assert _pass(clock, state) is True
+    pinned_at = clock.now()
+    assert _calls(fake_telegram)[-1] == ("pinChatMessage", DEFAULT_CHAT_ID, 1001)
+    assert _pin_incidents(location) == [(NOON_05, pinned_at)]
+    [restored] = _ops_rows(outbox.KIND_OPS_PIN_RESTORED)
+    assert (restored.location_id, restored.payload) == (location.pk, {})
+    assert _ops_rows(outbox.KIND_OPS_PIN_FAILED) == []
+    # Its notice goes out in the next pass, the only ops message of the whole hand-over.
+    assert _pass(clock, state) is True
+    restored.refresh_from_db()
+    assert restored.status == "sent"
+    assert [req for req in _requests(fake_telegram) if req[0] == "ops"] == [("ops", "sendMessage")]
+    assert not OutboxMessage.objects.filter(channel=outbox.CHANNEL_SUBSCRIBER).exists()

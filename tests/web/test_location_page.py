@@ -345,7 +345,7 @@ def test_location_page_settings_and_setup_sections(
         f'<p><a class="btn btn--secondary" href="/locations/{location.pk}/edit/">'
         "Edit location</a></p>"
     ) in settings_section
-    device = page[page.index("<h2>Device setup</h2>") : page.index("<h2>Delete location</h2>")]
+    device = page[page.index("<h2>Device setup</h2>") : page.index("<h2>Reset history</h2>")]
     assert f"<p>{DEVICE_SETUP_SENTENCE}</p>" in device
     assert (
         f'<a class="btn btn--secondary" href="/locations/{location.pk}/setup/">'

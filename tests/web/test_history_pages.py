@@ -41,13 +41,13 @@ from django.test import Client
 from powermon.alerts import ops
 from powermon.alerts.models import OutboxMessage
 from powermon.chart.models import ChartMessage
-from powermon.engine import history, maintenance, transitions
+from powermon.engine import history, maintenance, restore, transitions
 from powermon.engine.models import LocationState, PowerInterval, SystemState
 from powermon.locations import keys
 from powermon.locations.models import Location
 from powermon.web.history_views import HistoryResetView, OutageRemoveView
 from powermon.web.location_views import LocationDetailView, OutageRow, local_minute, outage_rows
-from powermon.worker import detection
+from powermon.worker import detection, io_loop
 
 User = get_user_model()
 
@@ -82,6 +82,21 @@ RESET_IN_PROGRESS_LINE = (
     "An outage is in progress. Reset the history after power returns, or delete the location."
 )
 NOTHING_TO_RESET_LINE = "There is no power history to reset."
+# 05-UI-SPEC Copywriting › Reset-history confirmation, verbatim.
+RESET_LEAD = "This cannot be undone. Resetting the history:"
+RESET_CONSEQUENCES = [
+    "deletes all recorded power history of this location: the chart and the daily totals "
+    "show no data for the time before the reset, and Recent outages is empty;",
+    "unpins its weekly chart in the channel if the bot can still pin there; otherwise unpin "
+    "it by hand in Telegram (the posted messages stay in the channel);",
+    "sets it to Waiting for first heartbeat: nothing is detected until the next heartbeat, "
+    "which restarts monitoring as On without an alert and posts and pins a new chart;",
+    "still sends the alerts already queued, because they report real events;",
+    "keeps the settings, the device key, the switches and the Delivery status.",
+]
+RESET_ALTERNATIVE = (
+    "To remove a single false outage instead, use Recent outages on the location page."
+)
 # 05-UI-SPEC Copywriting › Recent outages, verbatim.
 INTRO = (
     "Outages in the last 14 days, newest first. Remove an outage that was not a real power "
@@ -922,3 +937,335 @@ def test_reset_post_during_an_outage_is_refused(
     assert f'<p class="callout callout--error" role="alert">{RESET_REFUSED_FLASH}</p>' in page
     assert _written(location) == before
     assert len(fake_telegram.calls) == 0
+
+
+# Screen A2: the Reset history section (UI5-D9)
+
+
+def _reset_link(location: Any) -> str:
+    return f'<p><a class="btn btn--secondary" href="{_reset(location)}">Reset history</a></p>'
+
+
+@pytest.mark.django_db(transaction=True)
+def test_reset_section_states(
+    admin: Client, monkeypatch: pytest.MonkeyPatch, location_factory: Callable[..., Any]
+) -> None:
+    on = _two_outages(location_factory, name="On")
+    paused_on = _two_outages(location_factory, name="Paused on")
+    assert maintenance.set_maintenance(paused_on.pk, True, _at(15, 45)) is True
+    off = _off_since_9(location_factory, name="Off")
+    paused_off = _off_since_9(location_factory, name="Paused off")
+    assert maintenance.set_maintenance(paused_off.pk, True, _at(9, 30)) is True
+    never = location_factory(name="Never monitored")
+    _clock(monkeypatch, _at(16, 0))
+
+    def section(location: Any) -> str:
+        return _reset_section(_main(admin.get(_page(location)).content.decode()))
+
+    def shows(location: Any, line: str | None) -> None:
+        text = section(location)
+        # The description sentence is always shown, verbatim.
+        assert f"<p>{RESET_SENTENCE}</p>" in text
+        # Then exactly one of: the link-button, the D-06 line, the no-history line.
+        lines = [f"<p>{RESET_IN_PROGRESS_LINE}</p>", f"<p>{NOTHING_TO_RESET_LINE}</p>"]
+        for candidate in lines:
+            assert (candidate in text) == (candidate == line), candidate
+        assert (_reset_link(location) in text) == (line is None)
+        # A secondary link-button at most: never a form or a destructive button here.
+        assert "<form" not in text
+        assert "btn--danger" not in text
+        assert "<script" not in text
+
+    # On, and on in maintenance: the link-button.
+    shows(on, None)
+    shows(paused_on, None)
+    # Off, whatever the maintenance flag: the D-06 line and no link (D-06).
+    shows(off, f"<p>{RESET_IN_PROGRESS_LINE}</p>")
+    shows(paused_off, f"<p>{RESET_IN_PROGRESS_LINE}</p>")
+    # No stored interval: nothing to reset and no link.
+    shows(never, f"<p>{NOTHING_TO_RESET_LINE}</p>")
+    # Waiting with history after a restore (05-03): the reset is offered.
+    restore.restart_after_restore(_at(16, 0))
+    assert LocationState.objects.get(location=off).status == "waiting"
+    shows(on, None)
+    shows(off, None)
+
+
+# Screen C: the reset confirmation
+
+
+@pytest.mark.django_db(transaction=True)
+def test_reset_confirmation_page(
+    admin: Client, monkeypatch: pytest.MonkeyPatch, location_factory: Callable[..., Any]
+) -> None:
+    location = _two_outages(location_factory, name="Office")
+    _clock(monkeypatch, _at(16, 0))
+    url = _reset(location)
+    before = _written(location)
+
+    response = admin.get(url)
+
+    assert response.status_code == 200
+    html = response.content.decode()
+    page = _main(html)
+    assert "<title>Office · Reset history · Power Monitor</title>" in html
+    assert _crumbs(page) == [
+        ("", '<a href="/">Locations</a>'),
+        ("", f'<a class="name" href="/locations/{location.pk}/">Office</a>'),
+        (' aria-current="page"', "Reset history"),
+    ]
+    assert '<h1 class="name">Reset the history of Office?</h1>' in page
+    assert f"<p>{RESET_LEAD}</p>" in page
+    assert _consequences(page) == RESET_CONSEQUENCES
+    assert f"<p>{RESET_ALTERNATIVE}</p>" in page
+    assert page.index(RESET_LEAD) < page.index('<ul class="list">') < page.index(RESET_ALTERNATIVE)
+    assert re.findall(r"<form\b[^>]*>", page) == [f'<form method="post" action="{url}">']
+    button = '<button class="btn btn--danger" type="submit">Reset history</button>'
+    keep = f'<a class="btn btn--secondary" href="/locations/{location.pk}/">Keep history</a>'
+    assert page.index(RESET_ALTERNATIVE) < page.index(button) < page.index(keep)
+    assert page.count("btn--danger") == 1
+    assert "btn--primary" not in page
+    assert "autofocus" not in page
+    assert "<script" not in html
+    # No settings panel: not even the masked token.
+    assert '<dl class="panel settings">' not in page
+    # The GET wrote nothing.
+    assert _written(location) == before
+
+
+@pytest.mark.django_db(transaction=True)
+def test_reset_get_redirects_with_the_post_flash_when_a_check_fails(
+    admin: Client, monkeypatch: pytest.MonkeyPatch, location_factory: Callable[..., Any]
+) -> None:
+    off = _off_since_9(location_factory, name="Off")
+    never = location_factory(name="Never monitored")
+    _clock(monkeypatch, _at(9, 20))
+
+    for maintenance_on in (False, True):
+        if maintenance_on:
+            assert maintenance.set_maintenance(off.pk, True, _at(9, 30)) is True
+        before = (_written(off), _written(never))
+
+        refused = admin.get(_reset(off))
+
+        # UI5-D7: a refused GET redirects with the error flash its POST would give.
+        assert refused.status_code == 302
+        assert refused.url == _page(off)
+        page = admin.get(refused.url).content.decode()
+        assert _flashes(page) == [RESET_REFUSED_FLASH]
+        assert f'<p class="callout callout--error" role="alert">{RESET_REFUSED_FLASH}</p>' in page
+
+        nothing = admin.get(_reset(never))
+
+        assert nothing.status_code == 302
+        assert nothing.url == _page(never)
+        page = admin.get(nothing.url).content.decode()
+        assert _flashes(page) == [NOTHING_TO_RESET_FLASH]
+        assert f'<p class="callout" role="status">{NOTHING_TO_RESET_FLASH}</p>' in page
+        assert (_written(off), _written(never)) == before
+
+
+@pytest.mark.django_db(transaction=True)
+def test_reset_crafted_post_during_an_outage_is_refused(
+    admin: Client,
+    monkeypatch: pytest.MonkeyPatch,
+    location_factory: Callable[..., Any],
+    fake_telegram: FakeTelegram,
+) -> None:
+    location = _off_since_9(location_factory)
+    ChartMessage.objects.create(
+        location=location,
+        local_date=_at(9, 0).date(),
+        chat_id=location.chat_id,
+        bot_key=io_loop.bot_key(location.bot_token),
+        message_id=501,
+        pinned=True,
+        last_rendered_at=_at(9, 0),
+        created_at=_at(9, 0),
+    )
+    _clock(monkeypatch, _at(9, 20))
+
+    for maintenance_on in (False, True):
+        if maintenance_on:
+            # Its open piece is not monitored now: the status is still off (D-06).
+            assert maintenance.set_maintenance(location.pk, True, _at(9, 30)) is True
+        before = _written(location)
+
+        response = admin.post(_reset(location))
+
+        assert response.status_code == 302
+        assert response.url == _page(location)
+        page = admin.get(response.url).content.decode()
+        assert _flashes(page) == [RESET_REFUSED_FLASH]
+        assert _written(location) == before
+    assert len(fake_telegram.calls) == 0
+
+
+# Screens D and E: results, double submit and edge responses
+
+
+@pytest.mark.django_db(transaction=True)
+def test_reset_double_submit_says_nothing_to_reset(
+    admin: Client,
+    monkeypatch: pytest.MonkeyPatch,
+    location_factory: Callable[..., Any],
+    fake_telegram: FakeTelegram,
+) -> None:
+    location = _two_outages(location_factory)
+    _clock(monkeypatch, _at(16, 0))
+
+    first = admin.post(_reset(location))
+
+    assert first.status_code == 302
+    page = admin.get(first.url).content.decode()
+    assert _flashes(page) == [RESET_FLASH]
+    assert f'<p class="callout" role="status">{RESET_FLASH}</p>' in page
+    after = _written(location)
+
+    second = admin.post(_reset(location))
+
+    assert second.status_code == 302
+    assert second.url == _page(location)
+    page = admin.get(second.url).content.decode()
+    assert _flashes(page) == [NOTHING_TO_RESET_FLASH]
+    assert f'<p class="callout" role="status">{NOTHING_TO_RESET_FLASH}</p>' in page
+    assert _written(location) == after
+    assert len(fake_telegram.calls) == 0
+
+
+@pytest.mark.django_db(transaction=True)
+def test_reset_flashes_stack_in_queue_order(
+    admin: Client, monkeypatch: pytest.MonkeyPatch, location_factory: Callable[..., Any]
+) -> None:
+    location = _two_outages(location_factory)
+    _clock(monkeypatch, _at(16, 0))
+
+    # Two actions before the page is read: each flash in its own callout, in order (E5).
+    admin.post(_reset(location))
+    admin.post(_reset(location))
+
+    page = admin.get(_page(location)).content.decode()
+    assert _flashes(page) == [RESET_FLASH, NOTHING_TO_RESET_FLASH]
+    # A page reached without a Phase 5 action shows no flash.
+    assert _flashes(admin.get(_page(location)).content.decode()) == []
+
+
+@pytest.mark.django_db(transaction=True)
+def test_reset_urls_answer_404(
+    admin: Client, monkeypatch: pytest.MonkeyPatch, location_factory: Callable[..., Any]
+) -> None:
+    location = _two_outages(location_factory, name="Office")
+    gone = location_factory(name="Gone")
+    assert transitions.record_heartbeat(gone.pk, _at(16, 0)) == "started"
+    Location.objects.filter(pk=gone.pk).update(deleted_at=_at(16, 1))
+    _clock(monkeypatch, _at(16, 5))
+    before = (_written(location), _written(gone))
+
+    for url in (f"/locations/{gone.pk + 1000}/reset/", _reset(gone)):
+        assert admin.get(url).status_code == 404, url
+        assert admin.post(url).status_code == 404, url
+
+    assert (_written(location), _written(gone)) == before
+    # Deleted between the page's lookup and the reset's row lock: 404 too, never a flash.
+    monkeypatch.setattr(history, "reset_history", lambda pk, now: "gone")
+    assert admin.post(_reset(location)).status_code == 404
+    assert _written(location) == before[0]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_reset_post_needs_csrf(location_factory: Callable[..., Any]) -> None:
+    location = _two_outages(location_factory)
+    client = Client(enforce_csrf_checks=True)
+    client.force_login(User.objects.create_user("admin", password="not-used-here"))
+    before = _written(location)
+
+    response = client.post(_reset(location))
+
+    assert response.status_code == 403
+    assert _written(location) == before
+
+
+@pytest.mark.django_db(transaction=True)
+def test_anonymous_reset_url_redirects_to_sign_in(
+    client: Client, location_factory: Callable[..., Any]
+) -> None:
+    location = _two_outages(location_factory)
+    url = _reset(location)
+    before = _written(location)
+
+    assert client.get(url).url == f"/login/?next={url}"
+    response = client.post(url)
+
+    assert response.status_code == 302
+    assert response.url == f"/login/?next={url}"
+    assert _written(location) == before
+
+
+@pytest.mark.django_db(transaction=True)
+def test_reset_page_escapes_the_name_and_shows_a_long_name_whole(
+    admin: Client, monkeypatch: pytest.MonkeyPatch, location_factory: Callable[..., Any]
+) -> None:
+    location = _two_outages(location_factory, name=XSS_NAME)
+    name = "x" * 100
+    long = location_factory(name=name)
+    assert transitions.record_heartbeat(long.pk, _at(16, 0)) == "started"
+    _clock(monkeypatch, _at(16, 5))
+
+    html = admin.get(_reset(location)).content.decode()
+
+    assert f"<title>{ESCAPED_XSS_NAME} · Reset history · Power Monitor</title>" in html
+    assert f'<h1 class="name">Reset the history of {ESCAPED_XSS_NAME}?</h1>' in html
+    assert _crumbs(html)[1] == (
+        "",
+        f'<a class="name" href="/locations/{location.pk}/">{ESCAPED_XSS_NAME}</a>',
+    )
+    assert "<script" not in html
+    # E4 long-text: a 100-character name is shown whole, never truncated.
+    page = admin.get(_reset(long)).content.decode()
+    assert f"<title>{name} · Reset history · Power Monitor</title>" in page
+    assert f'<h1 class="name">Reset the history of {name}?</h1>' in page
+    assert _crumbs(page) == [
+        ("", '<a href="/">Locations</a>'),
+        ("", f'<a class="name" href="/locations/{long.pk}/">{name}</a>'),
+        (' aria-current="page"', "Reset history"),
+    ]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_reset_pages_show_no_secret(
+    admin: Client, monkeypatch: pytest.MonkeyPatch, location_factory: Callable[..., Any]
+) -> None:
+    location = _two_outages(location_factory, name="Office", bot_token=TOKEN)
+    off = _off_since_9(location_factory, name="Off", bot_token=TOKEN)
+    _clock(monkeypatch, _at(16, 0))
+    keys_shown = (location.device_key, off.device_key)
+
+    detail = admin.get(_page(location)).content.decode()
+    section = _reset_section(_main(detail))
+    confirm = admin.get(_reset(location)).content.decode()
+    flash_pages = [
+        # Reset (success), nothing to reset (info), refused during an outage (error).
+        admin.post(_reset(location), follow=True),
+        admin.post(_reset(location), follow=True),
+        admin.post(_reset(off), follow=True),
+    ]
+    flashes = [response.content.decode() for response in flash_pages]
+    assert [_flashes(page) for page in flashes] == [
+        [RESET_FLASH],
+        [NOTHING_TO_RESET_FLASH],
+        [RESET_REFUSED_FLASH],
+    ]
+
+    for html in (detail, section, confirm, *flashes):
+        for key in keys_shown:
+            assert key not in html
+            assert keys.mask_key(key) not in html
+        assert TOKEN not in html
+        assert SECRET not in html
+    # The confirmation page has no settings panel: not even the masked token.
+    assert "•" not in _main(confirm)
+    for response in flash_pages:
+        for url, _status in response.redirect_chain:
+            for key in keys_shown:
+                assert key not in url
+            assert SECRET not in url
