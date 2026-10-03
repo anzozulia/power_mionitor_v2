@@ -5,9 +5,12 @@
 # same image tag as `db`, so pg_dump's major version matches the server's (D-09).
 #
 # Modes:
-#   --once [--now EPOCH]  one schedule check: dump, verify and rotate when a dump is due
-# Exit codes: 0 ok (or no dump due); 1 a dump failed; 2 a configuration or usage error
-# (then nothing is written).
+#   --once [--now EPOCH]    one schedule check: dump, verify and rotate when a dump is due
+#   --health [--now EPOCH]  the container healthcheck: exit 0 only while the newest dump, by
+#                           the time in its name, is less than 26 h old (D-11). It reads file
+#                           names only, needs no database setting and runs as root, read-only.
+# Exit codes: 0 ok (or no dump due); 1 a dump failed, or unhealthy; 2 a configuration or
+# usage error (then nothing is written).
 #
 # Schedule (D-09, stateless): a dump is due when there is none yet, or when the newest dump,
 # by the UTC time in its name, is older than the most recent BACKUP_TIME_UTC slot. That slot
@@ -45,6 +48,8 @@ BACKUP_TIME_UTC=${BACKUP_TIME_UTC:-03:00}
 BACKUP_KEEP=${BACKUP_KEEP:-14}
 # A dump's name: its UTC start time, fixed width, so byte order (LC_ALL=C) is time order.
 DUMP_NAME_RE='^powermon-[0-9]{8}T[0-9]{6}Z\.dump$'
+# Healthy while the newest dump is younger than this: a night's slot plus two hours.
+HEALTH_MAX_AGE_S=$(( 26 * 3600 ))
 ARGS=("$@")
 
 log() { printf '%s backup: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
@@ -164,6 +169,22 @@ dump() {
   log "dump $name ok"
 }
 
+health() {
+  # Healthy while the newest dump, by the time in its name, is under 26 h old at epoch $1.
+  local epoch name age
+  if ! read -r epoch name < <(newest); then
+    log "unhealthy: no dump yet"
+    return 1
+  fi
+  age=$(( $1 - epoch ))
+  if (( age < HEALTH_MAX_AGE_S )); then
+    log "healthy: newest dump $name is $(( age / 3600 )) h old"
+    return 0
+  fi
+  log "unhealthy: newest dump $name is $(( age / 3600 )) h old (limit 26 h)"
+  return 1
+}
+
 prepare_as_root() {
   # Docker creates a missing bind source as root:root 0755: hand it to the postgres user,
   # owner-only, then run this script again as postgres (D-11, RESEARCH Pitfall 9).
@@ -180,12 +201,12 @@ prepare_as_root() {
 }
 
 usage() {
-  die "unknown mode $(printf '%q' "${1:-}"); use --once [--now EPOCH]"
+  die "unknown mode $(printf '%q' "${1:-}"); use --once or --health [--now EPOCH]"
 }
 
 MODE=${1:-}
 case $MODE in
-  --once)
+  --once | --health)
     shift
     NOW=$(date -u +%s)
     if (( $# > 0 )); then
@@ -199,6 +220,12 @@ case $MODE in
     usage "$MODE"
     ;;
 esac
+
+if [[ $MODE == --health ]]; then
+  # Before the settings check and the root branch: read-only, file names only.
+  health "$NOW"
+  exit $?
+fi
 
 check_settings
 if [[ $(id -u) == 0 ]]; then
