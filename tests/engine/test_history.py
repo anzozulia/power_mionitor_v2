@@ -1,4 +1,5 @@
-"""History corrections in the engine (DATA-02; D-01, D-02, D-04; INV-07 #1, #3).
+"""History corrections in the engine (DATA-02, DATA-03; D-01, D-02, D-04, D-05, D-06, D-07,
+UI5-D9; INV-07 #1, #2, #3).
 
 ``history.recent_outages`` reads the stored timeline as the chart does (KD1): one outage per
 ``outage_start_at`` (D-01, the chart's count rule), newest first, over the last 14 local
@@ -13,6 +14,14 @@ location's ``location_state`` row lock first:
   refined on 2026-10-03): an OFF that is sending, sent or uncertain keeps its ON;
 - live state (status, last heartbeat, on since, outage start, window start, state version)
   is never written, nothing is queued and nothing is sent (INV-07 #1).
+
+``history.reset_history`` is one transaction under the same row lock: refused while the
+locked status is off, maintenance or not (D-06); nothing written without history (UI5-D9);
+otherwise the whole timeline is deleted, the location waits for its first heartbeat with
+``state_version`` bumped (D-05), and its active chart records are marked for the worker's
+release (D-08). Configuration, switches, open incidents and queued alerts stay (D-05,
+D-07). The next heartbeat restarts silently, and a later silence is alerted once (INV-07
+#2).
 
 Histories are built only through ``transitions.record_heartbeat``, ``detection.run_cycle``
 and ``maintenance.set_maintenance``, with aware UTC times on the fixed day 2026-10-01. Tests
@@ -39,13 +48,15 @@ from conftest import (
 )
 from django.db import connection, transaction
 
-from powermon.alerts.models import OutboxMessage
+from powermon.alerts import delivery
+from powermon.alerts.models import OpsIncident, OutboxMessage
 from powermon.chart import source
-from powermon.engine import history, maintenance, transitions
+from powermon.chart.models import ChartMessage
+from powermon.engine import history, maintenance, restore, transitions
 from powermon.engine.models import LocationState, PowerInterval, SystemState
 from powermon.i18n import chart_texts
 from powermon.locations.models import Location
-from powermon.worker import detection
+from powermon.worker import detection, io_loop
 
 Interval = tuple[str, datetime, datetime | None, datetime | None]
 
@@ -780,3 +791,329 @@ def test_removal_rereads_the_status_under_the_lock(
     # The removal saw the committed status, not the one before it waited: refused.
     assert remover.result == "in_progress"
     assert ("off", _at(15, 0), _at(15, 30), _at(15, 0)) in _intervals(location)
+
+
+# The history reset (DATA-03; D-05, D-06, D-07, UI5-D9; INV-07 #2)
+
+YESTERDAY = date(2026, 9, 30)
+Marks = list[tuple[int, datetime | None, datetime | None]]
+
+
+def _chart(
+    location: Any, day: date = TODAY, *, message_id: int, retired_at: datetime | None = None
+) -> ChartMessage:
+    """A chart record an earlier I/O pass left in the location's chat, by its bot."""
+    return ChartMessage.objects.create(
+        location=location,
+        local_date=day,
+        chat_id=location.chat_id,
+        bot_key=io_loop.bot_key(location.bot_token),
+        message_id=message_id,
+        pinned=retired_at is None,
+        last_rendered_at=_at(8, 0),
+        created_at=_at(8, 0),
+        retired_at=retired_at,
+    )
+
+
+def _marks(location: Any) -> Marks:
+    """The location's chart records as (message id, history_reset_at, retired_at)."""
+    rows = ChartMessage.objects.filter(location=location).order_by("id")
+    return list(rows.values_list("message_id", "history_reset_at", "retired_at"))
+
+
+def _config(location: Any) -> tuple[Any, ...]:
+    """Everything a reset keeps on the location row (D-05)."""
+    stored = Location.objects.get(pk=location.pk)
+    return (
+        stored.name,
+        stored.period_s,
+        stored.grace_s,
+        stored.chat_id,
+        stored.bot_token,
+        stored.language,
+        stored.device_key,
+        stored.maintenance,
+        stored.alerts_enabled,
+        stored.router_grace,
+        stored.deleted_at,
+    )
+
+
+def _everything(location: Any) -> tuple[Any, ...]:
+    """What a reset could write: timeline, live state, chart marks, outbox, configuration."""
+    return (_intervals(location), _live(location), _marks(location), _outbox(), _config(location))
+
+
+@pytest.mark.django_db(transaction=True)
+def test_D05_reset_clears_history_and_waits(location_factory: Callable[..., Any]) -> None:
+    location = _two_outages(location_factory)
+    today = _chart(location, message_id=501)
+    # An older record already retired (a release done long ago): never marked again.
+    _chart(location, YESTERDAY, message_id=401, retired_at=_at(7, 0))
+    assert delivery.open_failing(location.pk, _at(15, 45), 403) is True
+    config = _config(location)
+    version = _live(location)[5]
+    now = _at(16, 0)
+
+    assert history.reset_history(location.pk, now) == "reset"
+
+    assert _intervals(location) == []
+    assert _live(location) == ("waiting", None, None, None, None, version + 1)
+    assert _marks(location) == [(today.message_id, now, None), (401, None, _at(7, 0))]
+    # Configuration, device key and the three switches are kept, and so is the open
+    # delivery_failing incident (delivery health, D-05).
+    assert _config(location) == config
+    incident = OpsIncident.objects.get(kind=delivery.KIND_DELIVERY_FAILING, location=location)
+    assert incident.ended_at is None
+
+
+@pytest.mark.django_db(transaction=True)
+def test_D07_queued_alerts_are_kept(location_factory: Callable[..., Any]) -> None:
+    location = _two_outages(location_factory)
+    rows = _outbox()
+    assert [row[2] for row in rows] == ["pending"] * 4
+
+    assert history.reset_history(location.pk, _at(16, 0)) == "reset"
+
+    # They report real events, and D-06 means every queued OFF already has its ON.
+    assert _outbox() == rows
+
+
+@pytest.mark.django_db(transaction=True)
+def test_D06_reset_refused_while_off(location_factory: Callable[..., Any]) -> None:
+    location = _off_since_9(location_factory)
+    _chart(location, message_id=501)
+
+    for maintenance_on in (False, True):
+        if maintenance_on:
+            # In maintenance the open piece is not monitored, but the status is still off.
+            assert maintenance.set_maintenance(location.pk, True, _at(9, 30)) is True
+            assert _intervals(location)[-1] == ("not_monitored", _at(9, 30), None, None)
+        before = _everything(location)
+
+        assert history.reset_history(location.pk, _at(9, 40)) == "in_progress"
+
+        assert _everything(location) == before
+    assert _live(location)[0] == "off"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_UI5_D9_nothing_to_reset_writes_nothing(location_factory: Callable[..., Any]) -> None:
+    # A location that never sent a heartbeat: no interval, nothing to reset, no version bump.
+    waiting = location_factory()
+    _chart(waiting, message_id=301)
+    before = _everything(waiting)
+
+    assert history.reset_history(waiting.pk, _at(9, 0)) == "nothing"
+
+    assert _everything(waiting) == before
+    # The second click of a double submit: the first reset wrote, the second writes nothing.
+    location = _two_outages(location_factory)
+    _chart(location, message_id=501)
+    assert history.reset_history(location.pk, _at(16, 0)) == "reset"
+    after = _everything(location)
+
+    assert history.reset_history(location.pk, _at(16, 0, 5)) == "nothing"
+
+    assert _everything(location) == after
+    assert _marks(location) == [(501, _at(16, 0), None)]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_reset_of_a_deleted_location_is_gone(location_factory: Callable[..., Any]) -> None:
+    location = _two_outages(location_factory)
+    _chart(location, message_id=501)
+    Location.objects.filter(pk=location.pk).update(deleted_at=_at(16, 0))
+    before = _everything(location)
+
+    assert history.reset_history(location.pk, _at(16, 5)) == "gone"
+
+    assert _everything(location) == before
+    # An unknown location (no state row) is gone too.
+    assert history.reset_history(location.pk + 1000, _at(16, 5)) == "gone"
+
+
+@pytest.mark.django_db
+def test_reset_rejects_a_naive_now(location_factory: Callable[..., Any]) -> None:
+    location = location_factory()
+    assert transitions.record_heartbeat(location.pk, _at(8, 0)) == "started"
+    before = _everything(location)
+
+    with pytest.raises(ValueError, match="naive"):
+        history.reset_history(location.pk, datetime(2026, 10, 1, 9, 0))  # noqa: DTZ001
+
+    assert _everything(location) == before
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV07_2_reset_right_after_start_then_silence_gives_one_off(
+    location_factory: Callable[..., Any], fake_telegram: FakeTelegram
+) -> None:
+    _no_anchors()
+    location = location_factory()
+    assert transitions.record_heartbeat(location.pk, _at(8, 0)) == "started"
+    assert transitions.record_heartbeat(location.pk, _at(8, 0, 30)) == "plain"
+
+    assert history.reset_history(location.pk, _at(8, 1)) == "reset"
+
+    # The next heartbeat restarts monitoring silently (K-1, MON-01).
+    assert transitions.record_heartbeat(location.pk, _at(8, 2)) == "started"
+    assert not OutboxMessage.objects.exists()
+    assert transitions.record_heartbeat(location.pk, _at(8, 3)) == "plain"
+    assert _intervals(location) == [("on", _at(8, 2), None, None)]
+    # A 1 h silence after that: exactly one OFF, from the last heartbeat (K-2).
+    assert detection.run_cycle(_at(9, 3)) == 1
+    assert detection.run_cycle(_at(9, 10)) == 0
+    assert detection.run_cycle(_at(10, 0)) == 0
+    assert _outbox() == [("power_off", _at(8, 3), "pending", "")]
+    assert _intervals(location) == [
+        ("on", _at(8, 2), _at(8, 3), None),
+        ("off", _at(8, 3), None, _at(8, 3)),
+    ]
+    assert len(fake_telegram.calls) == 0
+
+
+@pytest.mark.django_db(transaction=True)
+def test_snapshot_taken_before_the_reset_loses_its_off(
+    monkeypatch: pytest.MonkeyPatch, location_factory: Callable[..., Any]
+) -> None:
+    _no_anchors()
+    location = location_factory()
+    for minute in range(6):
+        transitions.record_heartbeat(location.pk, _at(10, minute))
+    real = transitions.read_snapshots
+
+    def snapshot_then_reset() -> Any:
+        snapshots = real()
+        # The admin resets between the detector's snapshot and its decision.
+        assert history.reset_history(location.pk, _at(10, 6, 30)) == "reset"
+        return snapshots
+
+    monkeypatch.setattr(transitions, "read_snapshots", snapshot_then_reset)
+
+    # The snapshot's state_version is stale after the reset: its OFF CAS changes no row.
+    assert detection.run_cycle(_at(10, 6, 31)) == 0
+
+    assert _live(location)[:5] == ("waiting", None, None, None, None)
+    assert _intervals(location) == []
+    assert _outbox() == []
+
+
+@pytest.mark.django_db(transaction=True)
+def test_reset_waits_on_the_row_lock(
+    location_factory: Callable[..., Any],
+    lock_holder: tuple[threading.Event, threading.Event],
+) -> None:
+    location = _two_outages(location_factory)
+    inside, release = lock_holder
+
+    def hold_the_row_lock() -> None:
+        with transaction.atomic(), connection.cursor() as cur:
+            cur.execute(transitions.LOCK_SQL, [location.pk])
+            cur.fetchone()
+            inside.set()
+            if not release.wait(5):
+                raise AssertionError("the lock holder was never released")
+
+    holder = Actor(hold_the_row_lock)
+    resetter = Actor(lambda: history.reset_history(location.pk, _at(16, 0)))
+    try:
+        holder.start()
+        assert inside.wait(5)
+        resetter.start()
+        assert wait_for(lambda: resetter.pid is not None and blocked_on_lock(resetter.pid))
+        # Still waiting on the state row lock: nothing is deleted yet.
+        assert resetter.is_alive()
+        assert len(_intervals(location)) == 5
+        release.set()
+        resetter.join(5)
+    finally:
+        _finish(holder, resetter, release=release)
+
+    assert holder.exc is None, holder.exc
+    assert resetter.exc is None, resetter.exc
+    assert resetter.result == "reset"
+    assert _intervals(location) == []
+    # A heartbeat after the reset takes the FIRST gate.
+    assert transitions.record_heartbeat(location.pk, _at(16, 1)) == "started"
+    assert _intervals(location) == [("on", _at(16, 1), None, None)]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_reset_rereads_the_status_under_the_lock(
+    location_factory: Callable[..., Any],
+    lock_holder: tuple[threading.Event, threading.Event],
+) -> None:
+    location = _two_outages(location_factory)
+    inside, release = lock_holder
+
+    def outage_starts_meanwhile() -> None:
+        # A writer holding the lock commits status off while the reset waits.
+        with transaction.atomic(), connection.cursor() as cur:
+            cur.execute(transitions.LOCK_SQL, [location.pk])
+            cur.fetchone()
+            LocationState.objects.filter(location=location).update(
+                status="off", outage_started_at=_at(15, 45)
+            )
+            inside.set()
+            if not release.wait(5):
+                raise AssertionError("the lock holder was never released")
+
+    holder = Actor(outage_starts_meanwhile)
+    resetter = Actor(lambda: history.reset_history(location.pk, _at(16, 0)))
+    try:
+        holder.start()
+        assert inside.wait(5)
+        resetter.start()
+        assert wait_for(lambda: resetter.pid is not None and blocked_on_lock(resetter.pid))
+        release.set()
+        resetter.join(5)
+    finally:
+        _finish(holder, resetter, release=release)
+
+    assert holder.exc is None, holder.exc
+    assert resetter.exc is None, resetter.exc
+    # The reset saw the committed status, not the one before it waited: refused.
+    assert resetter.result == "in_progress"
+    assert len(_intervals(location)) == 5
+
+
+@pytest.mark.django_db(transaction=True)
+def test_reset_of_a_waiting_location_with_history(location_factory: Callable[..., Any]) -> None:
+    _no_anchors()
+    location = location_factory()
+    assert transitions.record_heartbeat(location.pk, _at(8, 0)) == "started"
+    # After a restore (05-03) the location waits but keeps its history: the open piece is
+    # not monitored from the dump's last known moment.
+    restore.restart_after_restore(_at(9, 0))
+    assert _live(location)[0] == "waiting"
+    assert _intervals(location) == [("not_monitored", _at(8, 0), None, None)]
+    version = _live(location)[5]
+
+    assert history.reset_history(location.pk, _at(9, 5)) == "reset"
+
+    assert _intervals(location) == []
+    assert _live(location) == ("waiting", None, None, None, None, version + 1)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_reset_logs_one_info_line(
+    location_factory: Callable[..., Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    location = _two_outages(location_factory)
+    caplog.set_level(logging.INFO, logger=history.__name__)
+
+    assert history.reset_history(location.pk, _at(16, 0)) == "reset"
+
+    [record] = [r for r in caplog.records if r.name == history.__name__]
+    assert record.levelno == logging.INFO
+    message = record.getMessage()
+    assert message == f"history of location {location.pk} reset at {_at(16, 0).isoformat()}"
+    assert DEFAULT_BOT_TOKEN not in message
+    assert DEFAULT_BOT_TOKEN.split(":", 1)[1] not in message
+    assert location.device_key not in message
+    # A reset that writes nothing logs nothing.
+    caplog.clear()
+    assert history.reset_history(location.pk, _at(16, 1)) == "nothing"
+    assert [r for r in caplog.records if r.name == history.__name__] == []
