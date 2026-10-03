@@ -38,6 +38,50 @@ services:
     restart: unless-stopped
     logging: *logging
 
+  # Nightly database dumps in their own container (OPS-06, INV-25, D-09). Same image tag as
+  # db, so pg_dump's major version matches the server. Dumps go to docker_data/prod/backups,
+  # outside the PostgreSQL data directory, as a 0700 directory of 0600 files: they hold every
+  # bot token (D-11). No ports. Healthy while the newest dump is under 26 h old; a failing
+  # backup sends no notice, only this healthcheck and the log show it (D-12).
+  backup:
+    image: postgres:18.6-trixie
+    command: ["bash", "/backup/backup.sh"]
+    # Only POSTGRES_* and BACKUP_* pass through: every other app setting is blanked, so this
+    # container holds no app secret (D-11). Keep this list in step with .env.example
+    # (tests/test_compose.py checks it).
+    env_file: [.env.docker_production]
+    environment:
+      APP_ENV: ""
+      DEBUG: ""
+      SECRET_KEY: ""
+      ADMIN_USERNAME: ""
+      ADMIN_PASSWORD: ""
+      DOMAIN: ""
+      ACME_EMAIL: ""
+      DISPLAY_TZ: ""
+      PUBLIC_BASE_URL: ""
+      OPS_BOT_TOKEN: ""
+      OPS_CHAT_ID: ""
+      ALERT_MAX_AGE_HOURS: ""
+      LOG_LEVEL: ""
+    volumes:
+      - ./docker/backup:/backup:ro
+      - ./docker_data/prod/backups:/backups
+    depends_on:
+      # Never migrate: `run --rm --no-deps backup ... --restore` must work on a new, empty
+      # database, before migrate has run.
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "bash", "/backup/backup.sh", "--health"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 5m
+      start_interval: 5s
+    restart: unless-stopped
+    logging: *logging
+
   # One-shot on every deploy: apply migrations, then sync the env admin account. web and
   # worker start only after it exits 0, so a failed migration stops the deploy (D-02).
   migrate:
@@ -144,6 +188,8 @@ services:
       OPS_CHAT_ID: ""
       ALERT_MAX_AGE_HOURS: ""
       LOG_LEVEL: ""
+      BACKUP_TIME_UTC: ""
+      BACKUP_KEEP: ""
     volumes:
       - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
       # Certificates and ACME account: persisted so a redeploy never re-issues (D-04).

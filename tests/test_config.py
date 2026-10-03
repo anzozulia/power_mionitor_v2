@@ -56,6 +56,9 @@ VALID_PRODUCTION: dict[str, str] = {
     "OPS_CHAT_ID": OPS_CHAT_ID,
     "ALERT_MAX_AGE_HOURS": "6",
     "LOG_LEVEL": "INFO",
+    # Read only by docker/backup/backup.sh; the app ignores them (OPS-06).
+    "BACKUP_TIME_UTC": "03:00",
+    "BACKUP_KEEP": "14",
 }
 # How a required value can be wrong; None means the variable is not set at all.
 BAD_VALUES = ("missing", "empty", "blank", "example")
