@@ -27,7 +27,8 @@ boundary (``fake_telegram``); renders are real (Pillow), so each test keeps to a
 
 import dataclasses
 import json
-from collections.abc import Callable
+import logging
+from collections.abc import Callable, Iterator
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -38,8 +39,11 @@ from django.db import connection, transaction
 from django.db.models import F, Value
 from django.db.models.functions import Greatest
 
+from powermon.alerts import outbox
+from powermon.alerts.models import OpsIncident, OutboxMessage
 from powermon.chart import lifecycle
 from powermon.chart.models import ChartMessage
+from powermon.engine import transitions
 from powermon.engine.models import LocationState, PowerInterval, SystemState
 from powermon.worker import io_loop
 
@@ -51,12 +55,42 @@ SINCE = kyiv("2026-10-01 08:00")
 # Which bot a request went to, by a short label (a failing assert never prints a token).
 BOTS = {DEFAULT_BOT_TOKEN: "A"}
 DB = pytest.mark.django_db(transaction=True)
+LIFECYCLE_LOGGER = lifecycle.__name__
+# The bot may not unpin in the channel any more (best effort: the record is retired).
+NO_RIGHTS = {
+    "ok": False,
+    "error_code": 403,
+    "description": "Forbidden: not enough rights to unpin a message",
+}
+UNPIN_GONE = {
+    "ok": False,
+    "error_code": 400,
+    "description": "Bad Request: message to unpin not found",
+}
+BAD_GATEWAY = {"ok": False, "error_code": 502, "description": "Bad Gateway"}
 
 
 @pytest.fixture(autouse=True)
 def kyiv_tz(settings: Any) -> Any:
     settings.CFG = dataclasses.replace(settings.CFG, display_tz=KYIV)
     return settings
+
+
+@pytest.fixture(autouse=True)
+def never_unpin_all(request: pytest.FixtureRequest) -> Iterator[None]:
+    """After every test that fakes Telegram: no request used unpinAllChatMessages (D-08).
+
+    The fake is taken before the test runs, so this check runs before the fake's own
+    teardown resets its request list.
+    """
+    fake = (
+        request.getfixturevalue("fake_telegram")
+        if "fake_telegram" in request.fixturenames
+        else None
+    )
+    yield
+    if fake is not None:
+        assert _no_unpin_all(fake), "a request used unpinAllChatMessages"
 
 
 def _monitored(location_factory: Callable[..., Any], since: datetime = SINCE, **kw: Any) -> Any:
@@ -127,6 +161,28 @@ def _reset_by_hand(location: Any, at: datetime, *, mark: bool = True) -> None:
 
 def _rows() -> list[ChartMessage]:
     return list(ChartMessage.objects.order_by("id"))
+
+
+def _lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The lifecycle's WARNING (and worse) lines, in order."""
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == LIFECYCLE_LOGGER and r.levelno >= logging.WARNING
+    ]
+
+
+def _all_passes(
+    clock: FakeClock, state: io_loop.RelayState, fake: Any
+) -> list[list[tuple[str, int, int | None]]]:
+    """The accepted chart calls of each pass, until a pass makes no call."""
+    passes = []
+    while True:
+        start = len(fake.chart_calls)
+        if not _pass(clock, state):
+            return passes
+        passes.append(_calls(fake)[start:])
+        assert len(passes) < 10
 
 
 def _requests(fake: Any, start: int = 0) -> list[tuple[str, str]]:
@@ -518,13 +574,7 @@ def test_D08_older_marked_record_is_released_not_finalized(
     clock = FakeClock(NOON_05)
     state = io_loop.RelayState()
 
-    passes = []
-    while True:
-        start = len(fake_telegram.chart_calls)
-        if not _pass(clock, state):
-            break
-        passes.append(_calls(fake_telegram)[start:])
-        assert len(passes) < 10
+    passes = _all_passes(clock, state, fake_telegram)
 
     # One unpin per pass, yesterday's first; no final edit, and nothing after them.
     assert passes == [
@@ -537,3 +587,260 @@ def test_D08_older_marked_record_is_released_not_finalized(
         record.refresh_from_db()
         assert (record.retired_at, record.pinned, record.finalized_at) == (NOON_05, False, None)
     assert _no_unpin_all(fake_telegram)
+
+
+# Best effort: a release that cannot succeed retires the record and never loops (INV-19)
+
+
+@DB
+def test_D08_permanent_release_error_retires_with_one_warning(
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    ops_settings: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    location = _monitored(location_factory)
+    record = _seed(location, message_id=501)
+    _reset_by_hand(location, NOON_05)
+    # The bot may not unpin in the channel any more; later calls would be accepted.
+    fake_telegram.fail_method(
+        DEFAULT_BOT_TOKEN, "unpinChatMessage", status=403, json_body=NO_RIGHTS
+    )
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    caplog.set_level(logging.DEBUG)
+    clock = FakeClock(NOON_05 + timedelta(seconds=5))
+    state = io_loop.RelayState()
+
+    assert _pass(clock, state) is True
+
+    record.refresh_from_db()
+    assert (record.retired_at, record.pinned) == (clock.now(), False)
+    # Done for good: no backoff, no failure count, one WARNING with the short code.
+    assert state.not_before == {}
+    assert state.chart_failures == {}
+    [line] = _lines(caplog)
+    assert "release" in line and str(location.pk) in line and str(record.pk) in line
+    assert "http_403" in line
+    # Never the token (in any form) or Telegram's description in any log line (OPS-08).
+    secret = DEFAULT_BOT_TOKEN.split(":", 1)[1]
+    assert secret not in caplog.text and DEFAULT_BOT_TOKEN not in caplog.text
+    assert "not enough rights" not in caplog.text
+    # No ops notice and no incident in v1 (the accepted Open Edge 6 risk).
+    assert not OutboxMessage.objects.filter(channel=outbox.CHANNEL_OPS).exists()
+    assert not OpsIncident.objects.exists()
+    # The waiting location gets nothing else, and the release is never tried again.
+    clock.advance(minutes=15)
+    assert _pass(clock, state) is False
+    assert _requests(fake_telegram) == [("A", "unpinChatMessage")]
+
+
+@DB
+def test_D08_release_not_found_retires(
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    location = _monitored(location_factory)
+    record = _seed(location, message_id=501)
+    _reset_by_hand(location, NOON_05)
+    # The old chart was deleted in the channel.
+    fake_telegram.fail_method(
+        DEFAULT_BOT_TOKEN, "unpinChatMessage", status=400, json_body=UNPIN_GONE
+    )
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    caplog.set_level(logging.DEBUG)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+
+    assert _pass(clock, state) is True
+
+    record.refresh_from_db()
+    assert (record.retired_at, record.pinned) == (NOON_05, False)
+    assert state.not_before == {}
+    assert _lines(caplog) == []
+    assert _pass(clock, state) is False
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "unpinChatMessage") == 1
+
+
+# Backoff: a transient release waits under a key _prune keeps, and blocks the post even
+# after the first heartbeat (Pitfall 1)
+
+
+@DB
+def test_D08_transient_release_backs_off_and_blocks_the_post(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    location = _monitored(location_factory)
+    record = _seed(location, message_id=501)
+    _reset_by_hand(location, NOON_05)
+    # The unpin answers 502 once, then works.
+    fake_telegram.fail_method(
+        DEFAULT_BOT_TOKEN, "unpinChatMessage", status=502, json_body=BAD_GATEWAY
+    )
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+    key = lifecycle.chart_key(location.pk, "release", record.pk)
+    bot = io_loop.bot_wide_key(DEFAULT_BOT_TOKEN)
+    retry = NOON_05 + timedelta(seconds=32)
+
+    # 12:05:00: the release answers 502. The bot is held as an alert's 5xx would hold it
+    # (2 s), and the release waits step_delay(1) (30 s) longer.
+    assert _pass(clock, state) is True
+    assert state.not_before == {bot: NOON_05 + timedelta(seconds=2), key: retry}
+    record.refresh_from_db()
+    assert record.retired_at is None
+    # 12:05:01: the location's first heartbeat after the reset: it is on again.
+    clock.advance(seconds=1)
+    assert transitions.record_heartbeat(location.pk, clock.now()) == "started"
+    # Inside the backoff no pass makes a request, and nothing is posted though the
+    # location is monitored again; the release's key survives every prune.
+    for seconds in (1, 2, 10, 31):
+        clock.set(NOON_05 + timedelta(seconds=seconds))
+        assert _pass(clock, state) is False
+        assert state.not_before.get(key) == retry
+    assert _requests(fake_telegram) == [("A", "unpinChatMessage")]
+    # 12:05:32: the release works; only a later pass posts today's new chart.
+    clock.set(retry)
+    assert _pass(clock, state) is True
+    record.refresh_from_db()
+    assert (record.retired_at, record.pinned) == (retry, False)
+    assert key not in state.not_before and key not in state.chart_failures
+    assert _all_passes(clock, state, fake_telegram) == [
+        [("sendPhoto", DEFAULT_CHAT_ID, None)],
+        [("pinChatMessage", DEFAULT_CHAT_ID, 1001)],
+    ]
+
+    assert _requests(fake_telegram) == [
+        ("A", "unpinChatMessage"),
+        ("A", "unpinChatMessage"),
+        ("A", "sendPhoto"),
+        ("A", "pinChatMessage"),
+    ]
+    new = ChartMessage.objects.get(retired_at__isnull=True)
+    assert (new.message_id, new.pinned, new.history_reset_at) == (1001, True, None)
+
+
+# The first heartbeat after the release brings one new pinned chart (Phase 3 D-03, INV-19)
+
+
+@DB
+def test_D08_first_heartbeat_after_release_posts_and_pins_a_new_chart(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    location = _monitored(location_factory)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+    # Today's chart is posted and pinned; the reset comes 30 s later and is released.
+    assert _pass(clock, state) is True
+    assert _pass(clock, state) is True
+    clock.advance(seconds=30)
+    _reset_by_hand(location, clock.now())
+    assert _pass(clock, state) is True
+    [old] = _rows()
+    assert (old.message_id, old.retired_at, old.pinned) == (1001, clock.now(), False)
+    # The location waits 20 min: nothing is sent.
+    clock.advance(minutes=20)
+    assert _pass(clock, state) is False
+    start = len(fake_telegram.calls)
+
+    # The first heartbeat restarts monitoring silently (MON-01, K-1).
+    assert transitions.record_heartbeat(location.pk, clock.now()) == "started"
+
+    assert _all_passes(clock, state, fake_telegram) == [
+        [("sendPhoto", DEFAULT_CHAT_ID, None)],
+        [("pinChatMessage", DEFAULT_CHAT_ID, 1002)],
+    ]
+    assert _requests(fake_telegram, start) == [("A", "sendPhoto"), ("A", "pinChatMessage")]
+    new = ChartMessage.objects.get(retired_at__isnull=True)
+    assert (new.message_id, new.chat_id, new.local_date, new.pinned, new.history_reset_at) == (
+        1002,
+        DEFAULT_CHAT_ID,
+        TODAY,
+        True,
+        None,
+    )
+    # The old record is never called again: the refresh 15 min later edits the new chart.
+    clock.advance(minutes=15)
+    assert _pass(clock, state) is True
+    assert _calls(fake_telegram)[-1] == ("editMessageMedia", DEFAULT_CHAT_ID, 1002)
+    assert [call for call in _calls(fake_telegram) if call[2] == 1001] == [
+        ("pinChatMessage", DEFAULT_CHAT_ID, 1001),
+        ("unpinChatMessage", DEFAULT_CHAT_ID, 1001),
+    ]
+    # The restart sent nothing to subscribers or to the ops chat.
+    assert not OutboxMessage.objects.exists()
+
+
+@DB
+def test_D08_location_on_with_a_marked_record_releases_before_posting(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    location = _monitored(location_factory)
+    record = _seed(location, message_id=501)
+    _reset_by_hand(location, NOON_05)
+    # The first heartbeat comes before the worker's next pass: the location is on again
+    # with its marked record still active.
+    assert transitions.record_heartbeat(location.pk, NOON_05 + timedelta(seconds=5)) == "started"
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    clock = FakeClock(NOON_05 + timedelta(seconds=10))
+    state = io_loop.RelayState()
+    locations, rows = lifecycle.read_snapshot(TODAY)
+    assert [(loc.location_id, loc.awaiting_heartbeat) for loc in locations] == [
+        (location.pk, False)
+    ]
+    assert [(row.id, row.history_reset_at) for row in rows] == [(record.pk, NOON_05)]
+
+    passes = _all_passes(clock, state, fake_telegram)
+
+    # The release first; the post only once the old today-record is retired, so the
+    # partial unique index never refuses it (Phase 4 Pitfall 1).
+    assert passes == [
+        [("unpinChatMessage", DEFAULT_CHAT_ID, 501)],
+        [("sendPhoto", DEFAULT_CHAT_ID, None)],
+        [("pinChatMessage", DEFAULT_CHAT_ID, 1001)],
+    ]
+    record.refresh_from_db()
+    assert (record.retired_at, record.pinned) == (clock.now(), False)
+    assert ChartMessage.objects.get(retired_at__isnull=True).message_id == 1001
+
+
+# Only the reset location's own messages are unpinned, never with unpinAllChatMessages
+
+
+@DB
+def test_D08_release_never_calls_unpin_all(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    # Two locations share the channel; only one is reset. The channel's other pins (the
+    # other location's chart, the admin's own posts) must stay pinned (D-08, INV-19).
+    reset = _monitored(location_factory)
+    yesterday = _seed(reset, YESTERDAY, message_id=501, rendered=kyiv("2026-10-01 23:45"))
+    today = _seed(reset, message_id=502)
+    other = _monitored(location_factory)
+    neighbour = _seed(other, message_id=601)
+    _reset_by_hand(reset, NOON_05)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+
+    passes = _all_passes(clock, state, fake_telegram)
+
+    assert passes == [
+        [("unpinChatMessage", DEFAULT_CHAT_ID, 501)],
+        [("unpinChatMessage", DEFAULT_CHAT_ID, 502)],
+    ]
+    unpinned = [
+        json.loads(call.request.body)["message_id"]
+        for call in fake_telegram.calls
+        if call.request.url.endswith("/unpinChatMessage")
+    ]
+    assert unpinned == [yesterday.message_id, today.message_id]
+    assert _no_unpin_all(fake_telegram)
+    neighbour.refresh_from_db()
+    assert (neighbour.pinned, neighbour.retired_at, neighbour.history_reset_at) == (
+        True,
+        None,
+        None,
+    )
