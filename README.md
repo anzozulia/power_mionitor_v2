@@ -488,9 +488,10 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
     progress cannot be removed: remove it after power returns. Alerts of the removed outage
     that are still queued (for example while Telegram was unreachable) are dropped only if
     its OFF alert never went out; if the OFF went out, its ON alert is still sent, so the
-    channel is not left at power off. If that OFF alert is being sent at that moment, the
-    page says so ("An alert about this outage is being sent to the channel right now.
-    Nothing changed. Try again in a minute.") and nothing changes: try again a minute later.
+    channel is not left at power off. If one of the outage's alerts (its OFF, or the ON
+    that ended it) is being sent at that moment, the page says so ("An alert about this
+    outage is being sent to the channel right now. Nothing changed. Try again in a
+    minute.") and nothing changes: try again a minute later.
   - **Reset history:** deletes the location's whole recorded power history. It is refused
     while an outage is in progress (reset after power returns, or delete the location).
     The location then shows **Waiting for first heartbeat**; its next heartbeat restarts
