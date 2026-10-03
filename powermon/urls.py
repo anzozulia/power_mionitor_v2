@@ -3,6 +3,7 @@
 from django.urls import path
 
 from powermon.web.history_views import (
+    HistoryResetView,
     OutageRemoveView,
 )
 from powermon.web.location_views import (
@@ -52,6 +53,7 @@ urlpatterns = [
         OutageRemoveView.as_view(),
         name="outage-remove",
     ),
+    path("locations/<int:pk>/reset/", HistoryResetView.as_view(), name="location-reset"),
     path("locations/<int:pk>/setup/", LocationSetupView.as_view(), name="location-setup"),
     path(
         "locations/<int:pk>/setup/regenerate/",

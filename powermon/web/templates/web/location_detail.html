@@ -3,8 +3,8 @@
 {% comment %}
 UI-SPEC screen B (D-13): the location page. Sections in order (05-UI-SPEC UI5-D1): Status,
 Switches, Test message, Recent outages, Settings (with the "Edit location" link-button,
-UI-D10), Device setup, Delete location (a secondary link-button that only opens the
-confirmation page, UI-D5); 05-05 adds Reset history before Delete location. The switch
+UI-D10), Device setup, Reset history, Delete location (a secondary link-button that only
+opens the confirmation page, UI-D5). The switch
 rows come from location_views.switch_rows, in D-05 order: Maintenance, Alerts, Router grace.
 Read-only except the switches, each a one-click POST form (CSRF) that posts its target value
 (UI-D3) and redirects back here (UI-D4), and the test message, a one-click POST form whose
@@ -19,6 +19,11 @@ progress" and has an empty Remove cell), "No outages in the last 14 days." (hist
 outage in the window) or "No power history yet. …" (no interval at all). The off-time note
 always follows the table, the in-progress note only when the current outage is listed. Each
 Remove link only opens the GET confirmation page; it has a unique accessible name (UI5-D6).
+Reset history (05-UI-SPEC A2, D-05, D-06, UI5-D9): the description sentence, then exactly
+one of, in this order: the D-06 line while the stored status is off (whatever the
+maintenance flag), "There is no power history to reset." while the location has no stored
+interval, else the secondary "Reset history" link-button that only opens the confirmation
+page.
 Secrets (SEC-04): no device key appears on this page, not even masked; the bot token only
 in its masked form, in the settings panel.
 {% endcomment %}
@@ -118,6 +123,16 @@ in its masked form, in the settings panel.
 <h2>Device setup</h2>
 <p>Heartbeat URL, device key and copy-paste examples for the device.</p>
 <p><a class="btn btn--secondary" href="{% url 'location-setup' location.pk %}">Open device setup</a></p>
+
+<h2>Reset history</h2>
+<p>Deletes all recorded power history of this location and unpins its weekly chart where the bot still can. The location then waits for its next heartbeat, which restarts monitoring without an alert. Settings, the device key and the switches are kept. There is no undo.</p>
+{% if status.power_key == "off" %}
+<p>An outage is in progress. Reset the history after power returns, or delete the location.</p>
+{% elif not has_history %}
+<p>There is no power history to reset.</p>
+{% else %}
+<p><a class="btn btn--secondary" href="{% url 'location-reset' location.pk %}">Reset history</a></p>
+{% endif %}
 
 <h2>Delete location</h2>
 <p>Stops this location's alerts, drops the alerts still queued, unpins its weekly chart where the bot still can, and hides it from the admin panel. There is no undo.</p>

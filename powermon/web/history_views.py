@@ -1,4 +1,5 @@
-"""The Phase 5 history pages: the removal of a false outage (DATA-02; 05-UI-SPEC B, D, E).
+"""The Phase 5 history pages: the removal of a false outage (DATA-02) and the reset of a
+location's history (DATA-03; 05-UI-SPEC B, C, D, E).
 
 - Every view here needs the signed-in admin: LoginRequiredMiddleware denies by default and
   none of them is ``login_not_required``.
@@ -6,14 +7,18 @@
   writes: when a check fails it redirects to the location page with the flash its POST
   would give, so no page offers a button the admin may not press (UI5-D7).
 - The POST re-checks everything in the engine, under the location's row lock
-  (``history.remove_outage``): a stale tab or a hand-made request can never remove an
-  outage in progress (INV-07 #3).
+  (``history.remove_outage``, ``history.reset_history``): a stale tab or a hand-made
+  request can never remove an outage in progress (INV-07 #3) or reset a location during
+  an outage (D-06).
 - Every result is POST -> redirect -> GET to the location page, a fixed route and never a
-  value from the request, so a reload never repeats an action (05-UI-SPEC D).
+  value from the request, so a reload never repeats an action (05-UI-SPEC D). A double
+  submit gets an honest "nothing changed" flash: "already gone" for a removal (UI5-D8),
+  "nothing to reset" for a reset (UI5-D9).
 - An unknown or deleted location, or a start that is not a valid instant, answers 404,
   never 500 (05-UI-SPEC E).
-- No network I/O (KD2): the worker's regular 15-minute chart refresh shows the change
-  (D-03).
+- No network I/O (KD2): the worker's regular 15-minute chart refresh shows a removal
+  (D-03), and its next I/O pass unpins a reset location's old chart in its own chat
+  (D-08). The web never retires a chart record itself.
 - Flashes hold fixed copy plus at most one time formatted from a stored instant (UI5-D15),
   never a value echoed from the request, a token or a key (SEC-04, OPS-08).
 """
@@ -31,6 +36,7 @@ from powermon.clock import Clock, SystemClock
 from powermon.engine import history
 from powermon.i18n.duration import format_total_duration
 from powermon.web.location_views import local_minute, location_or_404
+from powermon.web.status import location_status
 
 ONE_US = timedelta(microseconds=1)
 
@@ -45,6 +51,22 @@ OUTAGE_GONE_MESSAGE = (
     "This outage is no longer in the history: it was already removed, or the history was "
     "reset. Nothing changed."
 )
+# 05-UI-SPEC Copywriting › Flashes › Removal deferred (amended 2026-10-03, wave-1 audit
+# W1-A1), verbatim: the outage's OFF alert is being sent; POST only.
+REMOVAL_DEFERRED_MESSAGE = (
+    "An alert about this outage is being sent to the channel right now. Nothing changed. "
+    "Try again in a minute."
+)
+# 05-UI-SPEC Copywriting › Flashes, verbatim.
+HISTORY_RESET_MESSAGE = (
+    "History reset. The location waits for its next heartbeat, which restarts monitoring "
+    "without an alert. The old weekly chart is unpinned when the bot can do so; if the pin "
+    "stays, unpin it by hand in Telegram."
+)
+RESET_REFUSED_MESSAGE = (
+    "An outage is in progress. Reset the history after power returns, or delete the location."
+)
+NOTHING_TO_RESET_MESSAGE = "There is no power history to reset. Nothing changed."
 
 
 def instant_or_404(start_us: int) -> datetime:
@@ -68,8 +90,10 @@ class OutageRemoveView(View):
     outage". It writes nothing; an outage that is gone or in progress redirects to the
     location page with the POST's flash (UI5-D7). POST runs ``history.remove_outage`` (one
     transaction under the row lock, no network I/O) and redirects to the location page
-    with the success, info or error flash for its result. The 14-day window limits the
-    list only: any ended outage of the location can be removed (UI5-D14).
+    with the success, info or error flash for its result. While the outage's OFF alert is
+    being sent the POST writes nothing and says so (info, "Removal deferred"); the GET does
+    not check this, because the attempt settles within seconds (W1-A1). The 14-day window
+    limits the list only: any ended outage of the location can be removed (UI5-D14).
     """
 
     template_name = "web/outage_remove.html"
@@ -107,6 +131,48 @@ class OutageRemoveView(View):
             messages.success(request, OUTAGE_REMOVED_MESSAGE.format(start=f"{day} {minute}"))
         elif result == "in_progress":
             messages.error(request, REMOVAL_REFUSED_MESSAGE)
+        elif result == "sending":
+            messages.info(request, REMOVAL_DEFERRED_MESSAGE)
         else:
             messages.info(request, OUTAGE_GONE_MESSAGE)
+        return redirect("location-detail", pk=pk)
+
+
+class HistoryResetView(View):
+    """``/locations/<pk>/reset/``: reset the location's history (DATA-03).
+
+    GET is the confirmation page (05-UI-SPEC screen C): what the reset does, then one form,
+    the destructive POST, next to "Keep history". It writes nothing; while the stored
+    status is off (D-06), or when the location has no stored interval (UI5-D9), it
+    redirects to the location page with the POST's flash (UI5-D7). POST runs
+    ``history.reset_history`` (one transaction under the row lock, no network I/O) and
+    redirects to the location page with the success, error or info flash for its result.
+    """
+
+    template_name = "web/history_reset.html"
+    # Tests inject a FakeClock with HistoryResetView.as_view(clock=...) or monkeypatch it.
+    clock: Clock = SystemClock()
+
+    def get(self, request: HttpRequest, pk: int) -> HttpResponse:
+        location = location_or_404(pk)
+        if location_status(location).power_key == "off":
+            messages.error(request, RESET_REFUSED_MESSAGE)
+            return redirect("location-detail", pk=pk)
+        if not history.has_history(pk):
+            messages.info(request, NOTHING_TO_RESET_MESSAGE)
+            return redirect("location-detail", pk=pk)
+        return render(request, self.template_name, {"location": location})
+
+    def post(self, request: HttpRequest, pk: int) -> HttpResponse:
+        location_or_404(pk)
+        result = history.reset_history(pk, self.clock.now())
+        if result == "gone":
+            # Deleted between the lookup and the lock: as for any deleted location.
+            raise Http404
+        if result == "reset":
+            messages.success(request, HISTORY_RESET_MESSAGE)
+        elif result == "in_progress":
+            messages.error(request, RESET_REFUSED_MESSAGE)
+        else:
+            messages.info(request, NOTHING_TO_RESET_MESSAGE)
         return redirect("location-detail", pk=pk)
