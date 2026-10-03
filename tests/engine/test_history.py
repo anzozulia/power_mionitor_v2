@@ -11,7 +11,8 @@ location's ``location_state`` row lock first:
 - each off piece of the outage becomes on, one piece at a time, so not-monitored time inside
   it stays not monitored (D-02);
 - the outage's queued alerts are dropped only when its OFF alert never went out (D-04 as
-  refined on 2026-10-03): an OFF that is sending, sent or uncertain keeps its ON;
+  refined on 2026-10-03): an OFF that is sent or uncertain keeps its ON; while the OFF is
+  sending the removal is deferred with nothing written (wave-1 audit amendment, W1-A1);
 - live state (status, last heartbeat, on since, outage start, window start, state version)
   is never written, nothing is queued and nothing is sent (INV-07 #1).
 
@@ -48,7 +49,7 @@ from conftest import (
 )
 from django.db import connection, transaction
 
-from powermon.alerts import delivery
+from powermon.alerts import delivery, outbox
 from powermon.alerts.models import OpsIncident, OutboxMessage
 from powermon.chart import source
 from powermon.chart.models import ChartMessage
@@ -547,7 +548,7 @@ def test_D04_on_alert_matched_by_payload_when_power_returned_during_maintenance(
 
 
 @pytest.mark.django_db(transaction=True)
-@pytest.mark.parametrize("off_status", ["sending", "sent", "uncertain"])
+@pytest.mark.parametrize("off_status", ["sent", "uncertain"])
 def test_D04_on_alert_kept_when_the_off_alert_went_out(
     location_factory: Callable[..., Any], off_status: str
 ) -> None:
@@ -562,6 +563,69 @@ def test_D04_on_alert_kept_when_the_off_alert_went_out(
     assert _status(on) == ("pending", "")
     assert _status(off) == (off_status, "")
     assert _intervals(location)[1] == ("on", _at(9, 0), _at(10, 0), None)
+
+
+# D-04 wave-1 audit amendment (W1-A1): "sending" is not final. A failed attempt (not sent,
+# 429, 4xx, 5xx) puts the OFF back to pending, so a removal during an attempt is deferred
+# with nothing written; the next removal keeps the ON (sent) or drops both (failed).
+
+
+@pytest.mark.django_db(transaction=True)
+def test_D04_W1_A1_removal_deferred_while_the_off_alert_is_sending(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = _two_outages(location_factory)
+    off = _row_of(location, "power_off", _at(9, 0))
+    on = _row_of(location, "power_on", _at(10, 0))
+    # The relay claimed the outage's OFF alert: an attempt is in flight.
+    assert outbox.claim(off.pk) is True
+    before = (_intervals(location), _outbox(), _live(location))
+
+    assert history.remove_outage(location.pk, _at(9, 0)) == "sending"
+
+    # Nothing written: the timeline, both alerts and the live state are unchanged.
+    assert (_intervals(location), _outbox(), _live(location)) == before
+    assert _status(off) == ("sending", "")
+    assert _status(on) == ("pending", "")
+
+
+@pytest.mark.django_db(transaction=True)
+def test_D04_W1_A1_failed_attempt_then_removal_drops_both(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = _two_outages(location_factory)
+    off = _row_of(location, "power_off", _at(9, 0))
+    on = _row_of(location, "power_on", _at(10, 0))
+    assert outbox.claim(off.pk) is True
+    assert history.remove_outage(location.pk, _at(9, 0)) == "sending"
+    # The attempt fails (e.g. a 502): the relay puts the OFF back to pending.
+    assert outbox.mark_retry(off.pk, _at(16, 1), "http_502") is True
+    assert _status(off) == ("pending", "http_502")
+
+    assert history.remove_outage(location.pk, _at(9, 0)) == "removed"
+
+    # The OFF never went out: both alerts are dropped, so the outage is never announced.
+    assert _status(off) == ("dropped", history.OUTAGE_REMOVED)
+    assert _status(on) == ("dropped", history.OUTAGE_REMOVED)
+    assert _intervals(location)[1] == ("on", _at(9, 0), _at(10, 0), None)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_D04_W1_A1_another_outage_sending_does_not_defer(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = _two_outages(location_factory)
+    other = _row_of(location, "power_off", _at(15, 0))
+    assert outbox.claim(other.pk) is True
+
+    assert history.remove_outage(location.pk, _at(9, 0)) == "removed"
+
+    # Only this outage's OFF rows decide; the other outage's attempt is untouched.
+    assert _status(_row_of(location, "power_off", _at(9, 0))) == (
+        "dropped",
+        history.OUTAGE_REMOVED,
+    )
+    assert _status(other) == ("sending", "")
 
 
 def _alerts_off_at_the_off(location_factory: Callable[..., Any]) -> Any:

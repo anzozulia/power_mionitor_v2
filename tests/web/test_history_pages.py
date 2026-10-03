@@ -38,7 +38,7 @@ from django.contrib.auth import get_user_model
 from django.db import DatabaseError
 from django.test import Client
 
-from powermon.alerts import ops
+from powermon.alerts import ops, outbox
 from powermon.alerts.models import OutboxMessage
 from powermon.chart.models import ChartMessage
 from powermon.engine import history, maintenance, restore, transitions
@@ -62,6 +62,11 @@ GONE_FLASH = (
     "reset. Nothing changed."
 )
 REFUSED_FLASH = "This outage is still in progress. It can be removed after power returns."
+# Amended 2026-10-03 (wave-1 audit, W1-A1): the outage's OFF alert is being sent.
+DEFERRED_FLASH = (
+    "An alert about this outage is being sent to the channel right now. Nothing changed. "
+    "Try again in a minute."
+)
 RESET_FLASH = (
     "History reset. The location waits for its next heartbeat, which restarts monitoring "
     "without an alert. The old weekly chart is unpinned when the bot can do so; if the pin "
@@ -702,6 +707,35 @@ def test_INV07_3_crafted_post_for_an_outage_in_progress_is_refused(
         assert _flashes(page) == [REFUSED_FLASH]
         assert f'<p class="callout callout--error" role="alert">{REFUSED_FLASH}</p>' in page
         assert _written(location) == before
+    assert len(fake_telegram.calls) == 0
+
+
+@pytest.mark.django_db(transaction=True)
+def test_D04_W1_A1_removal_post_while_the_off_alert_is_sending_is_deferred(
+    admin: Client,
+    monkeypatch: pytest.MonkeyPatch,
+    location_factory: Callable[..., Any],
+    fake_telegram: FakeTelegram,
+) -> None:
+    location = _two_outages(location_factory)
+    _clock(monkeypatch, _at(16, 0))
+    off = OutboxMessage.objects.get(location=location, kind="power_off", event_at=_at(9, 0))
+    # The relay claimed the outage's OFF alert: an attempt is in flight.
+    assert outbox.claim(off.pk) is True
+    url = _remove(location, _at(9, 0))
+    before = _written(location)
+
+    # The confirmation GET does not check it: the attempt settles within seconds.
+    assert admin.get(url).status_code == 200
+
+    response = admin.post(url)
+
+    assert response.status_code == 302
+    assert response.url == _page(location)
+    page = admin.get(response.url).content.decode()
+    assert _flashes(page) == [DEFERRED_FLASH]
+    assert f'<p class="callout" role="status">{DEFERRED_FLASH}</p>' in page
+    assert _written(location) == before
     assert len(fake_telegram.calls) == 0
 
 
