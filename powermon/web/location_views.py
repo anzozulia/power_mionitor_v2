@@ -23,13 +23,19 @@ the edit form, the delete and the key rotation (D-13, D-05, D-11, D-07, D-09, D-
   It is POST -> redirect -> GET too, so a reload never sends it again (UI-D4).
 - Every other view here does no network I/O.
 - Every location URL answers 404 for an unknown or deleted location (UI-SPEC screen H).
+- The location page lists the location's recent outages (Phase 5 D-01, 05-UI-SPEC A1),
+  read from the stored timeline by ``history.recent_outages``; their removal lives in
+  ``powermon.web.history_views``.
 """
 
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, ClassVar
+from zoneinfo import ZoneInfo
 
+from django.conf import settings
 from django.contrib import messages
 from django.http import Http404, HttpRequest, HttpResponse, HttpResponseBadRequest
 from django.shortcuts import get_object_or_404, redirect, render
@@ -38,10 +44,11 @@ from django.utils.decorators import method_decorator
 from django.views import View
 from django.views.decorators.cache import never_cache
 
-from powermon.alerts import delivery
+from powermon.alerts import delivery, ops
 from powermon.clock import Clock, SystemClock
-from powermon.engine import maintenance
+from powermon.engine import history, maintenance
 from powermon.i18n import strings
+from powermon.i18n.duration import format_total_duration
 from powermon.locations import actions, validators
 from powermon.locations.models import LANGUAGE_CHOICES, Location
 from powermon.telegram.client import DEFAULT_RETRY_AFTER_S, SendResult, TelegramClient
@@ -438,23 +445,85 @@ def delivery_row(location_id: int) -> DeliveryRow:
     )
 
 
+def local_minute(dt: datetime, tz: str) -> tuple[str, str]:
+    """``("YYYY-MM-DD", "HH:MM")`` of the instant ``dt`` in the display TZ ``tz`` (UI5-D4).
+
+    Seconds are cut off, never rounded. A naive ``dt`` has no defined instant: ValueError.
+    """
+    if dt.utcoffset() is None:
+        raise ValueError("a naive datetime has no defined instant")
+    local = dt.astimezone(ZoneInfo(tz))
+    return local.strftime("%Y-%m-%d"), local.strftime("%H:%M")
+
+
+@dataclass(frozen=True)
+class OutageRow:
+    """One row of the location page's Recent outages table (05-UI-SPEC A1, UI5-D2…D6)."""
+
+    # The outage start as integer microseconds since the Unix epoch: its URL identity (UI5-D5).
+    start_us: int
+    # The start in the display TZ, cut to the minute (UI5-D4).
+    start_date: str
+    start_time: str
+    # The end's date only when it falls on another local date than the start, else "";
+    # end_date and end_time are both "" while the outage is in progress.
+    end_date: str
+    end_time: str
+    in_progress: bool
+    # The off time in the chart's totals format, e.g. "1h 30m", "<1m" (UI5-D3).
+    off_text: str
+
+
+def outage_rows(outages: Iterable[history.Outage], tz: str) -> list[OutageRow]:
+    """The Recent outages rows of ``outages``, in their order, with times in ``tz``."""
+    rows = []
+    for outage in outages:
+        start_date, start_time = local_minute(outage.start, tz)
+        end_date = end_time = ""
+        if outage.end is not None:
+            end_date, end_time = local_minute(outage.end, tz)
+            if end_date == start_date:
+                end_date = ""
+        rows.append(
+            OutageRow(
+                start_us=ops.instant_us(outage.start),
+                start_date=start_date,
+                start_time=start_time,
+                end_date=end_date,
+                end_time=end_time,
+                in_progress=outage.in_progress,
+                off_text=format_total_duration(outage.off_us, "en"),
+            )
+        )
+    return rows
+
+
 class LocationDetailView(View):
-    """``/locations/<pk>/``: the location page (UI-SPEC screen B, D-13).
+    """``/locations/<pk>/``: the location page (UI-SPEC screen B, D-13; 05-UI-SPEC A1).
 
     Read-only: the status with the delivery health, the switches, the test message, the
-    settings and the way to the device setup. It never shows the device key, not even
-    masked, and the bot token only masked (SEC-04).
+    recent outages (Phase 5 D-01), the settings and the way to the device setup. It never
+    shows the device key, not even masked, and the bot token only masked (SEC-04).
     """
 
     template_name = "web/location_detail.html"
+    # Tests inject a FakeClock with LocationDetailView.as_view(clock=...) or monkeypatch it:
+    # "now" bounds the recent outages and counts an open off piece's time.
+    clock: Clock = SystemClock()
 
     def get(self, request: HttpRequest, pk: int) -> HttpResponse:
         location = location_or_404(pk)
+        tz = settings.TIME_ZONE
+        recent = history.recent_outages(location.pk, self.clock.now(), tz)
+        rows = outage_rows(recent.outages, tz)
         context = {
             "location": location,
             "status": location_status(location),
             "delivery": delivery_row(location.pk),
             "switch_rows": switch_rows(location),
+            "outage_rows": rows,
+            "has_history": recent.has_history,
+            "outage_in_progress": any(row.in_progress for row in rows),
             **settings_context(location),
         }
         return render(request, self.template_name, context)

@@ -332,6 +332,7 @@ def test_location_page_settings_and_setup_sections(
         "Status",
         "Switches",
         "Test message",
+        "Recent outages",
         "Settings",
         "Device setup",
         "Delete location",
@@ -494,9 +495,10 @@ def test_location_page_test_message_section(
 
     page = admin.get(_page(location)).content.decode()
 
-    # UI-SPEC screen B, section 3: after Switches, before Settings; the paragraph, then a
-    # plain POST form (no script: the browser's own indicator shows while it waits, E4).
-    section = page[page.index("<h2>Test message</h2>") : page.index("<h2>Settings</h2>")]
+    # UI-SPEC screen B, section 3: after Switches, before Recent outages (05-UI-SPEC UI5-D1);
+    # the paragraph, then a plain POST form (no script: the browser's own indicator shows
+    # while it waits, E4).
+    section = page[page.index("<h2>Test message</h2>") : page.index("<h2>Recent outages</h2>")]
     assert f"<p>{TEST_MESSAGE_PARAGRAPH}</p>" in section
     assert section.count("<form") == 1
     assert "<script" not in page
