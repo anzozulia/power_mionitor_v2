@@ -8,7 +8,9 @@ orphan behind. ``pinned`` is a separate field, set only once the pin succeeded. 
 later edit, pin and unpin targets the chat stored here, never the location's current
 chat (D-04). A pin may take effect while ``pinned`` stays false (an ambiguous answer, an
 outcome that could not be written), so every older record gets one unpin whatever
-``pinned`` says, and ``unpinned_at`` records that it was made (INV-19, 03-09).
+``pinned`` says, and ``unpinned_at`` records that it was made (INV-19, 03-09). A history
+reset of the location sets ``history_reset_at`` on its active records: the worker then
+unpins each one in its own chat and retires it, with no final edit (DATA-03, D-08).
 
 The partial unique index ``chart_message_one_active_per_day`` allows at most one active
 (not retired) row per location and local date, so a second post for a day can never be
@@ -58,6 +60,8 @@ class ChartMessage(models.Model):
     unpinned_at = models.DateTimeField(null=True)
     # The message is gone ("not found", 03-09); the day may get a new record.
     retired_at = models.DateTimeField(null=True)
+    # Set by a history reset (DATA-03, D-08): the record is released, never edited again.
+    history_reset_at = models.DateTimeField(null=True)
     created_at = models.DateTimeField()
 
     class Meta:
