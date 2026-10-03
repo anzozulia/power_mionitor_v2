@@ -17,11 +17,13 @@ timeline writer:
    ``outage_started_at``, also while its open piece is not monitored), never from a value
    read before the transaction, so a stale tab or a hand-made POST is refused too
    (INV-07 #3, D-02);
-3. while an attempt to send the outage's OFF alert is in flight (status "sending"), the
+3. while an attempt to send one of the outage's alerts is in flight (status "sending"), the
    removal is deferred with nothing written: "sending" is not final, because a failed
    attempt (not sent, 429, 4xx, 5xx) puts the row back to "pending", and the removed
-   outage would then be announced late. The attempt settles within seconds, and the
-   next removal decides (D-04 wave-1 audit amendment, W1-A1);
+   outage would then be announced late. That is its OFF alert (D-04 wave-1 audit
+   amendment, W1-A1) or its ON alert matched by ``_restores`` (wave-2 audit, W2-A1: when
+   the OFF alert expired or was never queued, the ON alert is its location's head and can
+   be sending itself). The attempt settles within seconds, and the next removal decides;
 4. each off piece of the outage becomes ``on`` through ``timeline.overwrite``, one piece at
    a time: not-monitored time inside the outage stays not monitored (D-02);
 5. the outage's queued alerts are dropped only when its OFF alert never went out (D-04 as
@@ -71,7 +73,7 @@ from typing import Literal
 from django.db import connection, transaction
 
 from powermon.alerts import outbox
-from powermon.alerts.models import OutboxMessage
+from powermon.alerts.models import OPEN_STATUSES, OutboxMessage
 from powermon.chart import model
 from powermon.engine import timeline
 from powermon.engine.transitions import DELETED_SQL, LOCK_SQL, WAITING_SQL
@@ -87,8 +89,9 @@ OUTAGE_REMOVED = "outage_removed"
 # its ON alert must still go out (D-04 as refined): never leave the channel at power off.
 # "sending" is not here: it is not final (W1-A1), and a removal waits for it to settle.
 OFF_WENT_OUT = ("sent", "uncertain")
-# An attempt to send the OFF alert is in flight: the removal is deferred (W1-A1).
-OFF_IN_FLIGHT = "sending"
+# An attempt to send one of the outage's alerts is in flight, its OFF alert (W1-A1) or its
+# matched ON alert (W2-A1): the removal is deferred.
+IN_FLIGHT = "sending"
 
 RemoveResult = Literal["removed", "gone", "in_progress", "sending"]
 ResetResult = Literal["reset", "in_progress", "nothing", "gone"]
@@ -276,10 +279,11 @@ def remove_outage(location_id: int, outage_start: datetime) -> RemoveResult:
       hand-made start; UI5-D8);
     - "in_progress", with nothing written: it is the location's current outage, decided
       under the lock (INV-07 #3), or one of its pieces is still open;
-    - "sending", with nothing written: an attempt to send the outage's OFF alert is in
-      flight. Checked under the lock, after the checks above and before any timeline
-      write; the next removal keeps the ON alert if that attempt went out, or drops both
-      alerts if it failed (W1-A1).
+    - "sending", with nothing written: an attempt to send one of the outage's alerts is in
+      flight, its OFF alert (W1-A1) or an ON alert matched to it by ``_restores`` (W2-A1).
+      Checked under the lock, after the checks above and before any timeline write. The
+      next removal decides from the settled rows: the ON alert is kept when the OFF alert
+      went out, and the alerts still pending are dropped when it never did.
 
     ``location_state`` is never written. ValueError for a naive ``outage_start``.
     """
@@ -305,14 +309,17 @@ def remove_outage(location_id: int, outage_start: datetime) -> RemoveResult:
         if any(end is None for _start, end in pieces):
             # Defensive: an open off piece always belongs to the current outage.
             return "in_progress"
-        if any(row.status == OFF_IN_FLIGHT for row in _off_alerts(location_id, outage_start)):
-            # W1-A1: before any write. A failed attempt would put the OFF back to pending.
+        offs = _off_alerts(location_id, outage_start)
+        ons = _on_alerts(location_id, outage_start)
+        if any(row.status == IN_FLIGHT for row in (*offs, *ons)):
+            # Before any write: a failed attempt would put the row back to pending. The OFF
+            # (W1-A1), or the ON, the head when the OFF expired or was never queued (W2-A1).
             return "sending"
         # One piece at a time: a single overwrite across the whole outage would also turn
         # its not-monitored pieces into on (D-02).
         for start, end in pieces:
             timeline.overwrite(cur, location_id, start, end, "on")
-        dropped = _drop_queued_alerts(location_id, outage_start)
+        dropped = _drop_queued_alerts(offs, ons)
     # Ids, a time and a count only: never a key or a token (OPS-08).
     log.info(
         "outage %s of location %s removed, %s queued alert(s) dropped",
@@ -354,28 +361,42 @@ def _off_alerts(location_id: int, outage_start: datetime) -> list[OutboxMessage]
     )
 
 
-def _drop_queued_alerts(location_id: int, outage_start: datetime) -> int:
+def _on_alerts(location_id: int, outage_start: datetime) -> list[OutboxMessage]:
+    """The outage's open ON alerts: the location's subscriber power_on rows in "pending" or
+    "sending" that ``_restores`` matches to the outage that starts at ``outage_start``.
+
+    Read ``FOR UPDATE`` in the removal's transaction, like ``_off_alerts``. Only open rows
+    are read: a sent, uncertain, expired or dropped ON row is final, so it neither defers
+    the removal nor can be dropped. A row dated before the outage start never matches.
+    """
+    rows = OutboxMessage.objects.select_for_update().filter(
+        channel=outbox.CHANNEL_SUBSCRIBER,
+        location_id=location_id,
+        kind=outbox.KIND_POWER_ON,
+        status__in=OPEN_STATUSES,
+        event_at__gte=outage_start,
+    )
+    return [row for row in rows if _restores(row, outage_start)]
+
+
+def _drop_queued_alerts(offs: list[OutboxMessage], ons: list[OutboxMessage]) -> int:
     """Drop the removed outage's queued alerts in the removal's transaction; return how many.
+
+    ``offs`` and ``ons`` are the outage's rows from ``_off_alerts`` and ``_on_alerts``, read
+    ``FOR UPDATE`` earlier in the same transaction, so their statuses are still current.
 
     D-04 as refined by the maintainer (2026-10-03): when an OFF alert of the outage
     (subscriber, power_off, ``event_at`` = the outage start) is sent or uncertain, the
     subscribers saw (or may have seen) "power off", so nothing is dropped and its queued ON
     alert is delivered. Otherwise the outage's pending OFF alert and its pending ON alert
-    (matched by ``_restores``) become "dropped" with last_error "outage_removed", so a false
-    outage is never announced late. An OFF that is still "sending" never reaches this step:
-    ``remove_outage`` defers the removal first (W1-A1). Alerts of other outages are never
-    touched. The rows are read ``FOR UPDATE`` and each drop is a conditional update on
-    status "pending".
+    become "dropped" with last_error "outage_removed", so a false outage is never announced
+    late. A row still "sending" never reaches this step: ``remove_outage`` defers the
+    removal first (W1-A1 for the OFF, W2-A1 for the ON). Alerts of other outages are never
+    touched. Each drop is a conditional update on status "pending".
     """
-    subscriber = OutboxMessage.objects.select_for_update().filter(
-        channel=outbox.CHANNEL_SUBSCRIBER, location_id=location_id
-    )
-    offs = _off_alerts(location_id, outage_start)
     if any(row.status in OFF_WENT_OUT for row in offs):
         return 0
-    ons = subscriber.filter(kind=outbox.KIND_POWER_ON, status="pending", event_at__gte=outage_start)
-    ids = [row.pk for row in offs if row.status == "pending"]
-    ids += [row.pk for row in ons if _restores(row, outage_start)]
+    ids = [row.pk for row in (*offs, *ons) if row.status == "pending"]
     if not ids:
         return 0
     return OutboxMessage.objects.filter(pk__in=ids, status="pending").update(
