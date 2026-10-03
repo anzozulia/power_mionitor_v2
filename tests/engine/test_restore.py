@@ -28,22 +28,42 @@ display TZ is pinned to Europe/Kyiv (UTC+3 that day).
 """
 
 import dataclasses
+import logging
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from io import StringIO
 from typing import Any
 
 import pytest
-from conftest import FakeClock
+from conftest import DEFAULT_BOT_TOKEN, OPS_BOT_TOKEN, OPS_CHAT_ID, FakeClock
 from django.core.management import call_command
+from django.core.management.base import CommandError
+from django.db import connection
+from django.db.models import Model, Value
+from django.db.models.functions import Greatest
 
 from powermon.alerts import outbox
+from powermon.alerts.delivery import KIND_DELIVERY_FAILING
 from powermon.alerts.models import OpsIncident, OutboxMessage
-from powermon.engine import all_silent, restore, transitions
+from powermon.chart.lifecycle import KIND_CHART_PIN_FAILED
+from powermon.engine import all_silent, lapse, maintenance, restore, transitions
 from powermon.engine.models import LocationState, PowerInterval, SystemState
+from powermon.locations.models import Location
 from powermon.web.management.commands import post_restore as post_restore_command
+from powermon.worker import detection, io_loop
+from powermon.worker.lease import Lease, LeaseState
 
 pytestmark = pytest.mark.django_db(transaction=True)
+
+# Every table the restart may write, for "nothing changed" checks.
+TABLES: dict[str, type[Model]] = {
+    "location": Location,
+    "location_state": LocationState,
+    "power_interval": PowerInterval,
+    "outbox_message": OutboxMessage,
+    "ops_incident": OpsIncident,
+    "system_state": SystemState,
+}
 
 Interval = tuple[str, datetime, datetime | None, datetime | None]
 
@@ -142,12 +162,52 @@ def _on_since_8(location_factory: Callable[..., Any], **overrides: Any) -> Any:
     return location
 
 
+def _off_since_9(location_factory: Callable[..., Any], **overrides: Any) -> Any:
+    """On since 08:00, silent after its 09:00 heartbeat: OFF since 09:00, its alert pending.
+
+    The OFF comes from the detector's cycle at 09:01:31 (period 60 s + grace 30 s), so the
+    caller writes ``system_state`` (the detection window) first.
+    """
+    location = location_factory(**overrides)
+    _beat_every_minute(location, _at(8, 0), _at(9, 0))
+    assert detection.run_cycle(_at(9, 1, 31)) == 1
+    assert _intervals(location) == [
+        ("on", _at(8, 0), _at(9, 0), None),
+        ("off", _at(9, 0), None, _at(9, 0)),
+    ]
+    return location
+
+
+def _snapshot() -> dict[str, list[dict[str, Any]]]:
+    """Every row of every table the restart may write, by table, in primary-key order."""
+    return {
+        name: list(model._default_manager.order_by("pk").values()) for name, model in TABLES.items()
+    }
+
+
+def _subscriber_rows() -> list[OutboxMessage]:
+    return list(OutboxMessage.objects.filter(channel=outbox.CHANNEL_SUBSCRIBER).order_by("id"))
+
+
+def _pass(clock: FakeClock, state: io_loop.RelayState) -> bool:
+    """One I/O pass with charts, the detection cursor moved to the clock's now (never back).
+
+    The worker's detection thread keeps the cursor within a cycle of now.
+    """
+    SystemState.objects.get_or_create(pk=1)
+    SystemState.objects.filter(pk=1).update(
+        last_cycle_completed_at=Greatest("last_cycle_completed_at", Value(clock.now()))
+    )
+    return io_loop.run_iteration(clock, state, charts=True)
+
+
 # D-13 / D-14: one location, end to end through the command (tracer)
 
 
 def test_D13_D14_post_restore_restarts_a_location_silently(
-    location_factory: Callable[..., Any], monkeypatch: pytest.MonkeyPatch
+    location_factory: Callable[..., Any], monkeypatch: pytest.MonkeyPatch, ops_settings: Any
 ) -> None:
+    # The ops chat is configured, so any notice would be queued as a row (none may be).
     _system(cursor=_at(10, 0, 5), resumed=_at(7, 0))
     location = _on_since_8(location_factory)
     LocationState.objects.filter(pk=location.pk).update(window_start_at=_at(9, 0))
@@ -219,3 +279,283 @@ def test_post_restore_on_an_empty_database_prints_zero_counts(
     assert SystemState.objects.count() == singletons
     assert not OutboxMessage.objects.exists()
     assert not OpsIncident.objects.exists()
+
+
+# SC4: the worker's first start on the restored database
+
+
+def test_SC4_worker_after_post_restore_sends_only_the_gap_notice(
+    location_factory: Callable[..., Any], ops_settings: Any, fake_telegram: Any
+) -> None:
+    # The dump: one location off since 09:00 with its OFF alert still pending (Telegram
+    # was down), one on since 08:00; the last completed detection cycle at 10:00.
+    _system(cursor=_at(10, 0), resumed=_at(7, 0))
+    off = _off_since_9(location_factory, name="Off location")
+    on = _on_since_8(location_factory, name="On location")
+    [off_alert] = _subscriber_rows()
+    assert (off_alert.kind, off_alert.status) == (outbox.KIND_POWER_OFF, "pending")
+    assert restore.restart_after_restore(_at(10, 15)) == restore.RestoreCounts(2, 1, 0)
+
+    # The worker starts at 10:20: activation, then the forced carve of a new lease term.
+    clock = FakeClock(_at(10, 20))
+    relay = io_loop.RelayState()
+    assert io_loop.activate(relay, clock) == 0
+    assert lapse.carve_if_needed(_at(10, 20), force=True) == lapse.Gap(_at(10, 0), _at(10, 20))
+
+    [notice] = OutboxMessage.objects.exclude(status="dropped")
+    assert (notice.channel, notice.kind, notice.location_id) == (
+        outbox.CHANNEL_OPS,
+        outbox.KIND_OPS_GAP,
+        None,
+    )
+    # The carve skips waiting locations: both keep the not-monitored piece from 10:00.
+    assert _intervals(off)[-2:] == [
+        ("off", _at(9, 0), _at(10, 0), _at(9, 0)),
+        ("not_monitored", _at(10, 0), None, None),
+    ]
+    assert _intervals(on)[-1] == ("not_monitored", _at(10, 0), None, None)
+
+    fake_telegram.accept(OPS_BOT_TOKEN)
+    assert _pass(clock, relay) is True
+
+    # One request in all: the gap notice to the admin. No alert to the location's chat,
+    # no chart call (waiting locations make none).
+    assert len(fake_telegram.calls) == 1
+    assert [message["chat_id"] for message in fake_telegram.sent] == [OPS_CHAT_ID]
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "sendMessage") == 0
+    notice.refresh_from_db()
+    assert notice.status == "sent"
+    assert [(row.kind, row.status) for row in _subscriber_rows()] == [
+        (outbox.KIND_POWER_OFF, "dropped")
+    ]
+
+
+# D-13: maintenance, outages in progress, the cursor rule, untouched locations
+
+
+def test_D13_maintenance_location_keeps_its_flag_and_piece(
+    location_factory: Callable[..., Any],
+) -> None:
+    _system(cursor=_at(10, 0), resumed=_at(7, 0))
+    location = location_factory()
+    _beat_every_minute(location, _at(8, 0), _at(9, 30))
+    assert maintenance.set_maintenance(location.pk, True, _at(9, 30))
+    in_maintenance = [
+        ("on", _at(8, 0), _at(9, 30), None),
+        ("not_monitored", _at(9, 30), None, None),
+    ]
+    assert _intervals(location) == in_maintenance
+
+    assert restore.restart_after_restore(NOW) == restore.RestoreCounts(1, 0, 0)
+
+    assert _state(location) == ("waiting", None, None, None, None)
+    location.refresh_from_db()
+    assert location.maintenance is True
+    # Already not monitored: the open piece is kept as it is.
+    assert _intervals(location) == in_maintenance
+
+    # The first heartbeat during maintenance opens not monitored (Phase 4 D-02): the piece
+    # stays as it is.
+    assert transitions.record_heartbeat(location.pk, _at(10, 30)) == "started"
+    assert _state(location) == ("on", _at(10, 30), _at(10, 30), None, None)
+    assert _intervals(location) == in_maintenance
+    assert not OutboxMessage.objects.exists()
+
+
+def test_D13_outage_in_progress_at_the_dump_never_gets_its_on_alert(
+    location_factory: Callable[..., Any],
+) -> None:
+    _system(cursor=_at(10, 0), resumed=_at(7, 0))
+    location = _off_since_9(location_factory)
+
+    assert restore.restart_after_restore(NOW) == restore.RestoreCounts(1, 1, 0)
+
+    assert _state(location) == ("waiting", None, None, None, None)
+    # The off piece ends at the dump's cursor and keeps its outage start.
+    assert _intervals(location) == [
+        ("on", _at(8, 0), _at(9, 0), None),
+        ("off", _at(9, 0), _at(10, 0), _at(9, 0)),
+        ("not_monitored", _at(10, 0), None, None),
+    ]
+
+    # Power is back by the first heartbeat: a silent start, no ON alert (the accepted
+    # trade-off of D-13), and the dump's OFF alert never goes out either.
+    assert transitions.record_heartbeat(location.pk, _at(10, 30)) == "started"
+    assert _intervals(location)[-2:] == [
+        ("not_monitored", _at(10, 0), _at(10, 30), None),
+        ("on", _at(10, 30), None, None),
+    ]
+    assert [(row.kind, row.status) for row in _subscriber_rows()] == [
+        (outbox.KIND_POWER_OFF, "dropped")
+    ]
+
+
+def test_D13_cursor_before_the_open_start_uses_the_open_start(
+    location_factory: Callable[..., Any],
+) -> None:
+    # Monitoring started at 10:10, after the last completed cycle (10:00).
+    _system(cursor=_at(10, 0), resumed=_at(7, 0))
+    location = location_factory()
+    _beat_every_minute(location, _at(10, 10), _at(10, 12))
+
+    restore.restart_after_restore(NOW)
+
+    # Never before the open piece's start: the piece is replaced from that start.
+    assert _intervals(location) == [("not_monitored", _at(10, 10), None, None)]
+
+
+def test_D13_no_cursor_uses_the_open_start(location_factory: Callable[..., Any]) -> None:
+    _system(cursor=None, resumed=_at(7, 0))
+    location = _on_since_8(location_factory)
+
+    restore.restart_after_restore(NOW)
+
+    assert _intervals(location) == [("not_monitored", _at(8, 0), None, None)]
+    # Still no cursor: the worker starts fresh, with no gap notice.
+    assert _cursor() is None
+
+
+def test_D13_deleted_and_waiting_locations_are_untouched(
+    location_factory: Callable[..., Any],
+) -> None:
+    _system(cursor=_at(10, 0), resumed=_at(7, 0))
+    deleted = _on_since_8(location_factory, name="Deleted location")
+    Location.objects.filter(pk=deleted.pk).update(deleted_at=_at(9, 0))
+    location_factory(name="Waiting location")
+    before = _snapshot()
+
+    assert restore.restart_after_restore(NOW) == restore.RestoreCounts(0, 0, 0)
+
+    assert _snapshot() == before
+
+
+# D-14: every open incident closes quietly
+
+
+def test_D14_every_open_incident_closes_quietly(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    location = location_factory()
+    still_open = [
+        OpsIncident.objects.create(
+            kind=all_silent.KIND_ALL_SILENT, location=None, started_at=_at(9, 0)
+        ),
+        OpsIncident.objects.create(
+            kind=KIND_DELIVERY_FAILING,
+            location=location,
+            started_at=_at(9, 10),
+            details={"http_status": 403},
+        ),
+        OpsIncident.objects.create(
+            kind=KIND_CHART_PIN_FAILED, location=location, started_at=_at(9, 20)
+        ),
+    ]
+    closed = OpsIncident.objects.create(
+        kind=lapse.KIND_MONITORING_GAP, location=None, started_at=_at(8, 0), ended_at=_at(8, 5)
+    )
+
+    assert restore.restart_after_restore(NOW) == restore.RestoreCounts(0, 0, 3)
+
+    for incident in still_open:
+        incident.refresh_from_db()
+        assert incident.ended_at == NOW
+    closed.refresh_from_db()
+    assert closed.ended_at == _at(8, 5)
+    # No recovery or end notice, with the ops chat configured.
+    assert not OutboxMessage.objects.exists()
+
+
+# Idempotency, the worker-lock guard, a naive now
+
+
+def test_post_restore_twice_changes_nothing_the_second_time(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    _system(cursor=_at(10, 0), resumed=_at(7, 0))
+    _off_since_9(location_factory, name="Off location")
+    _on_since_8(location_factory, name="On location")
+    OpsIncident.objects.create(kind=all_silent.KIND_ALL_SILENT, location=None, started_at=_at(9, 0))
+    assert restore.restart_after_restore(NOW) == restore.RestoreCounts(2, 1, 1)
+    after_first = _snapshot()
+
+    assert restore.restart_after_restore(_at(10, 25)) == restore.RestoreCounts(0, 0, 0)
+
+    assert _snapshot() == after_first
+
+
+def test_post_restore_refuses_while_a_worker_holds_the_lock(
+    location_factory: Callable[..., Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _system(cursor=_at(10, 0), resumed=_at(7, 0))
+    location = _on_since_8(location_factory)
+    _queue(location, outbox.KIND_POWER_OFF, "pending", _at(7, 0))
+    OpsIncident.objects.create(kind=all_silent.KIND_ALL_SILENT, location=None, started_at=_at(9, 0))
+    before = _snapshot()
+    lease = Lease(connection.settings_dict, FakeClock(NOW))
+    try:
+        assert lease.ensure_held().state == LeaseState.HELD
+        assert restore.worker_lock_held() is True
+
+        with pytest.raises(restore.WorkerActive):
+            restore.restart_after_restore(NOW)
+        with pytest.raises(CommandError, match="stop web and worker before post_restore"):
+            _post_restore(monkeypatch)
+
+        assert _snapshot() == before
+    finally:
+        lease.close()
+
+    assert restore.worker_lock_held() is False
+    assert restore.restart_after_restore(NOW) == restore.RestoreCounts(1, 1, 1)
+
+
+def test_restart_after_restore_rejects_a_naive_now() -> None:
+    with pytest.raises(ValueError, match="aware now"):
+        restore.restart_after_restore(datetime(2026, 10, 1, 10, 20))  # noqa: DTZ001
+
+
+# RESEARCH Pitfall 3: the FIRST gate after a restore
+
+
+def test_Pitfall3_first_gate_clamps_to_the_open_start(
+    location_factory: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _system(cursor=_at(10, 0), resumed=_at(7, 0))
+    location = location_factory()
+    _beat_every_minute(location, _at(8, 0), _at(9, 59))
+    restore.restart_after_restore(NOW)
+    assert _intervals(location) == [
+        ("on", _at(8, 0), _at(10, 0), None),
+        ("not_monitored", _at(10, 0), None, None),
+    ]
+    monkeypatch.setattr(transitions, "_restore_clamp_warned", False)
+    caplog.set_level(logging.WARNING, logger=transitions.__name__)
+
+    # The new server's clock is behind the dump: the first heartbeat is received at 09:59.
+    assert transitions.record_heartbeat(location.pk, _at(9, 59)) == "started"
+
+    assert _state(location) == ("on", _at(10, 0), _at(10, 0), None, None)
+    # The not-monitored piece would end where it starts: it is deleted, never closed
+    # before its start (no IntegrityError, no 500 on every heartbeat).
+    assert _intervals(location) == [
+        ("on", _at(8, 0), _at(10, 0), None),
+        ("on", _at(10, 0), None, None),
+    ]
+    assert not OutboxMessage.objects.exists()
+    warnings = [r for r in caplog.records if r.name == transitions.__name__]
+    assert [r.levelno for r in warnings] == [logging.WARNING]
+    assert f"location {location.pk} " in warnings[0].getMessage()
+
+
+def test_first_gate_without_an_open_interval_is_unchanged(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = location_factory()
+
+    assert transitions.record_heartbeat(location.pk, _at(8, 0)) == "started"
+
+    assert _state(location) == ("on", _at(8, 0), _at(8, 0), None, None)
+    assert _intervals(location) == [("on", _at(8, 0), None, None)]
+    assert not OutboxMessage.objects.exists()
