@@ -1,4 +1,4 @@
-"""After a database restore: restart every location silently (OPS-06, D-13, D-14).
+"""After a database restore: restart every location silently; fingerprint the history (OPS-06).
 
 A restore must never replay the dump's past to subscribers (PITFALLS Pitfall 12). The dump
 holds a live state from hours or days ago: locations "on" or "off" whose last heartbeat is
@@ -38,6 +38,16 @@ run afterwards in their own transaction and lock no state row. The whole step re
 run, before any write, while any database session holds the worker lock
 (``powermon.worker.lease.LOCK_KEY``, read from ``pg_locks``): run against a live system
 it would drop real queued alerts and reset live locations. A second run changes nothing.
+
+D-16: ``fingerprint`` is the restore drill's comparison tool (INV-25 #2, ``manage.py
+history_fingerprint``). It returns the row count and an md5 checksum of every row of
+``location``, ``power_interval`` and ``chart_message``, in id order, so a source and a
+restored database can be compared table by table. It runs as its own outermost
+transaction, made READ ONLY by its first statement, with no statement timeout, through
+Django's connection: the session time zone is UTC (``USE_TZ``), so timestamps have the
+same text on both sides (RESEARCH Pitfall 14). Secrets enter the location checksum only as
+md5 inside the aggregate; the output never holds a token or a device key. Compare before
+``post_restore``, which changes the open pieces and ``location_state``.
 
 Nothing here does network I/O, and time comes only from the caller (``now``); SQL
 constants use bound parameters only.
@@ -88,6 +98,30 @@ SELECT EXISTS (
 """
 _LOCK_CLASSID = LOCK_KEY >> 32
 _LOCK_OBJID = LOCK_KEY & 0xFFFFFFFF
+
+# The history a restore must carry over, in output order (D-16).
+FINGERPRINT_TABLES = ("location", "power_interval", "chart_message")
+# One statement per table: the row count and the md5 of every row's text joined in id order
+# (RESEARCH Pattern 7); empty tables give 0 and ''. The location projection names its
+# columns and hashes the bot token and the device key inside the aggregate, so neither is
+# ever a column of the result; the other two tables are fingerprinted as whole rows.
+FINGERPRINT_SQL: dict[str, str] = {
+    "location": r"""
+SELECT count(*), coalesce(md5(string_agg(t::text, E'\n' ORDER BY t.id)), '')
+  FROM (SELECT id, name, period_s, grace_s, router_grace, maintenance, alerts_enabled,
+               language, chat_id, deleted_at, created_at,
+               md5(bot_token) AS bot_token_md5, md5(device_key) AS device_key_md5
+          FROM location) t
+""",
+    "power_interval": r"""
+SELECT count(*), coalesce(md5(string_agg(t::text, E'\n' ORDER BY t.id)), '')
+  FROM (SELECT * FROM power_interval) t
+""",
+    "chart_message": r"""
+SELECT count(*), coalesce(md5(string_agg(t::text, E'\n' ORDER BY t.id)), '')
+  FROM (SELECT * FROM chart_message) t
+""",
+}
 
 
 class WorkerActive(Exception):
@@ -185,3 +219,29 @@ def restart_after_restore(now: datetime) -> RestoreCounts:
         counts.incidents,
     )
     return counts
+
+
+def fingerprint() -> list[tuple[str, int, str]]:
+    """``(table, row count, checksum)`` for each of FINGERPRINT_TABLES, read only (D-16).
+
+    Must be the outermost transaction: called inside a caller's transaction it raises
+    RuntimeError before running any statement. There its atomic block would only be a
+    savepoint, and ``SET TRANSACTION READ ONLY`` would stay on in the caller's transaction
+    after the savepoint is released. Otherwise one transaction whose first statement makes
+    it READ ONLY, then lifts the 5 s statement cap for this transaction only (``SET
+    LOCAL``), then runs FINGERPRINT_SQL in table order. A statement that tried to write
+    would be refused by PostgreSQL. ``manage.py history_fingerprint`` runs in autocommit,
+    so the guard never fires there.
+    """
+    if connection.in_atomic_block:
+        raise RuntimeError("fingerprint() must run outside a transaction")
+    result: list[tuple[str, int, str]] = []
+    with transaction.atomic(), connection.cursor() as cur:
+        cur.execute("SET TRANSACTION READ ONLY")
+        cur.execute("SET LOCAL statement_timeout = 0")
+        for table in FINGERPRINT_TABLES:
+            cur.execute(FINGERPRINT_SQL[table])
+            # An aggregate with no GROUP BY returns exactly one row.
+            count, checksum = cur.fetchone() or (0, "")
+            result.append((table, int(count), str(checksum)))
+    return result
