@@ -2,6 +2,9 @@
 
 from django.urls import path
 
+from powermon.web.history_views import (
+    OutageRemoveView,
+)
 from powermon.web.location_views import (
     AlertsSwitchView,
     LocationDeleteView,
@@ -43,6 +46,11 @@ urlpatterns = [
         "locations/<int:pk>/test-message/",
         SendTestMessageView.as_view(),
         name="location-test-message",
+    ),
+    path(
+        "locations/<int:pk>/outages/<int:start_us>/remove/",
+        OutageRemoveView.as_view(),
+        name="outage-remove",
     ),
     path("locations/<int:pk>/setup/", LocationSetupView.as_view(), name="location-setup"),
     path(

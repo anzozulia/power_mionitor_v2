@@ -332,6 +332,7 @@ def test_location_page_settings_and_setup_sections(
         "Status",
         "Switches",
         "Test message",
+        "Recent outages",
         "Settings",
         "Device setup",
         "Delete location",

@@ -1,9 +1,10 @@
 {% extends "base.html" %}
 {% load display_time %}
 {% comment %}
-UI-SPEC screen B (D-13): the location page. Sections in order: Status, Switches, Test
-message, Settings (with the "Edit location" link-button, UI-D10), Device setup, Delete
-location (a secondary link-button that only opens the confirmation page, UI-D5). The switch
+UI-SPEC screen B (D-13): the location page. Sections in order (05-UI-SPEC UI5-D1): Status,
+Switches, Test message, Recent outages, Settings (with the "Edit location" link-button,
+UI-D10), Device setup, Delete location (a secondary link-button that only opens the
+confirmation page, UI-D5); 05-05 adds Reset history before Delete location. The switch
 rows come from location_views.switch_rows, in D-05 order: Maintenance, Alerts, Router grace.
 Read-only except the switches, each a one-click POST form (CSRF) that posts its target value
 (UI-D3) and redirects back here (UI-D4), and the test message, a one-click POST form whose
@@ -11,6 +12,13 @@ button is the page's only accent button (UI-D15, D-11). No script, no inline sty
 The status panel's last row is Delivery (D-13): "OK" with its help, or the failing indicator
 with the full display_time of the incident's start, the cause line (or the supergroup line)
 and the retry line, from location_views.delivery_row.
+Recent outages (05-UI-SPEC A1, D-01): the outages of the last 14 local days, newest first,
+from location_views.outage_rows. Exactly one of: the table (Outage, Off time and a visually
+hidden Action column; each date and time its own .num span; the current outage reads "in
+progress" and has an empty Remove cell), "No outages in the last 14 days." (history but no
+outage in the window) or "No power history yet. …" (no interval at all). The off-time note
+always follows the table, the in-progress note only when the current outage is listed. Each
+Remove link only opens the GET confirmation page; it has a unique accessible name (UI5-D6).
 Secrets (SEC-04): no device key appears on this page, not even masked; the bot token only
 in its masked form, in the settings panel.
 {% endcomment %}
@@ -71,6 +79,37 @@ in its masked form, in the settings panel.
   {% csrf_token %}
   <button class="btn btn--primary" type="submit">Send test message</button>
 </form>
+
+<h2>Recent outages</h2>
+<p>Outages in the last 14 days, newest first. Remove an outage that was not a real power cut, for example when the device or its internet connection was down while the power was on.</p>
+{% if outage_rows %}
+<div class="table-wrap">
+<table>
+  <thead>
+    <tr>
+      <th scope="col">Outage</th>
+      <th scope="col">Off time</th>
+      <th scope="col"><span class="visually-hidden">Action</span></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in outage_rows %}
+    <tr>
+      <td><span class="num">{{ row.start_date }}</span> <span class="num">{{ row.start_time }}</span> – {% if row.in_progress %}in progress{% else %}{% if row.end_date %}<span class="num">{{ row.end_date }}</span> {% endif %}<span class="num">{{ row.end_time }}</span>{% endif %}</td>
+      <td><span class="num">{{ row.off_text }}</span></td>
+      <td>{% if not row.in_progress %}<a href="{% url 'outage-remove' location.pk row.start_us %}">Remove<span class="visually-hidden"> the outage from {{ row.start_date }} {{ row.start_time }}</span></a>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+<p class="help">Off time counts only time recorded as power off, as the chart's daily totals do. Time that was not monitored (maintenance, server downtime) is left out, so off time can be shorter than the span from start to end and than the ON alert's "was OFF for". The end shown is the last time recorded as power off, so it can be earlier than the ON alert when power came back while the location was not monitored.</p>
+{% if outage_in_progress %}<p class="help">The outage in progress can be removed after power returns.</p>{% endif %}
+{% elif has_history %}
+<p>No outages in the last 14 days.</p>
+{% else %}
+<p>No power history yet. Outages are listed here once the device has sent its first heartbeat.</p>
+{% endif %}
 
 <h2>Settings</h2>
 {% include "web/_settings_panel.html" %}
