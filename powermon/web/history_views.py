@@ -134,6 +134,9 @@ class OutageRemoveView(View):
         elif result == "sending":
             messages.info(request, REMOVAL_DEFERRED_MESSAGE)
         else:
+            # Deleted between the lookup and the row lock: 404, as for any deleted
+            # location, never a flash (05-UI-SPEC E, as HistoryResetView.post).
+            location_or_404(pk)
             messages.info(request, OUTAGE_GONE_MESSAGE)
         return redirect("location-detail", pk=pk)
 

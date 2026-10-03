@@ -826,6 +826,34 @@ def test_remove_urls_answer_404(
 
 
 @pytest.mark.django_db(transaction=True)
+def test_remove_post_for_a_location_deleted_mid_request_answers_404(
+    admin: Client,
+    monkeypatch: pytest.MonkeyPatch,
+    location_factory: Callable[..., Any],
+    fake_telegram: FakeTelegram,
+) -> None:
+    location = _two_outages(location_factory, name="Office")
+    _clock(monkeypatch, _at(16, 0))
+    before = _written(location)
+    remove_outage = history.remove_outage
+
+    def delete_then_remove(pk: int, start: datetime) -> history.RemoveResult:
+        # A second tab deletes the location after the view's lookup, before the row lock.
+        Location.objects.filter(pk=pk).update(deleted_at=_at(16, 0))
+        return remove_outage(pk, start)
+
+    monkeypatch.setattr(history, "remove_outage", delete_then_remove)
+
+    response = admin.post(_remove(location, _at(15, 0)))
+
+    # 404, as for any deleted location (05-UI-SPEC E), never the "already removed" flash.
+    assert response.status_code == 404
+    assert _flashes(admin.get("/").content.decode()) == []
+    assert _written(location) == before
+    assert len(fake_telegram.calls) == 0
+
+
+@pytest.mark.django_db(transaction=True)
 def test_remove_post_needs_csrf(location_factory: Callable[..., Any]) -> None:
     location = _two_outages(location_factory)
     client = Client(enforce_csrf_checks=True)
