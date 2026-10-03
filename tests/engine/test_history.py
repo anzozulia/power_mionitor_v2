@@ -604,6 +604,28 @@ def test_D04_on_alert_with_a_foreign_payload_is_kept(location_factory: Callable[
 
 
 @pytest.mark.django_db(transaction=True)
+def test_D04_nothing_to_drop_when_no_alert_was_queued(
+    location_factory: Callable[..., Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    _no_anchors()
+    location = location_factory(alerts_enabled=False)
+    assert transitions.record_heartbeat(location.pk, _at(8, 0)) == "started"
+    assert transitions.record_heartbeat(location.pk, _at(9, 0)) == "plain"
+    assert detection.run_cycle(_at(9, 1, 31)) == 1
+    assert transitions.record_heartbeat(location.pk, _at(10, 0)) == "restored"
+    # Alerts were off for the whole outage: nothing was queued, nothing is dropped.
+    assert _outbox() == []
+    caplog.set_level(logging.INFO, logger=history.__name__)
+
+    assert history.remove_outage(location.pk, _at(9, 0)) == "removed"
+
+    assert _outbox() == []
+    assert _intervals(location)[1] == ("on", _at(9, 0), _at(10, 0), None)
+    [record] = [r for r in caplog.records if r.name == history.__name__]
+    assert record.getMessage().endswith("removed, 0 queued alert(s) dropped")
+
+
+@pytest.mark.django_db(transaction=True)
 def test_removal_queues_nothing_and_logs_one_info_line(
     location_factory: Callable[..., Any], caplog: pytest.LogCaptureFixture
 ) -> None:
