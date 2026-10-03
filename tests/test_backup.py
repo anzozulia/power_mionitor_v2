@@ -11,12 +11,15 @@ postgres) is never reached here; the container runs it.
 """
 
 import os
+import signal
 import subprocess
-from collections.abc import Iterator
-from dataclasses import dataclass
-from datetime import UTC, datetime
+import time
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from stat import S_IMODE
+from typing import IO
 
 import pytest
 from django.conf import settings
@@ -25,6 +28,8 @@ BACKUP_SH = Path(settings.BASE_DIR) / "docker" / "backup" / "backup.sh"
 PASSWORD = "s3cret-test-password-123"
 DUMP_BYTES = "PGDMP stub dump\n"
 COMMAND_TIMEOUT_S = 30
+# The question --restore asks before it restores anything (D-15).
+TABLE_COUNT_SQL = "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'"
 
 # Every stub first appends one line per call: its name, then its arguments, tab-separated.
 _RECORD = r"""#!/bin/sh
@@ -32,9 +37,11 @@ _RECORD = r"""#!/bin/sh
 """
 STUBS = {
     # Writes the stub dump to its -f argument. STUB_FAIL_DUMP=1 writes a few bytes and
-    # fails; STUB_EMPTY_DUMP=1 writes an empty file and succeeds.
+    # fails; STUB_EMPTY_DUMP=1 writes an empty file and succeeds. With STUB_TIMES set, it
+    # appends the time it was called (as it saw it), whenever the test reads the file.
     "pg_dump": _RECORD
-    + r"""out=""
+    + r"""if [ -n "${STUB_TIMES:-}" ]; then date +%s.%N >> "$STUB_TIMES"; fi
+out=""
 while [ $# -gt 0 ]; do
   if [ "$1" = "-f" ]; then out=$2; shift; fi
   shift
@@ -112,6 +119,65 @@ def stubs(tmp_path: Path) -> Iterator[Stubs]:
     yield Stubs(bin_dir=bin_dir, log=tmp_path / "calls.log", backups=tmp_path / "backups")
 
 
+@dataclass
+class Loop:
+    """The container's command, ``bash backup.sh``, running in the background."""
+
+    proc: subprocess.Popen[bytes]
+    out: Path
+    handle: IO[str]
+
+    def output(self) -> str:
+        return self.out.read_text()
+
+    def stop(self, sig: int) -> int:
+        """Send ``sig`` and return the exit code; raises if it has not exited within 5 s."""
+        self.proc.send_signal(sig)
+        return self.proc.wait(timeout=5)
+
+
+@dataclass
+class Loops:
+    stubs: Stubs
+    tmp_path: Path
+    started: list[Loop] = field(default_factory=list)
+
+    def start(self, **env: str) -> Loop:
+        # Output goes to a file, not a pipe: nothing can block on a full pipe or on an
+        # inherited write end.
+        out = self.tmp_path / f"loop-{len(self.started)}.log"
+        handle = out.open("w")
+        proc = subprocess.Popen(
+            ["bash", str(BACKUP_SH)],
+            env=self.stubs.env(**env),
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+        )
+        loop = Loop(proc=proc, out=out, handle=handle)
+        self.started.append(loop)
+        return loop
+
+
+@pytest.fixture
+def loops(stubs: Stubs, tmp_path: Path) -> Iterator[Loops]:
+    runner = Loops(stubs=stubs, tmp_path=tmp_path)
+    yield runner
+    for loop in runner.started:
+        if loop.proc.poll() is None:
+            loop.proc.kill()
+            loop.proc.wait(timeout=5)
+        loop.handle.close()
+
+
+def _wait_for(check: Callable[[], bool], timeout_s: float) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if check():
+            return True
+        time.sleep(0.05)
+    return check()
+
+
 def _lines(result: subprocess.CompletedProcess[str]) -> list[str]:
     return [line for line in (result.stdout + result.stderr).splitlines() if line.strip()]
 
@@ -158,6 +224,22 @@ def _nights(first: int, last: int) -> list[datetime]:
 
 def _errors(result: subprocess.CompletedProcess[str]) -> list[str]:
     return [line for line in _lines(result) if "error:" in line]
+
+
+def _dump_names(stubs: Stubs) -> list[str]:
+    """The finished dumps only: temp files start with a dot."""
+    return [name for name in _names(stubs) if not name.startswith(".")]
+
+
+def _call_times(path: Path) -> list[float]:
+    if not path.exists():
+        return []
+    return [float(stamp) for stamp in path.read_text().split()]
+
+
+def _restores(stubs: Stubs) -> list[list[str]]:
+    """pg_restore calls that restore (every call except --list)."""
+    return [call for call in stubs.calls("pg_restore") if call[1:2] != ["--list"]]
 
 
 # The script and the image (RESEARCH A1)
@@ -418,3 +500,177 @@ def test_password_never_in_output_or_argv(stubs: Stubs) -> None:
         assert PASSWORD not in result.stdout + result.stderr
     assert stubs.calls()
     assert PASSWORD not in stubs.log.read_text()
+
+
+# The container loop (D-09, RESEARCH Pitfall 7)
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT], ids=["SIGTERM", "SIGINT"])
+def test_loop_dumps_at_start_cleans_leftovers_and_stops_on_term(
+    stubs: Stubs, loops: Loops, sig: int
+) -> None:
+    # A dump cut off by a stop or a crash leaves its temp file behind. SIGINT is the
+    # postgres image's STOPSIGNAL; SIGTERM is what `docker stop` sends by default.
+    stubs.backups.mkdir(mode=0o700)
+    leftover = stubs.backups / ".powermon-20261001T030000Z.dump.partial"
+    leftover.write_text("PGD")
+
+    loop = loops.start(BACKUP_CHECK_EVERY_S="1")
+    dumped = _wait_for(lambda: len(_dump_names(stubs)) == 1, 10)
+    leftover_gone = not leftover.exists()
+    asked = time.monotonic()
+    code = loop.stop(sig)
+    took = time.monotonic() - asked
+
+    assert dumped, loop.output()
+    assert leftover_gone
+    assert code == 0, loop.output()
+    assert took < 5
+    assert "stopping" in loop.output()
+    assert len(_names(stubs)) == 1
+    assert len(stubs.calls("pg_dump")) == 1
+
+
+def test_loop_paces_failed_dumps(stubs: Stubs, loops: Loops, tmp_path: Path) -> None:
+    # Retry after 2 s, then 4 s (the cap), instead of on every 1 s check (D-09). Only
+    # lower bounds on the gaps between stub-recorded call times are asserted: load can
+    # delay a call, never bring it forward.
+    times = tmp_path / "pg_dump.times"
+    loop = loops.start(
+        STUB_FAIL_DUMP="1",
+        STUB_TIMES=str(times),
+        BACKUP_CHECK_EVERY_S="1",
+        BACKUP_RETRY_FIRST_S="2",
+        BACKUP_RETRY_MAX_S="4",
+    )
+
+    three_calls = _wait_for(lambda: len(_call_times(times)) >= 3, 30)
+    time.sleep(2)
+    code = loop.stop(signal.SIGTERM)
+    calls = _call_times(times)
+    gaps = [later - earlier for earlier, later in zip(calls, calls[1:], strict=False)]
+
+    assert three_calls, loop.output()
+    assert code == 0, loop.output()
+    # The retry is counted on a whole-second clock from after the failed attempt.
+    assert gaps[0] >= 0.9, gaps
+    assert all(gap >= 2.9 for gap in gaps[1:]), gaps
+    # Every failed attempt removed its own temp file; no dump was ever renamed.
+    assert _names(stubs) == []
+
+
+# A dump on demand (D-16)
+
+
+def test_dump_now_dumps_even_when_not_due(stubs: Stubs) -> None:
+    # The slot was 20 minutes ago and the newest dump is from 10 minutes ago: nothing is
+    # due, so --once does nothing, but --dump-now dumps and rotates.
+    now = datetime.now(UTC).replace(microsecond=0)
+    slot = f"{now - timedelta(minutes=20):%H:%M}"
+    older = [_put_dump(stubs, now - timedelta(days=day)).name for day in range(13, 0, -1)]
+    recent = _put_dump(stubs, now - timedelta(minutes=10)).name
+
+    once = stubs.run("--once", BACKUP_TIME_UTC=slot)
+    forced = stubs.run("--dump-now", BACKUP_TIME_UTC=slot)
+
+    assert once.returncode == 0, once.stdout + once.stderr
+    assert forced.returncode == 0, forced.stdout + forced.stderr
+    names = _names(stubs)
+    new = [name for name in names if name not in [*older, recent]]
+    assert len(new) == 1
+    assert new[0] > recent
+    # Rotation applied: 15 dumps, the oldest one removed.
+    assert names == [*older[1:], recent, new[0]]
+    assert len(stubs.calls("pg_dump")) == 1
+
+
+# Restore only into an empty database (D-15, T-05-22, T-05-23)
+
+
+def test_restore_into_an_empty_database(stubs: Stubs) -> None:
+    dump = _put_dump(stubs, _utc(2026, 10, 3, 3, 0, 10))
+
+    result = stubs.run("--restore", dump.name, STUB_TABLES="0")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert stubs.calls() == [
+        ["pg_restore", "--list", str(dump)],
+        ["psql", "-X", "-At", "-c", TABLE_COUNT_SQL],
+        [
+            "pg_restore",
+            "--no-owner",
+            "--single-transaction",
+            "--exit-on-error",
+            "-d",
+            "powermon",
+            str(dump),
+        ],
+    ]
+    assert _errors(result) == []
+    # A restore reads the dump and deletes nothing.
+    assert _names(stubs) == [dump.name]
+
+
+def test_restore_refuses_a_database_with_tables(stubs: Stubs) -> None:
+    dump = _put_dump(stubs, _utc(2026, 10, 3, 3, 0, 10))
+
+    result = stubs.run("--restore", dump.name, STUB_TABLES="3")
+
+    assert result.returncode == 1
+    assert len(_lines(result)) == 1, _lines(result)
+    assert "restores only into a new, empty database" in _errors(result)[0]
+    assert _restores(stubs) == []
+    assert _names(stubs) == [dump.name]
+
+
+@pytest.mark.parametrize(
+    "case", ["parent dir", "sub dir", "empty name", "missing file", "fails --list"]
+)
+def test_restore_refuses_bad_names(stubs: Stubs, tmp_path: Path, case: str) -> None:
+    # Every name points at a real dump-looking file, so only the refusal stops a restore.
+    dump = _put_dump(stubs, _utc(2026, 10, 3, 3, 0, 10))
+    (tmp_path / "x.dump").write_text(DUMP_BYTES)
+    (stubs.backups / "sub").mkdir()
+    (stubs.backups / "sub" / "x.dump").write_text(DUMP_BYTES)
+    name, env = {
+        "parent dir": ("../x.dump", {}),
+        "sub dir": ("sub/x.dump", {}),
+        "empty name": ("", {}),
+        "missing file": ("powermon-20261004T030010Z.dump", {}),
+        "fails --list": (dump.name, {"STUB_FAIL_LIST": "1"}),
+    }[case]
+
+    result = stubs.run("--restore", name, **env)
+
+    assert result.returncode == 1
+    assert len(_lines(result)) == 1, _lines(result)
+    assert len(_errors(result)) == 1
+    assert _restores(stubs) == []
+    assert stubs.calls("psql") == []
+
+
+def test_restore_reports_a_failed_pg_restore(stubs: Stubs) -> None:
+    dump = _put_dump(stubs, _utc(2026, 10, 3, 3, 0, 10))
+
+    result = stubs.run("--restore", dump.name, STUB_RESTORE_EXIT="1")
+
+    assert result.returncode == 1
+    assert len(_errors(result)) == 1, _lines(result)
+    assert "pg_restore" in _errors(result)[0]
+    assert len(_restores(stubs)) == 1
+
+
+@pytest.mark.parametrize(
+    "args",
+    [("--restore",), ("--restore", "a.dump", "extra"), ("--dump-now", "extra")],
+    ids=["restore without a name", "restore with two names", "dump-now with an argument"],
+)
+def test_restore_without_a_name_is_a_usage_error(stubs: Stubs, args: tuple[str, ...]) -> None:
+    result = stubs.run(*args)
+
+    assert result.returncode == 2
+    lines = _lines(result)
+    assert len(lines) == 1, lines
+    assert args[0] in lines[0]
+    assert not stubs.backups.exists()
+    assert stubs.calls() == []
