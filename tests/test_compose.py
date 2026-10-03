@@ -4,6 +4,8 @@ Production is never started on a dev machine; it is deployed on the VPS (01-11).
 parse checks keep the committed deploy shape honest: only the TLS proxy is exposed,
 migrations gate the app, data lives under docker_data/<env>, logs are capped. Every
 long-running service has a healthcheck, and the worker's reads its health file (OPS-05).
+The backup service dumps from the db image's own pg_dump into docker_data/<env>/backups,
+outside the data directory, and gets only the database and backup settings (OPS-06, D-11).
 
 The checks stay true when 01-11 adds the local worker service and switches local
 migrate to ``release``.
@@ -31,6 +33,9 @@ ENVS = sorted(COMPOSE_FILES)
 CADDYFILE = BASE_DIR / "docker" / "Caddyfile"
 # Caddy reads only these two from its environment; every other app setting is blanked.
 CADDY_KEYS = frozenset({"DOMAIN", "ACME_EMAIL"})
+# The backup container gets the database settings and its own; every other one is blanked.
+BACKUP_KEY_PREFIXES = ("POSTGRES_", "BACKUP_")
+ENV_FILES = {"local": ".env.docker_local", "prod": ".env.docker_production"}
 # Caddyfile env placeholders such as {$DOMAIN} or {$PORT:443}; their braces are not blocks.
 _PLACEHOLDER_RE = re.compile(r"\{\$[A-Za-z_][A-Za-z0-9_]*(?::[^}]*)?\}")
 
@@ -361,6 +366,65 @@ def test_postgres_18_layout_and_logging(env: str) -> None:
     # Failed statements are never logged with their literal values (STACK G4).
     assert "log_min_error_statement=panic" in db["command"]
     assert "log_error_verbosity=terse" in db["command"]
+
+
+# Backups (OPS-06, INV-25, D-09, D-11)
+
+
+@pytest.mark.parametrize("env", ENVS)
+def test_backup_service_shape(env: str) -> None:
+    services = _services(env)
+    backup = services["backup"]
+
+    # The db's own image tag, so pg_dump's major version matches the server (D-09).
+    assert backup["image"] == services["db"]["image"] == "postgres:18.6-trixie"
+    assert "build" not in backup
+    assert backup["command"] == ["bash", "/backup/backup.sh"]
+    assert (BASE_DIR / "docker" / "backup" / "backup.sh").is_file()
+    # Dumps hold every bot token: their own directory, outside PGDATA's mount (D-11).
+    assert backup["volumes"] == [
+        "./docker/backup:/backup:ro",
+        f"./docker_data/{env}/backups:/backups",
+    ]
+    sources = [volume.split(":", 1)[0] for volume in backup["volumes"]]
+    assert not [s for s in sources if s.startswith(f"./docker_data/{env}/postgres")]
+    assert "ports" not in backup
+    assert "expose" not in backup
+    # Never migrate: the restore runs this service against a new, empty database.
+    assert _depends_on(backup) == {"db": {"condition": "service_healthy"}}
+    assert backup["restart"] == "unless-stopped"
+    assert backup["healthcheck"] == {
+        "test": ["CMD", "bash", "/backup/backup.sh", "--health"],
+        "interval": "60s",
+        "timeout": "10s",
+        "retries": 3,
+        "start_period": "5m",
+        "start_interval": "5s",
+    }
+    assert backup["logging"] == services["db"]["logging"]
+
+
+@pytest.mark.parametrize("env", ENVS)
+def test_backup_gets_only_database_and_backup_settings(env: str) -> None:
+    backup = _services(env)["backup"]
+    keys = _env_example_keys()
+    passed = {key for key in keys if key.startswith(BACKUP_KEY_PREFIXES)}
+
+    environment = backup.get("environment")
+
+    # `environment` overrides `env_file`: the one env file stays, and every app secret
+    # (SECRET_KEY, ADMIN_PASSWORD, OPS_BOT_TOKEN, ...) is blanked. A key added to
+    # .env.example later fails here until the backup service blanks or passes it (D-11).
+    assert backup["env_file"] == [ENV_FILES[env]]
+    assert isinstance(environment, dict), "backup environment must be a KEY: value mapping"
+    assert {"POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD", "BACKUP_KEEP"} <= passed
+    for key in keys:
+        if key in passed:
+            assert key not in environment, f"backup must read {key} from the env file"
+        else:
+            # A bare key (None) would pass the deploying shell's value through.
+            assert environment.get(key) == "", f"backup must blank {key} with an explicit ''"
+    assert set(environment) == set(keys) - passed
 
 
 def test_prod_app_services_build_runtime_and_read_prod_env() -> None:

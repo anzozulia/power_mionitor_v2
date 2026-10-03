@@ -1,7 +1,7 @@
 # Local stack. One command (D-03):
 #   docker compose -f docker-compose.local.yml up -d --build --wait
-# Same services as production minus caddy: db, the one-shot migrate (release), web and
-# worker. Only web publishes a port, bound to 127.0.0.1.
+# Same services as production minus caddy: db, the one-shot migrate (release), web, worker
+# and backup. Only web publishes a port, bound to 127.0.0.1.
 name: powermon-local
 
 x-logging: &logging
@@ -33,6 +33,49 @@ services:
       timeout: 3s
       retries: 20
       start_period: 30s
+    restart: unless-stopped
+    logging: *logging
+
+  # Nightly database dumps, as in production (OPS-06, INV-25, D-09), so the restore can be
+  # rehearsed locally. Same image tag as db, so pg_dump's major version matches the server.
+  # Dumps go to docker_data/local/backups, outside the PostgreSQL data directory, as a 0700
+  # directory of 0600 files (D-11). No ports. Healthy while the newest dump is under 26 h old.
+  backup:
+    image: postgres:18.6-trixie
+    command: ["bash", "/backup/backup.sh"]
+    # Only POSTGRES_* and BACKUP_* pass through: every other app setting is blanked, so this
+    # container holds no app secret (D-11). Keep this list in step with .env.example
+    # (tests/test_compose.py checks it).
+    env_file: [.env.docker_local]
+    environment:
+      APP_ENV: ""
+      DEBUG: ""
+      SECRET_KEY: ""
+      ADMIN_USERNAME: ""
+      ADMIN_PASSWORD: ""
+      DOMAIN: ""
+      ACME_EMAIL: ""
+      DISPLAY_TZ: ""
+      PUBLIC_BASE_URL: ""
+      OPS_BOT_TOKEN: ""
+      OPS_CHAT_ID: ""
+      ALERT_MAX_AGE_HOURS: ""
+      LOG_LEVEL: ""
+    volumes:
+      - ./docker/backup:/backup:ro
+      - ./docker_data/local/backups:/backups
+    depends_on:
+      # Never migrate: `run --rm --no-deps backup ... --restore` must work on a new, empty
+      # database, before migrate has run.
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "bash", "/backup/backup.sh", "--health"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 5m
+      start_interval: 5s
     restart: unless-stopped
     logging: *logging
 
