@@ -45,7 +45,12 @@ from powermon.engine import history, maintenance, restore, transitions
 from powermon.engine.models import LocationState, PowerInterval, SystemState
 from powermon.locations import keys
 from powermon.locations.models import Location
-from powermon.web.history_views import HistoryResetView, OutageRemoveView
+from powermon.web.history_views import (
+    OUTAGE_REMOVED_MESSAGE,
+    REMOVAL_DEFERRED_MESSAGE,
+    HistoryResetView,
+    OutageRemoveView,
+)
 from powermon.web.location_views import LocationDetailView, OutageRow, local_minute, outage_rows
 from powermon.worker import detection, io_loop
 
@@ -53,20 +58,11 @@ User = get_user_model()
 
 KYIV = "Europe/Kyiv"
 # 05-UI-SPEC Copywriting › Flashes, verbatim.
-REMOVED_FLASH = (
-    "Outage from {start} removed: its time now counts as power on. No message was sent. If it "
-    "is within the last 7 days, the pinned chart shows the change within 15 minutes."
-)
 GONE_FLASH = (
     "This outage is no longer in the history: it was already removed, or the history was "
     "reset. Nothing changed."
 )
 REFUSED_FLASH = "This outage is still in progress. It can be removed after power returns."
-# Amended 2026-10-03 (wave-1 audit, W1-A1): the outage's OFF alert is being sent.
-DEFERRED_FLASH = (
-    "An alert about this outage is being sent to the channel right now. Nothing changed. "
-    "Try again in a minute."
-)
 RESET_FLASH = (
     "History reset. The location waits for its next heartbeat, which restarts monitoring "
     "without an alert. The old weekly chart is unpinned when the bot can do so; if the pin "
@@ -364,7 +360,7 @@ def test_DATA02_remove_an_outage_from_the_location_page(
     assert response.url == _page(location)
     after = admin.get(response.url).content.decode()
     # 09:00 UTC is 12:00 in Kyiv (EEST).
-    assert _flashes(after) == [REMOVED_FLASH.format(start="2026-10-01 12:00")]
+    assert _flashes(after) == [OUTAGE_REMOVED_MESSAGE.format(start="2026-10-01 12:00")]
     assert len(_rows(after)) == 1
     assert len(fake_telegram.calls) == 0
 
@@ -733,8 +729,8 @@ def test_D04_W1_A1_removal_post_while_the_off_alert_is_sending_is_deferred(
     assert response.status_code == 302
     assert response.url == _page(location)
     page = admin.get(response.url).content.decode()
-    assert _flashes(page) == [DEFERRED_FLASH]
-    assert f'<p class="callout" role="status">{DEFERRED_FLASH}</p>' in page
+    assert _flashes(page) == [REMOVAL_DEFERRED_MESSAGE]
+    assert f'<p class="callout" role="status">{REMOVAL_DEFERRED_MESSAGE}</p>' in page
     assert _written(location) == before
     assert len(fake_telegram.calls) == 0
 
@@ -754,7 +750,7 @@ def test_remove_double_submit_says_already_gone(
 
     assert first.status_code == 302
     assert _flashes(admin.get(first.url).content.decode()) == [
-        REMOVED_FLASH.format(start="2026-10-01 18:00")
+        OUTAGE_REMOVED_MESSAGE.format(start="2026-10-01 18:00")
     ]
     after = _written(location)
 
@@ -790,12 +786,12 @@ def test_remove_success_flash_names_the_start_from_the_stored_instant(
 
     # In the display TZ, seconds cut off, never rounded (UI5-D4, UI5-D15).
     assert _flashes(admin.get(first.url).content.decode()) == [
-        REMOVED_FLASH.format(start="2026-10-01 12:00")
+        OUTAGE_REMOVED_MESSAGE.format(start="2026-10-01 12:00")
     ]
     kyiv.TIME_ZONE = "UTC"
     second = admin.post(_remove(location, _at(11, 0, 59)))
     assert _flashes(admin.get(second.url).content.decode()) == [
-        REMOVED_FLASH.format(start="2026-10-01 11:00")
+        OUTAGE_REMOVED_MESSAGE.format(start="2026-10-01 11:00")
     ]
 
 
@@ -921,7 +917,7 @@ def test_removal_pages_show_no_secret(
     ]
     flashes = [response.content.decode() for response in flash_pages]
     assert [_flashes(page) for page in flashes] == [
-        [REMOVED_FLASH.format(start="2026-10-01 12:00")],
+        [OUTAGE_REMOVED_MESSAGE.format(start="2026-10-01 12:00")],
         [GONE_FLASH],
         [REFUSED_FLASH],
     ]

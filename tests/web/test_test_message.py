@@ -53,6 +53,7 @@ from powermon.alerts.models import OpsIncident, OutboxMessage
 from powermon.locations.models import Location
 from powermon.telegram.client import SendResult
 from powermon.web.location_views import (
+    TEST_UNREACHABLE_MESSAGE,
     LocationDetailView,
     SendTestMessageView,
     flash_for_test_message,
@@ -101,10 +102,6 @@ REFUSED_FLASH = (
 MAYBE_FLASH = (
     "No answer from Telegram in time ({code}). The message may have been sent: check the "
     "channel before you try again."
-)
-UNREACHABLE_FLASH = (
-    "Telegram could not be reached ({code}), so the test message was not sent. Try again in a "
-    "minute."
 )
 RATE_LIMITED_FLASH = "Telegram asks to wait before the next message. Try again in {wait}."
 # Telegram's description texts below must never reach a flash (D-11, OPS-08).
@@ -459,17 +456,17 @@ FLASH_TABLE: dict[str, tuple[dict[str, Any], int, str]] = {
     "connect_error": (
         {"exc": _refused(DEFAULT_BOT_TOKEN)},
         messages.ERROR,
-        UNREACHABLE_FLASH.format(code="connect_error"),
+        TEST_UNREACHABLE_MESSAGE.format(code="connect_error"),
     ),
     "connect_timeout": (
         {"exc": requests.ConnectTimeout("connect timed out")},
         messages.ERROR,
-        UNREACHABLE_FLASH.format(code="connect_timeout"),
+        TEST_UNREACHABLE_MESSAGE.format(code="connect_timeout"),
     ),
     "http_503": (
         {"status": 503, "json_body": _error(503, "Service Unavailable")},
         messages.ERROR,
-        UNREACHABLE_FLASH.format(code="http_503"),
+        TEST_UNREACHABLE_MESSAGE.format(code="http_503"),
     ),
     # Rate limited: the wait in whole seconds, "1 second" when it is 1.
     "429-1s": (
