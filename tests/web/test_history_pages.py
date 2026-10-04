@@ -186,6 +186,16 @@ def _main(page: str) -> str:
     return page[page.index("<main") :]
 
 
+def _h1_text(page: str) -> str:
+    """The page's first h1 as text: tags dropped, whitespace collapsed, entities decoded.
+
+    So an h1 with attributes or an aria-hidden icon inside still reads as its copy.
+    """
+    match = re.search(r"<h1\b[^>]*>(.*?)</h1>", page, re.S)
+    assert match is not None, "no h1 on the page"
+    return " ".join(unescape(re.sub(r"<[^>]+>", " ", match.group(1))).split())
+
+
 def _section(page: str) -> str:
     """The Recent outages section of the location page."""
     return page[page.index("<h2>Recent outages</h2>") : page.index("<h2>Settings</h2>")]
@@ -570,7 +580,7 @@ def test_recent_outages_db_error_is_the_500_page(
     # E1 error: the P1 500 page, no partial table.
     assert response.status_code == 500
     html = response.content.decode()
-    assert "<h1>Something went wrong</h1>" in html
+    assert _h1_text(html) == "Something went wrong"
     assert "<table" not in html
     assert "Recent outages" not in html
     assert "could not connect" not in html

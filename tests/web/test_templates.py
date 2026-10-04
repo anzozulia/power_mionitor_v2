@@ -15,6 +15,7 @@ import re
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from html import unescape
 from typing import Any
 
 import pytest
@@ -55,6 +56,16 @@ def _set_state(location: Any, **fields: Any) -> None:
 def _text(fragment: str) -> str:
     """The visible text of an HTML fragment: tags dropped, whitespace collapsed."""
     return " ".join(re.sub(r"<[^>]+>", " ", fragment).split())
+
+
+def _h1_text(page: str) -> str:
+    """The page's first h1 as text: tags dropped, whitespace collapsed, entities decoded.
+
+    So an h1 with attributes or an aria-hidden icon inside still reads as its copy.
+    """
+    match = re.search(r"<h1\b[^>]*>(.*?)</h1>", page, re.S)
+    assert match is not None, "no h1 on the page"
+    return " ".join(unescape(re.sub(r"<[^>]+>", " ", match.group(1))).split())
 
 
 def _table_rows(html: str) -> list[list[str]]:
@@ -249,7 +260,7 @@ def test_list_database_failure_renders_500_without_a_table(
 
     assert response.status_code == 500
     html = response.content.decode()
-    assert "<h1>Something went wrong</h1>" in html
+    assert _h1_text(html) == "Something went wrong"
     assert "<table" not in html
     assert "Office" not in html
     assert "could not connect" not in html
