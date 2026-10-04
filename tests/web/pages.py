@@ -215,3 +215,69 @@ def assert_no_injected_script(html: str, label: str = "") -> None:
     for element in _tags(soup.find_all(True)):
         handlers = sorted(name for name in element.attrs if name.lower().startswith("on"))
         assert not handlers, f"{where}<{element.name}> has inline event handlers {handlers}"
+
+
+# RED stubs (TDD): the rest of the TEST-STRATEGY §5.1 API, not implemented yet.
+
+CSP = ""
+
+
+def breadcrumbs(page: Page, testid: str = "breadcrumbs") -> list[tuple[str, str | None]]:
+    return []
+
+
+def table(page: Page, testid: str) -> tuple[list[str], list[list[str]]]:
+    return [], []
+
+
+def definitions(page: Page, testid: str) -> list[tuple[str, str]]:
+    return []
+
+
+def field(page: Page, name: str) -> Tag:
+    return _soup(page)
+
+
+def field_error(page: Page, name: str) -> str | None:
+    return None
+
+
+def post_form(page: Page, action: str) -> Tag:
+    return _soup(page)
+
+
+def hidden_value(form: Page, name: str) -> str:
+    return ""
+
+
+def form_values(page: Page, testid: str) -> dict[str, str]:
+    return {}
+
+
+def code_block(page: Page, element_id: str) -> str:
+    return ""
+
+
+def section(page: Page, element_id: str) -> Tag:
+    return _soup(page)
+
+
+def assert_page(
+    response: HttpResponseBase,
+    *,
+    status: int = 200,
+    title: str | None = None,
+    app: bool | None = None,
+) -> BeautifulSoup:
+    return parse(response)
+
+
+def assert_no_secrets(
+    body: str | bytes,
+    secrets: object,
+    *,
+    label: str = "",
+    allow: object = (),
+    headers: object = (),
+) -> None:
+    return None
