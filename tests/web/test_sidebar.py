@@ -6,8 +6,8 @@ TEST-STRATEGY §8.5).
   a bare RequestFactory request without a ``user`` attribute, and runs no query for either.
 - For a signed-in request it returns a lazy object: the call runs no query, and reading it
   runs the location list's query plus at most one incident query, the same count for 1
-  and for 6 locations. A response that renders no template (the status JSON) never pays
-  for it.
+  and for 6 locations. A response that renders no template (the status JSON, the chart
+  PNG) never pays for it.
 - Its rows are frozen ``SidebarRow`` instances with exactly the display fields (pk, name,
   status, label, delivery_failing, last_heartbeat_at, outage_started_at), in list order
   (``Lower(name)``, then pk), deleted locations excluded: never a ``Location`` with its
@@ -26,6 +26,7 @@ import pytest
 from conftest import FakeClock
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import AnonymousUser
+from django.core.cache import cache
 from django.db import connection, transaction
 from django.test import Client, RequestFactory
 from django.test.utils import CaptureQueriesContext
@@ -249,23 +250,33 @@ def test_UI03_signed_in_page_carries_the_lazy_sidebar(
 def test_UI03_json_and_png_run_no_sidebar_query(
     settings: Any, location_factory: Callable[..., Any]
 ) -> None:
-    location_factory(name="Office")
+    location = location_factory(name="Office")
     client = Client()
     client.force_login(User.objects.create_user("admin", password="not-used-here"))
+    urls = ("/locations/status.json", f"/locations/{location.pk}/chart.png")
 
-    with CaptureQueriesContext(connection) as registered:
-        assert client.get("/locations/status.json").status_code == 200
+    def capture() -> list[CaptureQueriesContext]:
+        captured = []
+        for url in urls:
+            # An empty render cache, so both runs of the chart PNG do the same work.
+            cache.clear()
+            with CaptureQueriesContext(connection) as queries:
+                assert client.get(url).status_code == 200, url
+            captured.append(queries)
+        cache.clear()
+        return captured
 
+    registered = capture()
     processors = settings.TEMPLATES[0]["OPTIONS"]["context_processors"]
     assert SIDEBAR_PROCESSOR in processors
     without = [name for name in processors if name != SIDEBAR_PROCESSOR]
     settings.TEMPLATES = [
         {**settings.TEMPLATES[0], "OPTIONS": {"context_processors": without}},
     ]
-    with CaptureQueriesContext(connection) as unregistered:
-        assert client.get("/locations/status.json").status_code == 200
+    unregistered = capture()
 
-    # The JSON renders no template, so the sidebar never runs: the same queries either way,
-    # and one location query (the live rows').
-    assert len(registered.captured_queries) == len(unregistered.captured_queries)
-    assert len(_location_queries(registered)) == 1
+    # Neither renders a template, so the sidebar never runs: the same queries either way,
+    # and one location query each (the live rows' and the PNG's 404 check).
+    for url, with_sidebar, without_sidebar in zip(urls, registered, unregistered, strict=True):
+        assert len(with_sidebar.captured_queries) == len(without_sidebar.captured_queries), url
+        assert len(_location_queries(with_sidebar)) == 1, url

@@ -20,8 +20,8 @@ from django.urls import URLPattern, URLResolver, get_resolver, reverse
 from powermon.alerts import ops
 
 EXEMPT = {"login", "logout", "heartbeat", "healthz"}
-# Phase 6 surfaces that must be in the walk (UI-02, UI-05).
-NEW_SURFACES = {"location-status-json", "theme"}
+# Phase 6 surfaces that must be in the walk (UI-02, UI-05, UI-06).
+NEW_SURFACES = {"location-status-json", "theme", "location-chart"}
 
 
 def _named_routes(patterns: Iterable[Any] | None = None) -> list[URLPattern]:
