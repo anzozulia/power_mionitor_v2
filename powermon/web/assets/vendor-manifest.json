@@ -1,0 +1,566 @@
+{
+  "schema": 1,
+  "checked_at": "2026-10-05",
+  "entries": [
+    {
+      "name": "tailwindcss",
+      "version": "4.3.3",
+      "kind": "binary",
+      "source_url": "https://github.com/tailwindlabs/tailwindcss/releases/download/v4.3.3/tailwindcss-linux-x64",
+      "sha256": "dc61b3ac6b8c9ca874c0cc4c57b2409791a64c5540404ca5f5367360babc313a",
+      "bytes": 111749248,
+      "licence": "MIT",
+      "path": "Dockerfile#tailwind-amd64"
+    },
+    {
+      "name": "tailwindcss",
+      "version": "4.3.3",
+      "kind": "binary",
+      "source_url": "https://github.com/tailwindlabs/tailwindcss/releases/download/v4.3.3/tailwindcss-linux-arm64",
+      "sha256": "55fd0b241214eff3de1e8ee4f22796662f2d2e7a49bcfca7477cfd0bac398195",
+      "bytes": 109881488,
+      "licence": "MIT",
+      "path": "Dockerfile#tailwind-arm64"
+    },
+    {
+      "name": "@fontsource-variable/inter",
+      "version": "5.3.0",
+      "kind": "font",
+      "source_url": "https://cdn.jsdelivr.net/npm/@fontsource-variable/inter@5.3.0/files/inter-cyrillic-ext-wght-normal.woff2",
+      "sha256": "ca157063339ac4ad418f214f3abfed119b0798ab4d377386ce5c9e5a7a435ebd",
+      "bytes": 25960,
+      "licence": "OFL-1.1",
+      "path": "powermon/web/static/web/fonts/inter-cyrillic-ext-wght-normal.woff2"
+    },
+    {
+      "name": "@fontsource-variable/inter",
+      "version": "5.3.0",
+      "kind": "font",
+      "source_url": "https://cdn.jsdelivr.net/npm/@fontsource-variable/inter@5.3.0/files/inter-cyrillic-wght-normal.woff2",
+      "sha256": "71d5ee93cc1e9f1d520a3a8b66456de18c7879d8df09d57fcd2eaff75fef0075",
+      "bytes": 18748,
+      "licence": "OFL-1.1",
+      "path": "powermon/web/static/web/fonts/inter-cyrillic-wght-normal.woff2"
+    },
+    {
+      "name": "@fontsource-variable/inter",
+      "version": "5.3.0",
+      "kind": "font",
+      "source_url": "https://cdn.jsdelivr.net/npm/@fontsource-variable/inter@5.3.0/files/inter-latin-ext-wght-normal.woff2",
+      "sha256": "34b9c504cab7a73e37b746343a449132e56cf7b5481af2cb81dc74dcff25c956",
+      "bytes": 85068,
+      "licence": "OFL-1.1",
+      "path": "powermon/web/static/web/fonts/inter-latin-ext-wght-normal.woff2"
+    },
+    {
+      "name": "@fontsource-variable/inter",
+      "version": "5.3.0",
+      "kind": "font",
+      "source_url": "https://cdn.jsdelivr.net/npm/@fontsource-variable/inter@5.3.0/files/inter-latin-wght-normal.woff2",
+      "sha256": "3100e775e8616cd2611beecfa23a4263d7037586789b43f035236a2e6fbd4c62",
+      "bytes": 48256,
+      "licence": "OFL-1.1",
+      "path": "powermon/web/static/web/fonts/inter-latin-wght-normal.woff2"
+    },
+    {
+      "name": "@alpinejs/csp",
+      "version": "3.17.4",
+      "kind": "licence",
+      "source_url": "https://raw.githubusercontent.com/alpinejs/alpine/v3.17.4/LICENSE.md",
+      "sha256": "08b7502da6e7aa1d0bbdc97d220fbf669b9366c61bd0f072238283c89bc4773a",
+      "bytes": 1092,
+      "licence": "MIT",
+      "path": "powermon/web/static/web/vendor/LICENSES/alpinejs-MIT.txt"
+    },
+    {
+      "name": "@fontsource-variable/inter",
+      "version": "5.3.0",
+      "kind": "licence",
+      "source_url": "https://cdn.jsdelivr.net/npm/@fontsource-variable/inter@5.3.0/LICENSE",
+      "sha256": "3b0a5fca3d17942cde889069889dedbbbd075e9b599968c82a95f4d944e9b345",
+      "bytes": 4477,
+      "licence": "OFL-1.1",
+      "path": "powermon/web/static/web/vendor/LICENSES/inter-OFL-1.1.txt"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "licence",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/LICENSE",
+      "sha256": "b495047bd93a9b06913511076f504daba17d5bbeb3e0650f3bb53a4220329c57",
+      "bytes": 3208,
+      "licence": "ISC",
+      "path": "powermon/web/static/web/vendor/LICENSES/lucide-ISC.txt"
+    },
+    {
+      "name": "tailadmin-free",
+      "version": "2.4.0",
+      "kind": "licence",
+      "source_url": "https://raw.githubusercontent.com/TailAdmin/tailadmin-free-tailwind-dashboard-template/1bd2dc42a8467ae0281cf00bd0050da4c9c4be07/LICENSE",
+      "sha256": "8988044d6cd6bdcb6e7f2c955fb0d848d3c4fc6c8e766857a4e02313eb706d5e",
+      "bytes": 1066,
+      "licence": "MIT",
+      "path": "powermon/web/static/web/vendor/LICENSES/tailadmin-MIT.txt"
+    },
+    {
+      "name": "tailwindcss",
+      "version": "4.3.3",
+      "kind": "licence",
+      "source_url": "https://raw.githubusercontent.com/tailwindlabs/tailwindcss/v4.3.3/LICENSE",
+      "sha256": "60e0b68c0f35c078eef3a5d29419d0b03ff84ec1df9c3f9d6e39a519a5ae7985",
+      "bytes": 1071,
+      "licence": "MIT",
+      "path": "powermon/web/static/web/vendor/LICENSES/tailwindcss-MIT.txt"
+    },
+    {
+      "name": "@alpinejs/csp",
+      "version": "3.17.4",
+      "kind": "script",
+      "source_url": "https://cdn.jsdelivr.net/npm/@alpinejs/csp@3.17.4/dist/cdn.min.js",
+      "sha256": "0d18d7f8d7910e2e0212f0f056b12f50bebc3abb7d88d2f7c7cb4c336fe4519a",
+      "bytes": 72198,
+      "licence": "MIT",
+      "path": "powermon/web/static/web/vendor/alpine-csp-3.17.4.min.js"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/bell-off.svg",
+      "sha256": "347a54cda3aeb241c56cfa5e086c008d1bb31695e373eb908270882486805c0d",
+      "bytes": 517,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/bell-off.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/calendar-days.svg",
+      "sha256": "5de2c28c4a1efff9408ccc8aa82d9320cead853fe206128975b45605afeaba4f",
+      "bytes": 567,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/calendar-days.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/check.svg",
+      "sha256": "e4bab3ed87dca8961e94a4e72ce23c17a674bebcb72bbbbe5eff4ef41532aa83",
+      "bytes": 315,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/check.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/chevron-down.svg",
+      "sha256": "55b8aeca5b777fd17f0e7a100da6e20ad7305f9ba65b09502c373b795bf5a030",
+      "bytes": 319,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/chevron-down.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/chevron-right.svg",
+      "sha256": "62013d75bcc86b1fe6cece9251245488e9004efb239ea1ea15ce51a5534d7706",
+      "bytes": 321,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/chevron-right.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/circle-alert.svg",
+      "sha256": "ce9ed8492ca96c8ec007c56263a5fbea7b668aaa82e1aa5576c3cd11ea704c16",
+      "bytes": 415,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/circle-alert.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/circle-check.svg",
+      "sha256": "e89cf92a3e173a9e9b23d424d124e75a4ad5c2af91cd47c22ca661ab8a4ba29c",
+      "bytes": 361,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/circle-check.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/clock.svg",
+      "sha256": "7cc98a11ce3103870cc19dd809b8b9b12b5be894f5e3557acbc5df548c25e55c",
+      "bytes": 347,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/clock.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/copy.svg",
+      "sha256": "d522b8400f8a7e1f0ab05478053f26f890e38a6baa8f4fa9eabc4c7610e48b3f",
+      "bytes": 414,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/copy.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/cpu.svg",
+      "sha256": "87050f03a1bd4a9879c55aa717b58549cb52a9a26b59baca753c5f236d1480ec",
+      "bytes": 664,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/cpu.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/ellipsis-vertical.svg",
+      "sha256": "38cd8e1d177f7bae3ed655b53a72047d684e9d72fcef8e248225b30b5677cb82",
+      "bytes": 400,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/ellipsis-vertical.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/eye-off.svg",
+      "sha256": "071188b6c5b782298a5f26970404865a2bdb6b43eae5e902d5f23805af1e7453",
+      "bytes": 582,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/eye-off.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/eye.svg",
+      "sha256": "8154f830f389e14d550fe0451fa336dee579a0455133408728e0206553fab562",
+      "bytes": 434,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/eye.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/file-question-mark.svg",
+      "sha256": "bb48a7305a8db29ed3c71febf636f4146691ba9c36c51c6e6b80fa62991f1279",
+      "bytes": 500,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/file-question-mark.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/hourglass.svg",
+      "sha256": "98915227065289e7914c95e91500bf3870104e23532e7619aa8380d6e498235e",
+      "bytes": 512,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/hourglass.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/info.svg",
+      "sha256": "af880f5f1040830c149e539600fa62aee9d78ea231b03f9fb2eef78eaddb1d74",
+      "bytes": 369,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/info.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/key-round.svg",
+      "sha256": "d15c80ea08aacae42dc8596198eeee7e85aaaacbfb78b90d706e59001766740e",
+      "bytes": 533,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/key-round.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/layout-grid.svg",
+      "sha256": "15847126a5da66227940878fc1832bddc8882fc7233bfad8e86fe2fa0f4e95a3",
+      "bytes": 498,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/layout-grid.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/loader-circle.svg",
+      "sha256": "b221d6be9d402358c9e39d1f45cb4a09b9a501b2b9657baa3a5552b4e87d31a5",
+      "bytes": 335,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/loader-circle.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/lock.svg",
+      "sha256": "caff65b287f27e50e7f41b5b773c8aff493df53ce91444904ed88aa4a92fdf46",
+      "bytes": 384,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/lock.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/log-out.svg",
+      "sha256": "9da67f219f7662732fce31e8591491484bc70f43c861aec8d9641efe7f66a3e3",
+      "bytes": 395,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/log-out.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/map-pin.svg",
+      "sha256": "e2dc0e70367d8cac4fb5dc87201a6c206a12bf114aeb1336f373d81037027d31",
+      "bytes": 437,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/map-pin.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/maximize-2.svg",
+      "sha256": "4e06b4a114a6bae75176ebcfb986c6bfe898732f860a3c2cfde431c3e101461f",
+      "bytes": 390,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/maximize-2.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/menu.svg",
+      "sha256": "3bf452f0ef3e815781e02ac616f0ae8000732dac12e5bbd240e8d99f8cc2eb4f",
+      "bytes": 354,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/menu.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/message-square-warning.svg",
+      "sha256": "a02e23aedb40d3a577dafae63f96f007befb7a3f1bcfb8297bb9e4bdce68c83e",
+      "bytes": 481,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/message-square-warning.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/monitor.svg",
+      "sha256": "c7bfe77f4a40325e42f8ad0b251e090b9b5085212b9cef00a2b845d132990dc6",
+      "bytes": 424,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/monitor.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/moon.svg",
+      "sha256": "658aac5edb0f3ea5c5b2f792132f41a33a1e72840ea506c88f69fa1948048484",
+      "bytes": 409,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/moon.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/panel-left-close.svg",
+      "sha256": "f457d253cd4d55a5b24e01d4e2a32bc593d8ab4ab839981617299c6848174f52",
+      "bytes": 401,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/panel-left-close.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/panel-left-open.svg",
+      "sha256": "dc715d2c6ca1379dc413a5ab1b30d6173525a96e1bd03db0079a61588618c508",
+      "bytes": 399,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/panel-left-open.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/pencil.svg",
+      "sha256": "8a6c22aa180b2f082db20c2563c9cc8533905e736b8c62eb042b24541ab525d0",
+      "bytes": 454,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/pencil.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/plus.svg",
+      "sha256": "b19dd6e1e82c82baf5e4c19deca9f1ba5de4580e1094670ff00b134ef9886ce9",
+      "bytes": 331,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/plus.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/refresh-cw.svg",
+      "sha256": "99d49e196c743393d0f8ba10b08b060b36cd4299ea557c3685d596b14f079fed",
+      "bytes": 473,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/refresh-cw.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/rotate-ccw.svg",
+      "sha256": "aa1887394571288045795243a98cacb3355e4ffab2c08e26b60c500383dddbf1",
+      "bytes": 378,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/rotate-ccw.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/router.svg",
+      "sha256": "7dc259067913d998b67dd3c7830e686c47679132559b23f9d9b5ad9ad82f11c8",
+      "bytes": 505,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/router.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/send.svg",
+      "sha256": "ea3bef9d240b6d8a678b8ff55697c2b1ace1c38de2125c93e41f08a8c71741af",
+      "bytes": 468,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/send.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/sun.svg",
+      "sha256": "b521c27be18f3a734cbbae2c579519fa22236b5b990ccc5ee0f4274b86bcee5a",
+      "bytes": 559,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/sun.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/trash-2.svg",
+      "sha256": "0de8b67392eab0ddcf82731189544169f778f6aa7f8e89151bd85545beaae9e0",
+      "bytes": 467,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/trash-2.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/triangle-alert.svg",
+      "sha256": "1635aa7fa1b680d238da60d3d770a10cc8d3e5f32486a7c83ded62aaefe1ee37",
+      "bytes": 430,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/triangle-alert.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/user.svg",
+      "sha256": "3998c1721ed9f8c628aa099c5d522ac431b38590a4819a73ef57e581b3dc2f16",
+      "bytes": 374,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/user.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/wifi-off.svg",
+      "sha256": "fe728df7413f4830b61908cace85fd827089f701bd095065a386ab961756e64a",
+      "bytes": 573,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/wifi-off.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/wrench.svg",
+      "sha256": "82203e2b522ea48381facffbb4b6168769d840581a9143019326b45b5aece000",
+      "bytes": 494,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/wrench.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/x.svg",
+      "sha256": "2b24855a933d5f929ebb10c9e8e012c150e505064e00897380ad4e25a5a60965",
+      "bytes": 332,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/x.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/zap-off.svg",
+      "sha256": "6e059397aecaade1e838acb831d70b1413d2da3997f71c67210099699a46ffcd",
+      "bytes": 574,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/zap-off.svg"
+    },
+    {
+      "name": "lucide-static",
+      "version": "1.48.0",
+      "kind": "icon",
+      "source_url": "https://cdn.jsdelivr.net/npm/lucide-static@1.48.0/icons/zap.svg",
+      "sha256": "8382518ca4991718f6a3fd5ec837625d17da559cdd7d7f32514170d83b008d85",
+      "bytes": 464,
+      "licence": "ISC",
+      "path": "powermon/web/templates/icons/zap.svg"
+    }
+  ]
+}
