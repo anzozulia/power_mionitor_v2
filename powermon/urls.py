@@ -2,6 +2,7 @@
 
 from django.urls import path
 
+from powermon.web.chart_preview import LocationChartView
 from powermon.web.history_views import (
     HistoryResetView,
     OutageRemoveView,
@@ -34,6 +35,8 @@ urlpatterns = [
     # The live status of every location (UI-05): fixed vocabulary, no name, no secret.
     path("locations/status.json", LocationStatusJsonView.as_view(), name="location-status-json"),
     path("locations/<int:pk>/", LocationDetailView.as_view(), name="location-detail"),
+    # The weekly chart preview (UI-06); its view imports the chart lifecycle lazily.
+    path("locations/<int:pk>/chart.png", LocationChartView.as_view(), name="location-chart"),
     path("locations/<int:pk>/edit/", LocationEditView.as_view(), name="location-edit"),
     path("locations/<int:pk>/delete/", LocationDeleteView.as_view(), name="location-delete"),
     path(
