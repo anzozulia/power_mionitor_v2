@@ -270,10 +270,12 @@ Tests run inside the stack against its PostgreSQL:
 docker compose -f docker-compose.local.yml run --build --rm web pytest
 ```
 
-The full check (lint, format, types, tests, coverage gate):
+The full check (lint, format, types, tests, coverage gate). From Phase 6 on, the gate also
+covers the web package: every module in `powermon/web/` and `powermon/web/templatetags/`
+except `gunicorn_conf.py`, which the start-up tests exercise in a separate process.
 
 ```sh
-docker compose -f docker-compose.local.yml run --build --rm web sh -c "ruff check . && ruff format --check . && mypy powermon && pytest -q --cov=powermon --cov-report=term-missing:skip-covered && coverage report --include='powermon/engine/*,powermon/alerts/*,powermon/i18n/*,powermon/telegram/*,powermon/chart/*,powermon/worker/detection.py,powermon/worker/io_loop.py,powermon/worker/lease.py,powermon/worker/supervision.py' --fail-under=80"
+docker compose -f docker-compose.local.yml run --build --rm web sh -c "ruff check . && ruff format --check . && mypy powermon && pytest -q --cov=powermon --cov-report=term-missing:skip-covered && coverage report --include='powermon/engine/*,powermon/alerts/*,powermon/i18n/*,powermon/telegram/*,powermon/chart/*,powermon/worker/detection.py,powermon/worker/io_loop.py,powermon/worker/lease.py,powermon/worker/supervision.py,powermon/web/*.py,powermon/web/templatetags/*.py' --omit='powermon/web/gunicorn_conf.py' --fail-under=80"
 ```
 
 Dependencies are pinned in `uv.lock`, which only the pinned uv in the Dockerfile's

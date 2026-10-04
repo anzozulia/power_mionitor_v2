@@ -155,8 +155,9 @@ def test_UI03_sidebar_processor_lazy_and_constant(
         with transaction.atomic():
             delivery.open_failing(location.pk, fixed_now - timedelta(minutes=i + 1), 403)
 
+    lazy = sidebar(_signed_in())["sidebar"]
     with CaptureQueriesContext(connection) as six:
-        six_rows = sidebar(_signed_in())["sidebar"].rows
+        six_rows = lazy.rows
     assert len(six_rows) == 6
     # The location list's query plus one incident query, whatever the number of rows.
     assert len(one.captured_queries) == len(six.captured_queries) == 2

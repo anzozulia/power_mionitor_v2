@@ -17,6 +17,7 @@ from powermon.web.location_views import (
     RouterGraceSwitchView,
     SendTestMessageView,
 )
+from powermon.web.theme import ThemeView
 from powermon.web.views import (
     HeartbeatView,
     LocationCreateView,
@@ -65,6 +66,8 @@ urlpatterns = [
     ),
     path("login/", SignInView.as_view(), name="login"),
     path("logout/", SignOutView.as_view(), name="logout"),
+    # The no-JS theme switch (UI-02): sets the theme cookie, then always back to /.
+    path("theme/", ThemeView.as_view(), name="theme"),
     path("healthz", healthz, name="healthz"),
     # The exact device URL, with no trailing slash and no slash redirect: device clients do
     # not follow redirects, and v1's slash redirect echoed the key in its Location header.
