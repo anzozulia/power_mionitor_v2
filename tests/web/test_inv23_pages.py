@@ -36,6 +36,7 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.http import HttpResponse
 from django.test import Client
+from secret_fixtures import MASKED, MASKED_2, MASKED_3, SECRET, SECRETS, TOKEN, TOKEN_2, TOKEN_3
 
 from powermon.alerts import ops, outbox
 from powermon.engine.models import LocationState, PowerInterval
@@ -56,18 +57,6 @@ from powermon.web.location_views import LocationDetailView, local_minute
 
 User = get_user_model()
 
-SECRET = "Sx_9-Qw7Lm" * 4
-TOKEN = f"987654321:{SECRET}"
-MASKED = "987654321:••••••••"
-# Typed into an edit form that is invalid for another reason: never saved, never shown.
-SECRET_2 = "Zq-8_Lp4Rt" * 4
-TOKEN_2 = f"123123123:{SECRET_2}"
-MASKED_2 = "123123123:••••••••"
-# Saved by the last valid edit: from then on only its mask shows.
-SECRET_3 = "Hy7_-Kd2Wv" * 4
-TOKEN_3 = f"456456456:{SECRET_3}"
-MASKED_3 = "456456456:••••••••"
-SECRETS = (TOKEN, SECRET, TOKEN_2, SECRET_2, TOKEN_3, SECRET_3)
 THROTTLE_MESSAGE = "Too many failed sign-ins. Try again in 5 minutes."
 
 

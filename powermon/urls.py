@@ -6,6 +6,7 @@ from powermon.web.history_views import (
     HistoryResetView,
     OutageRemoveView,
 )
+from powermon.web.live import LocationStatusJsonView
 from powermon.web.location_views import (
     AlertsSwitchView,
     LocationDeleteView,
@@ -29,6 +30,8 @@ from powermon.web.views import (
 urlpatterns = [
     path("", LocationListView.as_view(), name="location-list"),
     path("locations/new/", LocationCreateView.as_view(), name="location-create"),
+    # The live status of every location (UI-05): fixed vocabulary, no name, no secret.
+    path("locations/status.json", LocationStatusJsonView.as_view(), name="location-status-json"),
     path("locations/<int:pk>/", LocationDetailView.as_view(), name="location-detail"),
     path("locations/<int:pk>/edit/", LocationEditView.as_view(), name="location-edit"),
     path("locations/<int:pk>/delete/", LocationDeleteView.as_view(), name="location-delete"),
