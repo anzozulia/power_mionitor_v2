@@ -49,7 +49,7 @@ from powermon.clock import Clock, SystemClock
 from powermon.engine import history, maintenance
 from powermon.i18n import strings
 from powermon.i18n.duration import format_total_duration
-from powermon.locations import actions, validators
+from powermon.locations import actions, examples, validators
 from powermon.locations.models import LANGUAGE_CHOICES, Location
 from powermon.telegram.client import DEFAULT_RETRY_AFTER_S, SendResult, TelegramClient
 from powermon.web import views
@@ -108,6 +108,10 @@ TEST_MAYBE_SENT_MESSAGE = (
 TEST_UNREACHABLE_MESSAGE = (
     "Telegram could not be reached ({code}), so the test message was not sent. Try again in a "
     "minute."
+)
+# 06-UI-SPEC amendment A1, verbatim: Telegram answered with an HTTP 5xx (``transient``).
+TEST_SERVER_ERROR_MESSAGE = (
+    "Telegram had a server error ({code}), so the test message was not sent. Try again in a minute."
 )
 # {wait} is "1 second" or "{N} seconds", N an integer.
 TEST_RATE_LIMITED_MESSAGE = "Telegram asks to wait before the next message. Try again in {wait}."
@@ -210,12 +214,16 @@ def settings_context(location: Location) -> dict[str, Any]:
 
     The bot token only ever goes out masked (SEC-04, D-11).
     """
+    # Only the public bot id before the colon, the digits the mask shows, enters the
+    # context; never the secret part (R3). A token without a colon has no public part.
+    bot_id, colon, _secret = location.bot_token.partition(":")
     return {
         "language_label": LANGUAGE_LABELS[location.language],
         "period_s": location.period_s,
         "grace_s": location.grace_s,
         "off_after_s": location.period_s + location.grace_s,
         "masked_token": validators.mask_token(location.bot_token),
+        "token_bot_id": bot_id if colon else "",
     }
 
 
@@ -349,7 +357,8 @@ def flash_for_test_message(result: SendResult, recovered: bool) -> tuple[int, st
     ``recovered`` is True when the success closed an open delivery-failing incident (D-12).
     - ok: success, "sent", or "sent while delivery was failing" when ``recovered``;
     - maybe_delivered (no answer in time): warning, check the channel before a retry;
-    - not_sent or transient (5xx): error, Telegram unreachable;
+    - not_sent: error, Telegram unreachable;
+    - transient (HTTP 5xx): error, Telegram had a server error (06-UI-SPEC A1);
     - rate_limited: warning, with the wait in whole seconds ("1 second" when it is 1);
     - permanent: error, the cause for 400/403 (not in the chat), 401/404 (bad token) or
       any other code (refused). ``edit_target_missing``, which sendMessage never returns,
@@ -361,8 +370,10 @@ def flash_for_test_message(result: SendResult, recovered: bool) -> tuple[int, st
         return messages.SUCCESS, TEST_RECOVERED_MESSAGE if recovered else TEST_SENT_MESSAGE
     if result.kind == "maybe_delivered":
         return messages.WARNING, TEST_MAYBE_SENT_MESSAGE.format(code=result.code)
-    if result.kind in ("not_sent", "transient"):
+    if result.kind == "not_sent":
         return messages.ERROR, TEST_UNREACHABLE_MESSAGE.format(code=result.code)
+    if result.kind == "transient":
+        return messages.ERROR, TEST_SERVER_ERROR_MESSAGE.format(code=result.code)
     if result.kind == "rate_limited":
         seconds = result.retry_after or DEFAULT_RETRY_AFTER_S
         wait = "1 second" if seconds == 1 else f"{seconds} seconds"
@@ -498,6 +509,15 @@ def outage_rows(outages: Iterable[history.Outage], tz: str) -> list[OutageRow]:
     return rows
 
 
+def outages_total_text(outages: Iterable[history.Outage]) -> str:
+    """The summed off time of the listed outages in the chart's totals format, e.g.
+    "1h 35m"; "" when none is listed. Templates never add durations themselves."""
+    off_us = [outage.off_us for outage in outages]
+    if not off_us:
+        return ""
+    return format_total_duration(sum(off_us), "en")
+
+
 class LocationDetailView(View):
     """``/locations/<pk>/``: the location page (UI-SPEC screen B, D-13; 05-UI-SPEC A1).
 
@@ -508,13 +528,16 @@ class LocationDetailView(View):
 
     template_name = "web/location_detail.html"
     # Tests inject a FakeClock with LocationDetailView.as_view(clock=...) or monkeypatch it:
-    # "now" bounds the recent outages and counts an open off piece's time.
+    # "now" bounds the recent outages, counts an open off piece's time and is the page's
+    # "now" for its relative times (UI-11).
     clock: Clock = SystemClock()
 
     def get(self, request: HttpRequest, pk: int) -> HttpResponse:
         location = location_or_404(pk)
         tz = settings.TIME_ZONE
-        recent = history.recent_outages(location.pk, self.clock.now(), tz)
+        # One reading of the clock for the whole page.
+        now = self.clock.now()
+        recent = history.recent_outages(location.pk, now, tz)
         rows = outage_rows(recent.outages, tz)
         context = {
             "location": location,
@@ -522,8 +545,14 @@ class LocationDetailView(View):
             "delivery": delivery_row(location.pk),
             "switch_rows": switch_rows(location),
             "outage_rows": rows,
+            "outages_total_text": outages_total_text(recent.outages),
             "has_history": recent.has_history,
             "outage_in_progress": any(row.in_progress for row in rows),
+            # The {% relative_time %} tags read it (UI-11).
+            "now": now,
+            # The device-setup card's URL: the configured base URL only, never the
+            # request's Host header (R13), the same value as on the setup page.
+            "heartbeat_url": examples.heartbeat_url(settings.PUBLIC_BASE_URL),
             **settings_context(location),
         }
         return render(request, self.template_name, context)
@@ -572,9 +601,12 @@ class LocationEditView(View):
             raise Http404
         # The id and a flag only: never a token or a chat ID (OPS-08).
         log.info("settings saved for location %s (channel changed: %s)", pk, result.channel_changed)
-        # A chat or token change also moves the chart: the flash says so (D-08).
-        flash = CHANNEL_CHANGED_MESSAGE if result.channel_changed else CHANGES_SAVED_MESSAGE
-        messages.success(request, flash)
+        # A chat or token change also moves the chart: the flash says so (D-08), and it
+        # stays until dismissed (UI-09: an instructive success is sticky).
+        if result.channel_changed:
+            messages.success(request, CHANNEL_CHANGED_MESSAGE, extra_tags="sticky")
+        else:
+            messages.success(request, CHANGES_SAVED_MESSAGE)
         return redirect("location-detail", pk=pk)
 
     def _render(
@@ -609,7 +641,8 @@ class LocationDeleteView(View):
         if actions.delete_location(pk, self.clock.now()):
             # The id only (OPS-08).
             log.info("location %s deleted", pk)
-            messages.success(request, LOCATION_DELETED_MESSAGE)
+            # Instructive, so sticky (UI-09): it says what to do if the pin stays.
+            messages.success(request, LOCATION_DELETED_MESSAGE, extra_tags="sticky")
         else:
             messages.info(request, ALREADY_DELETED_MESSAGE)
         return redirect("location-list")
@@ -675,7 +708,8 @@ class RegenerateKeyView(View):
         ):
             # The id only: never a key (OPS-08).
             log.info("device key regenerated for location %s", pk)
-            messages.success(request, REGENERATED_MESSAGE)
+            # Instructive, so sticky (UI-09): the device needs the new key.
+            messages.success(request, REGENERATED_MESSAGE, extra_tags="sticky")
         else:
             messages.info(request, ALREADY_REGENERATED_MESSAGE)
         return views.render_setup(request, pk, revealed=True)

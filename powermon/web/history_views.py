@@ -40,23 +40,20 @@ from powermon.web.status import location_status
 
 ONE_US = timedelta(microseconds=1)
 
-# 05-UI-SPEC Copywriting › Flashes, verbatim. {start} is "YYYY-MM-DD HH:MM" in the display
-# TZ, formatted from the stored outage start (UI5-D15).
+# 06-UI-SPEC amendment A7, verbatim. {start} is "YYYY-MM-DD HH:MM" in the display TZ,
+# formatted from the stored outage start (UI5-D15).
 OUTAGE_REMOVED_MESSAGE = (
-    "Outage from {start} removed: its time now counts as power on. No message was sent. If it "
-    "is within the last 7 days, the pinned chart shows the change within 15 minutes."
+    "Outage from {start} removed: its time now counts as power on. The removal sent no message. "
+    "If it is within the last 7 days, the pinned chart shows the change within 15 minutes."
 )
 REMOVAL_REFUSED_MESSAGE = "This outage is still in progress. It can be removed after power returns."
 OUTAGE_GONE_MESSAGE = (
     "This outage is no longer in the history: it was already removed, or the history was "
     "reset. Nothing changed."
 )
-# 05-UI-SPEC Copywriting › Flashes › Removal deferred (amended 2026-10-03, wave-1 audit
-# W1-A1), verbatim: the outage's OFF alert is being sent; POST only.
-REMOVAL_DEFERRED_MESSAGE = (
-    "An alert about this outage is being sent to the channel right now. Nothing changed. "
-    "Try again in a minute."
-)
+# 06-UI-SPEC amendment A4, verbatim (05-UI-SPEC's Removal deferred flash of W1-A1, now
+# opening with the outcome): the outage's OFF alert is being sent; POST only.
+REMOVAL_DEFERRED_MESSAGE = "Not removed: an alert about this outage is being sent to the channel right now. Try again in a minute."  # noqa: E501
 # 05-UI-SPEC Copywriting › Flashes, verbatim.
 HISTORY_RESET_MESSAGE = (
     "History reset. The location waits for its next heartbeat, which restarts monitoring "
@@ -173,7 +170,8 @@ class HistoryResetView(View):
             # Deleted between the lookup and the lock: as for any deleted location.
             raise Http404
         if result == "reset":
-            messages.success(request, HISTORY_RESET_MESSAGE)
+            # Instructive, so sticky (UI-09): it says what to do if the old pin stays.
+            messages.success(request, HISTORY_RESET_MESSAGE, extra_tags="sticky")
         elif result == "in_progress":
             messages.error(request, RESET_REFUSED_MESSAGE)
         else:

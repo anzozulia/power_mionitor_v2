@@ -79,6 +79,16 @@ def _masked(key: str) -> str:
     return "•" * 12 + key[-4:]
 
 
+def _h1_text(page: str) -> str:
+    """The page's first h1 as text: tags dropped, whitespace collapsed, entities decoded.
+
+    So an h1 with attributes or an aria-hidden icon inside still reads as its copy.
+    """
+    match = re.search(r"<h1\b[^>]*>(.*?)</h1>", page, re.S)
+    assert match is not None, "no h1 on the page"
+    return " ".join(unescape(re.sub(r"<[^>]+>", " ", match.group(1))).split())
+
+
 def _settings_rows(page: str) -> list[tuple[str, str]]:
     panel = re.search(r'<dl class="panel settings name">(.*?)</dl>', page, re.S)
     assert panel is not None
@@ -312,7 +322,7 @@ def test_setup_unknown_or_deleted_location_404(
     ):
         assert response.status_code == 404
         page = response.content.decode()
-        assert "<h1>Page not found</h1>" in page
+        assert _h1_text(page) == "Page not found"
         assert deleted.device_key not in page
 
 
@@ -325,7 +335,7 @@ def test_reveal_requires_csrf(location: Any) -> None:
 
     assert response.status_code == 403
     page = response.content.decode()
-    assert "<h1>Form expired</h1>" in page
+    assert _h1_text(page) == "Form expired"
     assert location.device_key not in page
 
 

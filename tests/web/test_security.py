@@ -36,6 +36,10 @@ CSP = (
 HSTS = "max-age=31536000"
 TEMPLATES_DIR = Path(settings.BASE_DIR) / "powermon" / "web" / "templates"
 WEB_PACKAGE = Path(settings.BASE_DIR) / "powermon" / "web"
+# R1: the one web module that may call mark_safe, relative to WEB_PACKAGE. 06-06 adds the
+# {% icon %} tag there with the one audited mark_safe; 06-07 replaces the test below with
+# tests/web/test_frontend_lint.py, which confines mark_safe to the same file.
+MARK_SAFE_MODULE = "templatetags/icons.py"
 
 # A complete production env with no example values (see tests/test_config.py).
 PRODUCTION_ENV: dict[str, str] = {
@@ -286,7 +290,7 @@ def test_pages_load_only_same_origin_assets(client: Client, page: str) -> None:
     assert '<meta name="robots" content="noindex, nofollow">' in html
 
 
-def test_no_template_disables_escaping() -> None:
+def test_no_template_disables_escaping(tmp_path: Path) -> None:
     templates = sorted(TEMPLATES_DIR.rglob("*.html"))
     names = {p.relative_to(TEMPLATES_DIR).as_posix() for p in templates}
     assert {"base.html", "web/login.html", "404.html", "500.html", "403_csrf.html"} <= names
@@ -304,6 +308,23 @@ def test_no_template_disables_escaping() -> None:
         text = path.read_text(encoding="utf-8")
         for what, pattern in forbidden.items():
             assert not re.search(pattern, text, re.IGNORECASE), f"{path.name}: {what}"
-    # Rule 1 also covers Python: no web module marks strings safe.
-    for path in WEB_PACKAGE.rglob("*.py"):
-        assert "mark_safe" not in path.read_text(encoding="utf-8"), path.name
+
+    # Rule 1 also covers Python: no web module marks strings safe, except the one audited
+    # icon tag at exactly MARK_SAFE_MODULE.
+    def marking_safe(package: Path) -> list[str]:
+        modules = (path.relative_to(package).as_posix() for path in package.rglob("*.py"))
+        return sorted(
+            name
+            for name in modules
+            if name != MARK_SAFE_MODULE
+            and "mark_safe" in (package / name).read_text(encoding="utf-8")
+        )
+
+    assert marking_safe(WEB_PACKAGE) == []
+    # The exemption is that one path: mark_safe in any other module, or in an icons.py
+    # anywhere else, still fails.
+    others = ["templatetags/display_time.py", "views.py", "x/templatetags/icons.py"]
+    for name in [MARK_SAFE_MODULE, *others]:
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text("from django.utils.safestring import mark_safe\n")
+    assert marking_safe(tmp_path) == others
