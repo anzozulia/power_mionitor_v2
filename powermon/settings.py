@@ -76,6 +76,10 @@ TEMPLATES = [
                 "django.template.context_processors.request",
                 "django.contrib.auth.context_processors.auth",
                 "django.contrib.messages.context_processors.messages",
+                # The allowlisted theme cookie for <html data-theme> (UI-02); no query.
+                "powermon.web.context_processors.theme",
+                # The sidebar location list, lazy and signed-in only (UI-03, R11).
+                "powermon.web.context_processors.sidebar",
             ],
         },
     },

@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from django.template import Context, Template
 
-from powermon.web.templatetags.display_time import display_time
+from powermon.web.templatetags.display_time import display_time, display_time_compact
 
 KYIV = "Europe/Kyiv"
 
@@ -73,3 +73,36 @@ def test_display_time_is_a_template_filter(kyiv: Any, value: datetime | None) ->
     rendered = Template("{% load display_time %}{{ t|display_time }}").render(Context({"t": value}))
 
     assert rendered == display_time(value)
+
+
+# The compact form (UI-SPEC: narrow cells and the status JSON's "compact" strings)
+
+
+def test_display_time_compact(kyiv: Any) -> None:
+    # Expected: the display TZ to the minute; the seconds are cut off, never rounded.
+    assert display_time_compact(datetime(2026, 10, 1, 8, 0, 59, tzinfo=UTC)) == "2026-10-01 11:00"
+    # Edge, the DST day: the repeated autumn hour reads the same twice in the compact form;
+    # the full form shown next to it tells the two instants apart.
+    assert display_time_compact(datetime(2026, 10, 25, 0, 30, tzinfo=UTC)) == "2026-10-25 03:30"
+    assert display_time_compact(datetime(2026, 10, 25, 1, 30, tzinfo=UTC)) == "2026-10-25 03:30"
+    # It is a template filter too.
+    template = Template("{% load display_time %}{{ t|display_time_compact }}")
+    rendered = template.render(Context({"t": datetime(2026, 10, 25, 1, 30, tzinfo=UTC)}))
+    assert rendered == "2026-10-25 03:30"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "2026-10-25 00:30",
+        # The one deliberate naive datetime: it is the bad input under test.
+        datetime(2026, 10, 25, 0, 30),  # noqa: DTZ001
+        date(2026, 10, 25),
+        0,
+    ],
+    ids=["string", "naive-datetime", "date", "number"],
+)
+def test_display_time_compact_never_and_bad_input(kyiv: Any, value: object) -> None:
+    # No heartbeat yet reads "Never"; anything that is not an aware time is blank.
+    assert display_time_compact(None) == "Never"
+    assert display_time_compact(value) == ""
