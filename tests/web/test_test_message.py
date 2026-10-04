@@ -53,6 +53,7 @@ from powermon.alerts.models import OpsIncident, OutboxMessage
 from powermon.locations.models import Location
 from powermon.telegram.client import SendResult
 from powermon.web.location_views import (
+    TEST_SERVER_ERROR_MESSAGE,
     TEST_UNREACHABLE_MESSAGE,
     LocationDetailView,
     SendTestMessageView,
@@ -452,7 +453,7 @@ FLASH_TABLE: dict[str, tuple[dict[str, Any], int, str]] = {
         messages.WARNING,
         MAYBE_FLASH.format(code="read_timeout"),
     ),
-    # Nothing left the client, or Telegram answered with a 5xx.
+    # Nothing left the client: Telegram was not reached.
     "connect_error": (
         {"exc": _refused(DEFAULT_BOT_TOKEN)},
         messages.ERROR,
@@ -463,10 +464,11 @@ FLASH_TABLE: dict[str, tuple[dict[str, Any], int, str]] = {
         messages.ERROR,
         TEST_UNREACHABLE_MESSAGE.format(code="connect_timeout"),
     ),
+    # Telegram answered with a 5xx: a server error (06-UI-SPEC A1).
     "http_503": (
         {"status": 503, "json_body": _error(503, "Service Unavailable")},
         messages.ERROR,
-        TEST_UNREACHABLE_MESSAGE.format(code="http_503"),
+        TEST_SERVER_ERROR_MESSAGE.format(code="http_503"),
     ),
     # Rate limited: the wait in whole seconds, "1 second" when it is 1.
     "429-1s": (

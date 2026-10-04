@@ -41,8 +41,7 @@ User = get_user_model()
 
 # 06-UI-SPEC "Amendments applied in Phase 6", verbatim: pinned here once.
 A1_SERVER_ERROR = (
-    "Telegram had a server error ({code}), so the test message was not sent. Try again in a "
-    "minute."
+    "Telegram had a server error ({code}), so the test message was not sent. Try again in a minute."
 )
 A1_NOT_SENT_KEPT = (
     "Telegram could not be reached ({code}), so the test message was not sent. Try again in a "
@@ -279,9 +278,7 @@ def test_N11_unthrottled_sign_in_has_no_retry_after(client: Client) -> None:
 
 
 @pytest.mark.django_db
-def test_R3_setup_context_has_only_the_public_bot_id(
-    admin: Client, location_factory: Make
-) -> None:
+def test_R3_setup_context_has_only_the_public_bot_id(admin: Client, location_factory: Make) -> None:
     location = location_factory(bot_token=TOKEN)
 
     for response in (

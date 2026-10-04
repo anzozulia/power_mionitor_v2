@@ -103,7 +103,11 @@ class SignInView(LoginView):
         )
         response = self.render_to_response(
             self.get_context_data(
-                form=form, throttled=True, throttle_message=rules.THROTTLE_MESSAGE
+                form=form,
+                throttled=True,
+                throttle_message=rules.THROTTLE_MESSAGE,
+                # The N11 countdown's start: the same value as the Retry-After header.
+                retry_after=rules.RETRY_AFTER,
             )
         )
         response.status_code = 429
@@ -134,13 +138,21 @@ class SignInView(LoginView):
 # /login/?next=/logout/, which would GET the POST-only /logout/ (405) after sign-in.
 @method_decorator(login_not_required, name="dispatch")
 class SignOutView(LogoutView):
-    """``/logout/``: POST only (GET is 405), CSRF-protected, then back to the sign-in page."""
+    """``/logout/``: POST only (GET is 405), CSRF-protected, then back to the sign-in page.
+
+    The response tells the browser to drop its cache (``Clear-Site-Data: "cache"``), so
+    cached admin pages and the private chart image do not outlive the session. It is the
+    only response that sends this header.
+    """
 
     def post(self, request: HttpRequest, *args: Any, **kwargs: Any) -> HttpResponse:
         response = super().post(request, *args, **kwargs)
         # Added after the logout: the session is flushed by then, and the default message
         # storage keeps a short message in its own cookie, so the flash survives.
         messages.info(request, SIGNED_OUT_MESSAGE)
+        # R6 as amended by the maintainer on 2026-10-04 (brief §12 Q11); the quotes are
+        # part of the value. Only "cache": cookies stay, so the flash above survives.
+        response["Clear-Site-Data"] = '"cache"'
         return response
 
 
@@ -259,7 +271,8 @@ class LocationCreateView(View):
         if not form.is_valid():
             return render(request, self.template_name, {"form": form})
         location = _create_location(form.cleaned_data, self.clock.now())
-        messages.success(request, LOCATION_CREATED_MESSAGE)
+        # Instructive, so sticky (UI-09): it says what to do next on the setup page.
+        messages.success(request, LOCATION_CREATED_MESSAGE, extra_tags="sticky")
         return redirect("location-setup", pk=location.pk)
 
 
@@ -284,6 +297,9 @@ def render_setup(request: HttpRequest, pk: int, *, revealed: bool) -> HttpRespon
     shown_key = key if revealed else keys.mask_key(key)
     # The configured base URL only, never the request's Host header.
     url = examples.heartbeat_url(settings.PUBLIC_BASE_URL)
+    # Only the public bot id before the colon, the digits the mask shows, enters the
+    # context; never the secret part (R3). A token without a colon has no public part.
+    bot_id, colon, _secret = location.bot_token.partition(":")
     context = {
         "location": location,
         "status": location_status(location),
@@ -300,6 +316,7 @@ def render_setup(request: HttpRequest, pk: int, *, revealed: bool) -> HttpRespon
         "grace_s": location.grace_s,
         "off_after_s": location.period_s + location.grace_s,
         "masked_token": validators.mask_token(location.bot_token),
+        "token_bot_id": bot_id if colon else "",
     }
     response = render(request, SETUP_TEMPLATE, context)
     add_never_cache_headers(response)
