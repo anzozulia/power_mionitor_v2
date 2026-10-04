@@ -24,6 +24,7 @@ from django.contrib.messages.storage.fallback import FallbackStorage
 from django.contrib.sessions.backends.db import SessionStore
 from django.db import connection
 from django.test import Client, RequestFactory
+from pages import messages
 
 from powermon.engine import transitions
 from powermon.engine.models import LocationState, PowerInterval
@@ -96,6 +97,16 @@ def _on_since_8(location_factory: Callable[..., Any]) -> Any:
     return location
 
 
+def _flashes(page: str) -> list[tuple[str, str]]:
+    """Each flash on the page as (role, text), toast or legacy callout alike (UI-09)."""
+    return [(message.role, message.text) for message in messages(page)]
+
+
+def _is_info(page: str) -> bool:
+    """Every flash on the page is an info flash (a legacy callout carries no level)."""
+    return all(message.level in (None, "info") for message in messages(page))
+
+
 def _maintenance_form(page: str, location: Any) -> str:
     """The body of the one form that posts to the location's maintenance switch."""
     forms = re.findall(
@@ -126,7 +137,7 @@ def test_LOC08_maintenance_on_from_the_location_page(
     assert response.status_code == 302
     assert response.url == _page(location)
     followed = admin.get(response.url).content.decode()
-    assert re.findall(r'role="status">([^<]*)<', followed) == [MAINTENANCE_ON_FLASH]
+    assert _flashes(followed) == [("status", MAINTENANCE_ON_FLASH)]
     assert '<span class="status status--maintenance">Maintenance</span>' in followed
     assert "<h3>Maintenance is on</h3>" in followed
     assert '<button class="btn btn--secondary" type="submit">Turn maintenance off</button>' in (
@@ -184,7 +195,7 @@ def test_maintenance_off_from_the_location_page(
 
     assert (response.status_code, response.url) == (302, _page(location))
     followed = admin.get(response.url).content.decode()
-    assert re.findall(r'role="status">([^<]*)<', followed) == [MAINTENANCE_OFF_FLASH]
+    assert _flashes(followed) == [("status", MAINTENANCE_OFF_FLASH)]
     assert "<h3>Maintenance is off</h3>" in followed
     assert Location.objects.get(pk=location.pk).maintenance is False
     assert _open_state(location) == "on"
@@ -204,8 +215,8 @@ def test_switch_already_on_shows_the_info_flash(
     again = admin.post(_switch(location), {"value": "on"}, follow=True).content.decode()
 
     # UI-D3: a second click (a double click, a second tab, a stale page) writes nothing.
-    assert re.findall(r'role="status">([^<]*)<', again) == [ALREADY_ON_FLASH]
-    assert '<p class="callout" role="status">' in again
+    assert _flashes(again) == [("status", ALREADY_ON_FLASH)]
+    assert _is_info(again)
     assert (
         list(PowerInterval.objects.filter(location=location).values_list("id", "end_at"))
         == intervals
@@ -215,7 +226,7 @@ def test_switch_already_on_shows_the_info_flash(
     other = location_factory(name="Other")
     off = admin.post(_switch(other), {"value": "off"}, follow=True).content.decode()
 
-    assert re.findall(r'role="status">([^<]*)<', off) == [ALREADY_OFF_FLASH]
+    assert _flashes(off) == [("status", ALREADY_OFF_FLASH)]
     assert Location.objects.get(pk=other.pk).maintenance is False
     assert len(fake_telegram.calls) == 0
 
@@ -309,7 +320,7 @@ def test_LOC10_alerts_off_from_the_location_page(
 
     assert (response.status_code, response.url) == (302, _page(location))
     followed = admin.get(response.url).content.decode()
-    assert re.findall(r'role="status">([^<]*)<', followed) == [ALERTS_OFF_FLASH]
+    assert _flashes(followed) == [("status", ALERTS_OFF_FLASH)]
     assert "<h3>Alerts are off</h3>" in followed
     after = _form(followed, _alerts(location))
     assert '<input type="hidden" name="value" value="on">' in after
@@ -333,16 +344,16 @@ def test_alerts_switch_already_off_shows_the_info_flash(
     again = admin.post(_alerts(location), {"value": "off"}, follow=True).content.decode()
 
     # UI-D3: the same state again writes nothing, not even a no-op UPDATE of the row.
-    assert re.findall(r'role="status">([^<]*)<', again) == [ALERTS_ALREADY_OFF_FLASH]
-    assert '<p class="callout" role="status">' in again
+    assert _flashes(again) == [("status", ALERTS_ALREADY_OFF_FLASH)]
+    assert _is_info(again)
     assert _ctid(location) == row
 
     on = admin.post(_alerts(location), {"value": "on"}, follow=True).content.decode()
 
-    assert re.findall(r'role="status">([^<]*)<', on) == [ALERTS_ON_FLASH]
+    assert _flashes(on) == [("status", ALERTS_ON_FLASH)]
     assert Location.objects.get(pk=location.pk).alerts_enabled is True
     on_again = admin.post(_alerts(location), {"value": "on"}, follow=True).content.decode()
-    assert re.findall(r'role="status">([^<]*)<', on_again) == [ALERTS_ALREADY_ON_FLASH]
+    assert _flashes(on_again) == [("status", ALERTS_ALREADY_ON_FLASH)]
     assert len(fake_telegram.calls) == 0
 
 
@@ -440,7 +451,7 @@ def test_router_grace_switch_flashes(
 
     assert (on.status_code, on.url) == (302, _page(location))
     followed = admin.get(on.url).content.decode()
-    assert re.findall(r'role="status">([^<]*)<', followed) == [ROUTER_GRACE_ON_FLASH]
+    assert _flashes(followed) == [("status", ROUTER_GRACE_ON_FLASH)]
     assert "<h3>Router grace is on</h3>" in followed
     assert '<button class="btn btn--secondary" type="submit">Turn router grace off</button>' in (
         _form(followed, _router_grace(location))
@@ -451,18 +462,22 @@ def test_router_grace_switch_flashes(
     # Edge (idempotency, UI-D3): on twice writes nothing the second time.
     row = _ctid(location)
     again = admin.post(_router_grace(location), {"value": "on"}, follow=True).content.decode()
-    assert re.findall(r'role="status">([^<]*)<', again) == [ROUTER_GRACE_ALREADY_ON_FLASH]
+    assert _flashes(again) == [("status", ROUTER_GRACE_ALREADY_ON_FLASH)]
     assert _ctid(location) == row
 
     off = admin.post(_router_grace(location), {"value": "off"}, follow=True).content.decode()
 
     # The off flash names the plain timeout of this location: P + G = 45 + 20 seconds.
-    assert re.findall(r'role="status">([^<]*)<', off) == [
-        "Router grace is off. From now on, OFF is reported after 65 seconds without a heartbeat."
+    assert _flashes(off) == [
+        (
+            "status",
+            "Router grace is off. From now on, OFF is reported after 65 seconds without a "
+            "heartbeat.",
+        )
     ]
     assert _columns(location) == before
     off_again = admin.post(_router_grace(location), {"value": "off"}, follow=True).content.decode()
-    assert re.findall(r'role="status">([^<]*)<', off_again) == [ROUTER_GRACE_ALREADY_OFF_FLASH]
+    assert _flashes(off_again) == [("status", ROUTER_GRACE_ALREADY_OFF_FLASH)]
     assert LocationState.objects.get(location=location).state_version == version
     assert _open_state(location) == "on"
     assert len(fake_telegram.calls) == 0
