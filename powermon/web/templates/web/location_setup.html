@@ -21,7 +21,10 @@ navigations answered 200 with this page, and every response is no-store (the vie
   (data-fh=waiting, JS only, revealed by the poll) and received (data-fh=received, shown for
   every power state but waiting, with the last heartbeat time only when there is one, so a
   first heartbeat on a page rendered while waiting flips the line and offers the reload chip
-  instead of filling a time in place). Step 5 never wraps the key region.
+  instead of filling a time in place). The poll flips the two variants on the JSON's power,
+  the same rule. The time sits in an aria-live="off" paragraph: every poll refills it and the
+  relative component rewrites it every 15 s, and only the flip is announced. Step 5 never
+  wraps the key region.
 - Content: one [data-confirm-scope] wrapper starts the confirmDialog component (the
   regenerate entry is a plain link with data-confirm to the S9 confirmation GET; the click
   handling is document-wide). Inside: from xl a 2fr / 1fr grid, the five step cards
@@ -130,7 +133,7 @@ Every class is spelled out: no class name is built from data.
 </div></div>
 <div data-fh="received"{% if status.power_key == "waiting" %} hidden{% endif %} class="flex min-w-0 items-start gap-2">{% icon "circle-check" class="mt-0.5 size-4 shrink-0 text-ok-text" %}<div class="flex min-w-0 flex-col">
 <p class="font-semibold text-fg">First heartbeat received.</p>
-{% if status.last_heartbeat_at %}<p class="text-fg-muted">{% include "partials/_time.html" with value=status.last_heartbeat_at variant="full" label="Last heartbeat" now=now only %}</p>
+{% if status.last_heartbeat_at %}<p aria-live="off" class="text-fg-muted">{% include "partials/_time.html" with value=status.last_heartbeat_at variant="full" label="Last heartbeat" now=now only %}</p>
 {% endif %}</div></div>
 </div>
 </div>

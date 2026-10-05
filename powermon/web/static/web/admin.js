@@ -672,7 +672,8 @@
     // gets the number in its mono [data-count-value] span and "location" or "locations" in
     // its [data-count-noun] span, or its whole text when it has no number span. The
     // sidebar's group count ([data-live="sidebar-count"], mono) gets the JSON's number of
-    // locations as its text.
+    // locations as its text. S8's step 5 shows its received line for every power state
+    // but waiting (the JSON's power, not its status).
     window.Alpine.data("poll", function () {
       var POLL_INTERVAL_MS = 30000;
       var POLL_BACKOFF_MS = [60000, 120000, 240000, 300000];
@@ -777,7 +778,11 @@
             pill.textContent = entry.delivery.text;
           }
         } else if (kind === "first-heartbeat") {
-          var received = status !== "waiting";
+          // S8 step 5 follows the power state, as the server's rule does: received for
+          // every power state but waiting. The status cannot tell: it reads maintenance
+          // while a location under maintenance still waits for its first heartbeat (D-02).
+          // apply hands over only validated entries, so power is one of POWER_KEYS.
+          var received = entry.power !== "waiting";
           var waitingLine = element.querySelector('[data-fh="waiting"]');
           var receivedLine = element.querySelector('[data-fh="received"]');
           if (waitingLine) {
@@ -1526,9 +1531,10 @@
     // are hidden). Pressing a cell shows only the matching locations: a status cell by
     // data-status, Delivery failing by data-delivery; pressing the active cell or All shows
     // every location. Rows get data-filtered (the CSS collapses them, so columns never
-    // move), cards get hidden, the description says how many are shown, and the no-match
-    // line's "show all" resets the filter and focuses All. The filter is never in the URL;
-    // it is applied again after each poll (pm:status).
+    // move), cards get hidden, the description's parts say how many are shown (the counts
+    // in their mono spans), and the no-match line's "show all" resets the filter and
+    // focuses All. The filter is never in the URL; it is applied again after each poll
+    // (pm:status).
     window.Alpine.data("fleetFilter", function () {
       var FILTERS = ["all", "on", "off", "maintenance", "waiting", "failing"];
       return {
@@ -1563,12 +1569,43 @@
             });
           };
 
-          var describe = function (shown, total) {
-            var noun = total === 1 ? " location" : " locations";
-            if (active !== "all") {
-              return "Showing " + shown + " of " + total + noun;
+          // The writers of the description's parts. Each writes only a value that differs:
+          // the description is a polite live region, so writing the same text or flag again
+          // (every poll applies the filter again) would announce the sentence again.
+          var setText = function (element, value) {
+            if (element && element.textContent !== value) {
+              element.textContent = value;
             }
-            return total === 1 ? "Showing 1 location" : "Showing all " + total + noun;
+          };
+          var setHidden = function (element, value) {
+            if (element && element.hidden !== value) {
+              element.hidden = value;
+            }
+          };
+
+          // The description (list.fleet_showing): "Showing all {M} locations", "Showing 1
+          // location", or "Showing {N} of {M} locations" while a filter is active
+          // ("location" when M is 1). The counts stay in the mono [data-showing-shown] and
+          // [data-showing-total] spans and the words in Inter: only the parts' texts and the
+          // hidden flags of "all " and " of {M}" change. A description without the count
+          // span gets the whole sentence.
+          var describe = function (shown, total) {
+            var filtered = active !== "all";
+            var noun = total === 1 ? "location" : "locations";
+            var count = showing.querySelector("[data-showing-shown]");
+            if (!count) {
+              var sentence = "Showing " + shown + " of " + total + " " + noun;
+              if (!filtered) {
+                sentence = total === 1 ? "Showing 1 location" : "Showing all " + total + " " + noun;
+              }
+              setText(showing, sentence);
+              return;
+            }
+            setHidden(showing.querySelector("[data-showing-all]"), filtered || total === 1);
+            setText(count, String(filtered ? shown : total));
+            setHidden(showing.querySelector("[data-showing-of]"), !filtered);
+            setText(showing.querySelector("[data-showing-total]"), String(total));
+            setText(showing.querySelector("[data-showing-noun]"), noun);
           };
 
           var apply = function () {
@@ -1601,7 +1638,7 @@
               line.hidden = shown !== 0;
             });
             if (showing) {
-              showing.textContent = describe(shown, total);
+              describe(shown, total);
             }
           };
 

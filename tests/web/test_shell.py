@@ -283,6 +283,40 @@ def test_UI01_breadcrumb_trails(location_factory: Callable[..., Any]) -> None:
 
 
 @pytest.mark.django_db
+def test_W6A2_regenerate_post_shows_the_setup_trail(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = location_factory(name="Kyiv office")
+    detail = f"/locations/{location.pk}/"
+    setup = f"{detail}setup/"
+    regenerate = f"{setup}regenerate/"
+    home = ("Locations", "/")
+    named = ("Kyiv office", detail)
+
+    def trail(method: str, path: str, about: object = location) -> list[Crumb]:
+        request = RequestFactory().generic(method, path)
+        request.resolver_match = resolve(path)
+        return breadcrumb_trail(Context({"request": request, "location": about}))
+
+    # Expected: the Regenerate POST answers with the revealed S8 page (D-14), so it gets
+    # S8's trail, Device setup current (06-UI-SPEC S8), not the S9 confirmation's.
+    assert trail("POST", regenerate) == [home, named, ("Device setup", None)]
+    # Edge: the GET is the S9 confirmation and keeps its own trail; the Reveal POST is
+    # S8's own route and keeps S8's trail.
+    assert trail("GET", regenerate) == [
+        home,
+        named,
+        ("Device setup", setup),
+        ("Regenerate key", None),
+    ]
+    assert trail("POST", setup) == [home, named, ("Device setup", None)]
+    # Failure: a POST on another route keeps that page's trail (a re-rendered edit form),
+    # and a Regenerate POST without a location still gets the one-item trail.
+    assert trail("POST", f"{detail}edit/") == [home, named, ("Edit", None)]
+    assert trail("POST", regenerate, None) == ONE_ITEM
+
+
+@pytest.mark.django_db
 def test_UI01_one_item_trail_on_the_probe(admin: Client) -> None:
     soup = parse(admin.get(PROBE_PATH))
 

@@ -52,6 +52,11 @@ the real tree must pass:
   [data-power] and shows the changed chip on the location page when the JSON's power
   differs, and a power outside the engine's vocabulary makes an entry invalid (W5-A2); the
   poll writes the JSON's location total into the sidebar's [data-live="sidebar-count"].
+- admin.js wave-6 audit pins: S8 step 5 flips on the JSON's power, as the server's rule
+  does, never on its status (W6-A1); fleetFilter writes S3's shown count and total only
+  into the description's mono spans and the noun into its own, and the whole sentence only
+  when the spans are absent (W6-A3); it writes a text or a hidden flag of that polite
+  region only when the value differs (W6-A4).
 - CSS entries (powermon/web/assets/css/*.css): @import only "tailwindcss" or a ./ or ../ path;
   every url() relative or data: (comments skipped).
 - Python (powermon/web/**/*.py), read with the stdlib ast module: SafeString, SafeText,
@@ -1342,6 +1347,11 @@ CONTRACT_HOOKS: dict[str, tuple[str, ...]] = {
         '"pm:status"',
         '"Showing all "',
         '"Showing 1 location"',
+        "[data-showing-all]",
+        "[data-showing-shown]",
+        "[data-showing-of]",
+        "[data-showing-total]",
+        "[data-showing-noun]",
     ),
     "offAfterHint": (
         '"id_period_s"',
@@ -2866,6 +2876,577 @@ def test_sidebar_count_follows_the_poll() -> None:
     assert re.search(rf"\b{CLASS}=\"[^\"]*\bnum\b", tag.group(0)) is not None
     # Failure: no poll at all.
     assert sidebar_count_violations("var x = 1;") == ["sidebar count never written"]
+
+
+# admin.js wave-6 audit pins (W6-A1 step 5)
+
+
+_FIRST_HEARTBEAT_BRANCH = re.compile(r"\bkind\s*===\s*\"first-heartbeat\"")
+_RECEIVED_FROM_POWER = re.compile(r"\breceived\s*=\s*entry\s*\.\s*power\s*!==\s*\"waiting\"")
+# Any read of a status in code: the local copy or entry.status.
+_STATUS_READ = re.compile(r"(?<![\w$])status\b")
+_LIVE_LOOP = re.compile(
+    r"\bquerySelectorAll\(\s*\"\[data-live\]\[data-location-id\]\"\s*\)\s*\.\s*forEach\s*\("
+)
+_ENTRY_FROM_VALID = re.compile(r"\bvar\s+entry\s*=\s*own\(\s*valid\s*,")
+# A call of updateLocation, not its declaration.
+_UPDATE_LOCATION_CALL = re.compile(r"(?<![\w$.])(?<!function )updateLocation\s*\(")
+# The server's rule (location_setup.html): the received line is hidden while power waits.
+SETUP_RECEIVED_RULE = 'data-fh="received"{% if status.power_key == "waiting" %} hidden{% endif %}'
+STEP5_STATUS = "step 5 does not follow the power state"
+STEP5_READS_STATUS = "step 5 reads the status"
+STEP5_UNVALIDATED = "step 5 gets unvalidated entries"
+STEP5_POWER_UNCHECKED = "power outside the vocabulary reaches step 5"
+
+
+def first_heartbeat_violations(source: str) -> list[str]:
+    """W6-A1: S8 step 5 follows the power state, as the server's rule does. The poll's
+    first-heartbeat branch sets received from the entry's power (every power but waiting)
+    and never reads the status, which stays "maintenance" while a location under
+    maintenance still waits for its first heartbeat. updateLocation gets only entries of
+    the validated set, whose power is one of POWER_KEYS."""
+    body = component_bodies(source).get("poll", "")
+    update = function_body(body, "updateLocation")
+    apply = function_body(body, "apply")
+    branches = if_blocks(update, _FIRST_HEARTBEAT_BRANCH)
+    if not branches:
+        return ["no first-heartbeat branch"]
+    start, end = branches[0]
+    branch = update[start : end + 1]
+    found = set()
+    if next(_code_matches(_RECEIVED_FROM_POWER, branch), None) is None:
+        found.add(STEP5_STATUS)
+    if next(_code_matches(_STATUS_READ, branch), None) is not None:
+        found.add(STEP5_READS_STATUS)
+    code = _mask_js(apply)
+    loops = []
+    for match in _code_matches(_LIVE_LOOP, apply):
+        each = code.index("forEach", match.start())
+        loops.append(apply[each : _closing(code, each) + 1])
+    calls = list(_code_matches(_UPDATE_LOCATION_CALL, body))
+    fed = [loop for loop in loops if next(_code_matches(_UPDATE_LOCATION_CALL, loop), None)]
+    if (
+        len(calls) != 1
+        or len(fed) != 1
+        or next(_code_matches(_ENTRY_FROM_VALID, fed[0]), None) is None
+    ):
+        found.add(STEP5_UNVALIDATED)
+    conditions = [apply[start:end] for start, end in if_conditions(apply)]
+    if not any(_POWER_VALID.search(condition) for condition in conditions):
+        found.add(STEP5_POWER_UNCHECKED)
+    return sorted(found)
+
+
+STEP5_RECEIVED = '      var received = entry.power !== "waiting";\n'
+GOOD_FIRST_HEARTBEAT = (
+    """Alpine.data("poll", function () {
+  function updateLocation(element, entry) {
+    var kind = element.getAttribute("data-live");
+    var status = entry.status;
+    if (kind === "status") {
+      element.setAttribute("data-status", status);
+    } else if (kind === "first-heartbeat") {
+"""
+    + STEP5_RECEIVED
+    + """      var waitingLine = element.querySelector('[data-fh="waiting"]');
+      if (waitingLine) {
+        waitingLine.hidden = received;
+      }
+    }
+  }
+  function apply(payload) {
+    Object.keys(locations).forEach(function (id) {
+      var entry = locations[id];
+      if (entry && POWER_KEYS.indexOf(entry.power) >= 0) {
+        valid[id] = entry;
+      }
+    });
+    document.querySelectorAll("[data-live][data-location-id]").forEach(function (element) {
+      var entry = own(valid, element.getAttribute("data-location-id"));
+      if (entry) {
+        updateLocation(element, entry);
+      }
+    });
+  }
+})
+"""
+)
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    [
+        pytest.param("", "", [], id="good"),
+        # Edge: the status rule left in a comment is not a read.
+        pytest.param(
+            STEP5_RECEIVED,
+            STEP5_RECEIVED + '      // var received = status !== "waiting";\n',
+            [],
+            id="comment",
+        ),
+        # Failure: the wave-6 shape (received from the status), entries that skipped the
+        # vocabulary filter, a second caller and an unchecked power.
+        pytest.param(
+            STEP5_RECEIVED,
+            '      var received = status !== "waiting";\n',
+            [STEP5_STATUS, STEP5_READS_STATUS],
+            id="status",
+        ),
+        pytest.param(
+            STEP5_RECEIVED,
+            '      var received = entry.status !== "waiting";\n',
+            [STEP5_STATUS, STEP5_READS_STATUS],
+            id="entry-status",
+        ),
+        pytest.param("own(valid,", "own(locations,", [STEP5_UNVALIDATED], id="unvalidated"),
+        pytest.param(
+            "  function apply(payload) {\n",
+            "  function apply(payload) {\n    updateLocation(element, locations[id]);\n",
+            [STEP5_UNVALIDATED],
+            id="second-caller",
+        ),
+        pytest.param(
+            " && POWER_KEYS.indexOf(entry.power) >= 0", "", [STEP5_POWER_UNCHECKED], id="unchecked"
+        ),
+    ],
+)
+def test_first_heartbeat_rule(old: str, new: str, expected: list[str]) -> None:
+    assert old in GOOD_FIRST_HEARTBEAT
+    assert first_heartbeat_violations(GOOD_FIRST_HEARTBEAT.replace(old, new)) == expected
+
+
+def test_W6A1_step5_follows_the_power_state() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+    setup = (TEMPLATES / "web" / "location_setup.html").read_text(encoding="utf-8")
+    row = LiveRow(
+        pk=7,
+        name="Office",
+        status="maintenance",
+        status_label="Maintenance",
+        last_heartbeat_at=None,
+        alerts_off=False,
+        router_grace=False,
+        delivery=None,
+        power="waiting",
+        on_since=None,
+        outage_started_at=None,
+        delivery_failing=False,
+    )
+
+    # Expected: the poll flips step 5 on the JSON's power, the same rule the server renders
+    # (the received line is hidden while the power state is waiting), so the first poll
+    # never contradicts the page it updates.
+    assert first_heartbeat_violations(source) == []
+    assert setup.count('data-fh="received"') == 1
+    assert SETUP_RECEIVED_RULE in setup
+    # Edge: maintenance switched on before the first heartbeat (D-02): the JSON's status is
+    # maintenance and its power still waiting, so step 5 keeps the waiting line.
+    assert (status_payload(row)["status"], status_payload(row)["power"]) == (
+        "maintenance",
+        "waiting",
+    )
+    # Failure: no poll at all.
+    assert first_heartbeat_violations("var x = 1;") == ["no first-heartbeat branch"]
+
+
+# admin.js wave-6 audit pins (W6-A3 and W6-A4: S3's fleet-showing description)
+
+
+def var_function(source: str, name: str) -> tuple[list[str], str]:
+    """(parameter names, text) of the first ``var <name> = function (...) {...}`` in code,
+    or ([], "")."""
+    code = _mask_js(source)
+    pattern = re.compile(rf"\bvar\s+{re.escape(name)}\s*=\s*function\s*\(([^)]*)\)\s*\{{")
+    match = next(_code_matches(pattern, source), None)
+    if match is None:
+        return [], ""
+    end = _closing(code, match.end() - 1, "{", "}")
+    parameters = [part.strip() for part in match.group(1).split(",") if part.strip()]
+    return parameters, source[match.start() : end + 1]
+
+
+def call_arguments(block: str, name: str) -> list[tuple[int, list[str]]]:
+    """(offset, arguments) of every ``<name>(...)`` call in code, each argument's text with
+    its whitespace collapsed; brackets and strings stay inside one argument."""
+    code = _mask_js(block)
+    calls = []
+    for match in _code_matches(re.compile(rf"(?<![\w$.]){re.escape(name)}\s*\("), block):
+        opening = code.index("(", match.start())
+        closing = _closing(code, opening)
+        arguments, depth, start = [], 0, opening + 1
+        for index in range(opening + 1, closing):
+            char = code[index]
+            if char in "([{":
+                depth += 1
+            elif char in ")]}":
+                depth -= 1
+            elif char == "," and depth == 0:
+                arguments.append(" ".join(block[start:index].split()))
+                start = index + 1
+        arguments.append(" ".join(block[start:closing].split()))
+        calls.append((match.start(), arguments))
+    return calls
+
+
+# The description's parts (_fleet_health.html), by the key describe writes them under.
+SHOWING_HOOKS = {
+    "all": "[data-showing-all]",
+    "shown": "[data-showing-shown]",
+    "of": "[data-showing-of]",
+    "total": "[data-showing-total]",
+    "noun": "[data-showing-noun]",
+}
+_SHOWING_LOOKUP = re.compile(r"showing\s*\.\s*querySelector\(\s*\"(\[data-showing-[a-z]+\])\"\s*\)")
+_SHOWING_VARIABLE = re.compile(
+    r"\bvar\s+([\w$]+)\s*=\s*showing\s*\.\s*querySelector\(\s*\"(\[data-showing-[a-z]+\])\"\s*\)"
+)
+_DIRECT_WRITE = r"(?<![\w$.])([\w$]+)\s*\.\s*{prop}\s*=(?!=)"
+SHOWING_WHOLE = "whole text written over the count spans"
+SHOWING_COUNT = "count span gets more than the number"
+SHOWING_TOTAL = "total span gets more than the number"
+SHOWING_NOUN = "noun span gets more than the noun"
+SHOWING_TOGGLES = "the all and of parts are never toggled"
+SHOWING_TEXT_UNCOMPARED = "text written without a compare"
+SHOWING_HIDDEN_UNCOMPARED = "hidden flag written without a compare"
+
+
+def _showing_part(target: str, variables: Mapping[str, str]) -> str | None:
+    """The part a write target names: "whole" (the description), a SHOWING_HOOKS key, or
+    None."""
+    if target == "showing":
+        return "whole"
+    hook = variables.get(target)
+    if hook is None:
+        lookup = _SHOWING_LOOKUP.fullmatch(target)
+        hook = lookup.group(1) if lookup else None
+    return next((key for key, value in SHOWING_HOOKS.items() if value == hook), None)
+
+
+def _direct_writes(block: str, prop: str) -> list[tuple[int, list[str]]]:
+    """(offset, [target, value]) of every ``<name>.<prop> = value;`` in code."""
+    code = _mask_js(block)
+    writes = []
+    for match in _code_matches(re.compile(_DIRECT_WRITE.format(prop=prop)), block):
+        end = code.find(";", match.end())
+        value = block[match.end() : len(block) if end < 0 else end]
+        writes.append((match.start(), [match.group(1), " ".join(value.split())]))
+    return writes
+
+
+def _noun_only(value: str, describe: str) -> bool:
+    """The value is "location" or "locations": a literal, or a variable of describe whose
+    assignment holds only those literals and no concatenation."""
+    if re.fullmatch(r"[\w$]+", value):
+        assigned = re.search(rf"\bvar\s+{re.escape(value)}\s*=([^;]*);", describe)
+        if assigned is None:
+            return False
+        value = assigned.group(1)
+    words = {a or b for a, b in _JS_STRING.findall(value)}
+    return bool(words) and words <= {"location", "locations"} and "+" not in value
+
+
+def showing_write_violations(source: str) -> list[str]:
+    """W6-A3 and the mono rule: fleetFilter's describe writes the shown count and the total
+    only as String(...) into the mono [data-showing-shown] and [data-showing-total] spans,
+    the noun only as "location" or "locations" into [data-showing-noun], and toggles the
+    "all " and " of {M}" parts; it writes the whole sentence only when the description has
+    no count span (the fallback), and no other fleetFilter code writes the description."""
+    body = component_bodies(source).get("fleetFilter", "")
+    _, describe = var_function(body, "describe")
+    if not describe:
+        return ["no describe"]
+    variables = {
+        match.group(1): match.group(2) for match in _code_matches(_SHOWING_VARIABLE, describe)
+    }
+    count = next((name for name, hook in variables.items() if hook == SHOWING_HOOKS["shown"]), None)
+    found = set()
+    guards = []
+    if count is None:
+        found.add(f"no {SHOWING_HOOKS['shown']} hook")
+    else:
+        unguarded = re.compile(rf"(?<![\w$!=])!\s*{re.escape(count)}(?![\w$.\[(])")
+        guards = if_blocks(describe, unguarded)
+    writes: dict[str | None, list[str]] = {}
+    for offset, arguments in [
+        *call_arguments(describe, "setText"),
+        *_direct_writes(describe, "textContent"),
+    ]:
+        if len(arguments) != 2:
+            continue
+        part = _showing_part(arguments[0], variables)
+        writes.setdefault(part, []).append(arguments[1])
+        if part == "whole" and not inside(offset, guards):
+            found.add(SHOWING_WHOLE)
+    start = body.index(describe)
+    for offset, arguments in [
+        *call_arguments(body, "setText"),
+        *_direct_writes(body, "textContent"),
+    ]:
+        outside = not start <= offset < start + len(describe)
+        if outside and arguments and arguments[0] == "showing":
+            found.add(SHOWING_WHOLE)
+    if count is not None and any(
+        not re.fullmatch(r"String\([^\"'+]*\)", value) for value in writes.get("shown", [""])
+    ):
+        found.add(SHOWING_COUNT)
+    if writes.get("total") != ["String(total)"]:
+        found.add(SHOWING_TOTAL)
+    if not all(_noun_only(value, describe) for value in writes.get("noun", [""])):
+        found.add(SHOWING_NOUN)
+    toggled = {
+        _showing_part(arguments[0], variables)
+        for _, arguments in [
+            *call_arguments(describe, "setHidden"),
+            *_direct_writes(describe, "hidden"),
+        ]
+        if arguments
+    }
+    if not {"all", "of"} <= toggled:
+        found.add(SHOWING_TOGGLES)
+    return sorted(found)
+
+
+def showing_announce_violations(source: str) -> list[str]:
+    """W6-A4: the description is a polite live region, so fleetFilter writes one of its
+    texts or hidden flags only when the value differs. Its text writer setText and its flag
+    writer setHidden assign inside an if that compares the same property with !==; no other
+    fleetFilter code assigns a textContent, and describe assigns no hidden flag itself."""
+    body = component_bodies(source).get("fleetFilter", "")
+    found = set()
+    helpers = {}
+    for helper, prop, message in (
+        ("setText", "textContent", SHOWING_TEXT_UNCOMPARED),
+        ("setHidden", "hidden", SHOWING_HIDDEN_UNCOMPARED),
+    ):
+        parameters, text = var_function(body, helper)
+        helpers[helper] = text
+        if len(parameters) != 2:
+            found.add(f"no {helper}")
+            continue
+        element, value = (re.escape(parameter) for parameter in parameters)
+        compare = re.compile(rf"(?<![\w$.]){element}\s*\.\s*{prop}\s*!==\s*{value}(?![\w$])")
+        guards = if_blocks(text, compare)
+        assigns = list(_code_matches(re.compile(rf"\.\s*{prop}\s*=(?!=)"), text))
+        if not assigns or any(not inside(match.start(), guards) for match in assigns):
+            found.add(message)
+    set_text = helpers["setText"]
+    start = body.find(set_text) if set_text else -1
+    for match in _code_matches(re.compile(r"\.\s*textContent\s*=(?!=)"), body):
+        if not (set_text and start <= match.start() < start + len(set_text)):
+            found.add(SHOWING_TEXT_UNCOMPARED)
+    _, describe = var_function(body, "describe")
+    if next(_code_matches(re.compile(r"\.\s*hidden\s*=(?!=)"), describe), None) is not None:
+        found.add(SHOWING_HIDDEN_UNCOMPARED)
+    return sorted(found)
+
+
+SHOWING_SET_TEXT = (
+    "    var setText = function (element, value) {\n"
+    "      if (element && element.textContent !== value) {\n"
+    "        element.textContent = value;\n"
+    "      }\n"
+    "    };\n"
+)
+SHOWING_SET_HIDDEN = (
+    "    var setHidden = function (element, value) {\n"
+    "      if (element && element.hidden !== value) {\n"
+    "        element.hidden = value;\n"
+    "      }\n"
+    "    };\n"
+)
+SHOWING_COUNT_WRITE = "      setText(count, String(filtered ? shown : total));\n"
+SHOWING_NOUN_WRITE = '      setText(showing.querySelector("[data-showing-noun]"), noun);\n'
+SHOWING_TOTAL_WRITE = (
+    '      setText(showing.querySelector("[data-showing-total]"), String(total));\n'
+)
+SHOWING_OF_TOGGLE = '      setHidden(showing.querySelector("[data-showing-of]"), !filtered);\n'
+SHOWING_DESCRIBED = "        describe(shown, total);\n"
+GOOD_SHOWING = (
+    """Alpine.data("fleetFilter", function () {
+  return { init: function () {
+    var showing = root.querySelector('[data-testid="fleet-showing"]');
+"""
+    + SHOWING_SET_TEXT
+    + SHOWING_SET_HIDDEN
+    + """    var describe = function (shown, total) {
+      var filtered = active !== "all";
+      var noun = total === 1 ? "location" : "locations";
+      var count = showing.querySelector("[data-showing-shown]");
+      if (!count) {
+        var sentence = "Showing " + shown + " of " + total + " " + noun;
+        if (!filtered) {
+          sentence = total === 1 ? "Showing 1 location" : "Showing all " + total + " " + noun;
+        }
+        setText(showing, sentence);
+        return;
+      }
+      setHidden(showing.querySelector("[data-showing-all]"), filtered || total === 1);
+"""
+    + SHOWING_COUNT_WRITE
+    + SHOWING_OF_TOGGLE
+    + SHOWING_TOTAL_WRITE
+    + SHOWING_NOUN_WRITE
+    + """    };
+    var apply = function () {
+      if (showing) {
+"""
+    + SHOWING_DESCRIBED
+    + """      }
+    };
+  } };
+})
+"""
+)
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    [
+        pytest.param("", "", [], id="good"),
+        # Edge: a whole-text write in a comment is not one.
+        pytest.param(
+            SHOWING_COUNT_WRITE,
+            SHOWING_COUNT_WRITE + "      // showing.textContent = sentence;\n",
+            [],
+            id="comment",
+        ),
+        # Failure: the wave-6 shape (apply writes describe's sentence as the whole text),
+        # the whole text written over the spans, words in a number span, a number in the
+        # noun span, no count span, no toggle.
+        pytest.param(
+            SHOWING_DESCRIBED,
+            "        showing.textContent = describe(shown, total);\n",
+            [SHOWING_WHOLE],
+            id="whole-in-apply",
+        ),
+        pytest.param(
+            SHOWING_NOUN_WRITE,
+            SHOWING_NOUN_WRITE + '      setText(showing, "Showing " + shown);\n',
+            [SHOWING_WHOLE],
+            id="whole-after-spans",
+        ),
+        pytest.param(
+            SHOWING_COUNT_WRITE,
+            '      setText(count, "Showing " + shown);\n',
+            [SHOWING_COUNT],
+            id="words-in-count",
+        ),
+        pytest.param(
+            SHOWING_TOTAL_WRITE,
+            '      setText(showing.querySelector("[data-showing-total]"), " of " + total);\n',
+            [SHOWING_TOTAL],
+            id="words-in-total",
+        ),
+        pytest.param(
+            SHOWING_NOUN_WRITE,
+            '      setText(showing.querySelector("[data-showing-noun]"), total + " " + noun);\n',
+            [SHOWING_NOUN],
+            id="number-in-noun",
+        ),
+        pytest.param(
+            '      var count = showing.querySelector("[data-showing-shown]");\n',
+            "      var count = null;\n",
+            [f"no {SHOWING_HOOKS['shown']} hook", SHOWING_WHOLE],
+            id="no-count-span",
+        ),
+        pytest.param(SHOWING_OF_TOGGLE, "", [SHOWING_TOGGLES], id="no-toggle"),
+    ],
+)
+def test_showing_write_rule(old: str, new: str, expected: list[str]) -> None:
+    assert old in GOOD_SHOWING
+    assert showing_write_violations(GOOD_SHOWING.replace(old, new)) == expected
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    [
+        pytest.param("", "", [], id="good"),
+        # Edge: an unguarded write in a comment is not one.
+        pytest.param(
+            SHOWING_SET_TEXT,
+            SHOWING_SET_TEXT + "    // element.textContent = value;\n",
+            [],
+            id="comment",
+        ),
+        # Failure: writers that do not compare, a compare of another property, direct
+        # writes in describe, the wave-6 shape (apply writes the whole text on every run)
+        # and a missing writer.
+        pytest.param(
+            "element && element.textContent !== value",
+            "element",
+            [SHOWING_TEXT_UNCOMPARED],
+            id="text-uncompared",
+        ),
+        pytest.param(
+            "element && element.hidden !== value",
+            "element",
+            [SHOWING_HIDDEN_UNCOMPARED],
+            id="hidden-uncompared",
+        ),
+        pytest.param(
+            "element && element.textContent !== value",
+            "element && element.hidden !== value",
+            [SHOWING_TEXT_UNCOMPARED],
+            id="other-property",
+        ),
+        pytest.param(
+            SHOWING_COUNT_WRITE,
+            "      count.textContent = String(filtered ? shown : total);\n",
+            [SHOWING_TEXT_UNCOMPARED],
+            id="direct-text",
+        ),
+        pytest.param(
+            SHOWING_OF_TOGGLE,
+            '      showing.querySelector("[data-showing-of]").hidden = !filtered;\n',
+            [SHOWING_HIDDEN_UNCOMPARED],
+            id="direct-hidden",
+        ),
+        pytest.param(
+            SHOWING_DESCRIBED,
+            "        showing.textContent = describe(shown, total);\n",
+            [SHOWING_TEXT_UNCOMPARED],
+            id="whole-in-apply",
+        ),
+        pytest.param(SHOWING_SET_HIDDEN, "", ["no setHidden"], id="no-set-hidden"),
+    ],
+)
+def test_showing_announce_rule(old: str, new: str, expected: list[str]) -> None:
+    assert old in GOOD_SHOWING
+    assert showing_announce_violations(GOOD_SHOWING.replace(old, new)) == expected
+
+
+# A span tag carrying the attribute, template tags inside the tag included.
+_SHOWING_SPAN = r"<span\b[^>]*\s{attribute}(?![\w-])[^>]*>"
+
+
+def test_W6A3_fleet_showing_keeps_its_counts_mono() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+    card = (TEMPLATES / "web" / "_fleet_health.html").read_text(encoding="utf-8")
+
+    # Expected: describe writes the shown count and the total only as numbers into the
+    # description's mono spans and the noun into its own span, so a filter press or a poll
+    # keeps the counts mono and the words Inter; the whole sentence is only the fallback for
+    # a description without the spans.
+    assert showing_write_violations(source) == []
+    # Edge: the card renders each part exactly once, the two counts with the num token.
+    for hook in SHOWING_HOOKS.values():
+        spans = re.findall(_SHOWING_SPAN.format(attribute=hook[1:-1]), card)
+        assert len(spans) == 1, hook
+        mono = re.search(rf"\b{CLASS}=\"[^\"]*\bnum\b", spans[0]) is not None
+        assert mono == (hook in (SHOWING_HOOKS["shown"], SHOWING_HOOKS["total"])), hook
+    # Failure: no fleetFilter at all.
+    assert showing_write_violations("var x = 1;") == ["no describe"]
+
+
+def test_W6A4_fleet_showing_writes_only_what_changed() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+
+    # Expected: fleetFilter compares before every write to the polite description (texts
+    # and hidden flags), so a poll that changes nothing announces nothing and a filter press
+    # announces the new sentence once.
+    assert showing_announce_violations(source) == []
+    # Failure: no fleetFilter at all.
+    assert showing_announce_violations("var x = 1;") == ["no setHidden", "no setText"]
 
 
 # CSS entries

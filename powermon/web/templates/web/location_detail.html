@@ -16,9 +16,10 @@ GET with a toast. JavaScript only enhances it.
 - Live hooks: main carries the poll (data-poll-page detail); the header pill, the since and
   last-heartbeat times of the meta line and the Status card carry data-live and
   data-location-id. While maintenance is on, the since rows carry no live hook: the poll
-  does not read the power state, so a power change under maintenance shows the reload chip
-  instead of flipping one row. The delivery row and banner carry no data-live: the
-  poll's list-format delivery text must never replace their full-format text.
+  reads the stored power state from the [data-power] pill and, when the status JSON's
+  power differs, shows the "Status changed · Reload page" chip instead of flipping a row in
+  place. The delivery row and banner carry no data-live: the poll's list-format delivery
+  text must never replace their full-format text.
 - Banners after the header: delivery failing (warning, with the cause or migrate line, the
   retry line and its own test-message form) and maintenance (muted, the power-state help
   line). Both can show at once.
