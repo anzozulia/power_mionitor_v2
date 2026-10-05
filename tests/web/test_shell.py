@@ -50,7 +50,14 @@ from pages import (
     text,
 )
 from secret_fixtures import SECRETS, TOKEN
-from urls_shell import PROBE_PATH, PROBE_TEMPLATE, PROBE_TITLE, render_probe
+from urls_shell import (
+    LIVE_PROBE_PATH,
+    LIVE_PROBE_TITLE,
+    PROBE_PATH,
+    PROBE_TEMPLATE,
+    PROBE_TITLE,
+    render_probe,
+)
 
 from powermon.web import context_processors
 from powermon.web.templatetags import timefmt
@@ -65,9 +72,6 @@ DISTINCT_NAME = "Shell Probe Zhytomyr"
 LONG_NAME = ("Very long location name " * 5)[:100]
 THEMES = ("light", "dark", "system")
 ONE_ITEM = [("Locations", None)]
-# The live probe of urls_shell: the live_indicator block and the chip slot filled.
-LIVE_PROBE_PATH = "/_shell/live/"
-LIVE_PROBE_TITLE = "Live probe"
 # The chip slot's four chips (06-11 binding contract), in order, with their tone and text.
 CHIPS = [
     ("updated", "muted", "Updated just now"),
