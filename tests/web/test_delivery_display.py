@@ -14,6 +14,8 @@ The list view takes an injected clock (``LocationListView.as_view(clock=...)``) 
 "today" decision, through RequestFactory as in tests/web/test_locations.py (LOC-02).
 """
 
+# class-guard: pending migration
+
 import re
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta

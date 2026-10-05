@@ -24,6 +24,8 @@ is asserted (``_post_delete``). The chart helpers are copied from tests/chart (t
 ``__init__.py``).
 """
 
+# class-guard: pending migration
+
 import dataclasses
 import re
 import threading

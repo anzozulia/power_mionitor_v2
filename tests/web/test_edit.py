@@ -20,6 +20,8 @@ helpers (``_monitor``, the detection cursor in ``_pass``, ``_chart_steps``) are 
 tests/chart, not imported: tests have no ``__init__.py``.
 """
 
+# class-guard: pending migration
+
 import dataclasses
 import re
 import threading

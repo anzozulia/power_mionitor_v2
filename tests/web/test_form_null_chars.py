@@ -11,6 +11,8 @@ constants fails these tests. No UI-SPEC row fits a NUL in the location name, so 
 keeps Django's text (a recorded residual) and its test checks only the safe refusal.
 """
 
+# class-guard: pending migration
+
 import re
 from html import unescape
 

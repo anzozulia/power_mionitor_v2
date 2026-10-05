@@ -7,6 +7,8 @@ add-location form tests: K-6 at form level, the UI-SPEC validation copy, the wri
 token and the create itself (one transaction, no Telegram call).
 """
 
+# class-guard: pending migration
+
 import logging
 import re
 import string
@@ -748,3 +750,14 @@ def test_anonymous_add_form_redirects_to_sign_in(client: Client) -> None:
     assert response.status_code == 302
     assert response.url == "/login/?next=/locations/new/"
     assert Location.objects.count() == 0
+
+
+# The page shell on the add form: moved unchanged from tests/web/test_templates.py by
+# 06-09, since it reads only this page (06-17 migrates it with the form).
+
+
+def test_nav_marks_the_list_only_on_the_list_page(admin: Client) -> None:
+    html = admin.get("/locations/new/").content.decode()
+
+    assert '<a href="/">Locations</a>' in html
+    assert "aria-current" not in html

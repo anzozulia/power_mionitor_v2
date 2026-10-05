@@ -17,6 +17,8 @@
   the signed-in admin.
 """
 
+# class-guard: pending migration
+
 import re
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -311,8 +313,8 @@ def test_location_page_settings_and_setup_sections(
     )
 
     page = admin.get(_page(location)).content.decode()
-    setup = admin.get(f"/locations/{location.pk}/setup/").content.decode()
 
+    # The setup page shows these same rows: *_on_setup in tests/web/test_setup_page.py.
     expected = [
         ("Language", "Russian"),
         ("Heartbeat period", "45 s"),
@@ -327,7 +329,6 @@ def test_location_page_settings_and_setup_sections(
     ]
     assert ROUTER_GRACE_S == 180
     assert _settings_rows(page) == expected
-    assert _settings_rows(setup) == expected
     assert re.findall(r"<h2>(.*?)</h2>", page) == [
         "Status",
         "Switches",
@@ -406,18 +407,13 @@ def test_location_page_escapes_the_name(
     location = location_factory(name=XSS_NAME)
 
     page = admin.get(_page(location)).content.decode()
-    setup = admin.get(f"/locations/{location.pk}/setup/").content.decode()
 
     assert f'<h1 class="name">{ESCAPED_XSS_NAME}</h1>' in page
     assert f"<title>{ESCAPED_XSS_NAME} · Power Monitor</title>" in page
     assert _crumbs(page)[-1] == (' class="name" aria-current="page"', ESCAPED_XSS_NAME)
-    assert _crumbs(setup)[1] == (
-        "",
-        f'<a class="name" href="/locations/{location.pk}/">{ESCAPED_XSS_NAME}</a>',
-    )
-    # E3 loading / E10 loading: plain forms and static links, no script at all.
-    for html in (page, setup):
-        assert "<script" not in html
+    # E3 loading / E10 loading: plain forms and static links, no script at all. The setup
+    # page's half is *_on_setup in tests/web/test_setup_page.py (06-09).
+    assert "<script" not in page
 
 
 @pytest.mark.django_db
@@ -443,23 +439,16 @@ def test_breadcrumbs_on_location_and_setup_pages(
     detail = f"/locations/{location.pk}/"
 
     page = admin.post(f"{detail}maintenance/", {"value": "on"}, follow=True).content.decode()
-    setup = admin.get(f"{detail}setup/").content.decode()
 
     assert _crumbs(page) == [
         ("", '<a href="/">Locations</a>'),
         (' class="name" aria-current="page"', "Office"),
     ]
-    assert _crumbs(setup) == [
-        ("", '<a href="/">Locations</a>'),
-        ("", f'<a class="name" href="{detail}">Office</a>'),
-        (' aria-current="page"', "Device setup"),
-    ]
-    # Order inside <main>: breadcrumbs, then the flash, then the h1.
+    # Order inside <main>: breadcrumbs, then the flash, then the h1. The setup page's
+    # half is *_on_setup in tests/web/test_setup_page.py (06-09).
     main = page[page.index("<main") :]
     assert main.index('<nav aria-label="Breadcrumb">') < main.index('<div class="messages')
     assert main.index('<div class="messages') < main.index("<h1")
-    setup_main = setup[setup.index("<main") :]
-    assert setup_main.index('<nav aria-label="Breadcrumb">') < setup_main.index("<h1")
 
 
 # Accent and destructive buttons (UI-D15, UI-D5)

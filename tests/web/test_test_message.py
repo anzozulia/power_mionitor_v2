@@ -20,6 +20,8 @@ LOC-02 injection pattern); Telegram is faked at the HTTP boundary (``fake_telegr
 ``ops_settings`` configures the admin chat.
 """
 
+# class-guard: pending migration
+
 import dataclasses
 import re
 from collections.abc import Callable
@@ -45,7 +47,10 @@ from django.contrib.sessions.backends.db import SessionStore
 from django.db import transaction
 from django.http import HttpResponse
 from django.test import Client, RequestFactory
+from pages import main as page_main
 from pages import messages as page_messages
+from pages import parse as page_parse
+from pages import text as page_text
 from urllib3.exceptions import MaxRetryError, NewConnectionError
 
 from powermon.alerts import delivery, outbox
@@ -202,12 +207,24 @@ def _get(rf: RequestFactory, view: Callable[..., HttpResponse], path: str, **kwa
     return response.content.decode()
 
 
-def _list_delivery(rf: RequestFactory, clock: FakeClock) -> str:
-    """The Delivery cell of the list's only row, rendered at the clock's time."""
-    html = _get(rf, LocationListView.as_view(clock=clock), "/")
-    cells = re.findall(r"<td\b[^>]*>(.*?)</td>", html, re.S)
-    assert len(cells) == 4, "the list has one row of four cells"
-    return cells[3]
+def _list_text(rf: RequestFactory, clock: FakeClock) -> str:
+    """The list page's visible text, rendered at the clock's time.
+
+    The list (S3) is rewritten by 06-14 and 06-18, so it is read as text only: every
+    element carrying the ``hidden`` attribute is dropped (a hidden live variant is not
+    shown), then the text of ``<main>``. A space goes in at every element boundary, so the
+    text of adjacent elements (cells, card lines, a label and its value) never runs
+    together, whatever whitespace the markup has; the pill's label is one string, so it
+    still reads whole.
+    """
+    page = page_parse(_get(rf, LocationListView.as_view(clock=clock), "/"))
+    for element in [found for found in page.find_all(True) if found.has_attr("hidden")]:
+        element.extract()
+    shown = page_main(page)
+    for element in shown.find_all(True):
+        element.insert_before(" ")
+        element.insert_after(" ")
+    return page_text(shown)
 
 
 def _page_delivery(rf: RequestFactory, location: Any) -> str:
@@ -259,10 +276,8 @@ def test_INV16_1_test_message_clears_failing_and_releases_the_queue(
     assert (_row(off).status, _row(off).next_attempt_at) == ("pending", T0 + timedelta(minutes=15))
     assert _incidents(location) == [(T0, None)]
     assert len(_ops_rows(outbox.KIND_OPS_DELIVERY_FAILING)) == 1
-    # The badge: the list's Delivery cell and the location page's Delivery row (D-13).
-    assert _list_delivery(rf, clock) == (
-        '<span class="status status--failing">Failing since 13:06 (http_403)</span>'
-    )
+    # The badge: the list's Delivery text and the location page's Delivery row (D-13).
+    assert "Failing since 13:06 (http_403)" in _list_text(rf, clock)
     assert _page_delivery(rf, location) == (
         '<span class="status status--failing">'
         "Failing since 2026-10-01 13:06:31 EEST (http_403)</span>"
@@ -287,8 +302,10 @@ def test_INV16_1_test_message_clears_failing_and_releases_the_queue(
     assert _incidents(location) == [(T0, tested_at)]
     assert len(_ops_rows(outbox.KIND_OPS_DELIVERY_RESTORED)) == 1
     assert _row(off).next_attempt_at == tested_at
-    # The badge clears on both pages.
-    assert _list_delivery(rf, clock) == "OK"
+    # The badge clears on both pages: no failing text on the list, and OK as its own word.
+    listed = _list_text(rf, clock)
+    assert "Failing since" not in listed
+    assert re.search(r"\bOK\b", listed), listed
     assert _page_delivery(rf, location) == "OK"
 
     # The worker's next pass, still at the test time (10 minutes before the hold would

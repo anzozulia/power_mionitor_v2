@@ -11,6 +11,8 @@ The Django test client sends every request from REMOTE_ADDR 127.0.0.1 unless a t
 another one. Cases that need exact times inject a FakeClock into SignInView.
 """
 
+# class-guard: pending migration
+
 import logging
 import re
 from datetime import datetime, timedelta
