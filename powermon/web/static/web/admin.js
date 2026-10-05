@@ -221,6 +221,8 @@
   // Live updates (UI-05): the status JSON's vocabulary. Only these values are ever written
   // into data-status and data-delivery; texts go through textContent.
   var STATUS_KEYS = ["on", "off", "maintenance", "waiting"];
+  // The stored power state, also under maintenance (the JSON's power, S5's data-power).
+  var POWER_KEYS = ["on", "off", "waiting"];
   var DELIVERY_STATES = ["ok", "failing"];
   // The sidebar cell kind per status (data-cell).
   var CELL_KINDS = { on: "age", off: "off", maintenance: "mnt", waiting: "wait" };
@@ -662,12 +664,15 @@
     // polling and shows the "Live updates paused" chip with the reload link; the sign-in page is
     // never read. A success writes attributes and text of the live elements only (unknown
     // ids are ignored), shows the "Status changed" reload chip when the page can no longer
-    // match the data (list: another set of locations; location page: another status or
-    // delivery state; any page: its location gone or a time it cannot show in place, such
-    // as a first heartbeat where the page rendered "Never"), and dispatches pm:status on
-    // window. The list's count ([data-live="count"]) gets the number in its mono
-    // [data-count-value] span and "location" or "locations" in its [data-count-noun] span,
-    // or its whole text when it has no number span.
+    // match the data (list: another set of locations; location page: another status,
+    // delivery state or, under maintenance, power state, which the page renders in its
+    // [data-power] pill with no live hook on its since rows; any page: its location gone or
+    // a time it cannot show in place, such as a first heartbeat where the page rendered
+    // "Never"), and dispatches pm:status on window. The list's count ([data-live="count"])
+    // gets the number in its mono [data-count-value] span and "location" or "locations" in
+    // its [data-count-noun] span, or its whole text when it has no number span. The
+    // sidebar's group count ([data-live="sidebar-count"], mono) gets the JSON's number of
+    // locations as its text.
     window.Alpine.data("poll", function () {
       var POLL_INTERVAL_MS = 30000;
       var POLL_BACKOFF_MS = [60000, 120000, 240000, 300000];
@@ -680,7 +685,8 @@
       var stopped = false;
       var failures = 0;
       var changed = false;
-      // Per location id, the status and delivery state the page was rendered with.
+      // Per location id, the status, delivery state and (location page under maintenance)
+      // power state the page was rendered with.
       var rendered = {};
 
       function snapshot() {
@@ -694,11 +700,16 @@
             entry.delivery = element.getAttribute("data-delivery");
           }
         });
-        // The location page's delivery row and banner carry data-delivery without an id.
+        // The location page's delivery row and banner carry data-delivery without an id, and
+        // its Power state row (maintenance only) carries data-power, the stored power state.
         var ids = Object.keys(rendered);
         var delivery = main.querySelector("[data-delivery]");
         if (ids.length === 1 && rendered[ids[0]].delivery === undefined && delivery) {
           rendered[ids[0]].delivery = delivery.getAttribute("data-delivery");
+        }
+        var power = main.querySelector("[data-power]");
+        if (ids.length === 1 && rendered[ids[0]].power === undefined && power) {
+          rendered[ids[0]].power = power.getAttribute("data-power");
         }
       }
 
@@ -829,6 +840,10 @@
             element.textContent = on + " on, " + off + " off" + failingWords;
           });
         }
+        // The sidebar's group count (outside main): the number of locations, as text.
+        document.querySelectorAll('[data-live="sidebar-count"]').forEach(function (element) {
+          element.textContent = String(total);
+        });
         // The count keeps its number in the mono [data-count-value] span and the noun in
         // [data-count-noun]; an element without the number span gets the whole text.
         main.querySelectorAll('[data-live="count"]').forEach(function (element) {
@@ -877,6 +892,7 @@
           if (
             entry &&
             STATUS_KEYS.indexOf(entry.status) >= 0 &&
+            POWER_KEYS.indexOf(entry.power) >= 0 &&
             entry.delivery &&
             DELIVERY_STATES.indexOf(entry.delivery.state) >= 0
           ) {
@@ -903,7 +919,8 @@
           } else if (
             page === "detail" &&
             (entry.status !== before.status ||
-              (before.delivery !== undefined && entry.delivery.state !== before.delivery))
+              (before.delivery !== undefined && entry.delivery.state !== before.delivery) ||
+              (before.power !== undefined && entry.power !== before.power))
           ) {
             changed = true;
           }
