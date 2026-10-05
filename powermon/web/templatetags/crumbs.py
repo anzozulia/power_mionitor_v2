@@ -18,6 +18,10 @@ The trails, one per app page (06-UI-SPEC page contracts):
 - ``outage-remove``: Locations › {name} › Remove outage
 - ``location-reset``: Locations › {name} › Reset history
 
+A POST answered with another page shows that page's trail (``POST_TRAILS``): the
+Regenerate POST answers with the revealed setup page (D-14), so it gets
+Locations › {name} › Device setup, while its GET, the confirmation, keeps its own trail.
+
 Every href comes from ``reverse()`` with a route name and the location's pk, never from
 the request (T-06-42). The name is the stored name, escaped by the template (R1).
 
@@ -74,6 +78,10 @@ TRAILS: dict[str, tuple[Step, ...]] = {
     "location-reset": ((NAME, DETAIL_ROUTE), ("Reset history", None)),
 }
 
+# The routes whose POST answers with another page, mapped to that page's route: the
+# Regenerate POST renders the setup page (location_views.RegenerateKeyView.post).
+POST_TRAILS: dict[str, str] = {"location-regenerate": SETUP_ROUTE}
+
 
 def fallback() -> list[Crumb]:
     """The one-item trail: Locations, as the current page."""
@@ -111,9 +119,12 @@ def breadcrumb_trail(context: Context) -> list[Crumb]:
     """``{% breadcrumb_trail as trail %}``: the trail of the page being rendered.
 
     Reads ``request.resolver_match.url_name`` and ``location`` from the context,
-    defensively: either may be missing, and then the trail is the one item Locations.
+    defensively: either may be missing, and then the trail is the one item Locations. A
+    POST on a ``POST_TRAILS`` route gets the trail of the page it answers with.
     """
     request = context.get("request")
     match = getattr(request, "resolver_match", None)
     url_name = getattr(match, "url_name", None)
+    if getattr(request, "method", None) == "POST" and isinstance(url_name, str):
+        url_name = POST_TRAILS.get(url_name, url_name)
     return trail_for(url_name, context.get("location"))
