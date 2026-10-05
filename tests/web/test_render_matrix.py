@@ -1449,7 +1449,7 @@ def _keys_of(env: Env) -> list[str]:
     return [*found, *env.old_keys]
 
 
-def _secrets(env: Env) -> list[str]:
+def secrets_of(env: Env) -> list[str]:
     """Everything no page may show outside its allowances, without repeats."""
     values = [*SECRETS, OPS_BOT_TOKEN, OPS_SECRET, MASKED, MASKED_2, MASKED_3]
     for key in _keys_of(env):
@@ -1607,7 +1607,7 @@ def test_UI01_render_matrix(env: Env, case: Case) -> None:
     body = _without_csrf(soup)
     assert_no_secrets(
         body,
-        _secrets(env),
+        secrets_of(env),
         label=case.id,
         allow=_allowances(env, case.surface),
         headers=_redirects(response),

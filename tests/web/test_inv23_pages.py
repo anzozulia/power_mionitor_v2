@@ -22,25 +22,55 @@ security rules 3, 4 and 8).
   no injected or inline script. The confirmation pages have no settings panel, so not even
   the mask shows.
 
-Pages are read through ``pages.py``: the flashes with ``messages()`` (toast or legacy
-callout), the regenerate marker with ``hidden_value(post_form(...), "marker")``.
+Pages are read through ``pages.py``: the flashes with ``messages()``, the regenerate marker
+with ``hidden_value(post_form(...), "marker")``.
+
+Phase 6 (TEST-STRATEGY §9) extends the matrix to every new surface:
+
+- the sidebar on every app page of the render matrix (tests/web/test_render_matrix.py
+  ``CASES``, each with one more location holding the fixture token): no token, secret part,
+  key, key mask or "•" in it;
+- the theme POST's redirect (headers, cookies and body, a token typed into ``next`` and a key
+  in the Referer included) and the built CSS and admin.js bodies;
+- every action's redirect and the toasts of the page it leads to: add, test message
+  (Telegram's answer carries the token), edit, remove, reset, the three switches, delete
+  and sign-out, each with exactly one toast and no secret in a header;
+- ``test_INV23_2_matrix_is_complete`` maps each §9 row, read from the TEST-STRATEGY table
+  itself, to the routes whose responses it scans and the test functions that scan them,
+  and imports each module to prove the function exists. ``INV23_ROUTES`` is exported for
+  tests/web/test_routes_coverage.py: every named admin route is in some row.
 
 The scans run through the signed-in test client, Telegram faked at the HTTP boundary
 (``fake_telegram``); the 429 page comes from five failed sign-ins in a separate client.
 """
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
 import requests
-from conftest import DEFAULT_BOT_TOKEN, FakeClock, FakeTelegram
+import test_render_matrix as matrix
+from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, FakeClock, FakeTelegram
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.contrib.staticfiles.storage import staticfiles_storage
 from django.http import HttpResponse
+from django.http.response import HttpResponseBase
 from django.test import Client
-from pages import assert_no_injected_script, hidden_value, message_texts, messages, post_form
+from pages import (
+    TOAST_REGIONS,
+    all_by_testid,
+    assert_no_injected_script,
+    assert_no_secrets,
+    by_testid,
+    hidden_value,
+    message_texts,
+    messages,
+    parse,
+    post_form,
+)
 from secret_fixtures import MASKED, MASKED_2, MASKED_3, SECRET, SECRETS, TOKEN, TOKEN_2, TOKEN_3
 
 from powermon.alerts import ops, outbox
@@ -58,9 +88,20 @@ from powermon.web.history_views import (
     HistoryResetView,
     OutageRemoveView,
 )
-from powermon.web.location_views import LocationDetailView, local_minute
+from powermon.web.location_views import (
+    LocationDeleteView,
+    LocationDetailView,
+    LocationEditView,
+    SendTestMessageView,
+    SwitchView,
+    local_minute,
+)
+from powermon.web.views import LocationCreateView
 
 User = get_user_model()
+
+# The render matrix's world (signed-in admin, every clock at its NOW), for the sidebar row.
+env = matrix.env
 
 THROTTLE_MESSAGE = "Too many failed sign-ins. Try again in 5 minutes."
 
@@ -418,3 +459,287 @@ def test_INV23_2_history_pages_and_flashes_never_show_a_token_or_the_key(
         assert_no_injected_script(html, label)
     # No action called Telegram (KD2).
     assert len(fake_telegram.calls) == 0
+
+
+# Phase 6: the sidebar, the theme POST, the static assets, every action's redirect
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("case", [case for case in matrix.CASES if case.app], ids=lambda c: c.id)
+def test_INV23_2_sidebar_on_every_app_page(env: matrix.Env, case: matrix.Case) -> None:
+    # Every app page of the render matrix, with one more location that holds the fixture
+    # token and a key: the sidebar lists it, and shows none of its secrets, not even masked.
+    probe = env.make("Sidebar probe")
+    response = case.build(env)
+    page = parse(response)
+
+    sidebar = by_testid(page, "sidebar")
+    listed = {str(link["title"]) for link in all_by_testid(sidebar, "sidebar-location")}
+    assert probe.name in listed
+    html = str(sidebar)
+    assert_no_secrets(html, matrix.secrets_of(env), label=case.id)
+    assert "•" not in html
+
+
+def _all_keys() -> list[str]:
+    """Every location's key and its mask, as they are now."""
+    found: list[str] = []
+    for key in Location.objects.values_list("device_key", flat=True):
+        found += [key, keys.mask_key(key)]
+    return found
+
+
+def _header_lines(response: HttpResponseBase) -> list[str]:
+    """Every response header and cookie as text."""
+    lines = [f"{name}: {value}" for name, value in response.items()]
+    return [*lines, *(morsel.OutputString() for morsel in response.cookies.values())]
+
+
+def _body(response: HttpResponseBase) -> bytes:
+    if getattr(response, "streaming", False):
+        return b"".join(response.streaming_content)  # type: ignore[attr-defined]
+    return response.content  # type: ignore[attr-defined,no-any-return]
+
+
+@pytest.mark.django_db
+def test_INV23_2_theme_post_and_static_assets(
+    admin: Client, location_factory: Callable[..., Any]
+) -> None:
+    location = location_factory(name="Office", bot_token=TOKEN)
+    key = location.device_key
+    secrets = [*SECRETS, MASKED, key, keys.mask_key(key)]
+
+    # The theme POST: a redirect to / whose headers, cookies and body hold no secret, with
+    # a token typed into next and a key in the Referer (both ignored, R8).
+    response = admin.post(
+        "/theme/",
+        {"theme": "dark", "next": f"/?t={TOKEN}"},
+        HTTP_REFERER=f"http://testserver/locations/{location.pk}/setup/?key={key}",
+    )
+    assert response.status_code == 302
+    assert response["Location"] == "/"
+    assert response.cookies["theme"].value == "dark"
+    assert_no_secrets(
+        response.content.decode(), secrets, label="theme POST", headers=_header_lines(response)
+    )
+    # The built CSS and admin.js, as WhiteNoise serves them: no secret in the bytes.
+    for name in ("web/build/app.css", "web/admin.js"):
+        static = admin.get("/static/" + staticfiles_storage.stored_name(name))
+        assert static.status_code == 200, name
+        body = _body(static)
+        assert len(body) > 1000, name
+        assert_no_secrets(body, secrets, label=name, headers=_header_lines(static))
+    # Failure: the scan sees a secret in the bytes and in a header.
+    with pytest.raises(AssertionError):
+        assert_no_secrets(b"x" + key.encode(), secrets)
+    with pytest.raises(AssertionError):
+        assert_no_secrets("", secrets, headers=[f"Location: /?k={key}"])
+
+
+@pytest.mark.django_db
+def test_INV23_2_action_redirects_and_toasts(
+    admin: Client,
+    location_factory: Callable[..., Any],
+    fake_telegram: FakeTelegram,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock(HISTORY_NOW)
+    for view in (
+        LocationCreateView,
+        LocationDetailView,
+        LocationEditView,
+        LocationDeleteView,
+        SwitchView,
+        SendTestMessageView,
+        OutageRemoveView,
+        HistoryResetView,
+    ):
+        monkeypatch.setattr(view, "clock", clock)
+    office = location_factory(name="Office", bot_token=TOKEN)
+    _timeline(
+        office,
+        ("on", _at(8), _at(9)),
+        ("off", _at(9), _at(10)),
+        ("on", _at(10), _at(11)),
+        ("off", _at(11), _at(12)),
+        ("on", _at(12), None),
+    )
+    _live(office, "on", last_heartbeat_at=_at(15, 59), on_since=_at(12))
+    shop = location_factory(name="Shop", bot_token=TOKEN)
+    # Telegram's refusal carries the token in its description: the flash never shows it.
+    fake_telegram.fail(TOKEN, status=403, json_body=_error(403, f"Forbidden: bot {TOKEN} kicked"))
+    urls = _urls(office)
+    add = {
+        "name": "New site",
+        "period_s": "60",
+        "grace_s": "30",
+        "bot_token": TOKEN,
+        "chat_id": str(DEFAULT_CHAT_ID),
+        "language": "en",
+    }
+    actions = [
+        ("add", "/locations/new/", add),
+        ("test message", urls["test"], {}),
+        ("edit", urls["edit"], _form(office, name="Renamed")),
+        ("remove outage", _remove_url(office, _at(9)), {}),
+        ("reset", urls["reset"], {}),
+        ("maintenance", f"{urls['detail']}maintenance/", {"value": "on"}),
+        ("alerts", f"{urls['detail']}alerts/", {"value": "off"}),
+        ("router grace", f"{urls['detail']}router-grace/", {"value": "on"}),
+        ("delete", _urls(shop)["delete"], {}),
+        ("sign out", "/logout/", {}),
+    ]
+
+    for label, url, data in actions:
+        secrets = [*SECRETS, MASKED, MASKED_2, MASKED_3, *_all_keys()]
+        response = admin.post(url, data)
+        # A redirect with no secret in any header, cookie or its body.
+        assert response.status_code == 302, label
+        assert_no_secrets(
+            response.content.decode(), secrets, label=label, headers=_header_lines(response)
+        )
+        # The page it leads to shows exactly one toast, and no toast region holds a secret.
+        page = admin.get(response["Location"])
+        assert page.status_code == 200, label
+        assert len(messages(page)) == 1, label
+        for region in TOAST_REGIONS:
+            html = str(by_testid(parse(page), region))
+            assert_no_secrets(html, secrets, label=f"{label} {region}")
+            assert "•" not in html, label
+    assert len(fake_telegram.calls) == 1
+
+
+# The §9 rows (TEST-STRATEGY, INV-23 #2): the routes each scans and the tests that scan it
+
+STRATEGY = Path(settings.BASE_DIR) / "docs" / "phase-6" / "TEST-STRATEGY.md"
+MATRIX = ("test_render_matrix", "test_UI01_render_matrix")
+FRAGMENTS = ("test_fragments", "test_INV23_2_confirmations_have_no_secrets")
+TOKEN_PAGES = ("test_inv23_pages", "test_INV23_2_token_never_in_any_page")
+KEY_PAGES = ("test_inv23_pages", "test_INV23_2_key_only_in_reveal_and_regenerate")
+HISTORY_PAGES = (
+    "test_inv23_pages",
+    "test_INV23_2_history_pages_and_flashes_never_show_a_token_or_the_key",
+)
+CONFIRMATIONS = frozenset(
+    {"location-delete", "location-regenerate", "outage-remove", "location-reset"}
+)
+ACTIONS = frozenset(
+    {
+        "location-create",
+        "location-test-message",
+        "location-edit",
+        "outage-remove",
+        "location-reset",
+        "location-maintenance",
+        "location-alerts",
+        "location-router-grace",
+        "location-delete",
+        "logout",
+    }
+)
+type Proof = tuple[str, str]
+INV23_ROWS: dict[str, tuple[frozenset[str], tuple[Proof, ...]]] = {
+    "S1 sign-in, incl. wrong credentials and 429": (frozenset({"login"}), (MATRIX, TOKEN_PAGES)),
+    "S3 list (with sidebar and fleet tiles)": (frozenset({"location-list"}), (MATRIX, TOKEN_PAGES)),
+    "S4 add: GET, invalid POST with a typed token": (
+        frozenset({"location-create"}),
+        (MATRIX, ("test_locations", "test_R3_token_never_returned")),
+    ),
+    "S5 location page, every state and every flash": (
+        frozenset({"location-detail"}),
+        (MATRIX, HISTORY_PAGES, ("test_location_page", "test_location_page_shows_no_secret")),
+    ),
+    "S6 edit: GET, invalid POST (typed second token), after a valid save": (
+        frozenset({"location-edit"}),
+        (MATRIX, TOKEN_PAGES, ("test_edit", "test_edit_token_is_write_only")),
+    ),
+    "S7 delete: page and fragment": (frozenset({"location-delete"}), (MATRIX, FRAGMENTS)),
+    "S8 setup GET (masked)": (
+        frozenset({"location-setup"}),
+        (MATRIX, ("test_setup_page", "test_UI08_key_only_in_its_elements")),
+    ),
+    "S8 Reveal POST (`no-store`)": (
+        frozenset({"location-setup"}),
+        (MATRIX, KEY_PAGES, ("test_setup_page", "test_UI08_key_only_in_its_elements")),
+    ),
+    "S9 regenerate: page and fragment": (frozenset({"location-regenerate"}), (MATRIX, FRAGMENTS)),
+    "S9 Regenerate POST (`no-store`)": (frozenset({"location-regenerate"}), (MATRIX, KEY_PAGES)),
+    "S10 remove outage, S11 reset: pages, fragments, and every refusal redirect": (
+        frozenset({"outage-remove", "location-reset"}),
+        (
+            MATRIX,
+            FRAGMENTS,
+            ("test_history_confirm", "test_removal_pages_show_no_secret"),
+            ("test_history_confirm", "test_reset_pages_show_no_secret"),
+        ),
+    ),
+    "Every action's redirect and the following page's toasts (switches, test message incl. "
+    "Telegram errors carrying the token, edit, delete, remove, reset)": (
+        ACTIONS,
+        (("test_inv23_pages", "test_INV23_2_action_redirects_and_toasts"), TOKEN_PAGES),
+    ),
+    "E1 404, E2 403 CSRF, E3 500": (frozenset(), (MATRIX,)),
+    "Status JSON": (
+        frozenset({"location-status-json"}),
+        (("test_status_json", "test_INV23_2_status_json_has_no_secrets"),),
+    ),
+    "Chart PNG (bytes and PNG text chunks)": (
+        frozenset({"location-chart"}),
+        (("test_chart_preview", "test_INV23_2_chart_png_has_no_secrets"),),
+    ),
+    "Modal fragments (all four, both outcomes)": (CONFIRMATIONS, (FRAGMENTS,)),
+    "Theme POST response (redirect)": (
+        frozenset({"theme"}),
+        (("test_inv23_pages", "test_INV23_2_theme_post_and_static_assets"),),
+    ),
+    "Sidebar (on every app page)": (
+        frozenset(),
+        (
+            ("test_inv23_pages", "test_INV23_2_sidebar_on_every_app_page"),
+            ("test_shell", "test_UI05_live_slots_hold_no_secret"),
+        ),
+    ),
+    "Static assets (built CSS, `admin.js`)": (
+        frozenset(),
+        (("test_inv23_pages", "test_INV23_2_theme_post_and_static_assets"),),
+    ),
+}
+# The named routes whose responses the INV-23 matrix scans (tests/web/test_routes_coverage.py).
+INV23_ROUTES = frozenset().union(*(routes for routes, _proofs in INV23_ROWS.values()))
+
+
+def strategy_rows(document: str) -> list[str]:
+    """The first cell of each body row of the §9 table, its bold markers dropped."""
+    section = document.split("## 9.", 1)[1].split("\n## ", 1)[0]
+    rows = [line for line in section.splitlines() if line.startswith("|")]
+    return [row.split("|")[1].strip().replace("**", "") for row in rows[2:]]
+
+
+def inv23_gaps(
+    rows: Mapping[str, tuple[frozenset[str], tuple[Proof, ...]]], doc: list[str]
+) -> list[str]:
+    """Where the mapping and the §9 table disagree, and each proof that does not exist."""
+    return []
+
+
+def test_INV23_2_matrix_is_complete() -> None:
+    doc = strategy_rows(STRATEGY.read_text(encoding="utf-8"))
+
+    # Expected: every §9 row maps to the tests that prove it, and each one exists.
+    assert len(doc) == 19
+    assert inv23_gaps(INV23_ROWS, doc) == []
+    assert {"location-status-json", "location-chart", "theme", "logout"} <= INV23_ROUTES
+    # Failure: a §9 row with no mapping, a mapped row the table lacks, a missing test.
+    broken = dict(INV23_ROWS)
+    del broken["Status JSON"]
+    broken["Status XML"] = (frozenset(), (("test_inv23_pages", "test_no_such_function"),))
+    assert inv23_gaps(broken, doc) == [
+        "row 'Status JSON' has no proof",
+        "row 'Status XML' is not in the §9 table",
+        "row 'Status XML': test_inv23_pages.test_no_such_function does not exist",
+    ]
+    # Edge: a row with no proof at all is a gap, and so is a module that does not exist.
+    empty = {**INV23_ROWS, "Status JSON": (frozenset(), ())}
+    assert inv23_gaps(empty, doc) == ["row 'Status JSON' has no proof"]
+    ghost = {**INV23_ROWS, "Status JSON": (frozenset(), (("test_ghost", "test_x"),))}
+    assert inv23_gaps(ghost, doc) == ["row 'Status JSON': test_ghost.test_x does not exist"]

@@ -10,9 +10,10 @@
 - Matrix completeness: every named admin route is rendered by the render matrix
   (``test_render_matrix.MATRIX_ROUTES``) or is in the explicit POST-only list, whose
   routes answer a signed-in GET with 405; the status JSON and the chart PNG are the two
-  admin surfaces that are not HTML pages. The device endpoint and the health check are not
-  admin routes. A new route on none of these lists, and a listed name that is no route,
-  fail here.
+  admin surfaces that are not HTML pages. Every admin route is also in the INV-23
+  secret-scan matrix (``test_inv23_pages.INV23_ROUTES``, from its TEST-STRATEGY §9 rows).
+  The device endpoint and the health check are not admin routes. A new route missing from
+  either matrix, and a listed name that is no route, fail here.
 """
 
 from collections.abc import Callable, Iterable
@@ -23,6 +24,7 @@ import pytest
 from django.contrib.auth import get_user_model
 from django.test import Client
 from django.urls import URLPattern, URLResolver, get_resolver, reverse
+from test_inv23_pages import INV23_ROUTES
 from test_render_matrix import MATRIX_ROUTES
 
 from powermon.alerts import ops
@@ -111,8 +113,11 @@ def test_R14_every_named_route_is_login_required(
     assert not EXEMPT & set(checked)
 
 
-def matrix_gaps(names: set[str], rendered: Iterable[str], post_only: Iterable[str]) -> list[str]:
-    """What keeps the route table and the matrix lists apart (TEST-STRATEGY §5.6)."""
+def matrix_gaps(
+    names: set[str], rendered: Iterable[str], post_only: Iterable[str], scanned: Iterable[str]
+) -> list[str]:
+    """What keeps the route table and the matrix lists apart (TEST-STRATEGY §5.6): the
+    render matrix or the POST-only list, and the INV-23 matrix (``scanned``)."""
     rendered, post_only = set(rendered), set(post_only)
     listed = rendered | post_only | NOT_HTML | NOT_ADMIN
     gaps = [
@@ -126,18 +131,24 @@ def matrix_gaps(names: set[str], rendered: Iterable[str], post_only: Iterable[st
 def test_R14_matrix_completeness() -> None:
     names = {str(pattern.name) for pattern in _named_routes()}
 
-    # Expected: every named admin route is rendered by the matrix or is POST-only.
-    assert matrix_gaps(names, MATRIX_ROUTES, POST_ONLY) == []
+    # Expected: every named admin route is rendered by the matrix or is POST-only, and is
+    # in the INV-23 secret-scan matrix.
+    assert matrix_gaps(names, MATRIX_ROUTES, POST_ONLY, INV23_ROUTES) == []
     assert NOT_ADMIN | {"login", "logout"} == EXEMPT
-    # Failure: a new route that no list names fails the check.
-    assert matrix_gaps(names | {"location-export"}, MATRIX_ROUTES, POST_ONLY) == [
-        "location-export: neither rendered by the matrix nor POST-only"
+    # Failure: a new route that no list names fails both checks.
+    assert matrix_gaps(names | {"location-export"}, MATRIX_ROUTES, POST_ONLY, INV23_ROUTES) == [
+        "location-export: neither rendered by the matrix nor POST-only",
+        "location-export: not in the INV-23 matrix",
+    ]
+    # Failure: a rendered route the INV-23 matrix forgot fails.
+    assert matrix_gaps(names, MATRIX_ROUTES, POST_ONLY, INV23_ROUTES - {"theme"}) == [
+        "theme: not in the INV-23 matrix"
     ]
     # Edge: a listed name that is no route fails too, and so does a route on two lists.
-    assert matrix_gaps(names - {"theme"}, MATRIX_ROUTES, POST_ONLY) == [
+    assert matrix_gaps(names - {"theme"}, MATRIX_ROUTES, POST_ONLY, INV23_ROUTES) == [
         "theme: listed but not a route"
     ]
-    assert matrix_gaps(names, MATRIX_ROUTES | {"theme"}, POST_ONLY) == [
+    assert matrix_gaps(names, MATRIX_ROUTES | {"theme"}, POST_ONLY, INV23_ROUTES) == [
         "theme: both rendered and POST-only"
     ]
 
