@@ -1,10 +1,7 @@
-{% extends "base.html" %}
-{% comment %}Fixed copy only: never print the requested path or any request data.{% endcomment %}
+{% extends "layouts/error.html" %}
+{% comment %}E1, copy row e404. Fixed copy only: never print the requested path or any request data (R11).{% endcomment %}
 {% block title %}Page not found{% endblock %}
-{% block header %}<header class="site-header"><span class="wordmark">Power Monitor</span></header>{% endblock %}
-{% block main_class %} main--single{% endblock %}
-{% block content %}
-<h1>Page not found</h1>
-<p>This page does not exist. Check the address, or go back to the location list.</p>
-<p><a href="/">Back to locations</a></p>
-{% endblock %}
+{% block code %}404{% endblock %}
+{% block code_label %}404{% endblock %}
+{% block heading %}Page not found{% endblock %}
+{% block body %}This page does not exist. Check the address, or go back to the location list.{% endblock %}

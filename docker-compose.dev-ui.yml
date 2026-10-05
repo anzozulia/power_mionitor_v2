@@ -1,0 +1,42 @@
+# Local-only admin UI dev loop (UI-13). Never used in production. Usage:
+#   docker compose -f docker-compose.local.yml -f docker-compose.dev-ui.yml up -d --build
+# - css: the Dockerfile's css stage (pinned Tailwind binary) rebuilds
+#   powermon/web/static/web/build/app.css (gitignored) whenever a template, admin.js or the
+#   entry changes. --watch=always keeps watching with stdin closed, as in a container.
+# - web: runserver with DEBUG=1 instead of gunicorn, so template edits show up at once and
+#   WhiteNoise serves the rebuilt file unhashed. Still published on 127.0.0.1:8000 only (the
+#   local file's binding). Django's DEBUG error pages echo POST data and use inline script,
+#   so the UAT console checks run without this override (DEBUG off).
+# Mount ./powermon only, never .:/app, which would hide the image's /app/.venv.
+
+# YAML anchors do not cross files, so the json-file caps of docker-compose.local.yml are
+# repeated here.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  css:
+    build:
+      context: .
+      target: css
+    command:
+      - tailwindcss
+      - -i
+      - powermon/web/assets/css/app.css
+      - -o
+      - powermon/web/static/web/build/app.css
+      - --watch=always
+    volumes:
+      - ./powermon:/app/powermon
+    logging: *logging
+
+  web:
+    command: ["python", "manage.py", "runserver", "0.0.0.0:8000"]
+    environment:
+      DEBUG: "1"
+    volumes:
+      - ./powermon:/app/powermon
+    logging: *logging

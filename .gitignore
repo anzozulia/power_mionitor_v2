@@ -6,3 +6,4 @@ docker_data/
 staticfiles/
 __pycache__/
 .coverage*
+powermon/web/static/web/build/

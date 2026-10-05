@@ -1,16 +1,18 @@
-"""Content-Security-Policy on every response (UI-SPEC, Security-Bound UI Rules, rule 5).
+"""Content-Security-Policy on every response (06-UI-SPEC security-bound rule R5, brief §8).
 
-Admin pages load one same-origin stylesheet and no scripts, so the policy turns
-"no third-party runtime assets on pages that show secrets" (v1-lessons section 4) into
-a checked guarantee. Only the exact heartbeat path is exempt: it answers devices, not
-browsers.
+The Phase 6 admin loads only same-origin assets: its own scripts (admin.js and the vendored
+CSP build of Alpine), the one built stylesheet, the self-hosted fonts and same-origin images
+(plus data: images, which the forms plugin's select chevron uses). Live updates fetch only
+same-origin URLs. No inline script or style, no eval, no third-party host: the policy turns
+"no third-party runtime assets on pages that show secrets" (v1-lessons section 4) into a
+checked guarantee. Only the exact heartbeat path is exempt: it answers devices, not browsers.
 """
 
 from collections.abc import Callable
 
 from django.http import HttpRequest, HttpResponseBase
 
-CSP = "default-src 'none'; style-src 'self'; img-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"  # noqa: E501
+CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"  # noqa: E501
 HEARTBEAT_PATH = "/hb"
 
 
