@@ -3,7 +3,8 @@
  * without defer. Its first statement applies the stored sidebar rail flag to <html> before
  * first paint. The rest of its top level only registers listeners and touches nothing on the
  * page: alpine:init (the Alpine.data components, bound by x-data in the templates), the
- * delegated submit guard on document and the pageshow reset.
+ * delegated submit guard on document and the one pageshow listener (the guard's reset, then
+ * the handlers components register with onPageshow).
  *
  * Rules (06-UI-SPEC Interaction Contract, R1, R4): every DOM write sets an attribute or
  * textContent; server values come only from data-* attributes; no browser storage beyond the
@@ -183,6 +184,116 @@
 
   // The theme choices; the server allowlist is context_processors.THEMES.
   var THEMES = ["light", "dark", "system"];
+
+  // Live updates (UI-05): the status JSON's vocabulary. Only these values are ever written
+  // into data-status and data-delivery; texts go through textContent.
+  var STATUS_KEYS = ["on", "off", "maintenance", "waiting"];
+  var DELIVERY_STATES = ["ok", "failing"];
+  var NEVER = "Never";
+  // The sidebar cell kind per status (data-cell).
+  var CELL_KINDS = { on: "age", off: "off", maintenance: "mnt", waiting: "wait" };
+
+  // The value of an object's own property, never one inherited from its prototype.
+  function own(object, key) {
+    return object && Object.prototype.hasOwnProperty.call(object, key) ? object[key] : undefined;
+  }
+
+  // A URL from the page (a data-* value or a link's href) that stays on this origin.
+  function sameOrigin(url) {
+    try {
+      return new URL(url, window.location.href).origin === window.location.origin;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  // Shows the [data-delivery-variant] children of a live element that match the delivery
+  // state (ok or failing) and hides the others: the delivery cell's OK text and failing
+  // pill, the sidebar row's failing marks.
+  function showDeliveryVariant(container, state) {
+    container.querySelectorAll("[data-delivery-variant]").forEach(function (variant) {
+      variant.hidden = variant.getAttribute("data-delivery-variant") !== state;
+    });
+  }
+
+  // The innermost element of a time wrapper whose whole text is "Never" (no <time>).
+  function neverHolder(wrapper) {
+    if (wrapper.children.length === 0 && wrapper.textContent.trim() === NEVER) {
+      return wrapper;
+    }
+    var elements = wrapper.querySelectorAll("*");
+    for (var index = elements.length - 1; index >= 0; index -= 1) {
+      var element = elements[index];
+      if (element.children.length === 0 && element.textContent.trim() === NEVER) {
+        return element;
+      }
+    }
+    return null;
+  }
+
+  // Writes one instant of the status JSON ({iso, display, compact}, or null) into a time
+  // wrapper rendered by partials/_time.html: the <time datetime>, its display parts (full,
+  // or compact plus the tail) and the [data-relative] sibling. A wrapper rendered as
+  // "Never" gets the display text in place of that word. Returns false when the wrapper
+  // cannot show the value in place (the caller then offers a reload).
+  function fillInstant(wrapper, instant) {
+    var time = wrapper.querySelector("time");
+    if (!instant) {
+      if (time) {
+        return false;
+      }
+      var filled = wrapper.querySelector("[data-instant-text]");
+      if (filled) {
+        filled.textContent = NEVER;
+      }
+      return true;
+    }
+    if (typeof instant.iso !== "string" || typeof instant.display !== "string") {
+      return false;
+    }
+    if (!time) {
+      var holder = wrapper.querySelector("[data-instant-text]") || neverHolder(wrapper);
+      if (!holder) {
+        return false;
+      }
+      holder.setAttribute("data-instant-text", "");
+      holder.textContent = instant.display;
+      return true;
+    }
+    var compact = typeof instant.compact === "string" ? instant.compact : "";
+    var display = instant.display;
+    time.setAttribute("datetime", instant.iso);
+    var parts = wrapper.querySelectorAll("[data-part]");
+    if (parts.length === 0) {
+      time.textContent = display;
+    }
+    parts.forEach(function (part) {
+      var name = part.getAttribute("data-part");
+      if (name === "full") {
+        part.textContent = display;
+      } else if (name === "compact") {
+        part.textContent = compact;
+      } else if (name === "tail") {
+        part.textContent = display.indexOf(compact) === 0 ? display.slice(compact.length) : "";
+      }
+    });
+    var age = isoAge(instant.iso, serverNow());
+    wrapper.querySelectorAll("[data-relative]").forEach(function (element) {
+      element.setAttribute("data-relative", instant.iso);
+      if (age) {
+        element.textContent = relativeText(age);
+      }
+    });
+    return true;
+  }
+
+  // Handlers components register for the page being shown again: the one window pageshow
+  // listener at the end of this file runs them after the submit guard's reset.
+  var pageshowHandlers = [];
+
+  function onPageshow(handler) {
+    pageshowHandlers.push(handler);
+  }
 
   document.addEventListener("alpine:init", function () {
     // toasts (UI-09, UI-12): bound by x-data="toasts" on each toast region
@@ -517,6 +628,602 @@
         },
       };
     });
+
+    // poll (UI-05): bound by x-data="poll" on main#main of the Locations list, the location
+    // page and the setup page, with data-poll-url (the status JSON), data-poll-page (list,
+    // detail or setup) and data-reload-url (the page's own URL). While the tab is visible it
+    // GETs the status JSON every 30 s without following redirects, and at once when the tab
+    // becomes visible again. After a failure (network, not 200, not the JSON) it waits 60,
+    // 120, 240, then 300 s; after 3 failures in a row the LIVE indicator reads Paused and
+    // the "Live updates paused" chip shows. An opaque redirect (the session has ended) stops
+    // polling and shows the "Live updates paused" chip with the reload link; the sign-in page is
+    // never read. A success writes attributes and text of the live elements only (unknown
+    // ids are ignored), shows the "Status changed" reload chip when the page can no longer
+    // match the data (list: another set of locations; location page: another status or
+    // delivery state; any page: its location gone or a time it cannot show in place), and
+    // dispatches pm:status on window.
+    window.Alpine.data("poll", function () {
+      var POLL_INTERVAL_MS = 30000;
+      var POLL_BACKOFF_MS = [60000, 120000, 240000, 300000];
+      var POLL_PAUSE_AFTER = 3;
+      var POLL_TIMEOUT_MS = 15000;
+      var main = null;
+      var page = "";
+      var timer = null;
+      var busy = false;
+      var stopped = false;
+      var failures = 0;
+      var changed = false;
+      // Per location id, the status and delivery state the page was rendered with.
+      var rendered = {};
+
+      function snapshot() {
+        main.querySelectorAll("[data-location-id]").forEach(function (element) {
+          var id = element.getAttribute("data-location-id");
+          var entry = own(rendered, id) || (rendered[id] = {});
+          if (entry.status === undefined && element.hasAttribute("data-status")) {
+            entry.status = element.getAttribute("data-status");
+          }
+          if (entry.delivery === undefined && element.hasAttribute("data-delivery")) {
+            entry.delivery = element.getAttribute("data-delivery");
+          }
+        });
+        // The location page's delivery row and banner carry data-delivery without an id.
+        var ids = Object.keys(rendered);
+        var delivery = main.querySelector("[data-delivery]");
+        if (ids.length === 1 && rendered[ids[0]].delivery === undefined && delivery) {
+          rendered[ids[0]].delivery = delivery.getAttribute("data-delivery");
+        }
+      }
+
+      function showState() {
+        var paused = stopped || failures >= POLL_PAUSE_AFTER;
+        document.querySelectorAll('[data-testid="live-status"]').forEach(function (indicator) {
+          indicator.setAttribute("data-live-state", paused ? "paused" : "live");
+          var label = indicator.querySelector("[data-label]");
+          if (label) {
+            label.textContent = paused ? "Paused" : "Live";
+          }
+        });
+        var chip = "updated";
+        if (stopped) {
+          chip = "paused-reload";
+        } else if (failures >= POLL_PAUSE_AFTER) {
+          chip = "paused";
+        } else if (changed) {
+          chip = "changed";
+        }
+        document.querySelectorAll('[data-testid="live-chip"] [data-chip]').forEach(function (element) {
+          element.hidden = element.getAttribute("data-chip") !== chip;
+        });
+      }
+
+      function schedule(delay) {
+        window.clearTimeout(timer);
+        timer = null;
+        if (!stopped && document.visibilityState === "visible") {
+          timer = window.setTimeout(poll, delay);
+        }
+      }
+
+      function updateLocation(element, entry) {
+        var kind = element.getAttribute("data-live");
+        var status = entry.status;
+        if (kind === "status") {
+          element.setAttribute("data-status", status);
+          var label = element.querySelector("[data-label]");
+          if (label && typeof entry.label === "string") {
+            label.textContent = entry.label;
+          }
+        } else if (kind === "last-heartbeat") {
+          if (!fillInstant(element, entry.last_heartbeat)) {
+            changed = true;
+          }
+        } else if (kind === "since") {
+          var since = entry.since;
+          var sinceLabel = element.querySelector("[data-since-label]");
+          if (since && sinceLabel) {
+            sinceLabel.textContent = since.kind === "on" ? "On since" : "Outage since";
+          }
+          if (!fillInstant(element, since)) {
+            changed = true;
+          }
+        } else if (kind === "delivery") {
+          var state = entry.delivery.state;
+          element.setAttribute("data-delivery", state);
+          showDeliveryVariant(element, state);
+          var pill =
+            element.querySelector('[data-delivery-variant="failing"] [data-label]') ||
+            element.querySelector("[data-label]");
+          if (state === "failing" && pill && typeof entry.delivery.text === "string") {
+            pill.textContent = entry.delivery.text;
+          }
+        } else if (kind === "first-heartbeat") {
+          var received = status !== "waiting";
+          var waitingLine = element.querySelector('[data-fh="waiting"]');
+          var receivedLine = element.querySelector('[data-fh="received"]');
+          if (waitingLine) {
+            waitingLine.hidden = received;
+          }
+          if (receivedLine) {
+            receivedLine.hidden = !received;
+            var fillHere = !receivedLine.querySelector('[data-live="last-heartbeat"]');
+            if (received && fillHere && !fillInstant(receivedLine, entry.last_heartbeat)) {
+              changed = true;
+            }
+          }
+        }
+      }
+
+      function updateSidebar(locations, now) {
+        document.querySelectorAll('a[data-testid="sidebar-location"][data-location-id]').forEach(function (link) {
+          var entry = own(locations, link.getAttribute("data-location-id"));
+          if (!entry) {
+            return;
+          }
+          var status = entry.status;
+          link.setAttribute("data-status", status);
+          link.setAttribute("data-delivery", entry.delivery.state);
+          showDeliveryVariant(link, entry.delivery.state);
+          var cell = link.querySelector('[data-live="sidebar-cell"]');
+          if (cell) {
+            var since = "";
+            if (status === "on" && entry.last_heartbeat) {
+              since = entry.last_heartbeat.iso;
+            } else if (status === "off" && entry.since && entry.since.kind === "outage") {
+              since = entry.since.iso;
+            }
+            cell.setAttribute("data-cell", CELL_KINDS[status]);
+            cell.setAttribute("data-since", typeof since === "string" ? since : "");
+          }
+          renderSidebarRow(link, now);
+        });
+      }
+
+      function updateCounts(counts, total) {
+        var number = function (value) {
+          return typeof value === "number" && value >= 0 ? value : null;
+        };
+        var on = number(counts.on);
+        var off = number(counts.off);
+        var failing = number(counts.failing);
+        if (on !== null && off !== null && failing !== null) {
+          var dot = " \u00b7 ";
+          document.querySelectorAll('[data-live="summary"]').forEach(function (element) {
+            element.textContent = on + " on" + dot + off + " off" + (failing > 0 ? dot + failing + " fail" : "");
+          });
+          document.querySelectorAll('[data-live="summary-sr"]').forEach(function (element) {
+            element.textContent =
+              on + " on, " + off + " off" + (failing > 0 ? ", " + failing + " with delivery failing" : "");
+          });
+        }
+        main.querySelectorAll('[data-live="count"]').forEach(function (element) {
+          element.textContent = total === 1 ? "1 location" : total + " locations";
+        });
+        var setCount = function (element, value) {
+          if (value === null) {
+            return;
+          }
+          element.setAttribute("data-count", String(value));
+          var shown = element.querySelector('[data-testid="fleet-count"]');
+          if (shown) {
+            shown.textContent = String(value);
+          }
+        };
+        main.querySelectorAll('[data-testid="fleet-tile"][data-metric]').forEach(function (tile) {
+          setCount(tile, number(own(counts, tile.getAttribute("data-metric"))));
+        });
+        main.querySelectorAll('[data-testid="fleet-total"]').forEach(function (cell) {
+          setCount(cell, total);
+        });
+        main.querySelectorAll('[data-testid="fleet-bar"] [data-count]').forEach(function (segment) {
+          var key = segment.getAttribute("data-status") || segment.getAttribute("data-metric");
+          var value = number(own(counts, key));
+          if (value !== null) {
+            segment.setAttribute("data-count", String(value));
+          }
+        });
+      }
+
+      function apply(payload) {
+        var locations = payload.locations;
+        // Only entries in the payload's vocabulary are used; any other is an unknown id.
+        var valid = {};
+        Object.keys(locations).forEach(function (id) {
+          var entry = locations[id];
+          if (
+            entry &&
+            STATUS_KEYS.indexOf(entry.status) >= 0 &&
+            entry.delivery &&
+            DELIVERY_STATES.indexOf(entry.delivery.state) >= 0
+          ) {
+            valid[id] = entry;
+          }
+        });
+        var ids = Object.keys(locations);
+        var renderedIds = Object.keys(rendered);
+        if (page === "list") {
+          if (
+            ids.length !== renderedIds.length ||
+            renderedIds.some(function (id) {
+              return own(locations, id) === undefined;
+            })
+          ) {
+            changed = true;
+          }
+        }
+        renderedIds.forEach(function (id) {
+          var entry = own(valid, id);
+          var before = rendered[id];
+          if (!entry) {
+            changed = true;
+          } else if (
+            page === "detail" &&
+            (entry.status !== before.status ||
+              (before.delivery !== undefined && entry.delivery.state !== before.delivery))
+          ) {
+            changed = true;
+          }
+        });
+        var now = serverNow();
+        document.querySelectorAll("[data-live][data-location-id]").forEach(function (element) {
+          var entry = own(valid, element.getAttribute("data-location-id"));
+          if (entry && element.getAttribute("data-live").indexOf("sidebar") !== 0) {
+            updateLocation(element, entry);
+          }
+        });
+        // The list's rows and phone cards carry the state the filter and the tone bars use.
+        main
+          .querySelectorAll('tr[data-testid="location-row"], a[data-testid="location-card"]')
+          .forEach(function (element) {
+            var entry = own(valid, element.getAttribute("data-location-id"));
+            var holder = element.matches("tr") ? element : element.closest("li[data-status]");
+            if (entry && holder) {
+              holder.setAttribute("data-status", entry.status);
+              holder.setAttribute("data-delivery", entry.delivery.state);
+            }
+          });
+        updateSidebar(valid, now);
+        updateCounts(payload.counts, ids.length);
+      }
+
+      function succeeded(payload) {
+        failures = 0;
+        syncClock(payload.generated_at);
+        schedule(POLL_INTERVAL_MS);
+        apply(payload);
+        showState();
+        window.dispatchEvent(
+          new CustomEvent("pm:status", { detail: { generatedAt: payload.generated_at, page: page } })
+        );
+      }
+
+      function failed() {
+        failures += 1;
+        schedule(POLL_BACKOFF_MS[Math.min(failures, POLL_BACKOFF_MS.length) - 1]);
+        showState();
+      }
+
+      function ended() {
+        stopped = true;
+        schedule(0);
+        showState();
+      }
+
+      function poll() {
+        timer = null;
+        if (stopped || busy || document.visibilityState !== "visible") {
+          return;
+        }
+        busy = true;
+        var controller = typeof AbortController === "function" ? new AbortController() : null;
+        var timeout = controller
+          ? window.setTimeout(function () {
+              controller.abort();
+            }, POLL_TIMEOUT_MS)
+          : null;
+        var finish = function () {
+          busy = false;
+          window.clearTimeout(timeout);
+        };
+        fetch(main.dataset.pollUrl, {
+          redirect: "manual",
+          cache: "no-store",
+          signal: controller ? controller.signal : undefined,
+        })
+          .then(function (response) {
+            if (response.type === "opaqueredirect") {
+              return null;
+            }
+            if (response.status !== 200) {
+              throw new Error("status " + response.status);
+            }
+            return response.json();
+          })
+          .then(
+            function (payload) {
+              finish();
+              if (payload === null) {
+                ended();
+              } else if (
+                payload &&
+                typeof payload.locations === "object" &&
+                payload.locations !== null &&
+                typeof payload.counts === "object" &&
+                payload.counts !== null
+              ) {
+                succeeded(payload);
+              } else {
+                failed();
+              }
+            },
+            function () {
+              finish();
+              failed();
+            }
+          );
+      }
+
+      return {
+        init: function () {
+          main = this.$el;
+          page = main.dataset.pollPage || "";
+          if (!main.dataset.pollUrl || !sameOrigin(main.dataset.pollUrl)) {
+            return;
+          }
+          snapshot();
+          var reloadUrl = main.dataset.reloadUrl;
+          document.querySelectorAll('[data-testid="live-status"], [data-testid="live-chip"]').forEach(reveal);
+          if (reloadUrl && sameOrigin(reloadUrl)) {
+            document
+              .querySelectorAll('[data-testid="live-chip"] [data-chip="paused-reload"], [data-testid="live-chip"] [data-chip="changed"]')
+              .forEach(function (chip) {
+                var link = chip.matches("a") ? chip : chip.querySelector("a");
+                if (link) {
+                  link.setAttribute("href", reloadUrl);
+                }
+              });
+          }
+          // Step 5 of the setup page: the waiting line is JS only (it promises an update).
+          document.querySelectorAll('[data-live="first-heartbeat"]').forEach(function (step) {
+            var receivedLine = step.querySelector('[data-fh="received"]');
+            if (!receivedLine || receivedLine.hidden) {
+              reveal(step.querySelector('[data-fh="waiting"]'));
+            }
+          });
+          showState();
+          document.addEventListener("visibilitychange", function () {
+            if (document.visibilityState === "visible") {
+              window.clearTimeout(timer);
+              poll();
+            } else {
+              window.clearTimeout(timer);
+              timer = null;
+            }
+          });
+          schedule(POLL_INTERVAL_MS);
+        },
+      };
+    });
+
+    // copy (UI-08): bound by x-data="copy" on each copy button, whose data-copy-target names
+    // the element to copy and data-copied-msg the fixed message to announce. The button is
+    // revealed only where the clipboard API exists. A click (and only a click) copies the
+    // target's exact text, switches the visible label to "Copied" for 2 s (data-copied
+    // shows the check) and announces the message in the page's polite [data-copy-status]
+    // region; a rejected write keeps "Copy" and announces how to copy by hand. The value is
+    // never kept in an attribute, and the clipboard is never read.
+    window.Alpine.data("copy", function () {
+      var COPIED_MS = 2000;
+      var FAILED = "Copy failed. Select the text and copy it by hand.";
+
+      function announce(text) {
+        var region = document.querySelector("[data-copy-status]");
+        if (!region) {
+          return;
+        }
+        // Cleared first, so the same message twice in a row is announced twice.
+        region.textContent = "";
+        window.setTimeout(function () {
+          region.textContent = text;
+        }, 50);
+      }
+
+      return {
+        init: function () {
+          var button = this.$el;
+          var target = document.getElementById(button.getAttribute("data-copy-target") || "");
+          if (!target || !navigator.clipboard) {
+            return;
+          }
+          var label = labelNode(button);
+          var idle = label ? label.textContent : "";
+          var timer = null;
+          var reset = function () {
+            window.clearTimeout(timer);
+            if (label) {
+              label.textContent = idle;
+            }
+            button.removeAttribute("data-copied");
+          };
+          reveal(button);
+          button.addEventListener("click", function () {
+            navigator.clipboard.writeText(target.textContent).then(
+              function () {
+                reset();
+                if (label) {
+                  label.textContent = "Copied";
+                }
+                button.setAttribute("data-copied", "");
+                timer = window.setTimeout(reset, COPIED_MS);
+                announce(button.getAttribute("data-copied-msg") || "Copied");
+              },
+              function () {
+                reset();
+                announce(FAILED);
+              }
+            );
+          });
+        },
+      };
+    });
+
+    // tabs (UI-12): bound by x-data="tabs" on the setup page's examples step. It reveals the
+    // tablist, shows the selected panel only (hidden on the others), and moves the selection
+    // with a click or with Left, Right, Home and End on the focused tab (roving tabindex).
+    // Without it the four panels stay stacked under their captions.
+    window.Alpine.data("tabs", function () {
+      return {
+        init: function () {
+          var list = this.$el.querySelector('[role="tablist"][data-testid="example-tabs"]');
+          if (!list) {
+            return;
+          }
+          var tabs = Array.prototype.slice.call(list.querySelectorAll('[role="tab"]'));
+          var panels = tabs.map(function (tab) {
+            return document.getElementById(tab.getAttribute("aria-controls") || "");
+          });
+          if (tabs.length === 0 || panels.indexOf(null) >= 0) {
+            return;
+          }
+          var current = 0;
+          tabs.forEach(function (tab, index) {
+            if (tab.getAttribute("aria-selected") === "true") {
+              current = index;
+            }
+          });
+          var select = function (index, focus) {
+            current = index;
+            tabs.forEach(function (tab, position) {
+              var selected = position === index;
+              tab.setAttribute("aria-selected", selected ? "true" : "false");
+              tab.setAttribute("tabindex", selected ? "0" : "-1");
+              panels[position].hidden = !selected;
+            });
+            if (focus) {
+              tabs[index].focus();
+            }
+          };
+          tabs.forEach(function (tab, index) {
+            tab.addEventListener("click", function () {
+              select(index, false);
+            });
+          });
+          list.addEventListener("keydown", function (event) {
+            var next = null;
+            if (event.key === "ArrowRight") {
+              next = (current + 1) % tabs.length;
+            } else if (event.key === "ArrowLeft") {
+              next = (current - 1 + tabs.length) % tabs.length;
+            } else if (event.key === "Home") {
+              next = 0;
+            } else if (event.key === "End") {
+              next = tabs.length - 1;
+            }
+            if (next !== null) {
+              event.preventDefault();
+              select(next, true);
+            }
+          });
+          select(current, false);
+          reveal(list);
+        },
+      };
+    });
+
+    // revealGuard (R4): bound by x-data="revealGuard" on the revealed key region of the
+    // setup page, whose data-masked-url is the setup URL (no key in it). When the page is
+    // hidden (pagehide) it empties the key and the four examples, so a back/forward cache
+    // copy holds no key; when such a copy is shown again (pageshow with persisted) it
+    // replaces it with the masked setup page.
+    window.Alpine.data("revealGuard", function () {
+      var REVEALED_IDS = ["device-key", "example-curl", "example-cron", "example-wget-gnu", "example-wget-busybox"];
+      return {
+        init: function () {
+          var maskedUrl = this.$el.dataset.maskedUrl;
+          window.addEventListener("pagehide", function () {
+            REVEALED_IDS.forEach(function (id) {
+              var element = document.getElementById(id);
+              if (element) {
+                element.textContent = "";
+              }
+            });
+          });
+          onPageshow(function (event) {
+            if (event.persisted && maskedUrl && sameOrigin(maskedUrl)) {
+              window.location.replace(maskedUrl);
+            }
+          });
+        },
+      };
+    });
+
+    // chartImage (UI-06): bound by x-data="chartImage" on the weekly chart figure. When the
+    // image fails to load it reveals the [data-testid="weekly-chart-error"] warning and hides
+    // the links to the image (around it and the card's "Open full size").
+    window.Alpine.data("chartImage", function () {
+      return {
+        init: function () {
+          var figure = this.$el;
+          var card = figure.closest("section");
+          var image = figure.querySelector("img");
+          var warning =
+            figure.querySelector('[data-testid="weekly-chart-error"]') ||
+            (card ? card.querySelector('[data-testid="weekly-chart-error"]') : null);
+          if (!image || !warning) {
+            return;
+          }
+          var failed = function () {
+            reveal(warning);
+            var link = image.closest("a");
+            if (link && figure.contains(link)) {
+              link.hidden = true;
+            }
+            var fullSize = card ? card.querySelector('[data-testid="chart-full-size"]') : null;
+            if (fullSize) {
+              fullSize.hidden = true;
+            }
+          };
+          image.addEventListener("error", failed);
+          // The image may have failed before Alpine started.
+          if (image.complete && image.naturalWidth === 0) {
+            failed();
+          }
+        },
+      };
+    });
+
+    // sectionNav (UI-12): bound by x-data="sectionNav" on the location page's section nav.
+    // A click on one of its in-page links scrolls to the card (smoothly only when reduced
+    // motion is not requested) and moves the focus to it (tabindex -1 when it has none).
+    window.Alpine.data("sectionNav", function () {
+      return {
+        init: function () {
+          var nav = this.$el;
+          var reduced = window.matchMedia("(prefers-reduced-motion: reduce)");
+          nav.addEventListener("click", function (event) {
+            var link = event.target instanceof Element ? event.target.closest('a[href^="#"]') : null;
+            if (!link || !nav.contains(link) || event.button !== 0) {
+              return;
+            }
+            if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+              return;
+            }
+            var id = link.getAttribute("href").slice(1);
+            var target = id ? document.getElementById(id) : null;
+            if (!target) {
+              return;
+            }
+            event.preventDefault();
+            if (!target.hasAttribute("tabindex")) {
+              target.setAttribute("tabindex", "-1");
+            }
+            target.scrollIntoView({ behavior: reduced.matches ? "auto" : "smooth", block: "start" });
+            target.focus({ preventScroll: true });
+          });
+        },
+      };
+    });
   });
 
   // The submit guard (UI-09): one delegated listener for every POST form. The first submit
@@ -566,7 +1273,7 @@
     }
   }
 
-  window.addEventListener("pageshow", function () {
+  window.addEventListener("pageshow", function (event) {
     pending.forEach(function (entry) {
       entry.form.removeAttribute("data-submitted");
       if (entry.button) {
@@ -578,5 +1285,8 @@
       }
     });
     pending = [];
+    pageshowHandlers.forEach(function (handler) {
+      handler(event);
+    });
   });
 })();
