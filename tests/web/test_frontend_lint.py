@@ -52,6 +52,8 @@ the real tree must pass:
   [data-power] and shows the changed chip on the location page when the JSON's power
   differs, and a power outside the engine's vocabulary makes an entry invalid (W5-A2); the
   poll writes the JSON's location total into the sidebar's [data-live="sidebar-count"].
+- admin.js wave-6 audit pins: S8 step 5 flips on the JSON's power, as the server's rule
+  does, never on its status (W6-A1).
 - CSS entries (powermon/web/assets/css/*.css): @import only "tailwindcss" or a ./ or ../ path;
   every url() relative or data: (comments skipped).
 - Python (powermon/web/**/*.py), read with the stdlib ast module: SafeString, SafeText,
@@ -2866,6 +2868,177 @@ def test_sidebar_count_follows_the_poll() -> None:
     assert re.search(rf"\b{CLASS}=\"[^\"]*\bnum\b", tag.group(0)) is not None
     # Failure: no poll at all.
     assert sidebar_count_violations("var x = 1;") == ["sidebar count never written"]
+
+
+# admin.js wave-6 audit pins (W6-A1 step 5)
+
+
+_FIRST_HEARTBEAT_BRANCH = re.compile(r"\bkind\s*===\s*\"first-heartbeat\"")
+_RECEIVED_FROM_POWER = re.compile(r"\breceived\s*=\s*entry\s*\.\s*power\s*!==\s*\"waiting\"")
+# Any read of a status in code: the local copy or entry.status.
+_STATUS_READ = re.compile(r"(?<![\w$])status\b")
+_LIVE_LOOP = re.compile(
+    r"\bquerySelectorAll\(\s*\"\[data-live\]\[data-location-id\]\"\s*\)\s*\.\s*forEach\s*\("
+)
+_ENTRY_FROM_VALID = re.compile(r"\bvar\s+entry\s*=\s*own\(\s*valid\s*,")
+# A call of updateLocation, not its declaration.
+_UPDATE_LOCATION_CALL = re.compile(r"(?<![\w$.])(?<!function )updateLocation\s*\(")
+# The server's rule (location_setup.html): the received line is hidden while power waits.
+SETUP_RECEIVED_RULE = 'data-fh="received"{% if status.power_key == "waiting" %} hidden{% endif %}'
+STEP5_STATUS = "step 5 does not follow the power state"
+STEP5_READS_STATUS = "step 5 reads the status"
+STEP5_UNVALIDATED = "step 5 gets unvalidated entries"
+STEP5_POWER_UNCHECKED = "power outside the vocabulary reaches step 5"
+
+
+def first_heartbeat_violations(source: str) -> list[str]:
+    """W6-A1: S8 step 5 follows the power state, as the server's rule does. The poll's
+    first-heartbeat branch sets received from the entry's power (every power but waiting)
+    and never reads the status, which stays "maintenance" while a location under
+    maintenance still waits for its first heartbeat. updateLocation gets only entries of
+    the validated set, whose power is one of POWER_KEYS."""
+    body = component_bodies(source).get("poll", "")
+    update = function_body(body, "updateLocation")
+    apply = function_body(body, "apply")
+    branches = if_blocks(update, _FIRST_HEARTBEAT_BRANCH)
+    if not branches:
+        return ["no first-heartbeat branch"]
+    start, end = branches[0]
+    branch = update[start : end + 1]
+    found = set()
+    if next(_code_matches(_RECEIVED_FROM_POWER, branch), None) is None:
+        found.add(STEP5_STATUS)
+    if next(_code_matches(_STATUS_READ, branch), None) is not None:
+        found.add(STEP5_READS_STATUS)
+    code = _mask_js(apply)
+    loops = []
+    for match in _code_matches(_LIVE_LOOP, apply):
+        each = code.index("forEach", match.start())
+        loops.append(apply[each : _closing(code, each) + 1])
+    calls = list(_code_matches(_UPDATE_LOCATION_CALL, body))
+    fed = [loop for loop in loops if next(_code_matches(_UPDATE_LOCATION_CALL, loop), None)]
+    if (
+        len(calls) != 1
+        or len(fed) != 1
+        or next(_code_matches(_ENTRY_FROM_VALID, fed[0]), None) is None
+    ):
+        found.add(STEP5_UNVALIDATED)
+    conditions = [apply[start:end] for start, end in if_conditions(apply)]
+    if not any(_POWER_VALID.search(condition) for condition in conditions):
+        found.add(STEP5_POWER_UNCHECKED)
+    return sorted(found)
+
+
+STEP5_RECEIVED = '      var received = entry.power !== "waiting";\n'
+GOOD_FIRST_HEARTBEAT = (
+    """Alpine.data("poll", function () {
+  function updateLocation(element, entry) {
+    var kind = element.getAttribute("data-live");
+    var status = entry.status;
+    if (kind === "status") {
+      element.setAttribute("data-status", status);
+    } else if (kind === "first-heartbeat") {
+"""
+    + STEP5_RECEIVED
+    + """      var waitingLine = element.querySelector('[data-fh="waiting"]');
+      if (waitingLine) {
+        waitingLine.hidden = received;
+      }
+    }
+  }
+  function apply(payload) {
+    Object.keys(locations).forEach(function (id) {
+      var entry = locations[id];
+      if (entry && POWER_KEYS.indexOf(entry.power) >= 0) {
+        valid[id] = entry;
+      }
+    });
+    document.querySelectorAll("[data-live][data-location-id]").forEach(function (element) {
+      var entry = own(valid, element.getAttribute("data-location-id"));
+      if (entry) {
+        updateLocation(element, entry);
+      }
+    });
+  }
+})
+"""
+)
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    [
+        pytest.param("", "", [], id="good"),
+        # Edge: the status rule left in a comment is not a read.
+        pytest.param(
+            STEP5_RECEIVED,
+            STEP5_RECEIVED + '      // var received = status !== "waiting";\n',
+            [],
+            id="comment",
+        ),
+        # Failure: the wave-6 shape (received from the status), entries that skipped the
+        # vocabulary filter, a second caller and an unchecked power.
+        pytest.param(
+            STEP5_RECEIVED,
+            '      var received = status !== "waiting";\n',
+            [STEP5_STATUS, STEP5_READS_STATUS],
+            id="status",
+        ),
+        pytest.param(
+            STEP5_RECEIVED,
+            '      var received = entry.status !== "waiting";\n',
+            [STEP5_STATUS, STEP5_READS_STATUS],
+            id="entry-status",
+        ),
+        pytest.param("own(valid,", "own(locations,", [STEP5_UNVALIDATED], id="unvalidated"),
+        pytest.param(
+            "  function apply(payload) {\n",
+            "  function apply(payload) {\n    updateLocation(element, locations[id]);\n",
+            [STEP5_UNVALIDATED],
+            id="second-caller",
+        ),
+        pytest.param(
+            " && POWER_KEYS.indexOf(entry.power) >= 0", "", [STEP5_POWER_UNCHECKED], id="unchecked"
+        ),
+    ],
+)
+def test_first_heartbeat_rule(old: str, new: str, expected: list[str]) -> None:
+    assert old in GOOD_FIRST_HEARTBEAT
+    assert first_heartbeat_violations(GOOD_FIRST_HEARTBEAT.replace(old, new)) == expected
+
+
+def test_W6A1_step5_follows_the_power_state() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+    setup = (TEMPLATES / "web" / "location_setup.html").read_text(encoding="utf-8")
+    row = LiveRow(
+        pk=7,
+        name="Office",
+        status="maintenance",
+        status_label="Maintenance",
+        last_heartbeat_at=None,
+        alerts_off=False,
+        router_grace=False,
+        delivery=None,
+        power="waiting",
+        on_since=None,
+        outage_started_at=None,
+        delivery_failing=False,
+    )
+
+    # Expected: the poll flips step 5 on the JSON's power, the same rule the server renders
+    # (the received line is hidden while the power state is waiting), so the first poll
+    # never contradicts the page it updates.
+    assert first_heartbeat_violations(source) == []
+    assert setup.count('data-fh="received"') == 1
+    assert SETUP_RECEIVED_RULE in setup
+    # Edge: maintenance switched on before the first heartbeat (D-02): the JSON's status is
+    # maintenance and its power still waiting, so step 5 keeps the waiting line.
+    assert (status_payload(row)["status"], status_payload(row)["power"]) == (
+        "maintenance",
+        "waiting",
+    )
+    # Failure: no poll at all.
+    assert first_heartbeat_violations("var x = 1;") == ["no first-heartbeat branch"]
 
 
 # CSS entries

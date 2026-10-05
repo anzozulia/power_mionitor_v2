@@ -247,6 +247,25 @@ def _rail(page: Any) -> Tag:
     return rail
 
 
+def _assert_setup_trail(page: Any, location: Any, name: str = "Office") -> None:
+    """S8's trail in the top bar and under the h1 (06-UI-SPEC S8), in every state: exactly
+    Locations › {name} › Device setup, and only the last item is the current page."""
+    expected = [
+        ("Locations", "/"),
+        (name, f"/locations/{location.pk}/"),
+        ("Device setup", None),
+    ]
+    for testid in ("breadcrumbs", "breadcrumbs-compact"):
+        assert breadcrumbs(page, testid) == expected, testid
+        items = by_testid(page, testid).select("ol > li")
+        current = [
+            index
+            for index, item in enumerate(items)
+            if item.get("aria-current") == "page" or item.select('[aria-current="page"]')
+        ]
+        assert current == [len(items) - 1], testid
+
+
 def _rail_title(page: Tag, rail: Tag) -> str:
     """The text of the element that names the rail card (its aria-labelledby)."""
     labelled = page.find(id=str(rail["aria-labelledby"]))
@@ -267,10 +286,7 @@ def test_UI01_setup_masked_page(
 
     assert "no-store" in response["Cache-Control"]
     soup = assert_page(response, app=True, title="Office · Device setup")
-    detail = f"/locations/{location.pk}/"
-    trail = [("Locations", "/"), ("Office", detail), ("Device setup", None)]
-    assert breadcrumbs(soup) == trail
-    assert breadcrumbs(soup, "breadcrumbs-compact") == trail
+    _assert_setup_trail(soup, location)
     # The sidebar marks this location as the current one, and only it.
     current = {
         str(link["data-location-id"]): link.get("aria-current")
@@ -317,11 +333,7 @@ def test_UI01_setup_revealed_pages(admin: Client, location: Any) -> None:
 
     assert "no-store" in revealed["Cache-Control"]
     soup = assert_page(revealed, app=True, title="Office · Device setup")
-    assert breadcrumbs(soup) == [
-        ("Locations", "/"),
-        ("Office", f"/locations/{location.pk}/"),
-        ("Device setup", None),
-    ]
+    _assert_setup_trail(soup, location)
     assert text(h1(soup)) == "Office"
     assert [(step.get("data-step"), _step_title(step)) for step in _steps(soup)] == STEPS
     assert by_testid(soup, "device-key")["data-state"] == "revealed"
@@ -343,12 +355,9 @@ def test_UI01_setup_revealed_pages(admin: Client, location: Any) -> None:
         assert "no-store" in response["Cache-Control"]
         page = assert_page(response, app=True, title="Office · Device setup")
         assert text(h1(page)) == "Office"
-        # The trail is resolved from the URL name: it starts as the setup page's does.
-        assert [label for label, _ in breadcrumbs(page)][:3] == [
-            "Locations",
-            "Office",
-            "Device setup",
-        ]
+        # The response is S8, so its trail is S8's whole trail, Device setup current, never
+        # the S9 confirmation's "Regenerate key" (W6-A2).
+        _assert_setup_trail(page, location)
         assert [(step.get("data-step"), _step_title(step)) for step in _steps(page)] == STEPS
         assert by_testid(page, "device-key")["data-state"] == "revealed"
         assert code_block(page, "device-key") == new_key
@@ -735,7 +744,7 @@ def test_xss_name_is_escaped_everywhere_on_setup(
 
 
 @pytest.mark.django_db
-def test_long_name_has_the_wrapping_class_on_setup(
+def test_long_name_shows_in_full_on_setup(
     admin: Client, location_factory: Callable[..., Any]
 ) -> None:
     name = "x" * 100
@@ -1134,6 +1143,35 @@ def test_UI05_first_heartbeat_step(
     assert indicator.has_attr("hidden")
     chip = by_testid(_header(page), "live-chip")
     assert [link["href"] for link in chip.find_all("a")] == [_url(location), _url(location)]
+
+
+@pytest.mark.django_db
+def test_W6A4_step5_announces_the_flip_not_the_time(admin: Client, location: Any) -> None:
+    waiting = by_testid(parse(admin.get(_url(location))), "first-heartbeat")
+    _beat(location)
+
+    page = parse(admin.get(_url(location)))
+
+    # Expected: the received line's time (absolute and relative), which every poll refills
+    # and the relative component rewrites every 15 s, sits in one aria-live="off" element
+    # inside the polite step 5 region, so only the waiting -> received flip is announced.
+    step = by_testid(page, "first-heartbeat")
+    assert step["aria-live"] == "polite"
+    [heard] = step.select('[data-fh="received"]')
+    quiet = step.select('[aria-live="off"]')
+    assert len(quiet) == 1, "the polite step 5 region announces the ticking time"
+    assert any(parent is heard for parent in quiet[0].parents)
+    for timed in (*heard.find_all("time"), *heard.select("[data-relative]")):
+        assert any(parent is quiet[0] for parent in timed.parents), timed
+    # The flip itself stays announced: both lines sit outside the quiet element, and the
+    # received sentence is not in it.
+    for line in step.select("[data-fh]"):
+        assert line.find_parent(attrs={"aria-live": "off"}) is None
+    assert RECEIVED_LINE not in text(quiet[0])
+    assert text(heard).startswith(RECEIVED_LINE)
+    # Edge: rendered while waiting, the received line holds no time, so nothing is silenced.
+    assert waiting.select('[aria-live="off"]') == []
+    assert waiting.select('[data-fh="received"]')[0].find("time") is None
 
 
 @pytest.mark.django_db
