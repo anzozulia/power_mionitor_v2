@@ -20,19 +20,36 @@ default clock (the views' clock attributes, the sidebar's and timefmt's) reads t
 instant. Histories are built through the engine (``transitions.record_heartbeat``,
 ``detection.run_cycle``, ``maintenance.set_maintenance``), so those tests are
 ``django_db(transaction=True)``. Times are asserted in Europe/Kyiv.
+
+The header matrix (``test_UI07_header_ignored_elsewhere``) sends every other named route
+the same request with and without the header and compares the two responses. It is
+deterministic by construction: every default clock reads one pinned instant, every request
+starts from the same cookie jar (restored after it) and runs inside an atomic block that is
+rolled back (so each starts from the same database state), a warm-up of the same request
+precedes each pair, and the comparison drops ``Date``, ``Expires`` and ``Vary``, compares
+``Set-Cookie`` by cookie name and blanks the CSRF token values (masked differently on every
+render) and, for the S9 POST, the newly generated key.
 """
 
-from collections.abc import Callable
+import copy
+import re
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 from bs4 import BeautifulSoup, Tag
+from conftest import DEFAULT_BOT_TOKEN, FakeTelegram
 from django.contrib.auth import get_user_model
+from django.db import transaction
 from django.http import HttpResponse
+from django.http.response import HttpResponseBase
 from django.test import Client
+from django.urls import URLPattern, URLResolver, get_resolver
 from pages import (
     all_by_testid,
+    assert_no_secrets,
     assert_page,
     breadcrumbs,
     by_testid,
@@ -44,6 +61,7 @@ from pages import (
     parse,
     text,
 )
+from secret_fixtures import MASKED, SECRET, TOKEN
 
 from powermon.alerts import ops
 from powermon.clock import SystemClock
@@ -51,8 +69,20 @@ from powermon.engine import maintenance, transitions
 from powermon.engine.models import LocationState, PowerInterval, SystemState
 from powermon.locations import keys
 from powermon.locations.models import Location
-from powermon.web.history_views import OUTAGE_GONE_MESSAGE, REMOVAL_REFUSED_MESSAGE
-from powermon.web.location_views import regenerate_marker
+from powermon.web.history_views import (
+    HISTORY_RESET_MESSAGE,
+    NOTHING_TO_RESET_MESSAGE,
+    OUTAGE_GONE_MESSAGE,
+    OUTAGE_REMOVED_MESSAGE,
+    REMOVAL_REFUSED_MESSAGE,
+    RESET_REFUSED_MESSAGE,
+)
+from powermon.web.location_views import (
+    ALERTS_COPY,
+    LOCATION_DELETED_MESSAGE,
+    REGENERATED_MESSAGE,
+    regenerate_marker,
+)
 from powermon.worker import detection
 
 User = get_user_model()
@@ -134,6 +164,25 @@ REMOVE_CHART = (
 )
 # A key whose tail has upper-case letters, so no page text or hex marker holds it by chance.
 KEY = "abcdefghijklmnopqrstuvwx0123QZXK"
+# 06-UI-SPEC copy rows reset.*, verbatim.
+RESET_LEAD = "This cannot be undone. Resetting the history:"
+RESET_CONSEQUENCES = [
+    "deletes all recorded power history of this location: the chart and the daily totals "
+    "show no data for the time before the reset, and Recent outages is empty;",
+    "unpins its weekly chart in the channel if the bot can still pin there; otherwise unpin "
+    "it by hand in Telegram (the posted messages stay in the channel);",
+    "sets it to Waiting for first heartbeat: nothing is detected until the next heartbeat, "
+    "which restarts monitoring as On without an alert and posts and pins a new chart;",
+    "still sends the alerts already queued, because they report real events;",
+    "keeps the settings, the device key, the switches and the Delivery status.",
+]
+RESET_ALTERNATIVE = (
+    "To remove a single false outage instead, use Recent outages on the location page."
+)
+# The four routes whose GET honours the header (06-UI-SPEC Security-bound rules).
+CONFIRMATION_ROUTES = frozenset(
+    {"location-delete", "location-regenerate", "outage-remove", "location-reset"}
+)
 
 
 @pytest.fixture
@@ -250,6 +299,10 @@ def _setup(location: Any) -> str:
 
 def _remove(location: Any, start: datetime) -> str:
     return f"/locations/{location.pk}/outages/{ops.instant_us(start)}/remove/"
+
+
+def _reset(location: Any) -> str:
+    return f"/locations/{location.pk}/reset/"
 
 
 def _at(hour: int, minute: int, second: int = 0) -> datetime:
@@ -698,3 +751,409 @@ def test_UI07_remove_404s_match(
         assert response.status_code == 404, path
         assert not response.has_header(FRAGMENT)
         assert str(10**20) not in response.content.decode()
+
+
+# S11 reset the history (UI-07): page and fragment, the refusals
+
+
+@pytest.mark.django_db(transaction=True)
+def test_UI07_reset_page_and_fragment(
+    admin: Client,
+    kyiv: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    location_factory: Callable[..., Any],
+) -> None:
+    location = _two_outages(location_factory, name="Office")
+    _pin(monkeypatch, _at(16, 0))
+    url = _reset(location)
+    before = _written(location)
+
+    page = _get(admin, url)
+    fragment = _get(admin, url, "1")
+
+    soup, page_confirm = page_root(page, "Office · Reset history")
+    root = fragment_root(fragment)
+    trail = [("Locations", "/"), ("Office", _detail(location)), ("Reset history", None)]
+    assert breadcrumbs(soup) == trail
+    assert breadcrumbs(soup, "breadcrumbs-compact") == trail
+    assert h1(soup) is by_testid(page_confirm, "confirm-title")
+    assert text(root) == text(page_confirm)
+    for confirm in (page_confirm, root):
+        assert text(by_testid(confirm, "confirm-title")) == "Reset the history of Office?"
+        consequences = by_testid(confirm, "consequences")
+        assert [text(item) for item in consequences.find_all("li")] == RESET_CONSEQUENCES
+        words = text(confirm)
+        assert words.index(RESET_LEAD) < words.index(RESET_ALTERNATIVE)
+        # The alternative links Recent outages to the location page's card.
+        links = [
+            (link.get("href"), text(link))
+            for link in confirm.find_all("a")
+            if link.get("data-testid") != "keep"
+        ]
+        assert links == [(f"{_detail(location)}#recent-outages", "Recent outages")]
+        assert_confirm_form(
+            confirm,
+            action=url,
+            keep_href=f"{_detail(location)}#reset-history",
+            keep="Keep history",
+            submit="Reset history",
+        )
+        # No settings panel: not even the masked token.
+        assert all_by_testid(confirm, "settings-panel") == []
+    assert _written(location) == before
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("case", "level", "flash"),
+    [("power-off", "error", RESET_REFUSED_MESSAGE), ("no-history", "info", NOTHING_TO_RESET_MESSAGE)],
+)
+def test_UI07_reset_fragment_and_refusals(
+    admin: Client,
+    kyiv: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    location_factory: Callable[..., Any],
+    case: str,
+    level: str,
+    flash: str,
+) -> None:
+    if case == "power-off":
+        location = _off_since_9(location_factory, name="Office")
+    else:
+        location = _location(location_factory, name="Office")
+    _pin(monkeypatch, _at(9, 30))
+    url = _reset(location)
+    before = _written(location)
+
+    fragment = _get(admin, url, "1")
+    page = _get(admin, url)
+
+    # The same refusal in both variants: 302 to the location page, never cached.
+    for response in (fragment, page):
+        assert response.status_code == 302
+        assert response["Location"] == _detail(location)
+        assert not response.has_header(FRAGMENT)
+        assert_confirmation_headers(response)
+    # Only the full-page GET queued its flash.
+    assert_one_flash(admin.get(_detail(location)), level, flash)
+    # The browser's sequence: the fragment GET (refused, no flash), then the full GET.
+    assert _get(admin, url, "1").status_code == 302
+    shown = admin.get(url, follow=True)
+    assert shown.redirect_chain == [(_detail(location), 302)]
+    assert_one_flash(shown, level, flash)
+    # A fragment GET alone queues nothing.
+    assert _get(admin, url, "1").status_code == 302
+    assert messages(admin.get(_detail(location))) == []
+    assert _written(location) == before
+
+
+# The header never changes anything else (UI-07, R4; TEST-STRATEGY §8.3)
+
+
+CSRF_VALUE = re.compile(r'(name="csrfmiddlewaretoken" value=")[^"]*(")')
+# Headers that legitimately differ between two renders of the same state.
+SKIPPED_HEADERS = frozenset({"date", "expires", "vary"})
+
+
+@dataclass(frozen=True)
+class Seen:
+    """A response as the comparison sees it."""
+
+    status: int
+    headers: tuple[tuple[str, str], ...]
+    cookies: tuple[str, ...]
+    body: bytes
+
+
+@dataclass(frozen=True)
+class Call:
+    """One request of the matrix: the route name, the method, the path and its data."""
+
+    route: str
+    method: str
+    path: str
+    data: dict[str, str] | None = None
+    headers: dict[str, str] = field(default_factory=dict)
+
+
+def _body(response: HttpResponseBase) -> bytes:
+    if response.streaming:
+        return b"".join(response.streaming_content)
+    assert isinstance(response, HttpResponse)
+    return response.content
+
+
+def seen(response: HttpResponseBase, blank: Iterable[str] = ()) -> Seen:
+    """The status, the headers but Date, Expires and Vary, the cookie names and the body.
+
+    In a text or JSON body the CSRF token values and each ``blank`` value are blanked.
+    """
+    body = _body(response)
+    if str(response.get("Content-Type", "")).startswith(("text/", "application/json")):
+        decoded = CSRF_VALUE.sub(r"\1\2", body.decode())
+        for value in blank:
+            decoded = decoded.replace(value, "")
+        body = decoded.encode()
+    headers = tuple(
+        sorted(
+            (name.lower(), value)
+            for name, value in response.items()
+            if name.lower() not in SKIPPED_HEADERS
+        )
+    )
+    return Seen(response.status_code, headers, tuple(sorted(response.cookies)), body)
+
+
+def run(
+    client: Client, call: Call, location: Any, *, fragment: bool, follow: bool = False
+) -> tuple[HttpResponseBase, Seen]:
+    """``call`` once, from the client's cookies and the database as they are, both restored.
+
+    The request runs inside an atomic block that is rolled back; the location's key is read
+    inside it, so the S9 POST's new key can be blanked.
+    """
+    headers = dict(call.headers)
+    if fragment:
+        headers[FRAGMENT] = "1"
+    cookies = copy.deepcopy(client.cookies)
+    with transaction.atomic():
+        if call.method == "get":
+            response = client.get(call.path, headers=headers, follow=follow)
+        else:
+            response = client.post(call.path, call.data or {}, headers=headers, follow=follow)
+        key = Location.objects.get(pk=location.pk).device_key
+        transaction.set_rollback(True)
+    client.cookies = cookies
+    blank = [key] if call.route == "location-regenerate" else []
+    return response, seen(response, blank)
+
+
+def _named_routes(patterns: Iterable[Any] | None = None) -> set[str]:
+    """Every route name of the URLconf, included URLconfs too."""
+    found: set[str] = set()
+    for entry in get_resolver().url_patterns if patterns is None else patterns:
+        if isinstance(entry, URLResolver):
+            found |= _named_routes(entry.url_patterns)
+        elif isinstance(entry, URLPattern) and entry.name:
+            found.add(entry.name)
+    return found
+
+
+def _matrix(location: Any, marker: str) -> list[Call]:
+    """Every named route but the four confirmation routes' GET, with real values."""
+    detail = _detail(location)
+    return [
+        Call("location-list", "get", "/"),
+        Call("location-create", "get", "/locations/new/"),
+        # An invalid create: the form again, nothing written.
+        Call("location-create", "post", "/locations/new/", {"name": ""}),
+        Call("location-status-json", "get", "/locations/status.json"),
+        Call("location-detail", "get", detail),
+        Call("location-chart", "get", f"{detail}chart.png"),
+        Call("location-edit", "get", f"{detail}edit/"),
+        # An invalid edit: the form again, nothing written.
+        Call("location-edit", "post", f"{detail}edit/", {"name": ""}),
+        Call("location-maintenance", "post", f"{detail}maintenance/", {"value": "on"}),
+        Call("location-alerts", "post", f"{detail}alerts/", {"value": "off"}),
+        Call("location-router-grace", "post", f"{detail}router-grace/", {"value": "on"}),
+        Call("location-test-message", "post", f"{detail}test-message/", {}),
+        Call("location-setup", "get", _setup(location)),
+        # The Reveal POST: the full key, no-store.
+        Call("location-setup", "post", _setup(location), {}),
+        # The S9 POST: a new key each time, blanked before the comparison.
+        Call("location-regenerate", "post", _regenerate(location), {"marker": marker}),
+        Call("login", "get", "/login/"),
+        Call("logout", "post", "/logout/", {}),
+        Call("theme", "post", "/theme/", {"theme": "dark"}),
+        Call("healthz", "get", "/healthz"),
+        Call("heartbeat", "get", "/hb", headers={"Authorization": f"Bearer {location.device_key}"}),
+    ]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_UI07_header_ignored_elsewhere(
+    admin: Client,
+    kyiv: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    location_factory: Callable[..., Any],
+    fake_telegram: FakeTelegram,
+) -> None:
+    location = _two_outages(location_factory, name="Office")
+    _pin(monkeypatch, _at(16, 0))
+    fake_telegram.accept(DEFAULT_BOT_TOKEN)
+    matrix = _matrix(location, regenerate_marker(location.device_key))
+    # Every named route is in the matrix, or is one of the four confirmation routes, whose
+    # GET honours the header (tested above) and whose POSTs are tested below.
+    assert {call.route for call in matrix} | CONFIRMATION_ROUTES == _named_routes()
+    # The client's CSRF cookie exists before the first pair.
+    assert admin.get("/").status_code == 200
+
+    for call in matrix:
+        # The warm-up: the same request once, so caches (the chart PNG) are already filled.
+        run(admin, call, location, fragment=False)
+        with_header, flagged = run(admin, call, location, fragment=True)
+        without, plain = run(admin, call, location, fragment=False)
+        again = run(admin, call, location, fragment=True)[1]
+
+        assert flagged == plain, call
+        # Repeated runs give the same result.
+        assert again == flagged, call
+        for response in (with_header, without):
+            assert not response.has_header(FRAGMENT), call
+            assert FRAGMENT.lower() not in str(response.get("Vary", "")).lower(), call
+        # An HTML page answered with the header is still a whole page.
+        content_type = str(with_header.get("Content-Type", ""))
+        if with_header.status_code == 200 and content_type.startswith("text/html"):
+            assert parse(_body(with_header)).find("html") is not None, call
+
+
+@pytest.mark.django_db(transaction=True)
+def test_UI07_posts_ignore_the_header(
+    admin: Client,
+    kyiv: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    location_factory: Callable[..., Any],
+) -> None:
+    location = _two_outages(location_factory, name="Office")
+    _pin(monkeypatch, _at(16, 0))
+    assert admin.get("/").status_code == 200
+    posts = [
+        (Call("location-delete", "post", _delete(location), {}), "/", LOCATION_DELETED_MESSAGE),
+        (
+            Call("outage-remove", "post", _remove(location, _at(9, 0)), {}),
+            _detail(location),
+            OUTAGE_REMOVED_MESSAGE.format(start="2026-10-01 12:00"),
+        ),
+        (Call("location-reset", "post", _reset(location), {}), _detail(location), HISTORY_RESET_MESSAGE),
+    ]
+
+    for call, target, flash in posts:
+        run(admin, call, location, fragment=False)
+        flagged, with_seen = run(admin, call, location, fragment=True)
+        plain, without_seen = run(admin, call, location, fragment=False)
+        # The same redirect, headers and cookies with and without the header.
+        assert with_seen == without_seen, call.route
+        assert (flagged.status_code, flagged["Location"]) == (302, target), call.route
+        assert not flagged.has_header(FRAGMENT)
+        # Followed: the same page with the same one success flash.
+        shown_with = run(admin, call, location, fragment=True, follow=True)[0]
+        shown_without = run(admin, call, location, fragment=False, follow=True)[0]
+        for shown in (shown_with, shown_without):
+            assert shown.redirect_chain == [(target, 302)], call.route
+            assert_one_flash(shown, "success", flash)
+
+    # The S9 POST with the header: the full revealed setup page, no-store, never a fragment.
+    marker = regenerate_marker(location.device_key)
+    call = Call("location-regenerate", "post", _regenerate(location), {"marker": marker})
+    with transaction.atomic():
+        response = admin.post(call.path, call.data or {}, headers={FRAGMENT: "1"})
+        new_key = Location.objects.get(pk=location.pk).device_key
+        transaction.set_rollback(True)
+    assert response.status_code == 200
+    assert "no-store" in str(response["Cache-Control"])
+    assert not response.has_header(FRAGMENT)
+    soup = parse(response)
+    assert soup.find("html") is not None
+    assert all_by_testid(soup, "confirm") == []
+    assert new_key != location.device_key
+    assert new_key in response.content.decode()
+    assert_one_flash(response, "success", REGENERATED_MESSAGE)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_UI07_second_confirm_post_says_already(
+    admin: Client,
+    kyiv: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    location_factory: Callable[..., Any],
+) -> None:
+    location = _two_outages(location_factory, name="Office")
+    _pin(monkeypatch, _at(16, 0))
+    remove = _remove(location, _at(15, 0))
+
+    # A double click or a second tab, both with the header: the "already" info flash.
+    first = admin.post(remove, headers={FRAGMENT: "1"}, follow=True)
+    assert_one_flash(first, "success", OUTAGE_REMOVED_MESSAGE.format(start="2026-10-01 18:00"))
+    after = _written(location)
+    second = admin.post(remove, headers={FRAGMENT: "1"}, follow=True)
+    assert_one_flash(second, "info", OUTAGE_GONE_MESSAGE)
+    assert _written(location) == after
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("route", ["delete", "regenerate"])
+def test_UI07_fragment_keeps_pending_flash(
+    admin: Client, location_factory: Callable[..., Any], route: str
+) -> None:
+    location = _location(location_factory, name="Office")
+    # A flash is queued and not yet shown: the alerts switch, its redirect not followed.
+    queued = admin.post(f"{_detail(location)}alerts/", {"value": "off"})
+    assert queued.status_code == 302
+    before = _written(location)
+    url = _delete(location) if route == "delete" else _regenerate(location)
+
+    # A 200 fragment GET shows no toasts, so it leaves the flash in place and writes nothing.
+    fragment_root(_get(admin, url, "1"))
+    assert _written(location) == before
+
+    # The next page view shows it, exactly once.
+    assert_one_flash(admin.get(_detail(location)), "success", ALERTS_COPY["off"])
+    assert messages(admin.get(_detail(location))) == []
+
+
+# INV-23 #2: no confirmation page or fragment carries a secret
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV23_2_confirmations_have_no_secrets(
+    admin: Client,
+    kyiv: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    location_factory: Callable[..., Any],
+) -> None:
+    location = _two_outages(location_factory, name="Office", bot_token=TOKEN, device_key=KEY)
+    off = _off_since_9(
+        location_factory, name="Off", bot_token=TOKEN, device_key=KEY[::-1].upper()
+    )
+    _pin(monkeypatch, _at(16, 0))
+    secrets = [TOKEN, SECRET, MASKED]
+    for key in (KEY, off.device_key):
+        secrets += [key, keys.mask_key(key), key[-4:]]
+    urls = [
+        _delete(location),
+        _regenerate(location),
+        _remove(location, _at(9, 0)),
+        _reset(location),
+        # Refusals: an outage in progress, a reset during an outage, a gone outage.
+        _remove(off, _at(9, 0)),
+        _reset(off),
+        _remove(location, _at(8, 30)),
+    ]
+
+    for url in urls:
+        for variant in (None, "1"):
+            response = _get(admin, url, variant)
+            body = response.content.decode()
+            label = f"{url} {variant}"
+            assert_no_secrets(body, secrets, label=label, headers=[response.get("Location", "")])
+            if response.status_code != 200:
+                assert response.status_code == 302, label
+                continue
+            if variant:
+                fragment_root(response)
+                assert "•" not in body, label
+            else:
+                assert "•" not in str(main(page_root(response, _page_title(url, location))[0]))
+
+
+def _page_title(url: str, location: Any) -> str:
+    """The page title of the confirmation at ``url``."""
+    for suffix, name in (
+        ("delete/", "Delete"),
+        ("regenerate/", "Regenerate key"),
+        ("remove/", "Remove outage"),
+        ("reset/", "Reset history"),
+    ):
+        if url.endswith(suffix):
+            return f"{location.name} · {name}"
+    raise AssertionError(url)

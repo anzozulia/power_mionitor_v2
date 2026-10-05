@@ -22,17 +22,16 @@ Histories are built through the engine (``transitions.record_heartbeat``,
 ``detection.run_cycle``, ``maintenance.set_maintenance``), so these tests are
 ``django_db(transaction=True)``. The views get a ``FakeClock`` by monkeypatching their
 ``clock`` attribute. Times are asserted in Europe/Kyiv, pinned by the autouse ``kyiv``
-fixture. Copy strings are 05-UI-SPEC's, verbatim; they contain double quotes, so pages are
-compared after ``html.unescape``. Flashes are read through ``pages.messages()`` as
-(role, text), toast or legacy callout alike (UI-09).
+fixture. Copy strings are 06-UI-SPEC's copy rows remove.* and reset.*, verbatim. The two
+confirmation pages are read through ``pages.py`` and the 06-UI-SPEC hooks (the ``confirm``
+root, ``confirm-title``, ``outage-details``, ``consequences``, ``confirm-form``, ``keep``
+and ``confirm-submit``); their modal fragments are tested in tests/web/test_fragments.py.
+Flashes are read through ``pages.messages()`` as (role, text), toast or legacy callout
+alike (UI-09).
 """
 
-# class-guard: pending migration
-
-import re
 from collections.abc import Callable
 from datetime import UTC, datetime
-from html import unescape
 from typing import Any
 
 import pytest
@@ -116,7 +115,6 @@ CLOSING = (
 SECRET = "Sx_9-Qw7Lm" * 4
 TOKEN = f"987654321:{SECRET}"
 XSS_NAME = "<script>alert(1)</script>"
-ESCAPED_XSS_NAME = "&lt;script&gt;alert(1)&lt;/script&gt;"
 
 
 @pytest.fixture
@@ -160,34 +158,14 @@ def _is_info(page: str) -> bool:
     return all(flash.level in (None, "info") for flash in messages(page))
 
 
-def _main(page: str) -> str:
-    """The page's <main>: the header (with its sign-out form) left out."""
-    return page[page.index("<main") :]
-
-
-def _crumbs(page: str) -> list[tuple[str, str]]:
-    trail = re.search(r'<ol class="crumbs">(.*?)</ol>', page, re.S)
-    assert trail is not None, "no breadcrumb trail"
-    items = re.findall(r"<li\b([^>]*)>(.*?)</li>", trail.group(1), re.S)
-    return [(attrs, inner.strip()) for attrs, inner in items]
-
-
-def _panel(page: str) -> list[tuple[str, str]]:
-    """The confirmation's details panel as (term, value HTML) pairs."""
-    panel = re.search(r'<dl class="panel settings">(.*?)</dl>', page, re.S)
-    assert panel is not None, "no details panel"
-    return re.findall(r"<dt>(.*?)</dt>\s*<dd>(.*?)</dd>", panel.group(1), re.S)
-
-
-def _consequences(page: str) -> list[str]:
-    found = re.search(r'<ul class="list">(.*?)</ul>', page, re.S)
-    assert found is not None, "no consequence list"
-    return [unescape(item) for item in re.findall(r"<li>(.*?)</li>", found.group(1), re.S)]
-
-
 def _remove_trail(location: Any, name: str) -> list[tuple[str, str | None]]:
     """The S10 breadcrumbs: Locations > {name} > Remove outage (the current page)."""
     return [("Locations", "/"), (name, _page(location)), ("Remove outage", None)]
+
+
+def _reset_trail(location: Any, name: str) -> list[tuple[str, str | None]]:
+    """The S11 breadcrumbs: Locations > {name} > Reset history (the current page)."""
+    return [("Locations", "/"), (name, _page(location)), ("Reset history", None)]
 
 
 def _items(root: Any, testid: str) -> list[str]:
@@ -687,30 +665,31 @@ def test_reset_confirmation_page(
 
     response = admin.get(url)
 
-    assert response.status_code == 200
-    html = response.content.decode()
-    page = _main(html)
-    assert "<title>Office · Reset history · Power Monitor</title>" in html
-    assert _crumbs(page) == [
-        ("", '<a href="/">Locations</a>'),
-        ("", f'<a class="name" href="/locations/{location.pk}/">Office</a>'),
-        (' aria-current="page"', "Reset history"),
-    ]
-    assert '<h1 class="name">Reset the history of Office?</h1>' in page
-    assert f"<p>{RESET_LEAD}</p>" in page
-    assert _consequences(page) == RESET_CONSEQUENCES
-    assert f"<p>{RESET_ALTERNATIVE}</p>" in page
-    assert page.index(RESET_LEAD) < page.index('<ul class="list">') < page.index(RESET_ALTERNATIVE)
-    assert re.findall(r"<form\b[^>]*>", page) == [f'<form method="post" action="{url}">']
-    button = '<button class="btn btn--danger" type="submit">Reset history</button>'
-    keep = f'<a class="btn btn--secondary" href="/locations/{location.pk}/">Keep history</a>'
-    assert page.index(RESET_ALTERNATIVE) < page.index(button) < page.index(keep)
-    assert page.count("btn--danger") == 1
-    assert "btn--primary" not in page
-    assert "autofocus" not in page
-    assert "<script" not in html
+    # assert_page also proves there is no injected or inline script (R5).
+    soup = assert_page(response, app=True, title="Office · Reset history")
+    root = by_testid(main(soup), "confirm")
+    assert breadcrumbs(soup) == _reset_trail(location, "Office")
+    assert text(h1(soup)) == "Reset the history of Office?"
+    assert _items(root, "consequences") == RESET_CONSEQUENCES
+    words = text(root)
+    assert words.index(RESET_LEAD) < words.index(RESET_CONSEQUENCES[0])
+    assert words.index(RESET_CONSEQUENCES[-1]) < words.index(RESET_ALTERNATIVE)
+    # One form in main: the destructive POST, after Keep (back to the Reset history row).
+    [form] = main(soup).find_all("form")
+    assert (form.get("method"), form.get("action")) == ("post", url)
+    assert form is by_testid(root, "confirm-form")
+    button = by_testid(form, "confirm-submit")
+    assert (button.get("data-variant"), text(button)) == ("danger", "Reset history")
+    keep = by_testid(root, "keep")
+    assert (keep.get("href"), text(keep)) == (f"{_page(location)}#reset-history", "Keep history")
+    assert root.find_all(["a", "button"])[-2:] == [keep, button]
+    dangers = main(soup).find_all(attrs={"data-variant": "danger"})
+    assert [found.get("data-testid") for found in dangers] == ["confirm-submit"]
+    assert main(soup).find_all(attrs={"data-variant": "primary"}) == []
+    assert soup.find_all(autofocus=True) == []
     # No settings panel: not even the masked token.
-    assert '<dl class="panel settings">' not in page
+    assert main(soup).find_all(attrs={"data-testid": "settings-panel"}) == []
+    assert "•" not in str(main(soup))
     # The GET wrote nothing.
     assert _written(location) == before
 
@@ -891,24 +870,18 @@ def test_reset_page_escapes_the_name_and_shows_a_long_name_whole(
     assert transitions.record_heartbeat(long.pk, _at(16, 0)) == "started"
     _clock(monkeypatch, _at(16, 5))
 
-    html = admin.get(_reset(location)).content.decode()
+    response = admin.get(_reset(location))
 
-    assert f"<title>{ESCAPED_XSS_NAME} · Reset history · Power Monitor</title>" in html
-    assert f'<h1 class="name">Reset the history of {ESCAPED_XSS_NAME}?</h1>' in html
-    assert _crumbs(html)[1] == (
-        "",
-        f'<a class="name" href="/locations/{location.pk}/">{ESCAPED_XSS_NAME}</a>',
-    )
-    assert "<script" not in html
-    # E4 long-text: a 100-character name is shown whole, never truncated.
-    page = admin.get(_reset(long)).content.decode()
-    assert f"<title>{name} · Reset history · Power Monitor</title>" in page
-    assert f'<h1 class="name">Reset the history of {name}?</h1>' in page
-    assert _crumbs(page) == [
-        ("", '<a href="/">Locations</a>'),
-        ("", f'<a class="name" href="/locations/{long.pk}/">{name}</a>'),
-        (' aria-current="page"', "Reset history"),
-    ]
+    # assert_page also proves nothing renders as a script (R1).
+    soup = assert_page(response, app=True, title=f"{XSS_NAME} · Reset history")
+    assert text(h1(soup)) == f"Reset the history of {XSS_NAME}?"
+    assert breadcrumbs(soup)[1] == (XSS_NAME, _page(location))
+    assert XSS_NAME not in response.content.decode()
+    # E10 long-text: a 100-character name is shown whole, never truncated.
+    page = assert_page(admin.get(_reset(long)), app=True, title=f"{name} · Reset history")
+    assert text(h1(page)) == f"Reset the history of {name}?"
+    assert breadcrumbs(page) == _reset_trail(long, name)
+    assert breadcrumbs(page, "breadcrumbs-compact") == _reset_trail(long, name)
 
 
 @pytest.mark.django_db(transaction=True)
@@ -943,7 +916,7 @@ def test_reset_pages_show_no_secret(
         assert TOKEN not in html
         assert SECRET not in html
     # The confirmation page has no settings panel: not even the masked token.
-    assert "•" not in _main(confirm)
+    assert "•" not in str(main(confirm))
     for response in flash_pages:
         for url, _status in response.redirect_chain:
             for key in keys_shown:
