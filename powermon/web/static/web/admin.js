@@ -1801,13 +1801,40 @@
 
   // The submit guard (UI-09): one delegated listener for every POST form. The first submit
   // of a form marks it (data-submitted) and its submitter (aria-busy and aria-disabled, the
-  // visible label swapped for data-pending-label when the button has one); a later submit of
-  // the same form is prevented. It never sets the disabled attribute, which would drop the
-  // clicked button's name and value from the POST, and it never submits anything itself. A
-  // submit another handler already prevented (the theme switch) is left alone, and a
-  // submitter marked aria-disabled by a component does not submit. The pageshow listener
-  // below clears every mark when the browser restores the page from its back/forward cache.
+  // visible label swapped for data-pending-label when the button has one). Until that
+  // submit is released, a later submit is prevented when its form is marked or when it
+  // posts to the same action as a pending one (S5's two test-message forms while delivery
+  // fails; forms without an action never match). It never sets the disabled attribute,
+  // which would drop the clicked button's name and value from the POST, and it never
+  // submits anything itself. A submit another handler already prevented (the theme switch)
+  // is left alone, and a submitter marked aria-disabled by a component does not submit.
+  // Release undoes every mark of a submit: the pageshow listener below releases them all
+  // when the browser shows the page again (a back/forward cache restore), and each submit
+  // is released GUARD_RELEASE_MS after it started while the page is still shown, because a
+  // navigation the browser stopped or dropped (Stop, Esc) fires no pageshow.
   var pending = [];
+  // Twice the slowest legitimate POST: the test message, bounded by the Telegram client's
+  // DEFAULT_TIMEOUT (5 s connect + 10 s read).
+  var GUARD_RELEASE_MS = 30000;
+
+  // Undoes the guard's marks on one submit. An entry already released is left alone, so a
+  // stale timer never unmarks a newer submit of the same form.
+  function release(entry) {
+    var index = pending.indexOf(entry);
+    if (index === -1) {
+      return;
+    }
+    pending.splice(index, 1);
+    window.clearTimeout(entry.timer);
+    entry.form.removeAttribute("data-submitted");
+    if (entry.button) {
+      restore(entry.button, "aria-busy", entry.ariaBusy);
+      restore(entry.button, "aria-disabled", entry.ariaDisabled);
+    }
+    if (entry.label) {
+      entry.label.textContent = entry.text;
+    }
+  }
 
   document.addEventListener("submit", function (event) {
     var form = event.target;
@@ -1815,12 +1842,26 @@
       return;
     }
     var button = event.submitter || null;
-    if (form.hasAttribute("data-submitted") || (button && button.getAttribute("aria-disabled") === "true")) {
+    var action = form.getAttribute("action");
+    var busy =
+      form.hasAttribute("data-submitted") ||
+      pending.some(function (other) {
+        return action !== null && other.form.getAttribute("action") === action;
+      });
+    if (busy || (button && button.getAttribute("aria-disabled") === "true")) {
       event.preventDefault();
       return;
     }
     form.setAttribute("data-submitted", "");
-    var entry = { form: form, button: button, ariaBusy: null, ariaDisabled: null, label: null, text: "" };
+    var entry = {
+      form: form,
+      button: button,
+      ariaBusy: null,
+      ariaDisabled: null,
+      label: null,
+      text: "",
+      timer: null,
+    };
     if (button) {
       entry.ariaBusy = button.getAttribute("aria-busy");
       entry.ariaDisabled = button.getAttribute("aria-disabled");
@@ -1835,6 +1876,9 @@
       }
     }
     pending.push(entry);
+    entry.timer = window.setTimeout(function () {
+      release(entry);
+    }, GUARD_RELEASE_MS);
   });
 
   // Restores an attribute to the value it had before the guard set it (null: absent).
@@ -1846,18 +1890,9 @@
     }
   }
 
+  // Release edits pending, so this walks a copy.
   window.addEventListener("pageshow", function (event) {
-    pending.forEach(function (entry) {
-      entry.form.removeAttribute("data-submitted");
-      if (entry.button) {
-        restore(entry.button, "aria-busy", entry.ariaBusy);
-        restore(entry.button, "aria-disabled", entry.ariaDisabled);
-      }
-      if (entry.label) {
-        entry.label.textContent = entry.text;
-      }
-    });
-    pending = [];
+    pending.slice().forEach(release);
     pageshowHandlers.forEach(function (handler) {
       handler(event);
     });
