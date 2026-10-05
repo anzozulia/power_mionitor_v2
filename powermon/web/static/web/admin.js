@@ -672,7 +672,8 @@
     // gets the number in its mono [data-count-value] span and "location" or "locations" in
     // its [data-count-noun] span, or its whole text when it has no number span. The
     // sidebar's group count ([data-live="sidebar-count"], mono) gets the JSON's number of
-    // locations as its text.
+    // locations as its text. S8's step 5 shows its received line for every power state
+    // but waiting (the JSON's power, not its status).
     window.Alpine.data("poll", function () {
       var POLL_INTERVAL_MS = 30000;
       var POLL_BACKOFF_MS = [60000, 120000, 240000, 300000];
@@ -777,7 +778,11 @@
             pill.textContent = entry.delivery.text;
           }
         } else if (kind === "first-heartbeat") {
-          var received = status !== "waiting";
+          // S8 step 5 follows the power state, as the server's rule does: received for
+          // every power state but waiting. The status cannot tell: it reads maintenance
+          // while a location under maintenance still waits for its first heartbeat (D-02).
+          // apply hands over only validated entries, so power is one of POWER_KEYS.
+          var received = entry.power !== "waiting";
           var waitingLine = element.querySelector('[data-fh="waiting"]');
           var receivedLine = element.querySelector('[data-fh="received"]');
           if (waitingLine) {
