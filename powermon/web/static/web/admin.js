@@ -394,10 +394,11 @@
       var wide = null;
       var open = false;
 
+      // The sr label of an icon-only toggle: its [data-label] element, else its first text.
       function setLabel(button, text) {
-        var node = button ? labelNode(button) : null;
-        if (node) {
-          node.textContent = text;
+        var label = button ? button.querySelector("[data-label]") || labelNode(button) : null;
+        if (label) {
+          label.textContent = text;
         }
       }
 
@@ -770,7 +771,10 @@
           var status = entry.status;
           link.setAttribute("data-status", status);
           link.setAttribute("data-delivery", entry.delivery.state);
-          showDeliveryVariant(link, entry.delivery.state);
+          // The failing triangle (and its rail badge) shows only while delivery fails.
+          link.querySelectorAll('[data-live="sidebar-fail"]').forEach(function (mark) {
+            mark.hidden = entry.delivery.state !== "failing";
+          });
           var cell = link.querySelector('[data-live="sidebar-cell"]');
           if (cell) {
             var since = "";
