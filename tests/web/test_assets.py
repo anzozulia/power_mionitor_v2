@@ -19,6 +19,9 @@ TEST-STRATEGY §7.2 and 06-RESEARCH Pitfalls 7 and 13:
   crossorigin. The error layout still reads no context as its head grows (R11).
 - admin.js applies the stored rail flag first; the button partial renders a link or a button
   with data-variant and never the disabled attribute.
+- Pending (UI-09): every button, never a link, holds a hidden loader-circle spinner that
+  aria-busy shows in the leading icon's place (the icon hides), spinning under motion-safe,
+  and the built CSS has those group-aria-busy and motion-safe spin rules.
 
 The tests read the image they run in: the dev target is built from the same base stage as
 production, after the css stage and collectstatic.
@@ -68,6 +71,22 @@ _CSS_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
 _URL = re.compile(r"url\(\s*([^)]*)\)", re.IGNORECASE)
 _SCHEME = re.compile(r"^[a-z][a-z0-9+.-]*:", re.IGNORECASE)
 BUTTON = "partials/_button.html"
+VARIANTS = ("primary", "secondary", "ghost", "danger", "outline-danger")
+# The pending state (UI-09; 06-UI-SPEC Button > Pending, Spinner). The submit guard sets
+# aria-busy on the clicked button, the group: its leading icon hides and the loader-circle
+# spinner shows in its place, spinning only under motion-safe. CSS only, so the tokens are
+# what the tests can read.
+SPINNER = "loader-circle"
+SPINNER_PENDING = frozenset({"hidden", "group-aria-busy:inline-block", "motion-safe:animate-spin"})
+ICON_PENDING = frozenset({"group-aria-busy:hidden"})
+# The built rules for those tokens, in _compact form.
+GROUP_BUSY_RULE = (
+    r".group-aria-busy\:{utility}:is(:where(.group)[aria-busy=true]*){{display:{display}}}"
+)
+MOTION_SAFE_SPIN = re.compile(
+    r"@media\(prefers-reduced-motion:no-preference\)\{[^@]*"
+    r"\.motion-safe\\:animate-spin\{animation:var\(--animate-spin\)\}"
+)
 # The four Inter Variable subsets of the vendor manifest; E1-E3 preload two of them.
 FONT_SUBSETS = frozenset({"latin", "cyrillic", "latin-ext", "cyrillic-ext"})
 PRELOADED_SUBSETS = ("latin", "cyrillic")
@@ -627,7 +646,44 @@ def _attrs(element: Element) -> dict[str, str | None]:
     return dict(element.attributes)
 
 
-@pytest.mark.parametrize("variant", ["primary", "secondary", "ghost", "danger", "outline-danger"])
+def _classes(element: Element) -> set[str]:
+    """The tokens of ``element``'s class attribute (the pending state is CSS only)."""
+    return set(str(_attrs(element).get("class") or "").split())
+
+
+def _icon_name(svg: Element) -> str:
+    """The vendored icon an inline svg draws; the svg is hidden from assistive technology."""
+    assert ("aria-hidden", "true") in svg.attributes
+    assert ("focusable", "false") in svg.attributes
+    names = [name for name, markup in ICONS.items() if svg.children == _shapes(markup)]
+    assert len(names) == 1, names
+    return names[0]
+
+
+def _content(element: Element) -> list[str]:
+    """``element``'s children in order: an icon as ``<name>``, a span as ``[its text]`` and
+    text as it is."""
+    content: list[str] = []
+    for child in element.children:
+        if isinstance(child, str):
+            content.append(child)
+        elif child.name == "svg":
+            content.append(f"<{_icon_name(child)}>")
+        else:
+            content.append(f"[{''.join(str(part) for part in child.children)}]")
+    return content
+
+
+def _icons(element: Element) -> dict[str, set[str]]:
+    """The class tokens of each icon among ``element``'s children, keyed by icon name."""
+    return {
+        _icon_name(child): _classes(child)
+        for child in element.children
+        if isinstance(child, Element) and child.name == "svg"
+    }
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
 def test_button_partial_link_and_button(variant: str) -> None:
     link = _render_button(variant=variant, label="Back to locations", href="/", testid="back")
     button = _render_button(variant=variant, label="Save changes")
@@ -644,7 +700,8 @@ def test_button_partial_link_and_button(variant: str) -> None:
         "type": "submit",
         "data-variant": variant,
     }
-    assert button.children == ["Save changes"]
+    # A button holds the hidden pending spinner before its label (UI-09); a link never does.
+    assert _content(button) == [f"<{SPINNER}>", "Save changes"]
 
 
 def test_button_partial_options() -> None:
@@ -665,9 +722,9 @@ def test_button_partial_options() -> None:
     assert attrs["data-pending-label"] == "Saving…"
     assert attrs["data-testid"] == "switch"
     assert "disabled" not in attrs
-    suffix = button.children[1]
+    assert _content(button) == [f"<{SPINNER}>", "Turn off", "[maintenance]"]
+    suffix = button.children[-1]
     assert isinstance(suffix, Element)
-    assert button.children[0] == "Turn off"
     assert (suffix.name, suffix.children) == ("span", ["maintenance"])
 
 
@@ -682,25 +739,18 @@ def test_button_partial_escapes_its_values() -> None:
     assert '"><i>' not in html
 
 
-def _svg_before_label(element: Element, name: str, label: str) -> None:
-    """``element`` starts with the hidden svg of icon ``name``, followed by ``label``."""
-    svg = element.children[0]
-    assert isinstance(svg, Element) and svg.name == "svg"
-    assert ("aria-hidden", "true") in svg.attributes
-    assert ("focusable", "false") in svg.attributes
-    assert svg.children == _shapes(ICONS[name])
-    assert element.children[1] == label
-
-
 def test_button_icon_is_optional() -> None:
     button = _render_button(variant="primary", label="Add location", icon="plus")
     plain = render_to_string(BUTTON, {"variant": "primary", "label": "Add location"})
 
     assert button.name == "button"
-    assert len(button.children) == 2
-    _svg_before_label(button, "plus", "Add location")
-    # Without the parameter, or with an empty one, the partial renders no icon at all.
-    assert "<svg" not in plain
+    # The leading icon, then the pending spinner (UI-09), then the label.
+    assert _content(button) == ["<plus>", f"<{SPINNER}>", "Add location"]
+    # Without the parameter, or with an empty one, the partial renders no leading icon.
+    assert _content(_render_button(variant="primary", label="Add location")) == [
+        f"<{SPINNER}>",
+        "Add location",
+    ]
     empty = {"variant": "primary", "label": "Add location", "icon": ""}
     assert render_to_string(BUTTON, empty) == plain
 
@@ -717,10 +767,74 @@ def test_button_icon_on_a_small_link_keeps_the_suffix_last() -> None:
     )
 
     assert link.name == "a"
-    _svg_before_label(link, "pencil", "Edit")
+    assert _content(link) == ["<pencil>", "Edit", "[Office]"]
     suffix = link.children[2]
     assert isinstance(suffix, Element)
     assert (suffix.name, suffix.children) == ("span", ["Office"])
+
+
+# The pending spinner (UI-09; 06-UI-SPEC Button > Pending, Spinner)
+
+
+@pytest.mark.parametrize("size", ["", "sm"])
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_UI09_button_has_a_hidden_pending_spinner(variant: str, size: str) -> None:
+    button = _render_button(variant=variant, label="Save changes", size=size)
+
+    # Expected: one spinner before the label. It is hidden until the button (the group its
+    # variant reads) is aria-busy, then shown, spinning only when the user allows motion.
+    assert _content(button) == [f"<{SPINNER}>", "Save changes"]
+    assert "group" in _classes(button)
+    spinner = _icons(button)[SPINNER]
+    assert SPINNER_PENDING <= spinner
+    assert not ICON_PENDING & spinner
+    # 16 px, 14 px on a small button (the leading icon's sizes).
+    assert ("size-3.5" if size == "sm" else "size-4") in spinner
+
+
+@pytest.mark.parametrize("size", ["", "sm"])
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_UI09_spinner_takes_the_leading_icons_place(variant: str, size: str) -> None:
+    button = _render_button(variant=variant, label="Send test message", size=size, icon="send")
+
+    # Edge: with a leading icon, aria-busy hides the icon and shows the spinner in its place,
+    # at the same size and in the same colour.
+    assert _content(button) == ["<send>", f"<{SPINNER}>", "Send test message"]
+    icons = _icons(button)
+    assert ICON_PENDING <= icons["send"]
+    assert not SPINNER_PENDING & icons["send"]
+    assert icons[SPINNER] - SPINNER_PENDING == icons["send"] - ICON_PENDING
+
+
+@pytest.mark.parametrize("icon_name", ["", "pencil"])
+@pytest.mark.parametrize("size", ["", "sm"])
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_UI09_link_has_no_pending_spinner(variant: str, size: str, icon_name: str) -> None:
+    link = _render_button(
+        variant=variant, label="Edit", href="/locations/1/edit/", size=size, icon=icon_name
+    )
+
+    # Failure case: a link never submits, so it has no spinner, is no group and never hides
+    # its icon.
+    assert link.name == "a"
+    assert _content(link) == (["<pencil>", "Edit"] if icon_name else ["Edit"])
+    assert "group" not in _classes(link)
+    assert all(not (SPINNER_PENDING | ICON_PENDING) & found for found in _icons(link).values())
+
+
+def test_UI09_built_css_has_the_pending_spinner_rules() -> None:
+    compact = _compact(_built_css())
+
+    # group-aria-busy matches an element inside a .group whose aria-busy is true. Its :is()
+    # adds an attribute to the specificity, so it beats .hidden whatever the rule order.
+    for utility, display in (("inline-block", "inline-block"), ("hidden", "none")):
+        rule = GROUP_BUSY_RULE.format(utility=utility, display=display)
+        assert rule in compact, rule
+    assert ".hidden{display:none}" in compact
+    # The spinner spins only when the user allows motion (motion-safe).
+    assert MOTION_SAFE_SPIN.search(compact) is not None
+    assert "--animate-spin:spin" in compact
+    assert "@keyframesspin{" in compact
 
 
 def test_button_icon_rejects_an_unknown_name() -> None:
