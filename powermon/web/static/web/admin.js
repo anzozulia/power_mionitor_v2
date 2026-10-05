@@ -1569,14 +1569,16 @@
             });
           };
 
-          // The writers of the description's parts.
+          // The writers of the description's parts. Each writes only a value that differs:
+          // the description is a polite live region, so writing the same text or flag again
+          // (every poll applies the filter again) would announce the sentence again.
           var setText = function (element, value) {
-            if (element) {
+            if (element && element.textContent !== value) {
               element.textContent = value;
             }
           };
           var setHidden = function (element, value) {
-            if (element) {
+            if (element && element.hidden !== value) {
               element.hidden = value;
             }
           };
