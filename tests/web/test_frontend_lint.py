@@ -12,21 +12,33 @@ the real tree must pass:
 
 - Templates (powermon/web/templates/**/*.html): no |safe, safeseq, {% filter safe %} or
   autoescape off; no <style, style= attribute or :style binding; no on*= attribute, x-html or
-  javascript: URL; no {{ or {% inside an x-*, @* or :* attribute, and no arrow function,
-  template literal or browser global in a directive value (the @alpinejs/csp grammar); no
-  http(s):// except the SVG namespace and no protocol-relative URL; no hard-coded /static/
-  path; a <script> only in the two exact empty-body forms and only in layouts/app.html and
-  layouts/auth.html; every {% icon %} literal name has a file and every {% icon %} a class;
-  every {% static %} literal path has a manifest entry (comments are skipped for those two).
+  javascript: URL; no {{ or {% inside an x-*, @* or :* attribute, and nothing outside the
+  @alpinejs/csp grammar in a directive value (arrow function, template literal, browser
+  global, the keywords new, typeof, function, void, delete, in and instanceof, a second
+  statement, an assignment to a dotted path); no http(s):// except the SVG namespace and no
+  protocol-relative URL; no hard-coded /static/ path; a <script> only in the two exact
+  empty-body forms and only in layouts/app.html and layouts/auth.html; every {% icon %}
+  literal name has a file and every {% icon %} a class; every {% static %} literal path has
+  a manifest entry (comments are skipped for those two).
 - Icon SVGs (templates/icons/*.svg): no <script, on*=, style= or <style, href (xlink:href
   too) or foreignObject.
 - admin.js: no eval(, new Function, string timers, document.write, innerHTML, outerHTML,
-  insertAdjacentHTML, createContextualFragment, sessionStorage, indexedDB, caches.,
-  serviceWorker, pushState, replaceState, window.name, XMLHttpRequest, sendBeacon, confirm(,
-  alert(, prompt(, import/export, http(s)://, hard-coded /static/ path, FormData or the bot
-  token field; localStorage only inside a try block that has a catch, and only as
-  getItem/setItem/removeItem with the literal key powermon.sidebar.rail; document.cookie only
-  as an assignment of a string starting with theme= (R4).
+  insertAdjacentHTML, createContextualFragment, setHTMLUnsafe, parseHTMLUnsafe, srcdoc,
+  sessionStorage, indexedDB, caches., serviceWorker, pushState, replaceState, window.name,
+  XMLHttpRequest, sendBeacon, confirm(, alert(, prompt(, import/export, http(s)://,
+  hard-coded /static/ path, FormData or the bot token field; localStorage only inside a try
+  block that has a catch, and only as getItem/setItem/removeItem with the literal key
+  powermon.sidebar.rail; document.cookie only as an assignment of a string starting with
+  theme= (R4).
+- admin.js components (06-11): the Alpine.data names are exactly the 15 of the binding
+  contract and each component names its contract hooks; the theme cookie carries exactly
+  the attributes ThemeView sets (Secure only on https); the relative-time floors and units
+  are timefmt's; every fetch is a GET of a data-* value or a link's href with redirect:
+  "manual" and no body; the confirm dialog listens on document, finds the dialog by its
+  testid and injects only a 200 X-PM-Fragment response with one confirm root parsed by
+  DOMParser, else navigates; the clipboard is only written, in the copy click listener;
+  the reveal guard empties the key on pagehide and replaces a restored page; the only style
+  write is the fleet bar's flexGrow; the OFF-after bounds are the model's.
 - CSS entries (powermon/web/assets/css/*.css): @import only "tailwindcss" or a ./ or ../ path;
   every url() relative or data: (comments skipped).
 - Python (powermon/web/**/*.py), read with the stdlib ast module: SafeString, SafeText,
@@ -39,9 +51,8 @@ Not scanned: the vendored files under static/web/vendor/, which test_vendor_mani
 verifies by sha256 (the Alpine build legitimately holds https:// warning strings), and the
 licence texts under vendor/LICENSES/ (06-RESEARCH Pitfall 5).
 
-Later plans extend the rule tables through ``violations(text, rules)``: 06-11 (admin.js
-components) and 06-20 (the Alpine directive check: every x-data name registered in admin.js
-and every registered name used).
+Later plans extend the rule tables through ``violations(text, rules)``: 06-20 adds the Alpine
+directive check (every x-data name registered in admin.js and every registered name used).
 
 No string literal in this file (this docstring included) spells the class attribute with its
 equals sign, which 06-09's class guard rejects: patterns and samples that name the class
@@ -49,16 +60,23 @@ attribute are built from CLASS.
 """
 
 import ast
+import math
 import re
 from collections import Counter
 from collections.abc import Callable, Iterator, Mapping
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 from django.conf import settings
 from django.contrib.staticfiles.storage import staticfiles_storage
+from django.test import RequestFactory
 
+from powermon.locations.models import MAX_SECONDS, MIN_SECONDS
+from powermon.web.context_processors import THEME_COOKIE, THEMES
+from powermon.web.templatetags import timefmt
 from powermon.web.templatetags.icons import ICONS
+from powermon.web.theme import THEME_MAX_AGE, ThemeView
 
 WEB = Path(settings.BASE_DIR) / "powermon" / "web"
 TEMPLATES = WEB / "templates"
@@ -106,10 +124,16 @@ _DIRECTIVE = re.compile(
     r"(?<![\w-])(?:x-[\w:.-]+|@[\w:.-]+|:[\w:.-]+)\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>\"']+)"
 )
 # What the @alpinejs/csp parser rejects or the project bans in a directive value (06-RESEARCH
-# Pattern 4): arrow functions, template literals, browser globals and the keywords below.
+# Pattern 4): arrow functions, template literals, browser globals, the keywords new, typeof,
+# function, void, delete, in and instanceof (whole words: a Tailwind token such as ease-in
+# in an x-transition value is not one), a second statement (a ";" followed by more text; one
+# trailing ";" is allowed) and an assignment to a dotted path (user.name = x, a.b += 1).
 _OUTSIDE_CSP_GRAMMAR = re.compile(
     r"=>|`|(?<![\w$.])(?:window|document|globalThis|console|JSON|Math|eval|Function)\b"
     r"|\b(?:new|typeof|function)\b"
+    r"|(?<![\w$.-])(?:void|delete|in|instanceof)(?![\w$-])"
+    r"|;\s*\S"
+    r"|[\w$]+\.[\w$.]+\s*(?:[-+*/%&|^]|\*\*|<<|>>>?|&&|\|\||\?\?)?=(?!=)"
 )
 _URL_TOKEN = re.compile(r"https?://[^\s\"'<>()]*", _I)
 _PROTOCOL_RELATIVE = re.compile(r"(?:=|url\()\s*[\"']?\s*//", _I)
@@ -122,7 +146,10 @@ _STATIC_TAG = re.compile(r"{%\s*static\s+([\"'])(?P<path>[^\"']+)\1")
 
 
 def _directive_values(text: str) -> Iterator[str]:
-    return (match.group(1) for match in _DIRECTIVE.finditer(text))
+    """Every directive value, without its quotes."""
+    for match in _DIRECTIVE.finditer(text):
+        value = match.group(1)
+        yield value[1:-1] if value[:1] in "\"'" else value
 
 
 def _django_in_directive(text: str) -> bool:
@@ -317,6 +344,9 @@ ADMIN_JS_RULES: Rules = {
     "outerHTML": re.compile(r"\bouterHTML\b"),
     "insertAdjacentHTML": re.compile(r"\binsertAdjacentHTML\b"),
     "createContextualFragment": re.compile(r"\bcreateContextualFragment\b"),
+    "setHTMLUnsafe": re.compile(r"\bsetHTMLUnsafe\b"),
+    "parseHTMLUnsafe": re.compile(r"\bparseHTMLUnsafe\b"),
+    "srcdoc": re.compile(r"\bsrcdoc\b", _I),
     "sessionStorage": re.compile(r"\bsessionStorage\b"),
     "indexedDB": re.compile(r"\bindexedDB\b"),
     "Cache Storage": re.compile(r"\bcaches\s*\."),
@@ -544,6 +574,25 @@ GOOD_TEMPLATE = (
             ["directive outside the CSP grammar"],
             id="global",
         ),
+        *(
+            pytest.param(sample, ["directive outside the CSP grammar"], id=name)
+            for name, sample in (
+                ("two-statements", '<button x-on:click="a(); b()"></button>'),
+                ("in", """<p x-show="'k' in obj"></p>"""),
+                ("delete", '<button x-on:click="delete items.x"></button>'),
+                ("void", '<button x-on:click="void go()"></button>'),
+                ("instanceof", '<p x-show="el instanceof Element"></p>'),
+                ("dotted-assignment", """<button x-on:click="user.name = 'x'"></button>"""),
+                ("dotted-compound", '<button @click="item.count += 1"></button>'),
+            )
+        ),
+        pytest.param(
+            '<button x-on:click="go();" x-transition:enter="transition ease-in duration-150"'
+            ' :aria-pressed="a.b === c" x-show="item.count <= 3 && a.b !== d"'
+            ' x-text="label"></button>',
+            [],
+            id="grammar-ok",
+        ),
         pytest.param(
             '<a href="https://cdn.example.com/x.js">x</a>', ["URL to another origin"], id="https"
         ),
@@ -720,6 +769,9 @@ GOOD_JS = """(function () {
         pytest.param(
             "range.createContextualFragment(t);", ["createContextualFragment"], id="fragment"
         ),
+        pytest.param("el.setHTMLUnsafe(t);", ["setHTMLUnsafe"], id="set-html-unsafe"),
+        pytest.param("Document.parseHTMLUnsafe(t);", ["parseHTMLUnsafe"], id="parse-unsafe"),
+        pytest.param("frame.srcdoc = t;", ["srcdoc"], id="srcdoc"),
         pytest.param("sessionStorage.setItem('k', key);", ["sessionStorage"], id="session"),
         pytest.param("indexedDB.open('db');", ["indexedDB"], id="indexed-db"),
         pytest.param("caches.open('v1');", ["Cache Storage"], id="caches"),
@@ -778,6 +830,1000 @@ def test_frontend_lint_admin_js_real_tree() -> None:
     # The real file uses the storage it is allowed: the rail flag, inside a try/catch.
     assert len(_LOCAL_STORAGE.findall(source)) >= 1
     assert _try_catch_blocks(source) != []
+
+
+# admin.js components (06-11 binding contract)
+
+# The 15 Alpine.data names of the 06-11 binding contract: toasts from 06-07, the rest 06-11.
+CONTRACT_NAMES = frozenset(
+    {
+        "toasts",
+        "sidebar",
+        "theme",
+        "poll",
+        "relative",
+        "copy",
+        "tabs",
+        "confirmDialog",
+        "chartImage",
+        "fleetFilter",
+        "offAfterHint",
+        "errorSummary",
+        "throttleCountdown",
+        "revealGuard",
+        "sectionNav",
+    }
+)
+_REGISTRATION = re.compile(r"\bAlpine\s*\.\s*data\s*\(\s*([\"'])(?P<name>[^\"']*)\1")
+_COOKIE_WRITE = re.compile(r"\bdocument\s*\.\s*cookie\s*=(?!=)")
+_JS_STRING = re.compile(r"\"([^\"\\]*)\"|'([^'\\]*)'")
+# The one allowed form of the Secure attribute: appended only on an https page.
+_SECURE_ON_HTTPS = re.compile(
+    r"\(\s*(?:window\s*\.\s*)?location\s*\.\s*protocol\s*===\s*([\"'])https:\1"
+    r"\s*\?\s*([\"']); Secure\2\s*:\s*([\"'])\3\s*\)"
+)
+
+
+def _closing(code: str, start: int, opening: str = "(", closing: str = ")") -> int:
+    """Offset of the bracket that closes the first ``opening`` at or after ``start``."""
+    depth = 0
+    for index in range(code.index(opening, start), len(code)):
+        if code[index] == opening:
+            depth += 1
+        elif code[index] == closing:
+            depth -= 1
+            if depth == 0:
+                return index
+    return len(code) - 1
+
+
+def registered_names(source: str) -> list[str]:
+    """Every Alpine.data("<name>" registration in code order (comments and strings skipped)."""
+    code = _mask_js(source)
+    return [m.group("name") for m in _REGISTRATION.finditer(source) if code[m.start()] != " "]
+
+
+def component_spans(source: str) -> dict[str, tuple[int, int]]:
+    """(start, end) offsets of each ``Alpine.data(...)`` call, by name (the first one)."""
+    code = _mask_js(source)
+    spans: dict[str, tuple[int, int]] = {}
+    for match in _REGISTRATION.finditer(source):
+        if code[match.start()] != " ":
+            spans.setdefault(match.group("name"), (match.start(), _closing(code, match.start())))
+    return spans
+
+
+def component_bodies(source: str) -> dict[str, str]:
+    """The text of each ``Alpine.data(...)`` call, by name (the first one for a repeat)."""
+    return {name: source[start : end + 1] for name, (start, end) in component_spans(source).items()}
+
+
+def _code_matches(pattern: re.Pattern[str], source: str) -> Iterator[re.Match[str]]:
+    """Matches of ``pattern`` in the raw source that start in code (not a comment/string)."""
+    code = _mask_js(source)
+    return (m for m in pattern.finditer(source) if code[m.start()] != " ")
+
+
+_FETCH_CALL = re.compile(r"(?<![\w$])fetch\s*\(")
+_FETCH_NAME = re.compile(r"(?<![\w$])fetch\b")
+# A fetch URL is a value the server rendered into the page: a data-* value or a link's href.
+_FETCH_URL = re.compile(r"[\w$]+(?:\.[\w$]+)*\.(?:dataset\.[\w$]+|href)")
+
+
+def fetch_calls(source: str) -> list[tuple[str, str]]:
+    """(first argument, rest of the arguments) of every fetch(...) call in code."""
+    code = _mask_js(source)
+    calls = []
+    for match in _code_matches(_FETCH_CALL, source):
+        opening = code.index("(", match.start())
+        closing = _closing(code, match.start())
+        depth, comma = 0, closing
+        for index in range(opening + 1, closing):
+            if code[index] in "([{":
+                depth += 1
+            elif code[index] in ")]}":
+                depth -= 1
+            elif code[index] == "," and depth == 0:
+                comma = index
+                break
+        calls.append((source[opening + 1 : comma].strip(), source[comma + 1 : closing].strip()))
+    return calls
+
+
+def fetch_violations(source: str) -> list[str]:
+    """TEST-STRATEGY §5.5: every fetch is a GET of a server-rendered same-origin URL that
+    never follows a redirect (T-06-35, T-06-37)."""
+    found: set[str] = set()
+    calls = fetch_calls(source)
+    if sum(1 for _ in _code_matches(_FETCH_NAME, source)) != len(calls):
+        found.add("fetch used other than as a call")
+    for url, options in calls:
+        if _FETCH_URL.fullmatch(url) is None:
+            found.add("fetch URL not from a data-* value or a link's href")
+        if re.search(r"\bredirect\s*:\s*([\"'])manual\1", options) is None:
+            found.add('fetch without redirect: "manual"')
+        if re.search(r"\bmethod\s*:", options) and not re.search(
+            r"\bmethod\s*:\s*([\"'])GET\1", options
+        ):
+            found.add("fetch method other than GET")
+        if re.search(r"\bbody\s*:", options):
+            found.add("fetch with a body")
+    return sorted(found)
+
+
+_CLIPBOARD_WRITE = re.compile(r"\bnavigator\s*\.\s*clipboard\s*\.\s*writeText\s*\(")
+_CLICK_LISTENER = re.compile(r"\.\s*addEventListener\s*\(\s*([\"'])click\1")
+
+
+def clipboard_violations(source: str) -> list[str]:
+    """UI-08 / R4: the clipboard is only written, only by the copy component, only inside a
+    click listener; it is never read."""
+    code = _mask_js(source)
+    found: set[str] = set()
+    if re.search(r"\bclipboard\s*\.\s*read|\bexecCommand\b", code):
+        found.add("clipboard read or execCommand")
+    start, end = component_spans(source).get("copy", (-1, -1))
+    clicks = [
+        (m.start(), _closing(code, m.start()))
+        for m in _code_matches(_CLICK_LISTENER, source)
+        if start < m.start() < end
+    ]
+    writes = [m.start() for m in _code_matches(_CLIPBOARD_WRITE, source)]
+    if not writes:
+        found.add("no clipboard write")
+    if any(not any(a < w < b for a, b in clicks) for w in writes):
+        found.add("clipboard write outside the copy component's click listener")
+    return sorted(found)
+
+
+_FRAGMENT_HEADER = "X-PM-Fragment"
+
+
+def fragment_violations(source: str) -> list[str]:
+    """UI-07 / T-06-32: the confirm dialog injects the server's confirmation only from a 200
+    response carrying X-PM-Fragment: 1 with exactly one confirm root parsed by DOMParser,
+    and falls back to a full navigation for every other outcome."""
+    start, end = component_spans(source).get("confirmDialog", (0, -1))
+    body = source[start : end + 1]
+    found: set[str] = set()
+    outside = source[:start] + source[end + 1 :]
+    if _FRAGMENT_HEADER in outside:
+        found.add("X-PM-Fragment outside confirmDialog")
+    fragment_fetches = [
+        options
+        for _, options in fetch_calls(body)
+        if re.search(r"([\"'])X-PM-Fragment\1\s*:\s*([\"'])1\2", options)
+    ]
+    if len(fragment_fetches) != 1:
+        found.add("no single fetch sending X-PM-Fragment: 1")
+    checks = {
+        "no status 200 check": r"\.status\s*!==?\s*200|\.status\s*===?\s*200",
+        "no response header check": (
+            r"headers\s*\.\s*get\s*\(\s*([\"'])X-PM-Fragment\1\s*\)\s*[!=]==?\s*([\"'])1\2"
+        ),
+        "no DOMParser": r"new\s+DOMParser\s*\(\s*\)\s*\.\s*parseFromString\s*\([^)]*text/html",
+        "no single-root check": (
+            r"querySelectorAll\s*\(\s*'\[data-testid=\"confirm\"\]'\s*\)"
+            r"[\s\S]*?\.length\s*[!=]==?\s*1"
+        ),
+        "no opaque-redirect fallback": r"([\"'])opaqueredirect\1",
+        "no location.assign fallback": r"\blocation\s*\.\s*assign\s*\(",
+        "no showModal": r"\.showModal\s*\(",
+    }
+    found.update(name for name, pattern in checks.items() if re.search(pattern, body) is None)
+    return sorted(found)
+
+
+_DOCUMENT_CLICK = re.compile(r"\bdocument\s*\.\s*addEventListener\s*\(\s*([\"'])click\1")
+
+
+def confirm_scope_violations(source: str) -> list[str]:
+    """06-12 / 06-15: the dialog block renders after main and the kebab entries sit outside
+    the [data-confirm-scope] wrapper, so confirmDialog listens on document and finds the
+    dialog with document.querySelector, never inside its own element."""
+    body = component_bodies(source).get("confirmDialog", "")
+    code = _mask_js(body)
+    found: set[str] = set()
+    if not any(True for _ in _code_matches(_DOCUMENT_CLICK, body)):
+        found.add("a[data-confirm] click listener not on document")
+    if re.search(r"\$el\s*\.\s*addEventListener\s*\(\s*([\"'])click\1", body):
+        found.add("click listener on the component's element")
+    lookups = [
+        body[m.start() : _closing(code, m.start()) + 1]
+        for m in _code_matches(re.compile(r"\bdocument\s*\.\s*querySelector\s*\("), body)
+    ]
+    if not any('[data-testid="confirm-dialog"]' in lookup for lookup in lookups):
+        found.add("dialog not found with document.querySelector")
+    if re.search(r"\$el\s*\.\s*(?:querySelector|querySelectorAll|closest)\s*\(", body):
+        found.add("lookup inside the component's element")
+    return sorted(found)
+
+
+_STYLE_ACCESS = re.compile(r"\.\s*style\b")
+_FLEX_GROW_WRITE = re.compile(r"\.\s*style\s*\.\s*flexGrow\s*=(?!=)")
+
+
+def style_violations(source: str) -> list[str]:
+    """CSP style-src 'self': the one style write is the fleet bar's el.style.flexGrow."""
+    code = _mask_js(source)
+    found: set[str] = set()
+    for match in _STYLE_ACCESS.finditer(code):
+        if _FLEX_GROW_WRITE.match(code, match.start()) is None:
+            found.add("style access other than style.flexGrow =")
+    if re.search(r"setAttribute\s*\(\s*([\"'])style\1", source):
+        found.add("style attribute")
+    if re.search(r"\b(?:cssText|insertRule|adoptedStyleSheets|CSSStyleSheet)\b", code):
+        found.add("stylesheet or cssText write")
+    if re.search(r"createElement\s*\(\s*([\"'])style\1", source):
+        found.add("style element")
+    return sorted(found)
+
+
+def poll_schedule(source: str) -> dict[str, object]:
+    """The poll component's interval, backoff steps and failure threshold, from its text."""
+    body = component_bodies(source).get("poll", "")
+    return {
+        "interval": int(js_var(body, "POLL_INTERVAL_MS")),
+        "backoff": [int(n) for n in re.findall(r"\d+", js_var(body, "POLL_BACKOFF_MS"))],
+        "pause_after": int(js_var(body, "POLL_PAUSE_AFTER")),
+    }
+
+
+def missing_hooks(body: str, hooks: tuple[str, ...]) -> list[str]:
+    """The hooks of the binding contract that a component's text never names."""
+    return [hook for hook in hooks if hook not in body]
+
+
+def cookie_writes(source: str) -> list[str]:
+    """The right-hand side of every ``document.cookie = ...`` statement."""
+    code = _mask_js(source)
+    writes = []
+    for match in _COOKIE_WRITE.finditer(code):
+        end = code.find(";", match.end())
+        writes.append(source[match.end() : len(source) if end < 0 else end])
+    return writes
+
+
+def theme_cookie_violations(source: str, server: Mapping[str, str]) -> list[str]:
+    """How the theme cookie admin.js writes differs from the ``server``'s attributes.
+
+    ``server`` maps the lower-case attribute names path, max-age and samesite to the values
+    ThemeView sets. The JS write must set exactly those, name the cookie theme, and add
+    Secure only on an https page (the server sets it exactly in production, behind TLS).
+    """
+    writes = cookie_writes(source)
+    if len(writes) != 1:
+        return ["not exactly one cookie write"]
+    expression = writes[0]
+    secure = _SECURE_ON_HTTPS.search(expression)
+    if secure is not None:
+        expression = expression[: secure.start()] + expression[secure.end() :]
+    text = "".join(a or b for a, b in _JS_STRING.findall(expression))
+    found: set[str] = set()
+    if not text.startswith(THEME_COOKIE + "="):
+        found.add("cookie other than theme")
+    attributes: dict[str, str] = {}
+    for part in text.split(";")[1:]:
+        name, _, value = part.strip().partition("=")
+        attributes[name.lower()] = value
+    for name, value in server.items():
+        if attributes.get(name) != value:
+            found.add(f"{name} differs from the server")
+    if "secure" in attributes:
+        found.add("Secure without the https condition")
+    if set(attributes) - set(server) - {"secure"}:
+        found.add("attribute the server does not set")
+    if secure is None:
+        found.add("no Secure on https")
+    return sorted(found)
+
+
+def server_theme_cookie() -> dict[str, str]:
+    """Path, Max-Age and SameSite of the cookie ThemeView sets for a valid POST."""
+    response = ThemeView.as_view()(RequestFactory().post("/theme/", {"theme": "dark"}))
+    morsel = response.cookies[THEME_COOKIE]
+    return {
+        "path": morsel["path"],
+        "max-age": str(morsel["max-age"]),
+        "samesite": morsel["samesite"],
+    }
+
+
+def js_var(source: str, name: str) -> str:
+    """The initializer text of ``var <name> = ...;`` in admin.js."""
+    match = re.search(rf"\bvar\s+{name}\s*=\s*(?P<value>[^;]*);", source)
+    assert match is not None, name
+    return match.group("value").strip()
+
+
+def js_object(source: str, name: str) -> dict[str, int | str]:
+    """A flat ``var <name> = {key: 60, key: "text"}`` literal as a dict."""
+    body = js_var(source, name)
+    assert body.startswith("{") and body.endswith("}"), name
+    pairs = re.findall(r"([\w$]+)\s*:\s*(\"[^\"]*\"|\d+)", body)
+    return {key: int(value) if value.isdigit() else value[1:-1] for key, value in pairs}
+
+
+def relative_mismatches(source: str) -> list[str]:
+    """Ages at which admin.js's floors and units disagree with powermon's timefmt.
+
+    The JS constants (MS_PER_SECOND, AGE_FLOORS, JUST_NOW, UNIT_AGO, UNIT_WORDS,
+    UNIT_COMPACT) drive a port of admin.js's ageParts; its texts must equal timefmt's
+    relative_text, compact_age and age_words at every floor boundary.
+    """
+    ms_per_second = int(js_var(source, "MS_PER_SECOND"))
+    floors = js_object(source, "AGE_FLOORS")
+    just_now = js_var(source, "JUST_NOW").strip("\"'")
+    ago, words, compact = (js_object(source, n) for n in ("UNIT_AGO", "UNIT_WORDS", "UNIT_COMPACT"))
+    minute, hour, limit, day = (int(floors[k]) for k in ("minute", "hour", "hoursLimit", "day"))
+
+    def js_age(age: timedelta) -> tuple[int, str]:
+        seconds = math.floor(age / timedelta(milliseconds=1) / ms_per_second)
+        if seconds < 1:
+            return 0, "s"
+        if seconds < minute:
+            return seconds, "s"
+        if seconds < hour:
+            return seconds // minute, "min"
+        if seconds < limit:
+            return seconds // hour, "h"
+        return seconds // day, "d"
+
+    now = datetime(2026, 10, 25, 3, 30, tzinfo=UTC)
+    found = []
+    for seconds in (-90, 0, 0.5, 0.999, 1, 59, 59.999, 60, 3599, 3600, 172_799, 172_800, 10**7):
+        value = now - timedelta(seconds=seconds)
+        count, unit = js_age(now - value)
+        relative = just_now if (count, unit) == (0, "s") else f"{count}{ago[unit]}"
+        texts = (relative, f"{count}{compact[unit]}", f"{count}{words[unit]}")
+        expected = (
+            timefmt.relative_text(value, now),
+            timefmt.compact_age(value, now),
+            timefmt.age_words(value, now),
+        )
+        if texts != expected:
+            found.append(f"{seconds} s: {texts} != {expected}")
+    return found
+
+
+# Hooks of the binding contract each component must name (a pin against renames; 06-20
+# cross-checks the x-data names against the templates).
+CONTRACT_HOOKS: dict[str, tuple[str, ...]] = {
+    "theme": ('button[name="theme"]', "aria-pressed", '"data-theme"', "preventDefault"),
+    "sidebar": (
+        'getElementById("sidebar")',
+        '[data-testid="sidebar-toggle"]',
+        '[data-testid="drawer-close"]',
+        '[data-testid="rail-toggle"]',
+        "[data-drawer-overlay]",
+        "[data-shell-body]",
+        '[data-testid="skip-link"]',
+        '"data-drawer"',
+        '"data-rail"',
+        '"inert"',
+        'matchMedia("(min-width: 64rem)")',
+        '"powermon.sidebar.rail"',
+        "Open navigation",
+        "Close navigation",
+        "Collapse sidebar",
+        "Expand sidebar",
+        "[data-label]",
+        "toggleDrawer",
+        "closeDrawer",
+        "toggleRail",
+    ),
+    "relative": (
+        '"data-now"',
+        "[data-relative]",
+        'a[data-testid="sidebar-location"]',
+        "[data-live-age]",
+        '"pm:status"',
+        "RELATIVE_REFRESH_MS",
+    ),
+    "poll": (
+        "dataset.pollUrl",
+        "dataset.pollPage",
+        "dataset.reloadUrl",
+        '[data-testid="live-status"]',
+        '"data-live-state"',
+        '[data-testid="live-chip"]',
+        "[data-chip]",
+        '"Live"',
+        '"Paused"',
+        "[data-live][data-location-id]",
+        'a[data-testid="sidebar-location"]',
+        '[data-live="sidebar-fail"]',
+        '[data-delivery-variant="failing"] [data-label]',
+        "[data-since-label]",
+        '[data-fh="waiting"]',
+        '[data-fh="received"]',
+        '[data-live="summary"]',
+        '[data-live="summary-sr"]',
+        '[data-live="count"]',
+        '[data-testid="fleet-tile"]',
+        '[data-testid="fleet-count"]',
+        '[data-testid="fleet-bar"]',
+        '"opaqueredirect"',
+        '"visibilitychange"',
+        '"pm:status"',
+    ),
+    "copy": (
+        '"data-copy-target"',
+        '"data-copied-msg"',
+        "[data-copy-status]",
+        '"data-copied"',
+        '"Copied"',
+        '"Copy failed. Select the text and copy it by hand."',
+        "navigator.clipboard.writeText",
+    ),
+    "tabs": (
+        '[role="tablist"][data-testid="example-tabs"]',
+        '[role="tab"]',
+        '"aria-controls"',
+        '"aria-selected"',
+        '"tabindex"',
+        '"ArrowLeft"',
+        '"ArrowRight"',
+        '"Home"',
+        '"End"',
+    ),
+    "revealGuard": (
+        '"pagehide"',
+        "onPageshow(",
+        "persisted",
+        "location.replace(",
+        "dataset.maskedUrl",
+        '"device-key"',
+        '"example-curl"',
+        '"example-cron"',
+        '"example-wget-gnu"',
+        '"example-wget-busybox"',
+    ),
+    "chartImage": ('"error"', '[data-testid="weekly-chart-error"]', "naturalWidth"),
+    "sectionNav": (
+        'a[href^="#"]',
+        "(prefers-reduced-motion: reduce)",
+        "scrollIntoView",
+        '"tabindex"',
+        "preventScroll",
+    ),
+    "confirmDialog": (
+        "a[data-confirm]",
+        '[data-testid="confirm-dialog"]',
+        "[data-dialog-body]",
+        "[data-dialog-loading]",
+        "[data-dialog-close]",
+        '[data-testid="keep"]',
+        '[data-testid="confirm-submit"]',
+        '"aria-busy"',
+        '"cancel"',
+        '"Escape"',
+        '"close"',
+        "[popover]",
+        "popovertarget",
+        "preventDefault",
+    ),
+    "fleetFilter": (
+        'button[data-testid="filter-chip"][data-filter]',
+        '[data-testid="fleet-bar"]',
+        "style.flexGrow",
+        'tr[data-testid="location-row"]',
+        "li[data-status][data-delivery]",
+        '[data-testid="fleet-showing"]',
+        '"data-total"',
+        '[data-testid="no-match"]',
+        "[data-filter-reset]",
+        '"data-filtered"',
+        '"aria-pressed"',
+        '"pm:status"',
+        '"Showing all "',
+        '"Showing 1 location"',
+    ),
+    "offAfterHint": (
+        '"id_period_s"',
+        '"id_grace_s"',
+        "[data-off-after-value]",
+        "[data-off-after-fallback]",
+        "OFF_AFTER_MIN",
+        "OFF_AFTER_MAX",
+        '"input"',
+    ),
+    "errorSummary": (".focus(",),
+    "throttleCountdown": (
+        "[data-retry-after]",
+        '[data-testid="throttle-countdown"]',
+        'button[type="submit"]',
+        '"aria-disabled"',
+        '"(you can try again now)"',
+        '" left)"',
+    ),
+}
+
+
+def test_admin_js_theme_cookie_matches_server() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+    server = server_theme_cookie()
+
+    # Expected: the server sets Path=/, Max-Age=THEME_MAX_AGE and SameSite=Lax, and the one
+    # cookie admin.js writes carries exactly those, plus Secure only on https (UI-02).
+    assert server == {"path": "/", "max-age": str(THEME_MAX_AGE), "samesite": "Lax"}
+    assert theme_cookie_violations(source, server) == []
+    assert [w for w in cookie_writes(source) if "Max-Age=31536000" in w] != []
+    # The theme component only writes values of the server's allowlist.
+    assert set(re.findall(r"\"(\w+)\"", js_var(source, "THEMES"))) == THEMES
+
+
+@pytest.mark.parametrize(
+    ("write", "expected"),
+    [
+        # Edge: Secure under the https test, with or without window.
+        pytest.param(
+            '"theme=" + v + "; Path=/; Max-Age=31536000; SameSite=Lax" + '
+            '(location.protocol === "https:" ? "; Secure" : "")',
+            [],
+            id="no-window",
+        ),
+        # Failure: every attribute that drifts from the server.
+        pytest.param(
+            '"theme=" + v + "; Path=/; Max-Age=0; SameSite=Lax" + '
+            '(window.location.protocol === "https:" ? "; Secure" : "")',
+            ["max-age differs from the server"],
+            id="max-age-zero",
+        ),
+        pytest.param(
+            '"theme=" + v + "; Path=/; Max-Age=31536000" + '
+            '(window.location.protocol === "https:" ? "; Secure" : "")',
+            ["samesite differs from the server"],
+            id="no-samesite",
+        ),
+        pytest.param(
+            '"theme=" + v + "; Path=/locations/; Max-Age=31536000; SameSite=Strict" + '
+            '(window.location.protocol === "https:" ? "; Secure" : "")',
+            ["path differs from the server", "samesite differs from the server"],
+            id="path-and-samesite",
+        ),
+        pytest.param(
+            '"theme=" + v + "; Path=/; Max-Age=31536000; SameSite=Lax; Secure"',
+            ["Secure without the https condition", "no Secure on https"],
+            id="secure-always",
+        ),
+        pytest.param(
+            '"theme=" + v + "; Path=/; Max-Age=31536000; SameSite=Lax"',
+            ["no Secure on https"],
+            id="never-secure",
+        ),
+        pytest.param(
+            '"theme=" + v + "; Path=/; Max-Age=31536000; SameSite=Lax; Domain=example" + '
+            '(window.location.protocol === "https:" ? "; Secure" : "")',
+            ["attribute the server does not set"],
+            id="domain",
+        ),
+        pytest.param(
+            '"mode=" + v + "; Path=/; Max-Age=31536000; SameSite=Lax" + '
+            '(window.location.protocol === "https:" ? "; Secure" : "")',
+            ["cookie other than theme"],
+            id="other-name",
+        ),
+    ],
+)
+def test_theme_cookie_rule(write: str, expected: list[str]) -> None:
+    server = {"path": "/", "max-age": "31536000", "samesite": "Lax"}
+    sample = "function choose(v) {\n  document.cookie = " + write + ";\n}\n"
+
+    assert theme_cookie_violations(sample, server) == expected
+    # Failure: no write, or two writes.
+    assert theme_cookie_violations("var x = 1;", server) == ["not exactly one cookie write"]
+    assert theme_cookie_violations(sample + sample, server) == ["not exactly one cookie write"]
+
+
+def test_admin_js_all_names_registered() -> None:
+    names = registered_names(ADMIN_JS.read_text(encoding="utf-8"))
+
+    # Expected: exactly the 15 names of the binding contract, each registered once (06-20
+    # checks them against the templates' x-data values).
+    assert sorted(names) == sorted(CONTRACT_NAMES)
+    # Edge: a repeat is seen; a registration inside a comment or a string is not one.
+    assert Counter(registered_names('Alpine.data("theme", a);\nAlpine.data("theme", b);')) == {
+        "theme": 2
+    }
+    assert registered_names('// Alpine.data("x", f)\nvar s = \'Alpine.data("y"\';') == []
+
+
+def test_admin_js_relative_floors_match_timefmt() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+
+    # Expected: the JS floors are timefmt's, in seconds, with 1000 ms to the second.
+    assert int(js_var(source, "MS_PER_SECOND")) == timefmt.SECOND // timedelta(milliseconds=1)
+    assert js_object(source, "AGE_FLOORS") == {
+        "minute": timefmt.MINUTE // timefmt.SECOND,
+        "hour": timefmt.HOUR // timefmt.SECOND,
+        "hoursLimit": timefmt.HOURS_LIMIT // timefmt.SECOND,
+        "day": timefmt.DAY // timefmt.SECOND,
+    }
+    assert js_object(source, "UNIT_COMPACT") == timefmt.COMPACT_UNITS
+    for text in ('"just now"', '" s ago"', '" min ago"', '" h ago"', '" d ago"'):
+        assert text in source, text
+    # Edge: every floor boundary, a future instant and a sub-second age agree.
+    assert relative_mismatches(source) == []
+    # Failure: a drifted floor or unit is caught.
+    assert relative_mismatches(source.replace("hour: 3600", "hour: 3601")) != []
+    assert relative_mismatches(source.replace('min: " min ago"', 'min: " m ago"')) != []
+
+
+@pytest.mark.parametrize("name", sorted(CONTRACT_HOOKS))
+def test_admin_js_components_name_their_contract_hooks(name: str) -> None:
+    bodies = component_bodies(ADMIN_JS.read_text(encoding="utf-8"))
+
+    # Expected: the component exists and names every hook of its contract row.
+    assert missing_hooks(bodies.get(name, ""), CONTRACT_HOOKS[name]) == []
+    # Failure: a body without the hooks reports every one of them.
+    stub = 'Alpine.data("' + name + '", function () { return {}; })'
+    assert missing_hooks(component_bodies(stub)[name], CONTRACT_HOOKS[name]) == list(
+        CONTRACT_HOOKS[name]
+    )
+
+
+FETCH_URL_RULE = "fetch URL not from a data-* value or a link's href"
+NO_MANUAL = 'fetch without redirect: "manual"'
+
+
+def test_admin_js_fetch_rules() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+
+    # Expected: every fetch passes the rules, and the poll fetches its data-poll-url.
+    assert fetch_violations(source) == []
+    assert "main.dataset.pollUrl" in [url for url, _ in fetch_calls(source)]
+
+
+@pytest.mark.parametrize(
+    ("sample", "expected"),
+    [
+        pytest.param('fetch(main.dataset.pollUrl, { redirect: "manual" });', [], id="dataset"),
+        pytest.param(
+            "window.fetch(link.href, {redirect: 'manual', method: \"GET\", "
+            'headers: {"X-PM-Fragment": "1"}});',
+            [],
+            id="href-get",
+        ),
+        # Edge: a fetch in a comment or a string is not code.
+        pytest.param(
+            '// fetch("/x")\nvar s = "fetch(1)";\n'
+            'fetch(main.dataset.pollUrl, {redirect: "manual"});',
+            [],
+            id="comment",
+        ),
+        # Failure: a literal or built URL, a followed redirect, a write, an alias.
+        pytest.param(
+            'fetch("/locations/status.json", { redirect: "manual" });',
+            [FETCH_URL_RULE],
+            id="literal",
+        ),
+        pytest.param(
+            'fetch(main.dataset.pollUrl + "?all=1", { redirect: "manual" });',
+            [FETCH_URL_RULE],
+            id="built",
+        ),
+        pytest.param("fetch(main.dataset.pollUrl);", [NO_MANUAL], id="no-options"),
+        pytest.param(
+            'fetch(main.dataset.pollUrl, { redirect: "follow" });', [NO_MANUAL], id="follow"
+        ),
+        pytest.param(
+            'fetch(link.href, { redirect: "manual", method: "POST" });',
+            ["fetch method other than GET"],
+            id="post",
+        ),
+        pytest.param(
+            'fetch(link.href, { redirect: "manual", body: data });',
+            ["fetch with a body"],
+            id="body",
+        ),
+        pytest.param(
+            "var get = fetch; get(link.href);", ["fetch used other than as a call"], id="alias"
+        ),
+    ],
+)
+def test_fetch_rule(sample: str, expected: list[str]) -> None:
+    assert fetch_violations(sample) == expected
+
+
+def test_admin_js_poll_schedule() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+    body = component_bodies(source).get("poll", "")
+    expected = {
+        "interval": 30_000,
+        "backoff": [60_000, 120_000, 240_000, 300_000],
+        "pause_after": 3,
+    }
+
+    # Expected: 30 s while visible; 60 -> 120 -> 240 -> 300 s after failures; paused after
+    # 3 failures in a row; polls at once on becoming visible; stops on an opaque redirect.
+    assert poll_schedule(source) == expected
+    for hook in ('"visibilitychange"', "document.visibilityState", '"opaqueredirect"'):
+        assert hook in body, hook
+    # Failure: a drifted constant is seen.
+    drifted = source.replace("POLL_INTERVAL_MS = 30000", "POLL_INTERVAL_MS = 5000")
+    assert poll_schedule(drifted) != expected
+
+
+def test_admin_js_copy_uses_click_only() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+
+    # Expected: one clipboard write, inside the copy component's click listener; no read.
+    assert clipboard_violations(source) == []
+    assert len(list(_code_matches(_CLIPBOARD_WRITE, source))) == 1
+
+
+COPY_OK = (
+    'Alpine.data("copy", function () { return { init: function () {'
+    ' b.addEventListener("click", function () { navigator.clipboard.writeText(t.textContent); });'
+    " } }; });"
+)
+OUTSIDE_CLICK = "clipboard write outside the copy component's click listener"
+
+
+@pytest.mark.parametrize(
+    ("sample", "expected"),
+    [
+        pytest.param(COPY_OK, [], id="click"),
+        # Failure: a write on init (an automatic copy of a revealed key), a write in another
+        # component, any read, execCommand, no write at all.
+        pytest.param(
+            'Alpine.data("copy", function () { return { init: function () {'
+            " navigator.clipboard.writeText(t.textContent); } }; });",
+            [OUTSIDE_CLICK],
+            id="on-init",
+        ),
+        pytest.param(
+            COPY_OK.replace('"copy"', '"revealGuard"'), [OUTSIDE_CLICK], id="no-copy-component"
+        ),
+        pytest.param(
+            COPY_OK + 'Alpine.data("revealGuard", function () { return { init: function () {'
+            ' b.addEventListener("click", function () { navigator.clipboard.writeText(k); });'
+            " } }; });",
+            [OUTSIDE_CLICK],
+            id="other-component",
+        ),
+        pytest.param(
+            COPY_OK + " navigator.clipboard.readText();",
+            ["clipboard read or execCommand"],
+            id="read",
+        ),
+        pytest.param(
+            COPY_OK + ' document.execCommand("copy");',
+            ["clipboard read or execCommand"],
+            id="exec-command",
+        ),
+        pytest.param("var x = 1;", ["no clipboard write"], id="none"),
+    ],
+)
+def test_clipboard_rule(sample: str, expected: list[str]) -> None:
+    assert clipboard_violations(sample) == expected
+
+
+def test_admin_js_reveal_guard() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+    body = component_bodies(source).get("revealGuard", "")
+    replaced = re.findall(r"\blocation\s*\.\s*replace\s*\(\s*([^)]*)\)", body)
+
+    # Expected: pagehide empties the key and the four examples; pageshow with persisted
+    # replaces the page with the masked setup URL from data-masked-url (R4).
+    assert missing_hooks(body, CONTRACT_HOOKS["revealGuard"]) == []
+    assert re.search(r"\.textContent\s*=\s*\"\"", body) is not None
+    assert replaced != [] and all("maskedUrl" in argument for argument in replaced)
+    # Edge: admin.js keeps one window pageshow listener (06-07's reset), which also runs
+    # the handlers components register through onPageshow.
+    listener = re.search(r"window\.addEventListener\(\"pageshow\", function \(event\) \{", source)
+    assert listener is not None
+    assert "pageshowHandlers.forEach" in source[listener.end() :]
+    # Failure: a guard that never checks persisted, or replaces with another URL, is caught.
+    assert missing_hooks(body.replace("persisted", "loaded"), ("persisted",)) == ["persisted"]
+
+
+GOOD_CONFIRM = """window.Alpine.data("confirmDialog", function () {
+  return { init: function () {
+    var dialog = document.querySelector('dialog[data-testid="confirm-dialog"]');
+    document.addEventListener("click", function (event) {
+      var link = event.target.closest("a[data-confirm]");
+      dialog.showModal();
+      fetch(link.href, { redirect: "manual", headers: { "X-PM-Fragment": "1" } })
+        .then(function (response) {
+          if (response.type === "opaqueredirect" || response.status !== 200 ||
+              response.headers.get("X-PM-Fragment") !== "1") { throw new Error("full"); }
+          return response.text();
+        })
+        .then(function (html) {
+          var doc = new DOMParser().parseFromString(html, "text/html");
+          var roots = doc.querySelectorAll('[data-testid="confirm"]');
+          if (roots.length !== 1) { throw new Error("full"); }
+          body.appendChild(roots[0]);
+        })
+        .catch(function () { window.location.assign(link.href); });
+    });
+  } };
+});
+"""
+
+
+def test_admin_js_fragment_protocol() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+
+    # Expected: one fragment fetch, every injection condition checked, every other outcome
+    # a full navigation; the header is named nowhere else (UI-07, T-06-32).
+    assert fragment_violations(source) == []
+    assert "link.href" in [url for url, _ in fetch_calls(source)]
+    assert fragment_violations(GOOD_CONFIRM) == []
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    [
+        pytest.param(
+            "|| response.status !== 200 ", "", ["no status 200 check"], id="no-status-check"
+        ),
+        pytest.param(
+            '||\n              response.headers.get("X-PM-Fragment") !== "1"',
+            "",
+            ["no response header check"],
+            id="no-header-check",
+        ),
+        pytest.param(
+            'if (roots.length !== 1) { throw new Error("full"); }',
+            "",
+            ["no single-root check"],
+            id="no-root-count",
+        ),
+        pytest.param(
+            ".catch(function () { window.location.assign(link.href); });",
+            ";",
+            ["no location.assign fallback"],
+            id="no-fallback",
+        ),
+        pytest.param(
+            ', headers: { "X-PM-Fragment": "1" }',
+            "",
+            ["no single fetch sending X-PM-Fragment: 1"],
+            id="no-request-header",
+        ),
+        pytest.param(
+            'var doc = new DOMParser().parseFromString(html, "text/html");',
+            "var doc = document.implementation.createHTMLDocument(); doc.body.textContent = html;",
+            ["no DOMParser"],
+            id="no-domparser",
+        ),
+    ],
+)
+def test_fragment_rule(old: str, new: str, expected: list[str]) -> None:
+    assert old in GOOD_CONFIRM
+    assert fragment_violations(GOOD_CONFIRM.replace(old, new)) == expected
+
+
+def test_fragment_rule_flags_the_header_elsewhere_and_innerhtml() -> None:
+    poll = 'Alpine.data("poll", function () { var h = { "X-PM-Fragment": "1" }; });\n'
+    injected = GOOD_CONFIRM.replace("body.appendChild(roots[0]);", "body.innerHTML = html;")
+
+    # Failure: the fragment header in another component; markup injected as HTML.
+    assert fragment_violations(GOOD_CONFIRM + poll) == ["X-PM-Fragment outside confirmDialog"]
+    assert "innerHTML" in violations(injected, ADMIN_JS_RULES)
+
+
+def test_admin_js_no_confirm_call() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+    dialogs = {name: ADMIN_JS_RULES[name] for name in ("confirm(", "alert(", "prompt(")}
+
+    # Expected: the confirmation is the server's page in a native dialog, never confirm().
+    assert violations(source, dialogs) == []
+    assert ".showModal(" in component_bodies(source).get("confirmDialog", "")
+    # Failure: a browser dialog in any form is caught (06-07's rule).
+    assert violations("if (window.confirm('Delete?')) { go(); }", dialogs) == ["confirm("]
+    assert violations("self.alert(1);", dialogs) == ["alert("]
+
+
+def test_admin_js_confirm_dialog_is_document_wide() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+
+    # Expected: one click listener on document (the kebab entries are outside the scope
+    # wrapper) and the dialog found by its testid on document (it renders after main).
+    assert confirm_scope_violations(source) == []
+    assert confirm_scope_violations(GOOD_CONFIRM) == []
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    [
+        pytest.param(
+            'document.addEventListener("click"',
+            'this.$el.addEventListener("click"',
+            [
+                "a[data-confirm] click listener not on document",
+                "click listener on the component's element",
+            ],
+            id="listener-on-el",
+        ),
+        pytest.param(
+            "document.querySelector('dialog[data-testid=\"confirm-dialog\"]')",
+            "this.$el.querySelector('dialog[data-testid=\"confirm-dialog\"]')",
+            [
+                "dialog not found with document.querySelector",
+                "lookup inside the component's element",
+            ],
+            id="dialog-in-el",
+        ),
+    ],
+)
+def test_confirm_scope_rule(old: str, new: str, expected: list[str]) -> None:
+    assert old in GOOD_CONFIRM
+    assert confirm_scope_violations(GOOD_CONFIRM.replace(old, new)) == expected
+
+
+def test_admin_js_fleet_bar_style_only_flexgrow() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+    body = component_bodies(source).get("fleetFilter", "")
+
+    # Expected: the only style write is the fleet bar's flexGrow, inside fleetFilter.
+    assert style_violations(source) == []
+    assert len(_FLEX_GROW_WRITE.findall(_mask_js(source))) == 1
+    assert _FLEX_GROW_WRITE.search(_mask_js(body)) is not None
+
+
+@pytest.mark.parametrize(
+    ("sample", "expected"),
+    [
+        pytest.param("segment.style.flexGrow = String(count);", [], id="flex-grow"),
+        # Edge: style in a comment or a string is not code.
+        pytest.param('// el.style.color\nvar s = "x.style.color = 1";', [], id="comment"),
+        # Failure: any other style write.
+        pytest.param(
+            'el.style.color = "red";', ["style access other than style.flexGrow ="], id="color"
+        ),
+        pytest.param(
+            'el.setAttribute("style", "color: red");', ["style attribute"], id="attribute"
+        ),
+        pytest.param(
+            'el.style.cssText = "";',
+            ["style access other than style.flexGrow =", "stylesheet or cssText write"],
+            id="css-text",
+        ),
+        pytest.param(
+            'el.style.setProperty("--w", "1");',
+            ["style access other than style.flexGrow ="],
+            id="set-property",
+        ),
+        pytest.param(
+            'document.head.appendChild(document.createElement("style"));',
+            ["style element"],
+            id="style-element",
+        ),
+    ],
+)
+def test_style_rule(sample: str, expected: list[str]) -> None:
+    assert style_violations(sample) == expected
+
+
+def test_admin_js_off_after_bounds_match_the_model() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+    body = component_bodies(source).get("offAfterHint", "")
+
+    # Expected: the hint accepts exactly the whole numbers the form accepts (N8).
+    assert int(js_var(body, "OFF_AFTER_MIN")) == MIN_SECONDS
+    assert int(js_var(body, "OFF_AFTER_MAX")) == MAX_SECONDS
+
+
+def test_component_bodies_follow_the_brackets() -> None:
+    source = (
+        'window.Alpine.data("a", function () { var s = ")"; return { f: g(1) }; });\n'
+        '// Alpine.data("c", nothing)\n'
+        'window.Alpine.data("b", function () { return {}; });'
+    )
+    bodies = component_bodies(source)
+
+    # Expected: each call up to its own closing parenthesis; a bracket in a string is text.
+    assert bodies == {
+        "a": 'Alpine.data("a", function () { var s = ")"; return { f: g(1) }; })',
+        "b": 'Alpine.data("b", function () { return {}; })',
+    }
+    # Edge and failure: an unclosed call runs to the end; no registration gives nothing.
+    assert component_bodies('Alpine.data("x", f(') == {"x": 'Alpine.data("x", f('}
+    assert component_bodies("var x = 1;") == {}
 
 
 def test_js_masking_keeps_offsets() -> None:
