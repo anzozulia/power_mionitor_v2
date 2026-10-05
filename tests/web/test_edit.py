@@ -173,7 +173,7 @@ def _loaded_form(page: Any) -> dict[str, str]:
 
 
 def _flashes(admin: Client, url: str) -> list[str]:
-    """The flash messages the page at ``url`` shows, toast or legacy callout alike (UI-09)."""
+    """The flash messages the page at ``url`` shows, read from its toasts (UI-09)."""
     return message_texts(admin.get(url))
 
 
@@ -902,7 +902,7 @@ def test_edit_racing_a_regenerate_keeps_the_new_key(location_factory: Callable[.
     assert (saved.name, saved.grace_s) == ("Renamed", 45)
 
 
-# UI rule 1 and E5: the admin-typed name is escaped, the page has no script
+# UI rule 1 and E5: the admin-typed name is escaped, the page has no injected script
 
 
 @pytest.mark.django_db

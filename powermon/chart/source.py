@@ -1,8 +1,10 @@
 """The chart's one read of the stored timeline (KD1, INV-03).
 
-Worker side. The chart reads only ``power_interval``, the timeline that the engine and the
-lapse carve write. It never reads heartbeats (they are not stored), ``location_state`` or
-the outbox, so the chart, its totals and the alerts all come from the same intervals.
+Worker side, and the web's chart preview (UI-06), which reaches it through
+``lifecycle.chart_content`` inside its view, never at import time. The chart reads only
+``power_interval``, the timeline that the engine and the lapse carve write. It never reads
+heartbeats (they are not stored), ``location_state`` or the outbox, so the chart, its
+totals and the alerts all come from the same intervals.
 
 One overlap query per chart, served by the ``power_interval_loc_start`` index and bounded
 to the seven shown days: an interval that started before the week, or is still open,

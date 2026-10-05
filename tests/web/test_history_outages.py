@@ -26,8 +26,8 @@ Histories are built through the engine (``transitions.record_heartbeat``,
 ``django_db(transaction=True)``. The views get a ``FakeClock`` by monkeypatching their
 ``clock`` attribute. Times are asserted in Europe/Kyiv, pinned by the autouse ``kyiv``
 fixture. Template copy is the 06-UI-SPEC copy table's, verbatim. Pages are read through
-tests/web/pages.py and the 06-UI-SPEC hooks only. Flashes are read through
-``pages.messages()`` as (role, text), toast or legacy callout alike (UI-09).
+tests/web/pages.py and the 06-UI-SPEC hooks only. Flashes are the page's toasts, read
+through ``pages.messages()`` as (role, text) (UI-09).
 """
 
 import re
@@ -146,7 +146,7 @@ def _reset(location: Any) -> str:
 
 
 def _flashes(page: str) -> list[tuple[str, str]]:
-    """Each flash on a page as (role, text), toast or legacy callout alike (UI-09)."""
+    """Each flash (toast) on a page as (role, text) (UI-09)."""
     return [(flash.role, flash.text) for flash in messages(page)]
 
 

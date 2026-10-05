@@ -353,11 +353,8 @@ def test_delete_twice_shows_already_deleted(
     assert second.url == "/"
     page = admin.get(second.url).content.decode()
     assert message_texts(page) == [ALREADY_DELETED_FLASH]
-    # An info flash announced as status: a legacy callout (no level) or an info toast.
-    assert messages(page) in (
-        [Message(None, "status", ALREADY_DELETED_FLASH)],
-        [Message("info", "status", ALREADY_DELETED_FLASH)],
-    )
+    # An info toast, announced as status.
+    assert messages(page) == [Message("info", "status", ALREADY_DELETED_FLASH)]
     assert Location.objects.get(pk=location.pk).deleted_at == deleted_at
     assert LocationState.objects.get(location=location).state_version == version
     assert _row(late).status == "pending"
@@ -536,7 +533,7 @@ def test_delete_without_a_csrf_token_is_refused(location_factory: Callable[..., 
     assert Location.objects.get(pk=location.pk).deleted_at is None
 
 
-# UI rule 1, E6: the name is escaped and whole; the page shows no secret and no script
+# UI rule 1, E6: the name is escaped and whole; the page shows no secret and no injected script
 
 
 @pytest.mark.django_db

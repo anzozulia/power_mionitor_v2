@@ -18,8 +18,10 @@ How it draws (D-09, STACK Gotcha 1, 03-RESEARCH Pattern 2):
   no full 4× canvas is ever allocated.
 - All text is drawn at 1× after every band is pasted, so no band can cover text.
 
-Pure: imports nothing from Django. The web process must never import this module (it
-pulls in Pillow); only the worker renders.
+Pure: imports nothing from Django. No app module imports it at import time (it pulls in
+Pillow): ``lifecycle.chart_content`` imports it inside the call. The worker renders the
+channel's chart that way, and the web process only through its chart preview view
+(``powermon/web/chart_preview.py``, UI-06), when a preview is first requested.
 """
 
 import io
