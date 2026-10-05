@@ -146,6 +146,9 @@ A `BACKUP_TIME_UTC` or `BACKUP_KEEP` of the wrong shape makes no dump and keeps 
 
 ## 5. Deploy
 
+On a server whose ports 80 and 443 already belong to another web server (the shared VPS
+behind powermonitor.anzozulia.com), follow section 17 instead.
+
 One command deploys a fresh install and every update:
 
 ```sh
@@ -1374,3 +1377,196 @@ step 6). Target: at least 21/24, with no pillar below 3.
 **Earlier UAT items.** 04-UAT #5 and 05-UAT #5 (visual passes over the old pages) are
 superseded by Phase 6. 01-UAT #7 (a 100-character name at 360 px) is checked here as
 UI-12, in item 10.
+
+## 17. CI/CD and the shared-host deployment (powermonitor.anzozulia.com)
+
+The production instance runs on a shared VPS at `https://powermonitor.anzozulia.com`.
+GitHub Actions tests every change, and a green master build deploys itself there. This
+section replaces sections 3 to 5 for that server. Everything else in this README applies,
+with the Compose command below.
+
+### 17.1 CI
+
+`.github/workflows/ci.yml` runs on every push to `master`, on every pull request into
+`master`, and by hand (Actions, CI, "Run workflow"). Its `test` job runs the project gate
+of section 9 (ruff, ruff format, mypy, pytest with coverage, and the 80 % coverage gate)
+inside the dev image against a PostgreSQL in a tmpfs (`docker-compose.ci.yml`). It also
+checks the VPS Compose files and smoke-tests the tools in `deploy/`. A newer push to a pull
+request cancels the older run; a master run is never cancelled.
+
+The same gate on your machine, with its own project name so it never touches the local
+stack:
+
+```sh
+docker compose -p pmci -f docker-compose.local.yml -f docker-compose.ci.yml run --build --rm -T web sh -c "ruff check . && ruff format --check . && mypy powermon && pytest -q --cov=powermon --cov-report=term-missing:skip-covered && coverage report --include='powermon/engine/*,powermon/alerts/*,powermon/i18n/*,powermon/telegram/*,powermon/chart/*,powermon/worker/detection.py,powermon/worker/io_loop.py,powermon/worker/lease.py,powermon/worker/supervision.py,powermon/web/*.py,powermon/web/templatetags/*.py' --omit='powermon/web/gunicorn_conf.py' --fail-under=80"
+docker compose -p pmci -f docker-compose.local.yml -f docker-compose.ci.yml down -v --rmi local
+```
+
+### 17.2 CD
+
+The `deploy` job runs only for `master` (a push or a manual run), and only after the
+`test` job passed. It uses the GitHub environment `production`, which only `master` may
+deploy to, and its three environment secrets: `DEPLOY_SSH_KEY` (a private key used for
+nothing else), `DEPLOY_KNOWN_HOSTS` (the server's pinned host key) and `DEPLOY_HOST`. The
+job has no checkout. It connects as root over SSH and sends `deploy <commit>`. The key's
+line in `/root/.ssh/authorized_keys` starts with
+`restrict,command="/usr/local/sbin/powermon-deploy"`, so the key can run nothing but that
+script, which:
+
+1. accepts only `deploy <40-hex commit>`, takes a lock (one deploy at a time) and fetches
+   `origin/master`. It refuses a commit that is not on `origin/master`;
+2. skips a commit that is not newer than the deployed one (a re-run of an old build);
+3. checks the commit out and restarts nothing when only `docs/`, `tests/`, `.github/`,
+   `deploy/`, `README.md`, `LICENSE` or `PROJECT-BRIEF.md` changed;
+4. builds the images first. A failed build changes nothing: the old commit stays checked
+   out and the old containers keep running;
+5. takes a dump (section 14) when `powermon/migrations` changed;
+6. runs `up -d --wait`, which runs `migrate` once and then starts `web` and `worker`;
+7. checks `https://powermonitor.anzozulia.com/healthz` through the host nginx;
+8. if that fails, rolls back to the previous commit and starts it again, except after a
+   migration: then it stops and leaves the recovery to you (section 8, and the dump);
+9. removes this project's dangling images, never anything else on the host.
+
+Each outcome is one line in `/var/log/powermon-deploy.log` (rotated weekly, 8 kept,
+`/etc/logrotate.d/powermon-deploy`). The Actions log shows only those lines. The build
+and Compose output goes to `/var/log/powermon-deploy.out`, readable only by root, never to
+the Actions log, which is public.
+
+### 17.3 The shared host and the SEC-02 deviation
+
+The host's own nginx owns ports 80 and 443 for several sites, so it is this deployment's
+TLS proxy instead of the bundled Caddy. That is the one deviation from SEC-02 ("only the
+proxy publishes ports"). `docker-compose.vps.yml` adds to `docker-compose.prod.yml`:
+
+- `caddy` sits behind the `bundled-proxy` profile and never starts;
+- `web` publishes one port, `127.0.0.1:8091`, for nginx only. `db` publishes nothing.
+  Docker-published ports bypass host firewall rules, so on this host a port is published
+  only on 127.0.0.1 (`tests/test_compose.py` checks the file);
+- memory caps: web 512 MB, worker 384 MB, db 512 MB, migrate 384 MB, backup 256 MB.
+
+The vhost is `deploy/nginx/powermonitor.anzozulia.com.conf`:
+
+- it overwrites `X-Forwarded-For` with the client's address instead of appending to it,
+  so the login throttle (SEC-03) cannot be fooled by a client-supplied header, and sets
+  `X-Forwarded-Proto`, from which Django knows the request came over HTTPS;
+- its access log leaves the query string out, and its error log is at `crit`, so a
+  device key sent as `?key=` never reaches a log (OPS-08, INV-23);
+- it sends no HSTS header: Django sends it (one year);
+- requests over 1 MB are refused, and nginx buffers each request before it reaches
+  gunicorn, so slow clients cannot tie up the app's threads (INV-22 #2);
+- port 80 only redirects to HTTPS. There is no plain-HTTP heartbeat.
+
+The certificate comes from Let's Encrypt through the host's certbot and renews with its
+timer.
+
+Everywhere sections 5 to 15 say `docker compose -f docker-compose.prod.yml`, on this
+host run, from `/root/powermonitor`:
+
+```sh
+docker compose -f docker-compose.prod.yml -f docker-compose.vps.yml <command>
+```
+
+### 17.4 First bring-up
+
+Done once, as root on the server, in this order:
+
+```sh
+umask 022
+git clone https://github.com/anzozulia/power_mionitor_v2.git /root/powermonitor
+chmod 700 /root/powermonitor
+cd /root/powermonitor
+python3 deploy/make-secrets.py
+python3 deploy/make-secrets.py --check
+install -m 0755 -o root -g root deploy/powermon-deploy /usr/local/sbin/powermon-deploy
+install -m 0644 -o root -g root deploy/logrotate/powermon-deploy /etc/logrotate.d/powermon-deploy
+docker compose -f docker-compose.prod.yml -f docker-compose.vps.yml build
+docker compose -f docker-compose.prod.yml -f docker-compose.vps.yml up -d --wait --wait-timeout 300
+curl -fsS http://127.0.0.1:8091/healthz
+tar czf /root/nginx-pre-powermonitor-$(date +%s).tgz /etc/nginx
+certbot certonly --nginx -d powermonitor.anzozulia.com -n --agree-tos
+install -m 0644 -o root -g root deploy/nginx/powermonitor.anzozulia.com.conf /etc/nginx/sites-available/powermonitor.anzozulia.com.conf
+ln -sfn /etc/nginx/sites-available/powermonitor.anzozulia.com.conf /etc/nginx/sites-enabled/powermonitor.anzozulia.com.conf
+nginx -t && systemctl reload nginx
+certbot renew --dry-run --cert-name powermonitor.anzozulia.com
+docker compose -f docker-compose.prod.yml -f docker-compose.vps.yml exec -T backup bash /backup/backup.sh --dump-now
+```
+
+- `umask 022` matters: the app runs as uid 10001 and the backup script as uid 999, and
+  both must be able to read the clone's files.
+- `make-secrets.py` writes `.env.docker_production` (mode 0600) from `.env.example`. It
+  fixes `APP_ENV`, `DEBUG`, `DOMAIN`, `ACME_EMAIL` (unused here, the host certbot does
+  TLS) and `ADMIN_USERNAME=admin`, and sets `SECRET_KEY`, `ADMIN_PASSWORD` and
+  `POSTGRES_PASSWORD` to random values. It prints the names it set, never a value. It
+  refuses to overwrite the file: the database reads `POSTGRES_PASSWORD` only when it is
+  first created, so the file is never regenerated. Edit it by hand from then on. Never
+  create a `.env` file in the clone: Compose would read it.
+- The certificate is requested before the HTTPS vhost is installed, because the vhost
+  names the certificate files. If `nginx -t` fails, remove the symlink and do not reload.
+
+### 17.5 Admin password
+
+Read it in your own terminal, never in a chat or a shared screen:
+
+```sh
+ssh hetzner "grep '^ADMIN_PASSWORD=' /root/powermonitor/.env.docker_production | cut -d= -f2-"
+```
+
+Sign in at `https://powermonitor.anzozulia.com/login/` as `admin`. To change the password,
+edit the file on the server and redeploy (17.7): the admin account is synced from the env
+file on every deploy (section 7). Keep env values unquoted and use only letters, digits,
+`_`, `-` and `:` (no `$`, quotes, spaces or `#`): Compose expands `$` in env-file values,
+and a parse error quotes the whole line in its output. Generate a new password with
+`python3 -c "import secrets; print(secrets.token_urlsafe(50))"`.
+
+### 17.6 Turning on ops alerts
+
+Ops alerts are off on this server: `OPS_BOT_TOKEN` and `OPS_CHAT_ID` are empty, so ops
+notices go to the worker log at WARNING. To turn them on, set both in the env file on the
+server (section 4 says where the values come from), with the same rules for values as in
+17.5, then run the manual redeploy (17.7). `docker compose restart` does not re-read the
+env file (section 7). Check the file with `python3 deploy/make-secrets.py --check` in
+`/root/powermonitor`, then the worker log
+(`docker compose -f docker-compose.prod.yml -f docker-compose.vps.yml logs worker`).
+
+### 17.7 Manual redeploy
+
+After an env change, or to retry a failed deploy of the commit that is checked out:
+
+```sh
+ssh hetzner 'SSH_ORIGINAL_COMMAND="deploy $(git -C /root/powermonitor rev-parse HEAD)" /usr/local/sbin/powermon-deploy'
+```
+
+It builds, runs `up --wait` and checks `/healthz` through nginx, and prints its log
+lines. Exit code 0 means deployed.
+
+### 17.8 Rollback
+
+- **Preferred:** `git revert` the bad commit on `master` and push. CI tests the revert
+  and CD deploys it.
+- **Emergency:** on the server, `git -C /root/powermonitor checkout --detach <good commit>`,
+  then the manual redeploy (17.7). CD skips commits older than the deployed one, so the
+  next push to `master` moves the server forward again.
+- **After a migration:** section 8, and the restore in section 14.
+
+### 17.9 Changing the deploy tooling
+
+The files in `deploy/` are copies on the server. A change to them deploys without a
+restart (17.2, step 3) and takes effect only when installed again, as root:
+
+- the deploy script:
+  `install -m 0755 -o root -g root /root/powermonitor/deploy/powermon-deploy /usr/local/sbin/powermon-deploy`;
+- the vhost: take a backup first
+  (`tar czf /root/nginx-pre-powermonitor-$(date +%s).tgz /etc/nginx`), install it as in
+  17.4, then `nginx -t && systemctl reload nginx`;
+- the log rotation:
+  `install -m 0644 -o root -g root /root/powermonitor/deploy/logrotate/powermon-deploy /etc/logrotate.d/powermon-deploy`.
+
+### 17.10 Rotating the CI deploy key
+
+1. Generate a new key on your machine:
+   `ssh-keygen -t ed25519 -N '' -C gha-deploy@power_mionitor_v2 -f <dir>/id_ed25519`.
+2. On the server, back up `/root/.ssh/authorized_keys`, then replace the line that ends
+   with `gha-deploy@power_mionitor_v2` with
+   `restrict,command="/usr/local/sbin/powermon-deploy" <contents of id_ed25519.pub>`.
+3. `gh secret set DEPLOY_SSH_KEY --env production < <dir>/id_ed25519`
+4. Delete the local key files.

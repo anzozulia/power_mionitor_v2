@@ -1,0 +1,10 @@
+# Test-only Compose override, committed for CI (.github/workflows/ci.yml) and the local gate:
+#   COMPOSE_FILE=docker-compose.local.yml:docker-compose.ci.yml COMPOSE_PROJECT_NAME=<own name> docker compose run --build --rm -T web ...
+# then `docker compose down -v --rmi local` with the same project name. The test database
+# lives in a tmpfs and disappears with its container (a bind-mounted PGDATA under test-database
+# churn hung Docker Desktop in Phases 2-4). Never used with docker-compose.prod.yml.
+services:
+  db:
+    volumes: !override []
+    tmpfs:
+      - /var/lib/postgresql:size=2g

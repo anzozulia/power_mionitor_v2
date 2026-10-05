@@ -1,0 +1,7 @@
+# Installed as /etc/logrotate.d/powermon-deploy (README section 17).
+/var/log/powermon-deploy.log /var/log/powermon-deploy.out {
+    weekly
+    rotate 8
+    compress
+    missingok
+}

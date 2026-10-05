@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# Power Monitor deploy on the shared VPS (README section 17).
+#
+# Installed as a copy, root:root 0755, at /usr/local/sbin/powermon-deploy. A change to this
+# file reaches the server only when it is installed again by hand (README section 17).
+#
+# Two callers:
+#   - GitHub Actions (.github/workflows/ci.yml, job deploy). This script is the forced command
+#     of the CI deploy key in /root/.ssh/authorized_keys, so the client's command arrives in
+#     SSH_ORIGINAL_COMMAND and must be exactly "deploy <40-hex commit>".
+#   - The owner, as root on the server. Passing the checked-out commit redeploys it, e.g.
+#     after an env file change:
+#       SSH_ORIGINAL_COMMAND="deploy $(git -C /root/powermonitor rev-parse HEAD)" /usr/local/sbin/powermon-deploy
+#
+# A new commit must be on origin/master. A commit that is not newer than the deployed one
+# is skipped. When only non-runtime paths changed, the commit is checked out and nothing
+# restarts. Otherwise the images are built before anything restarts (a failed build changes
+# nothing). When powermon/migrations changed, a dump is taken first. Then the stack is
+# started and checked through the host nginx. A failed start rolls back to the previous
+# commit, except after a migration (README section 8).
+#
+# Prints no env value. Exit codes: 0 deployed or nothing to do; 1 failed; 2 refused.
+
+set -Eeuo pipefail
+umask 022
+export LC_ALL=C
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+unset COMPOSE_FILE COMPOSE_PROJECT_NAME COMPOSE_PROFILES
+
+REPO_DIR=/root/powermonitor
+DOMAIN=powermonitor.anzozulia.com
+LOG=/var/log/powermon-deploy.log
+OUT=/var/log/powermon-deploy.out
+LOCK=/run/lock/powermon-deploy.lock
+PROJECT=powermon-prod
+COMPOSE=(docker compose -f docker-compose.prod.yml -f docker-compose.vps.yml)
+# A change only under these paths needs no build and no restart.
+NON_RUNTIME_RE='^(docs/|tests/|\.github/|deploy/|README\.md$|LICENSE$|PROJECT-BRIEF\.md$)'
+MIGRATIONS=powermon/migrations
+SHA=""
+
+log() {
+  # The log file first: a dropped SSH client must not keep the deploy from being recorded.
+  local line
+  line="$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"
+  printf '%s\n' "$line" >> "$LOG"
+  printf '%s\n' "$line" >&3 || true
+}
+
+trap 'log "FAILED ${SHA:-?}: unexpected error at line $LINENO"' ERR
+# A dropped SSH client (cancelled run, job timeout, network) must not stop a deploy half way:
+# with SIGPIPE/SIGHUP ignored, a write to the closed channel fails instead of killing us.
+trap '' PIPE HUP
+# Only log() lines reach the SSH channel (fd 3), and with it the PUBLIC Actions log. All git,
+# docker and compose output goes to a root-only file: Compose quotes a malformed env-file
+# line word for word, and the Go CLI exits when its stdout is closed.
+exec 3>&1
+(umask 077 && : >> "$OUT")
+exec >> "$OUT" 2>&1
+
+checkout() {
+  git -c advice.detachedHead=false checkout --quiet --detach "$1"
+}
+
+healthy() {
+  # The app through the host nginx, as the internet reaches it: "ok" within about a minute.
+  local i body
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    body=$(curl -fsS --max-time 10 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/healthz" 2> /dev/null) || body=""
+    if [[ $body == ok ]]; then return 0; fi
+    sleep 5
+  done
+  return 1
+}
+
+start() {
+  timeout 900 "${COMPOSE[@]}" up -d --wait --wait-timeout 300 && healthy
+}
+
+prune() {
+  # Only dangling images of this Compose project, and only while Compose labels its images
+  # with the project. Never a host-wide prune: other projects share this host.
+  if [[ -n $(docker image ls -q --filter "label=com.docker.compose.project=$PROJECT") ]]; then
+    docker image prune -f --filter "label=com.docker.compose.project=$PROJECT" > /dev/null || true
+  else
+    log "prune skipped: no image carries the $PROJECT project label"
+  fi
+}
+
+cmd=${SSH_ORIGINAL_COMMAND:-}
+if [[ ! $cmd =~ ^deploy\ ([0-9a-f]{40})$ ]]; then
+  log "refused: the command must be 'deploy <40-hex commit>'"
+  exit 2
+fi
+SHA=${BASH_REMATCH[1]}
+
+exec 9> "$LOCK"
+if ! flock -w 900 9; then
+  log "FAILED $SHA: another deploy held the lock for 15 min"
+  exit 1
+fi
+
+cd "$REPO_DIR"
+if [[ ! -f docker-compose.vps.yml ]]; then
+  log "refused $SHA: $REPO_DIR has no docker-compose.vps.yml"
+  exit 2
+fi
+PREV=$(git rev-parse HEAD)
+started=$SECONDS
+
+if [[ $SHA != "$PREV" ]]; then
+  timeout 120 git fetch --quiet origin +refs/heads/master:refs/remotes/origin/master
+  if ! git cat-file -e "$SHA^{commit}" 2> /dev/null; then
+    log "refused $SHA: unknown commit"
+    exit 2
+  fi
+  if ! git merge-base --is-ancestor "$SHA" origin/master; then
+    log "refused $SHA: not on origin/master"
+    exit 2
+  fi
+  if git merge-base --is-ancestor "$SHA" "$PREV"; then
+    log "skipped $SHA: not newer than the deployed $PREV"
+    exit 0
+  fi
+  # Captured first, so a failing git diff stops the deploy (set -e + ERR trap) instead of
+  # reading as "no runtime change". Empty lines never count as a runtime change.
+  changed=$(git diff --no-renames --name-only "$PREV" "$SHA")
+  runtime=$(grep -cvE "$NON_RUNTIME_RE|^\$" <<< "$changed" || true)
+  checkout "$SHA"
+  if [[ ! -f docker-compose.vps.yml ]]; then
+    checkout "$PREV"
+    log "FAILED $SHA: it has no docker-compose.vps.yml; still running $PREV"
+    exit 1
+  fi
+  if [[ $runtime == 0 ]]; then
+    if ! healthy; then
+      log "FAILED $SHA: no runtime change since $PREV and nothing restarted, but the site is not healthy"
+      exit 1
+    fi
+    log "ok $SHA: no runtime change since $PREV; checked out, nothing restarted"
+    exit 0
+  fi
+fi
+
+# Build first: a failed build restarts nothing.
+if ! timeout 1800 "${COMPOSE[@]}" build; then
+  if [[ $SHA != "$PREV" ]]; then checkout "$PREV"; fi
+  log "FAILED $SHA: build failed; still running $PREV, nothing restarted"
+  exit 1
+fi
+
+migrated=no
+if [[ $SHA != "$PREV" ]] && ! git diff --quiet "$PREV" "$SHA" -- "$MIGRATIONS"; then
+  migrated=yes
+  if ! timeout 600 "${COMPOSE[@]}" exec -T backup bash /backup/backup.sh --dump-now; then
+    checkout "$PREV"
+    log "FAILED $SHA: the pre-migration dump failed; still running $PREV, nothing restarted"
+    exit 1
+  fi
+  log "pre-migration dump taken before $SHA"
+fi
+
+if start; then
+  prune
+  log "ok $SHA (was $PREV) in $((SECONDS - started)) s"
+  exit 0
+fi
+
+if [[ $migrated == yes ]]; then
+  log "FAILED $SHA: not healthy after its migrations; not rolled back (README section 8); the dump is in docker_data/prod/backups"
+  exit 1
+fi
+if [[ $SHA == "$PREV" ]]; then
+  log "FAILED $SHA: the redeploy is not healthy; there is no earlier commit to roll back to"
+  exit 1
+fi
+checkout "$PREV"
+if timeout 1800 "${COMPOSE[@]}" build && start; then
+  log "FAILED $SHA: not healthy; rolled back to $PREV, which is healthy"
+else
+  log "FAILED $SHA: not healthy; the rollback to $PREV is not healthy either"
+fi
+exit 1
