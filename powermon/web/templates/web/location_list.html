@@ -8,9 +8,16 @@ of those rows), ops_configured and now (the view clock's reading, passed to ever
   names in code) while the ops chat is not configured (Phase 2 D-09, INV-20).
 - Header: h1 Locations; meta "{N} locations" (1: "location"), N mono; primary "Add location".
   With no rows there is no meta count and no header button.
-- content: the table card "All locations" / "Sorted by name", shown from md (06-18 adds the
-  Fleet health card above it and the stacked cards below md). Caption Locations, scoped
+- content, while there are rows: one [data-fleet] wrapper bound to the fleetFilter component
+  (UI-04, N13) holding the Fleet health card (web/_fleet_health.html, from the view's counts
+  and the number of rows) and the table card. The filter is client-side only: no form,
+  nothing in the URL, and without JS every row shows.
+- The table card "All locations" / "Sorted by name", shown from md. Caption Locations, scoped
   column headers, one row per location with its id, status and delivery as data hooks.
+  A row the filter leaves out carries data-filtered and collapses, so the columns never
+  move. The last body row is the no-match line [data-testid=no-match] (copy row
+  list.no_match), rendered with the hidden attribute: fleetFilter shows it when no row
+  matches, and its link-styled "show all" button [data-filter-reset] resets the filter.
   The name link is the row's only link and its after box covers the row (the focus ring is
   drawn on that box). Status: the pill, then the tags Alerts off and Router grace. Last
   heartbeat: the relative time over the compact absolute time, one line from xl, or Never.
@@ -39,6 +46,8 @@ spelled out; no class name is built from data.
 {% block page_meta %}{% if rows %}<li><span data-live="count"><span class="num" data-count-value>{{ rows|length }}</span> <span data-count-noun>{% if rows|length == 1 %}location{% else %}locations{% endif %}</span></span></li>{% endif %}{% url 'location-list' as reload_url %}{% include "partials/_live_chip.html" with reload_url=reload_url only %}{% endblock %}
 {% block page_actions %}{% if rows %}{% url 'location-create' as add_url %}{% include "partials/_button.html" with variant="primary" label="Add location" href=add_url testid="add-location" icon="plus" only %}{% endif %}{% endblock %}
 {% block content %}{% if rows %}
+<div data-fleet x-data="fleetFilter" class="flex flex-col gap-4">
+{% include "web/_fleet_health.html" with counts=counts total=rows|length only %}
 <section aria-labelledby="locations-table-title" class="hidden rounded-card border border-border bg-surface md:block">
 <div class="flex items-baseline gap-2 rounded-t-[5px] border-b border-border bg-surface-muted px-4 py-2"><h2 id="locations-table-title" class="text-label font-semibold uppercase tracking-label text-fg-muted">All locations</h2><p class="text-label text-fg-subtle">Sorted by name</p></div>
 <div class="overflow-clip rounded-b-[5px]">
@@ -53,16 +62,18 @@ spelled out; no class name is built from data.
 </tr>
 </thead>
 <tbody>
-{% for row in rows %}<tr data-testid="location-row" data-location-id="{{ row.pk }}" data-status="{{ row.status }}" data-delivery="{% if row.delivery_failing %}failing{% else %}ok{% endif %}" class="group/row relative hover:bg-surface-muted has-[a:focus-visible]:bg-surface-muted motion-safe:transition-colors motion-safe:duration-150">
+{% for row in rows %}<tr data-testid="location-row" data-location-id="{{ row.pk }}" data-status="{{ row.status }}" data-delivery="{% if row.delivery_failing %}failing{% else %}ok{% endif %}" class="group/row relative hover:bg-surface-muted has-[a:focus-visible]:bg-surface-muted data-filtered:collapse motion-safe:transition-colors motion-safe:duration-150">
 <th scope="row" class="border-t border-border py-2 pr-3 pl-4 text-left align-middle font-normal xl:py-1 group-data-[status=off]/row:[box-shadow:inset_2px_0_0_var(--st-off)] group-data-[delivery=failing]/row:[box-shadow:inset_2px_0_0_var(--st-fail)]"><a href="{% url 'location-detail' row.pk %}" data-testid="location-link" title="{{ row.name }}" class="font-semibold break-words text-fg after:absolute after:inset-0 group-hover/row:text-accent-text focus-visible:shadow-none focus-visible:outline-none focus-visible:after:outline-2 focus-visible:after:-outline-offset-2 focus-visible:after:outline-focus focus-visible:after:[box-shadow:inset_0_0_0_4px_var(--focus-halo)] motion-safe:transition-colors motion-safe:duration-150">{{ row.name }}</a></th>
 <td class="border-t border-border px-3 py-2 align-middle xl:py-1"><div class="flex flex-wrap items-center gap-x-2 gap-y-1">{% include "partials/_status_pill.html" with status=row.status label=row.status_label live=True location_id=row.pk only %}{% if row.alerts_off %} {% include "partials/_tag.html" with tag="alerts-off" only %}{% endif %}{% if row.router_grace %} {% include "partials/_tag.html" with tag="router-grace" only %}{% endif %}</div></td>
 <td class="border-t border-border px-3 py-2 align-middle xl:py-1">{% include "partials/_time.html" with value=row.last_heartbeat_at variant="table" testid="last-heartbeat" live="last-heartbeat" location_id=row.pk now=now only %}</td>
 <td class="border-t border-border py-2 pr-4 pl-3 align-middle xl:py-1"><div class="flex items-center gap-1">{% include "partials/_delivery.html" with failing=row.delivery_failing text=row.delivery live=True location_id=row.pk only %}{% icon "chevron-right" class="ml-auto size-4 shrink-0 text-icon group-hover/row:text-fg motion-safe:transition-colors motion-safe:duration-150" %}</div></td>
 </tr>
-{% endfor %}</tbody>
+{% endfor %}<tr data-testid="no-match" hidden><td colspan="4" class="border-t border-border px-4 py-2 text-fg-muted">No locations match — <button type="button" data-filter-reset class="inline-flex min-h-11 items-center rounded-control font-semibold text-accent-text underline underline-offset-3 hover:text-fg md:pointer-fine:min-h-6 motion-safe:transition-colors motion-safe:duration-150">show all</button></td></tr>
+</tbody>
 </table>
 </div>
 </section>
+</div>
 {% else %}{% url 'location-create' as add_url %}
 <section class="rounded-card border border-border bg-surface">{% include "partials/_empty.html" with icon="map-pin" title="No locations yet" body="Add a location to get its heartbeat URL, device key and setup examples." testid="empty-state" accent=True cta_label="Add location" cta_href=add_url cta_testid="add-location" cta_icon="plus" only %}</section>
 {% endif %}{% endblock %}
