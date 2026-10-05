@@ -45,6 +45,13 @@ the real tree must pass:
   the poll writes S3's count number only into its mono [data-count-value] span and the noun
   into [data-count-noun] (W4-A2); fillInstant never fills a "Never" wrapper, which has no
   <time>, so the poll shows the changed chip instead.
+- admin.js wave-5 audit pins: a plain primary click on a same-page link (this page's URL but
+  for a non-empty hash) in the confirm dialog closes it, clears the focus return first and
+  is prevented only while the submit is pending; in a [popover] menu it hides the open menu
+  through the guarded Popover API, never prevented (W5-A1); the poll records S5's rendered
+  [data-power] and shows the changed chip on the location page when the JSON's power
+  differs, and a power outside the engine's vocabulary makes an entry invalid (W5-A2); the
+  poll writes the JSON's location total into the sidebar's [data-live="sidebar-count"].
 - CSS entries (powermon/web/assets/css/*.css): @import only "tailwindcss" or a ./ or ../ path;
   every url() relative or data: (comments skipped).
 - Python (powermon/web/**/*.py), read with the stdlib ast module: SafeString, SafeText,
@@ -78,8 +85,10 @@ from django.conf import settings
 from django.contrib.staticfiles.storage import staticfiles_storage
 from django.test import RequestFactory
 
+from powermon.engine.models import STATUSES
 from powermon.locations.models import MAX_SECONDS, MIN_SECONDS
 from powermon.web.context_processors import THEME_COOKIE, THEMES
+from powermon.web.live import LiveRow, status_payload
 from powermon.web.templatetags import timefmt
 from powermon.web.templatetags.icons import ICONS
 from powermon.web.theme import THEME_MAX_AGE, ThemeView
@@ -1245,9 +1254,12 @@ CONTRACT_HOOKS: dict[str, tuple[str, ...]] = {
         '[data-fh="received"]',
         '[data-live="summary"]',
         '[data-live="summary-sr"]',
+        '[data-live="sidebar-count"]',
         '[data-live="count"]',
         "[data-count-value]",
         "[data-count-noun]",
+        "[data-power]",
+        '"data-power"',
         '[data-testid="fleet-tile"]',
         '[data-testid="fleet-count"]',
         '[data-testid="fleet-bar"]',
@@ -1310,6 +1322,10 @@ CONTRACT_HOOKS: dict[str, tuple[str, ...]] = {
         "[popover]",
         "popovertarget",
         "preventDefault",
+        '"[popover] a[href]"',
+        '"a[href]"',
+        "samePageJump(",
+        "hidePopover",
     ),
     "fleetFilter": (
         'button[data-testid="filter-chip"][data-filter]',
@@ -2235,6 +2251,621 @@ def test_never_time_shows_the_changed_chip_instead_of_a_half_time() -> None:
     assert "changed = true" in poll
     # Failure: no fillInstant at all.
     assert never_fill_violations("var x = 1;") == ["no fillInstant"]
+
+
+# admin.js wave-5 audit pins (W5-A1, W5-A2 and the sidebar count)
+
+
+def call_texts(source: str, pattern: re.Pattern[str]) -> list[str]:
+    """The text of every call in code whose start ``pattern`` matches, to its closing
+    parenthesis."""
+    code = _mask_js(source)
+    return [
+        source[match.start() : _closing(code, match.start()) + 1]
+        for match in _code_matches(pattern, source)
+    ]
+
+
+def if_conditions(block: str) -> list[tuple[int, int]]:
+    """(start, end) offsets of the condition of each ``if (...)`` in code."""
+    code = _mask_js(block)
+    return [(m.end(), _closing(code, m.start())) for m in re.finditer(r"\bif\s*\(", code)]
+
+
+def if_blocks(block: str, condition: re.Pattern[str]) -> list[tuple[int, int]]:
+    """(open brace, close brace) offsets of each ``if (...) {...}`` in code whose condition
+    matches ``condition``, read in the raw text (string values count)."""
+    code = _mask_js(block)
+    found = []
+    for start, end in if_conditions(block):
+        opening = code.find("{", end)
+        if opening >= 0 and condition.search(block, start, end):
+            found.append((opening, _closing(code, opening, "{", "}")))
+    return found
+
+
+def inside(offset: int, blocks: list[tuple[int, int]]) -> bool:
+    return any(start < offset < end for start, end in blocks)
+
+
+_SAME_PAGE_JUMP = re.compile(r"\bsamePageJump\s*\(")
+_MODIFIER_KEYS = ("metaKey", "ctrlKey", "shiftKey", "altKey")
+_DIALOG_CLICK = re.compile(r"\bdialog\s*\.\s*addEventListener\s*\(\s*([\"'])click\1")
+_PENDING_CALL = re.compile(r"\bpending\s*\(\s*\)")
+_PREVENT = re.compile(r"\.\s*preventDefault\s*\(")
+_CLOSE_CALL = re.compile(r"(?<![\w$])(?:dialog\s*\.\s*)?close\s*\(")
+_RETURN_TO_CLEARED = re.compile(r"(?<![\w$.])returnTo\s*=\s*null\b")
+_HIDE_POPOVER = re.compile(r"\.\s*hidePopover\s*\(")
+_MENU_HIDE = re.compile(r"\bhideMenu\s*\(|\.\s*hidePopover\s*\(")
+
+
+def jump_predicate_violations(source: str) -> list[str]:
+    """W5-A1: samePageJump(event, link) holds only for a plain primary click (button 0, no
+    modifier key) on a link with no other target and no download whose URL is this page's
+    (origin, path and query) with a non-empty hash: the browser's own in-page jump."""
+    body = function_body(source, "samePageJump")
+    if not body:
+        return ["no samePageJump"]
+    code = _mask_js(body)
+    found = set()
+    plain = re.search(r"\bevent\s*\.\s*button\s*!==\s*0\b", code) is not None and all(
+        re.search(rf"\bevent\s*\.\s*{key}\b", code) for key in _MODIFIER_KEYS
+    )
+    if not plain:
+        found.add("not only a plain primary click")
+    if (
+        re.search(r"\blink\s*\.\s*target\s*!==\s*([\"'])_self\1", body) is None
+        or re.search(r"\blink\s*\.\s*hasAttribute\(\s*([\"'])download\1\s*\)", body) is None
+    ):
+        found.add("a link to another target or a download")
+    if re.search(r"\blink\s*\.\s*hash\s*!==\s*([\"'])\1", body) is None:
+        found.add("an empty hash")
+    if not all(
+        re.search(rf"\blink\s*\.\s*{part}\s*===\s*window\s*\.\s*location\s*\.\s*{part}\b", code)
+        for part in ("origin", "pathname", "search")
+    ):
+        found.add("a link to another page")
+    return sorted(found)
+
+
+def jump_branches(listener: str) -> list[str]:
+    """The block of each ``if`` in a listener whose condition calls samePageJump."""
+    return [listener[start : end + 1] for start, end in if_blocks(listener, _SAME_PAGE_JUMP)]
+
+
+def dialog_jump_violations(source: str) -> list[str]:
+    """W5-A1 (dialog): confirmDialog's dialog click listener has a samePageJump branch (S11's
+    "Recent outages" on S5). It prevents the click only inside its ``if (pending())`` guard,
+    and otherwise clears returnTo before it closes the dialog, so the close handler, which
+    runs later, never sends the focus (and the scroll) back to the trigger."""
+    body = component_bodies(source).get("confirmDialog", "")
+    listeners = call_texts(body, _DIALOG_CLICK)
+    branches = [branch for listener in listeners for branch in jump_branches(listener)]
+    if not branches:
+        return ["dialog stays open on a same-page link"]
+    found = set()
+    for branch in branches:
+        code = _mask_js(branch)
+        guards = if_blocks(branch, _PENDING_CALL)
+        prevents = [match.start() for match in _PREVENT.finditer(code)]
+        if not any(inside(offset, guards) for offset in prevents):
+            found.add("jump runs while the submit is pending")
+        if any(not inside(offset, guards) for offset in prevents):
+            found.add("jump prevented while not pending")
+        closes = [m.start() for m in _CLOSE_CALL.finditer(code) if not inside(m.start(), guards)]
+        cleared = _RETURN_TO_CLEARED.search(code)
+        if not closes:
+            found.add("dialog stays open on a same-page link")
+        elif cleared is None or cleared.start() > closes[0]:
+            found.add("focus sent back to the trigger after the jump")
+    return sorted(found)
+
+
+def menu_jump_violations(source: str) -> list[str]:
+    """W5-A1 (popover menu): confirmDialog's document click listener has a samePageJump
+    branch for a link in a [popover] menu (the kebab's "Reset history…" while a reset is
+    unavailable) that hides the menu and never prevents the click; every hidePopover call
+    of the component sits in a try block with a catch (no Popover API: a plain list)."""
+    body = component_bodies(source).get("confirmDialog", "")
+    listeners = call_texts(body, _DOCUMENT_CLICK)
+    branches = [branch for listener in listeners for branch in jump_branches(listener)]
+    code = _mask_js(body)
+    found = set()
+    hiding = [branch for branch in branches if _MENU_HIDE.search(_mask_js(branch))]
+    if not hiding or _HIDE_POPOVER.search(code) is None:
+        found.add("menu stays open after a same-page link")
+    if any(_PREVENT.search(_mask_js(branch)) for branch in branches):
+        found.add("menu jump prevented")
+    guarded = _try_catch_blocks(body)
+    if any(not inside(match.start(), guarded) for match in _HIDE_POPOVER.finditer(code)):
+        found.add("Popover API used without a guard")
+    return sorted(found)
+
+
+# The S5 overlays: the confirmation fragments the location page opens and its kebab menu.
+S5_OVERLAYS = (
+    "web/_confirm_delete.html",
+    "web/_confirm_remove_outage.html",
+    "web/_confirm_reset.html",
+    "partials/_menu.html",
+)
+_HASH_REFERENCE = re.compile(r"add:\"#([\w-]+)\"|href=\"[^\"]*?#([\w-]+)")
+
+
+def overlay_jump_ids() -> set[str]:
+    """The ids the S5 overlays link to on the location page (template comments skipped)."""
+    found: set[str] = set()
+    for name in S5_OVERLAYS:
+        text = _TEMPLATE_COMMENT.sub("", (TEMPLATES / name).read_text(encoding="utf-8"))
+        found.update(a or b for a, b in _HASH_REFERENCE.findall(text))
+    return found
+
+
+def jump_target_gaps(ids: set[str], page: str) -> list[str]:
+    """The ids that no tag of ``page`` carries together with tabindex="-1"."""
+    gaps = []
+    for element_id in sorted(ids):
+        tag = re.search(rf"<[a-z]+\b[^>]*\bid=\"{re.escape(element_id)}\"[^>]*>", page)
+        if tag is None or 'tabindex="-1"' not in tag.group(0):
+            gaps.append(element_id)
+    return gaps
+
+
+DIALOG_JUMP = (
+    "      } else if (jump && dialog.contains(jump) && samePageJump(event, jump)) {\n"
+    "        if (pending()) {\n"
+    "          event.preventDefault();\n"
+    "          return;\n"
+    "        }\n"
+    "        returnTo = null;\n"
+    "        close();\n"
+    "        focusJumpTarget(jump);\n"
+)
+MENU_JUMP = (
+    "      if (jump && samePageJump(event, jump)) {\n"
+    '        hideMenu(jump.closest("[popover]"));\n'
+    "        focusJumpTarget(jump);\n"
+    "        return;\n"
+    "      }\n"
+)
+MENU_HIDE_GUARD = (
+    "      try {\n"
+    '        if (popover.matches(":popover-open")) {\n'
+    "          popover.hidePopover();\n"
+    "        }\n"
+    "      } catch (error) {\n"
+    "        // No popover API: the menu is a plain list.\n"
+    "      }\n"
+)
+JUMP_SAMPLE = (
+    """function samePageJump(event, link) {
+  if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+    return false;
+  }
+  if ((link.target && link.target !== "_self") || link.hasAttribute("download")) {
+    return false;
+  }
+  return (
+    link.hash !== "" &&
+    link.origin === window.location.origin &&
+    link.pathname === window.location.pathname &&
+    link.search === window.location.search
+  );
+}
+window.Alpine.data("confirmDialog", function () {
+  return { init: function () {
+    var hideMenu = function (popover) {
+"""
+    + MENU_HIDE_GUARD
+    + """    };
+    document.addEventListener("click", function (event) {
+      var jump = closestTo(event, "[popover] a[href]");
+"""
+    + MENU_JUMP
+    + """      var link = closestTo(event, "a[data-confirm]");
+      event.preventDefault();
+    });
+    dialog.addEventListener("click", function (event) {
+      var keep = closestTo(event, '[data-testid="keep"]');
+      var jump = closestTo(event, "a[href]");
+      if (keep && dialog.contains(keep)) {
+        event.preventDefault();
+        close();
+"""
+    + DIALOG_JUMP
+    + """      } else if (pressOnBackdrop && outside(event)) {
+        close();
+      }
+    });
+  } };
+});
+"""
+)
+DIALOG_OPEN = "dialog stays open on a same-page link"
+FOCUS_BACK = "focus sent back to the trigger after the jump"
+JUMP_WHILE_PENDING = "jump runs while the submit is pending"
+MENU_OPEN = "menu stays open after a same-page link"
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    [
+        pytest.param("", "", [], id="good"),
+        # Failure: the hash, the page, the plain click or the target is not checked.
+        pytest.param('    link.hash !== "" &&\n', "", ["an empty hash"], id="empty-hash"),
+        pytest.param(
+            "    link.pathname === window.location.pathname &&\n",
+            "",
+            ["a link to another page"],
+            id="other-page",
+        ),
+        pytest.param(" || event.metaKey", "", ["not only a plain primary click"], id="modifier"),
+        pytest.param("event.button !== 0 || ", "", ["not only a plain primary click"], id="button"),
+        pytest.param(
+            ' || link.hasAttribute("download")',
+            "",
+            ["a link to another target or a download"],
+            id="download",
+        ),
+    ],
+)
+def test_jump_predicate_rule(old: str, new: str, expected: list[str]) -> None:
+    assert old in JUMP_SAMPLE
+    assert jump_predicate_violations(JUMP_SAMPLE.replace(old, new)) == expected
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    [
+        pytest.param("", "", [], id="good"),
+        # Edge: a clear in a comment is not one.
+        pytest.param(
+            "        returnTo = null;\n",
+            "        // returnTo = null;\n",
+            [FOCUS_BACK],
+            id="comment",
+        ),
+        # Failure: the wave-5 shape (no branch), the focus return cleared after the close or
+        # never, the click always prevented, or never while pending, and no close at all.
+        pytest.param(DIALOG_JUMP, "", [DIALOG_OPEN], id="no-branch"),
+        pytest.param(
+            "        returnTo = null;\n        close();\n",
+            "        close();\n        returnTo = null;\n",
+            [FOCUS_BACK],
+            id="cleared-after-close",
+        ),
+        pytest.param("        returnTo = null;\n", "", [FOCUS_BACK], id="never-cleared"),
+        pytest.param(
+            "        if (pending()) {\n          event.preventDefault();\n          return;\n"
+            "        }\n",
+            "        event.preventDefault();\n",
+            ["jump prevented while not pending", JUMP_WHILE_PENDING],
+            id="always-prevented",
+        ),
+        pytest.param(
+            "        if (pending()) {\n          event.preventDefault();\n          return;\n"
+            "        }\n",
+            "",
+            [JUMP_WHILE_PENDING],
+            id="no-pending-guard",
+        ),
+        pytest.param(
+            "        close();\n        focusJumpTarget",
+            "        focusJumpTarget",
+            [DIALOG_OPEN],
+            id="no-close",
+        ),
+    ],
+)
+def test_dialog_jump_rule(old: str, new: str, expected: list[str]) -> None:
+    assert old in JUMP_SAMPLE
+    assert dialog_jump_violations(JUMP_SAMPLE.replace(old, new)) == expected
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    [
+        pytest.param("", "", [], id="good"),
+        # Failure: the wave-5 shape (no branch), a branch that never hides the menu or
+        # prevents the jump, and the Popover API called without its guard.
+        pytest.param(MENU_JUMP, "", [MENU_OPEN], id="no-branch"),
+        pytest.param(
+            '        hideMenu(jump.closest("[popover]"));\n', "", [MENU_OPEN], id="no-hide"
+        ),
+        pytest.param(
+            "        return;\n      }\n      var link",
+            "        event.preventDefault();\n        return;\n      }\n      var link",
+            ["menu jump prevented"],
+            id="prevented",
+        ),
+        pytest.param(
+            MENU_HIDE_GUARD,
+            '      if (popover.matches(":popover-open")) {\n        popover.hidePopover();\n'
+            "      }\n",
+            ["Popover API used without a guard"],
+            id="unguarded",
+        ),
+    ],
+)
+def test_menu_jump_rule(old: str, new: str, expected: list[str]) -> None:
+    assert old in JUMP_SAMPLE
+    assert menu_jump_violations(JUMP_SAMPLE.replace(old, new)) == expected
+
+
+def test_W5A1_same_page_links_close_their_overlay() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+    body = component_bodies(source).get("confirmDialog", "")
+    target = function_body(source, "focusJumpTarget")
+    listeners = call_texts(body, _DIALOG_CLICK) + call_texts(body, _DOCUMENT_CLICK)
+    branches = [branch for listener in listeners for branch in jump_branches(listener)]
+
+    # Expected: one predicate decides a same-page jump. In the dialog (S11's "Recent
+    # outages" on S5) the dialog closes without the focus return and the click is prevented
+    # only while the submit is pending; in the kebab (the unavailable "Reset history…") the
+    # open menu hides. Both let the browser jump, and the focus goes to the card or row.
+    assert jump_predicate_violations(source) == []
+    assert dialog_jump_violations(source) == []
+    assert menu_jump_violations(source) == []
+    assert len(branches) == 2 and all("focusJumpTarget(jump)" in branch for branch in branches)
+    assert 'hasAttribute("tabindex")' in target and "preventScroll: true" in target
+    # Failure: no predicate, no component.
+    assert jump_predicate_violations("var x = 1;") == ["no samePageJump"]
+    assert dialog_jump_violations("var x = 1;") == [DIALOG_OPEN]
+    assert menu_jump_violations("var x = 1;") == [MENU_OPEN]
+
+
+def test_W5A1_overlay_links_point_at_focusable_targets() -> None:
+    detail = (TEMPLATES / "web" / "location_detail.html").read_text(encoding="utf-8")
+    menu = _TEMPLATE_COMMENT.sub(
+        "", (TEMPLATES / "partials" / "_menu.html").read_text(encoding="utf-8")
+    )
+
+    # Expected: on S5 the overlays link to the Recent outages card and the Reset history
+    # row, both tabindex -1 targets of the location page, so the focus can follow the jump.
+    assert overlay_jump_ids() == {"recent-outages", "reset-history"}
+    assert jump_target_gaps(overlay_jump_ids(), detail) == []
+    # Edge: the kebab's same-page entry sits inside its [popover] menu.
+    assert -1 < menu.find("<div popover") < menu.find("#reset-history")
+    # Failure: a target without tabindex, or missing from the page, is reported.
+    page = '<section id="recent-outages" aria-labelledby="x">'
+    assert jump_target_gaps({"recent-outages", "gone"}, page) == ["gone", "recent-outages"]
+
+
+_POWER_LOOKUP = re.compile(
+    r"\bvar\s+([\w$]+)\s*=\s*main\s*\.\s*querySelector\(\s*\"\[data-power\]\"\s*\)"
+)
+_ONE_ID = re.compile(r"\bids\s*\.\s*length\s*===\s*1\b")
+_DETAIL_PAGE = re.compile(r"\bpage\s*===\s*\"detail\"")
+_POWER_COMPARED = re.compile(
+    r"\bbefore\s*\.\s*power\s*!==\s*undefined\s*&&"
+    r"\s*entry\s*\.\s*power\s*!==\s*before\s*\.\s*power\b"
+)
+_POWER_VALID = re.compile(r"\bPOWER_KEYS\s*\.\s*indexOf\s*\(\s*entry\s*\.\s*power\s*\)\s*>=\s*0")
+
+
+def power_change_violations(source: str) -> list[str]:
+    """W5-A2: under maintenance S5 shows the stored power state only in its [data-power]
+    pill (the since rows have no live hook). The poll's snapshot records that value for the
+    page's one location id; apply shows the changed chip on the location page when the
+    JSON's power differs, and an entry whose power is not in POWER_KEYS is invalid."""
+    body = component_bodies(source).get("poll", "")
+    snapshot = function_body(body, "snapshot")
+    apply = function_body(body, "apply")
+    found = set()
+    lookup = next(_code_matches(_POWER_LOOKUP, snapshot), None)
+    record = None
+    if lookup is not None:
+        name = re.escape(lookup.group(1))
+        pattern = re.compile(rf"\.power\s*=\s*{name}\s*\.\s*getAttribute\(\s*\"data-power\"\s*\)")
+        record = next(_code_matches(pattern, snapshot), None)
+    if record is None or not inside(record.start(), if_blocks(snapshot, _ONE_ID)):
+        found.add("rendered power never recorded")
+    conditions = [apply[start:end] for start, end in if_conditions(apply)]
+    if not any(_DETAIL_PAGE.search(c) and _POWER_COMPARED.search(c) for c in conditions):
+        found.add("power change ignored on the location page")
+    if not any(_POWER_VALID.search(condition) for condition in conditions):
+        found.add("power outside the vocabulary accepted")
+    return sorted(found)
+
+
+POWER_RECORD = (
+    '    var power = main.querySelector("[data-power]");\n'
+    "    if (ids.length === 1 && rendered[ids[0]].power === undefined && power) {\n"
+    '      rendered[ids[0]].power = power.getAttribute("data-power");\n'
+    "    }\n"
+)
+POWER_COMPARE = " ||\n          (before.power !== undefined && entry.power !== before.power)"
+GOOD_POWER = (
+    """Alpine.data("poll", function () {
+  function snapshot() {
+    var ids = Object.keys(rendered);
+"""
+    + POWER_RECORD
+    + """  }
+  function apply(payload) {
+    Object.keys(locations).forEach(function (id) {
+      var entry = locations[id];
+      if (
+        entry &&
+        STATUS_KEYS.indexOf(entry.status) >= 0 &&
+        POWER_KEYS.indexOf(entry.power) >= 0
+      ) {
+        valid[id] = entry;
+      }
+    });
+    renderedIds.forEach(function (id) {
+      if (!entry) {
+        changed = true;
+      } else if (
+        page === "detail" &&
+        (entry.status !== before.status"""
+    + POWER_COMPARE
+    + """)
+      ) {
+        changed = true;
+      }
+    });
+  }
+})
+"""
+)
+POWER_NOT_RECORDED = "rendered power never recorded"
+POWER_IGNORED = "power change ignored on the location page"
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    [
+        pytest.param("", "", [], id="good"),
+        # Failure: the wave-5 shape (nothing recorded, nothing compared), a record for any
+        # number of ids, a comparison off the location page, and an unchecked power.
+        pytest.param(POWER_RECORD, "", [POWER_NOT_RECORDED], id="not-recorded"),
+        pytest.param("ids.length === 1 && ", "", [POWER_NOT_RECORDED], id="any-ids"),
+        pytest.param(POWER_COMPARE, "", [POWER_IGNORED], id="not-compared"),
+        pytest.param('page === "detail"', 'page === "list"', [POWER_IGNORED], id="other-page"),
+        pytest.param(
+            " &&\n        POWER_KEYS.indexOf(entry.power) >= 0",
+            "",
+            ["power outside the vocabulary accepted"],
+            id="unchecked",
+        ),
+    ],
+)
+def test_power_change_rule(old: str, new: str, expected: list[str]) -> None:
+    assert old in GOOD_POWER
+    assert power_change_violations(GOOD_POWER.replace(old, new)) == expected
+
+
+def test_W5A2_power_change_under_maintenance_shows_the_changed_chip() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+    detail = (TEMPLATES / "web" / "location_detail.html").read_text(encoding="utf-8")
+    content = detail[detail.index("{% block content %}") :]
+    others = [
+        path.relative_to(TEMPLATES).as_posix()
+        for path in sorted(TEMPLATES.rglob("*.html"))
+        if "data-power" in path.read_text(encoding="utf-8")
+    ]
+    row = LiveRow(
+        pk=7,
+        name="Office",
+        status="maintenance",
+        status_label="Maintenance",
+        last_heartbeat_at=None,
+        alerts_off=False,
+        router_grace=False,
+        delivery=None,
+        power="off",
+        on_since=None,
+        outage_started_at=datetime(2026, 10, 5, 8, 0, tzinfo=UTC),
+        delivery_failing=False,
+    )
+
+    # Expected: S5 renders the stored power state once, in its content, as [data-power];
+    # the JSON carries the same value as "power" in the engine's vocabulary, which is the
+    # poll's POWER_KEYS; the poll records the rendered value and compares it on S5.
+    assert power_change_violations(source) == []
+    power_keys = re.findall(r"\"([^\"]*)\"", js_var(source, "POWER_KEYS"))
+    assert sorted(power_keys) == sorted(STATUSES)
+    assert detail.count("data-power=") == 1
+    assert 'data-power="{{ status.power_key }}"' in content
+    assert others == ["web/location_detail.html"]
+    # Edge: under maintenance the JSON's status stays "maintenance"; its power moves.
+    assert status_payload(row)["status"] == "maintenance"
+    assert status_payload(row)["power"] == "off"
+    # Failure: no poll at all reports every rule.
+    assert power_change_violations("var x = 1;") == [
+        POWER_IGNORED,
+        "power outside the vocabulary accepted",
+        POWER_NOT_RECORDED,
+    ]
+
+
+_SIDEBAR_COUNT_LOOP = re.compile(
+    r"\b([\w$]+)\s*\.\s*querySelectorAll\(\s*'\[data-live=\"sidebar-count\"\]'\s*\)"
+    r"\s*\.\s*forEach\s*\("
+)
+# apply hands updateCounts the JSON's number of location ids as the total.
+_COUNTS_FROM_IDS = re.compile(
+    r"\bupdateCounts\(\s*payload\s*\.\s*counts\s*,\s*ids\s*\.\s*length\s*\)"
+)
+
+
+def sidebar_count_violations(source: str) -> list[str]:
+    """The sidebar's group count follows the poll: the poll's updateCounts writes
+    String(total), the JSON's number of locations, and nothing else, as the text of every
+    [data-live="sidebar-count"], looked up on document (the sidebar is outside main)."""
+    update = function_body(component_bodies(source).get("poll", ""), "updateCounts")
+    match = next(_code_matches(_SIDEBAR_COUNT_LOOP, update), None)
+    if match is None:
+        return ["sidebar count never written"]
+    code = _mask_js(update)
+    start = code.index("forEach", match.start())
+    loop = update[start : _closing(code, start) + 1]
+    parameter = re.match(r"forEach\s*\(\s*function\s*\(\s*([\w$]+)\s*\)", _mask_js(loop))
+    element = parameter.group(1) if parameter else "element"
+    found = set()
+    if match.group(1) != "document":
+        found.add("sidebar count looked up inside main")
+    if text_writes(loop, element) != ["String(total)"]:
+        found.add("sidebar count gets more than the number")
+    return sorted(found)
+
+
+GOOD_SIDEBAR_COUNT = """Alpine.data("poll", function () {
+  function updateCounts(counts, total) {
+    document.querySelectorAll('[data-live="sidebar-count"]').forEach(function (element) {
+      element.textContent = String(total);
+    });
+  }
+})
+"""
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    [
+        pytest.param("", "", [], id="good"),
+        # Edge: a loop in a comment is not one (the wave-5 shape: never written).
+        pytest.param(
+            "    document.querySelectorAll",
+            "    // document.querySelectorAll",
+            ["sidebar count never written"],
+            id="comment",
+        ),
+        # Failure: looked up inside main (the sidebar is outside it), or a noun added.
+        pytest.param(
+            "document.querySelectorAll",
+            "main.querySelectorAll",
+            ["sidebar count looked up inside main"],
+            id="in-main",
+        ),
+        pytest.param(
+            "element.textContent = String(total);",
+            'element.textContent = total + " locations";',
+            ["sidebar count gets more than the number"],
+            id="noun",
+        ),
+    ],
+)
+def test_sidebar_count_rule(old: str, new: str, expected: list[str]) -> None:
+    assert old in GOOD_SIDEBAR_COUNT
+    assert sidebar_count_violations(GOOD_SIDEBAR_COUNT.replace(old, new)) == expected
+
+
+def test_sidebar_count_follows_the_poll() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+    poll = component_bodies(source).get("poll", "")
+    sidebar = (TEMPLATES / "partials" / "sidebar.html").read_text(encoding="utf-8")
+    tag = re.search(r"<p data-live=\"sidebar-count\"[^>]*>(?P<text>[^<]*)</p>", sidebar)
+
+    # Expected: the poll hands the JSON's number of location ids to updateCounts, which
+    # writes it as the plain text of the sidebar's mono count, rendered with the number only.
+    assert sidebar_count_violations(source) == []
+    assert _COUNTS_FROM_IDS.search(poll) is not None
+    assert tag is not None and tag.group("text") == "{{ sidebar.rows|length }}"
+    assert re.search(rf"\b{CLASS}=\"[^\"]*\bnum\b", tag.group(0)) is not None
+    # Failure: no poll at all.
+    assert sidebar_count_violations("var x = 1;") == ["sidebar count never written"]
 
 
 # CSS entries

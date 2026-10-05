@@ -75,6 +75,34 @@
     return event.target instanceof Element ? event.target.closest(selector) : null;
   }
 
+  // A same-page jump: a plain primary click (button 0, no modifier key) on a link with no
+  // other target and no download whose URL is this page's (origin, path and query) with a
+  // non-empty hash. Its default action is the browser's own in-page jump.
+  function samePageJump(event, link) {
+    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+      return false;
+    }
+    if ((link.target && link.target !== "_self") || link.hasAttribute("download")) {
+      return false;
+    }
+    return (
+      link.hash !== "" &&
+      link.origin === window.location.origin &&
+      link.pathname === window.location.pathname &&
+      link.search === window.location.search
+    );
+  }
+
+  // Moves the focus to the element a same-page jump goes to when it takes the focus (the
+  // location page's cards and danger rows carry tabindex -1), without scrolling: the
+  // browser's own jump scrolls to it.
+  function focusJumpTarget(link) {
+    var target = document.getElementById(link.hash.slice(1));
+    if (target && target.hasAttribute("tabindex")) {
+      target.focus({ preventScroll: true });
+    }
+  }
+
   // Relative times (UI-11): a port of powermon/web/templatetags/timefmt.py. The age is the
   // difference of two instants, floored to the unit of its range; under 1 s or in the future
   // it is "just now". "now" is the client clock corrected by the server's own instant (the
@@ -193,6 +221,8 @@
   // Live updates (UI-05): the status JSON's vocabulary. Only these values are ever written
   // into data-status and data-delivery; texts go through textContent.
   var STATUS_KEYS = ["on", "off", "maintenance", "waiting"];
+  // The stored power state, also under maintenance (the JSON's power, S5's data-power).
+  var POWER_KEYS = ["on", "off", "waiting"];
   var DELIVERY_STATES = ["ok", "failing"];
   // The sidebar cell kind per status (data-cell).
   var CELL_KINDS = { on: "age", off: "off", maintenance: "mnt", waiting: "wait" };
@@ -634,12 +664,15 @@
     // polling and shows the "Live updates paused" chip with the reload link; the sign-in page is
     // never read. A success writes attributes and text of the live elements only (unknown
     // ids are ignored), shows the "Status changed" reload chip when the page can no longer
-    // match the data (list: another set of locations; location page: another status or
-    // delivery state; any page: its location gone or a time it cannot show in place, such
-    // as a first heartbeat where the page rendered "Never"), and dispatches pm:status on
-    // window. The list's count ([data-live="count"]) gets the number in its mono
-    // [data-count-value] span and "location" or "locations" in its [data-count-noun] span,
-    // or its whole text when it has no number span.
+    // match the data (list: another set of locations; location page: another status,
+    // delivery state or, under maintenance, power state, which the page renders in its
+    // [data-power] pill with no live hook on its since rows; any page: its location gone or
+    // a time it cannot show in place, such as a first heartbeat where the page rendered
+    // "Never"), and dispatches pm:status on window. The list's count ([data-live="count"])
+    // gets the number in its mono [data-count-value] span and "location" or "locations" in
+    // its [data-count-noun] span, or its whole text when it has no number span. The
+    // sidebar's group count ([data-live="sidebar-count"], mono) gets the JSON's number of
+    // locations as its text.
     window.Alpine.data("poll", function () {
       var POLL_INTERVAL_MS = 30000;
       var POLL_BACKOFF_MS = [60000, 120000, 240000, 300000];
@@ -652,7 +685,8 @@
       var stopped = false;
       var failures = 0;
       var changed = false;
-      // Per location id, the status and delivery state the page was rendered with.
+      // Per location id, the status, delivery state and (location page under maintenance)
+      // power state the page was rendered with.
       var rendered = {};
 
       function snapshot() {
@@ -666,11 +700,16 @@
             entry.delivery = element.getAttribute("data-delivery");
           }
         });
-        // The location page's delivery row and banner carry data-delivery without an id.
+        // The location page's delivery row and banner carry data-delivery without an id, and
+        // its Power state row (maintenance only) carries data-power, the stored power state.
         var ids = Object.keys(rendered);
         var delivery = main.querySelector("[data-delivery]");
         if (ids.length === 1 && rendered[ids[0]].delivery === undefined && delivery) {
           rendered[ids[0]].delivery = delivery.getAttribute("data-delivery");
+        }
+        var power = main.querySelector("[data-power]");
+        if (ids.length === 1 && rendered[ids[0]].power === undefined && power) {
+          rendered[ids[0]].power = power.getAttribute("data-power");
         }
       }
 
@@ -801,6 +840,10 @@
             element.textContent = on + " on, " + off + " off" + failingWords;
           });
         }
+        // The sidebar's group count (outside main): the number of locations, as text.
+        document.querySelectorAll('[data-live="sidebar-count"]').forEach(function (element) {
+          element.textContent = String(total);
+        });
         // The count keeps its number in the mono [data-count-value] span and the noun in
         // [data-count-noun]; an element without the number span gets the whole text.
         main.querySelectorAll('[data-live="count"]').forEach(function (element) {
@@ -849,6 +892,7 @@
           if (
             entry &&
             STATUS_KEYS.indexOf(entry.status) >= 0 &&
+            POWER_KEYS.indexOf(entry.power) >= 0 &&
             entry.delivery &&
             DELIVERY_STATES.indexOf(entry.delivery.state) >= 0
           ) {
@@ -875,7 +919,8 @@
           } else if (
             page === "detail" &&
             (entry.status !== before.status ||
-              (before.delivery !== undefined && entry.delivery.state !== before.delivery))
+              (before.delivery !== undefined && entry.delivery.state !== before.delivery) ||
+              (before.power !== undefined && entry.power !== before.power))
           ) {
             changed = true;
           }
@@ -1264,6 +1309,11 @@
     // its close button, Keep, the backdrop and Esc (cancel) are bound here; while the
     // destructive button is pending (the submit guard's aria-busy) they do nothing. On close
     // the focus goes back to the link, or to the menu button of the popover it was in.
+    // A same-page jump (see samePageJump) from a link inside the dialog (S11's "Recent
+    // outages" on S5) or inside a [popover] menu (the kebab's "Reset history…" while a reset
+    // is unavailable) closes that overlay and lets the browser jump; the focus then goes to
+    // the jump's target, not back to the trigger. While the submit is pending, a jump from
+    // the dialog is prevented and the dialog stays open.
     window.Alpine.data("confirmDialog", function () {
       return {
         init: function () {
@@ -1303,13 +1353,8 @@
             );
           };
 
-          // The element that gets the focus back: the link, or the button that opens the
-          // popover menu the link sits in (the menu closes when the dialog opens).
-          var focusTarget = function (link) {
-            var popover = link.closest("[popover]");
-            if (!popover || !popover.id) {
-              return link;
-            }
+          // Closes a popover menu while it is open.
+          var hideMenu = function (popover) {
             try {
               if (popover.matches(":popover-open")) {
                 popover.hidePopover();
@@ -1317,6 +1362,16 @@
             } catch (error) {
               // No popover API: the menu is a plain list.
             }
+          };
+
+          // The element that gets the focus back: the link, or the button that opens the
+          // popover menu the link sits in (the menu closes when the dialog opens).
+          var focusTarget = function (link) {
+            var popover = link.closest("[popover]");
+            if (!popover || !popover.id) {
+              return link;
+            }
+            hideMenu(popover);
             var openers = document.querySelectorAll("[popovertarget]");
             for (var index = 0; index < openers.length; index += 1) {
               if (openers[index].getAttribute("popovertarget") === popover.id) {
@@ -1388,6 +1443,14 @@
             if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
               return;
             }
+            // A same-page jump from a popover menu (the kebab's "Reset history…" while a
+            // reset is unavailable): the menu closes and the browser jumps to the row.
+            var jump = closestTo(event, "[popover] a[href]");
+            if (jump && !jump.hasAttribute("data-confirm") && samePageJump(event, jump)) {
+              hideMenu(jump.closest("[popover]"));
+              focusJumpTarget(jump);
+              return;
+            }
             var link = closestTo(event, "a[data-confirm]");
             if (!link || dialog.contains(link) || !link.href || !sameOrigin(link.href)) {
               return;
@@ -1404,9 +1467,21 @@
           }
           dialog.addEventListener("click", function (event) {
             var keep = closestTo(event, '[data-testid="keep"]');
+            var jump = closestTo(event, "a[href]");
             if (keep && dialog.contains(keep)) {
               event.preventDefault();
               close();
+            } else if (jump && dialog.contains(jump) && samePageJump(event, jump)) {
+              // A link to a card of this page (S11's "Recent outages" on S5): the dialog
+              // closes and the browser jumps there. returnTo is cleared first, because the
+              // close handler runs later and would send the focus, and the scroll, back.
+              if (pending()) {
+                event.preventDefault();
+                return;
+              }
+              returnTo = null;
+              close();
+              focusJumpTarget(jump);
             } else if (pressOnBackdrop && outside(event)) {
               close();
             }
