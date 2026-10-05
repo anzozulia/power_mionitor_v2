@@ -10,7 +10,7 @@
   is JS-only and rendered hidden. Messages render in arrival order and are escaped (R1).
 - partials/_alert.html renders ``data-tone`` for the five tones, the prefix only for warning
   and error, the hatch stripe only for muted, a role only when one is passed and an optional
-  action template.
+  action template. The action gets ``action_testid`` as its testid, never the alert's own.
 - partials/_button.html renders ``data-variant`` and never the disabled attribute; an href
   makes it a link.
 - admin.js registers the toasts component in its alpine:init listener and installs the
@@ -262,6 +262,39 @@ def test_alert_action_template() -> None:
     assert buttons[0]["data-variant"] == "primary"
     # Without an action template there is no button.
     assert _render_alert(tone="warning", title="Delivery failing").find("button") is None
+
+
+def test_alert_testid_never_reaches_its_action() -> None:
+    context = {
+        "tone": "warning",
+        "title": "Delivery failing",
+        "testid": "delivery-banner",
+        "action_template": BUTTON,
+        "variant": "primary",
+        "label": "Send test message",
+    }
+    page = parse(render_to_string(ALERT, {**context, "action_testid": "delivery-fix"}))
+    bare = parse(render_to_string(ALERT, context))
+
+    # Expected: the alert keeps its testid and the action gets action_testid, never both.
+    assert [element["data-testid"] for element in page.select("[data-testid]")] == [
+        "delivery-banner",
+        "delivery-fix",
+    ]
+    alert = by_testid(page, "delivery-banner")
+    button = by_testid(page, "delivery-fix")
+    assert (alert.name, alert["data-tone"], button.name) == ("div", "warning", "button")
+    assert button.find_parent(attrs={"data-testid": "delivery-banner"}) is alert
+    # Edge: without action_testid the action has no testid; the alert's is not copied.
+    assert [element["data-testid"] for element in bare.select("[data-testid]")] == [
+        "delivery-banner"
+    ]
+    action = bare.find("button")
+    assert isinstance(action, Tag) and not action.has_attr("data-testid")
+    # Failure input: an action_testid without an action template marks nothing.
+    lone = _render_alert(tone="info", title="Saved", testid="banner", action_testid="fix")
+    assert lone.find("button") is None
+    assert lone.select("[data-testid]") == [] and lone["data-testid"] == "banner"
 
 
 def test_alert_escapes_its_values() -> None:
