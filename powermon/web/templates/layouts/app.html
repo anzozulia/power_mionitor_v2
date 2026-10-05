@@ -1,0 +1,86 @@
+{% load static icons crumbs timefmt %}<!DOCTYPE html>
+<html lang="en" data-theme="{{ theme }}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>{% block title %}{% endblock %} · Power Monitor</title>
+<link rel="preload" href="{% static 'web/fonts/inter-latin-wght-normal.woff2' %}" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="{% static 'web/fonts/inter-cyrillic-wght-normal.woff2' %}" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="{% static 'web/build/app.css' %}">
+<link rel="icon" href="{% static 'web/favicon.svg' %}" type="image/svg+xml">
+<link rel="icon" href="{% static 'web/favicon.ico' %}" sizes="32x32">
+<script src="{% static 'web/admin.js' %}"></script>
+<script src="{% static 'web/vendor/alpine-csp-3.17.4.min.js' %}" defer></script>
+</head>
+{% comment %}
+The app layout: the shell every signed-in page extends (06-UI-SPEC Layout Shell; UI-01,
+UI-02, UI-03, UI-05, UI-11, UI-12). The sign-in page uses layouts/auth.html and the error
+pages layouts/error.html; neither has the sidebar or the top bar (R11).
+
+Head: the theme from the allowlisted cookie on html; the two font preloads, the stylesheet
+and the two favicons, all through the static tag; admin.js classic and render-blocking, so
+its first statement applies the stored rail flag before first paint, then the Alpine CSP
+build deferred. No other script, no inline script, no style.
+
+Body: x-data="relative" with data-now, the server instant the relative times were
+rendered at (the sidebar processor's now, which the sidebar cells use too). Then the skip
+link, the app shell (x-data="sidebar": the sidebar, the drawer overlay and the body
+column with the top bar and main), both toast regions and the dialog slot.
+
+Blocks:
+- title: the page title before " · Power Monitor".
+- main_attrs: extra attributes on main (the poll hooks on S3, S5 and S8).
+- live_indicator: inside the top bar, before the theme control; polling pages put
+  {% include "partials/_live.html" %} there. It lives in this file because a block inside
+  an included partial cannot be overridden by the page.
+- banners_above, then page_header, then banners_below, then content, inside main.
+- page_header: the standard header, built from page_title (the h1), page_badges (after
+  the h1), the compact breadcrumbs, page_meta (the li items of the meta line; the live
+  chip slot goes there) and page_actions. Confirmation pages override the whole block.
+- dialog: after main and the toast regions, outside every page block (S5 and S8 put the
+  confirm dialog shell there).
+
+The breadcrumb trail is computed once here (crumbs tag) and passed to both crumb navs.
+Every class is spelled out: no class name is built from data.
+{% endcomment %}{% breadcrumb_trail as trail %}
+<body x-data="relative" data-now="{{ sidebar.now|iso }}" class="bg-bg text-fg antialiased in-data-[drawer=open]:overflow-hidden">
+<a href="#main" data-testid="skip-link" class="sr-only focus:not-sr-only focus:fixed focus:top-2 focus:left-2 focus:z-60 focus:rounded-control focus:bg-surface focus:px-3 focus:py-2 focus:font-semibold focus:text-fg focus:shadow-pop">Skip to content</a>
+<div data-testid="app-shell" x-data="sidebar" class="flex min-h-dvh">
+{% include "partials/sidebar.html" %}
+<div data-drawer-overlay class="fixed inset-0 z-35 hidden bg-overlay in-data-[drawer=open]:block lg:in-data-[drawer=open]:hidden"></div>
+<div data-shell-body class="flex min-w-0 flex-1 flex-col bg-main-bg">
+<header data-testid="topbar" class="sticky top-0 z-20 flex h-12 shrink-0 items-center gap-2 border-b border-tb-border bg-tb-bg px-4">
+<button type="button" data-testid="sidebar-toggle" aria-controls="sidebar" aria-expanded="false" data-js-only hidden class="-ml-2 inline-flex size-11 shrink-0 items-center justify-center rounded-control text-icon hover:bg-surface-sunken hover:text-fg lg:hidden motion-safe:transition-colors motion-safe:duration-150">{% icon "menu" class="size-5" %}<span data-label class="sr-only">Open navigation</span></button>
+<button type="button" data-testid="rail-toggle" aria-controls="sidebar" aria-expanded="true" title="Collapse sidebar" data-js-only hidden class="-ml-2 hidden size-11 shrink-0 items-center justify-center rounded-control text-icon hover:bg-surface-sunken hover:text-fg xl:inline-flex md:pointer-fine:size-(--control-h) motion-safe:transition-colors motion-safe:duration-150">{% icon "panel-left-close" class="size-5 in-data-[rail=collapsed]:hidden" %}{% icon "panel-left-open" class="hidden size-5 in-data-[rail=collapsed]:block" %}<span data-label class="sr-only">Collapse sidebar</span></button>
+{% include "partials/_crumbs.html" with variant="topbar" trail=trail only %}
+<div class="ml-auto flex shrink-0 items-center gap-2">
+{% block live_indicator %}{% endblock %}
+{% include "partials/_theme_form.html" %}
+{% include "partials/_account_menu.html" %}
+</div>
+</header>
+<main id="main" tabindex="-1" {% block main_attrs %}{% endblock %} class="flex min-w-0 flex-1 flex-col gap-4 p-4 focus:outline-none focus:shadow-none">
+{% block banners_above %}{% endblock %}
+{% block page_header %}
+<header class="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+<div class="flex min-w-0 flex-col gap-4 md:gap-1">
+<div class="flex min-w-0 flex-wrap items-center gap-2">
+<h1 class="min-w-0 text-title font-semibold tracking-title text-fg break-words">{% block page_title %}{% endblock %}</h1>
+{% block page_badges %}{% endblock %}
+</div>
+{% include "partials/_crumbs.html" with variant="compact" trail=trail only %}
+<div class="has-[>ul:empty]:hidden sm:overflow-clip sm:[overflow-clip-margin:4px]"><ul class="flex flex-col gap-1 text-body text-fg-muted empty:hidden sm:-ml-4 sm:flex-row sm:flex-wrap sm:gap-x-0 sm:*:before:inline-block sm:*:before:w-4 sm:*:before:text-center sm:*:before:content-['·'_/_'']">{% block page_meta %}{% endblock %}</ul></div>
+</div>
+<div data-testid="page-actions" class="flex flex-wrap items-center gap-2 empty:hidden md:shrink-0 md:flex-nowrap">{% block page_actions %}{% endblock %}</div>
+</header>
+{% endblock %}
+{% block banners_below %}{% endblock %}
+{% block content %}{% endblock %}
+</main>
+</div>
+</div>
+{% include "partials/_toasts.html" %}
+{% block dialog %}{% endblock %}
+</body>
+</html>

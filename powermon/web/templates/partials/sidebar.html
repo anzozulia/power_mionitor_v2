@@ -1,0 +1,78 @@
+{% load icons timefmt %}{% comment %}
+The always-dark sidebar of the app layout (06-UI-SPEC Layout Shell > Sidebar; UI-01, UI-03,
+UI-12). Included once by layouts/app.html, never by the auth or error layouts (R11).
+
+Reads sidebar (the lazy context processor of 06-02: rows, counts, current_pk, now,
+ops_configured; absent for a request without a signed-in user, and then no location group
+and no ops chip render and no query runs) and request.resolver_match.url_name for the main
+nav's aria-current (None for a bare request: nothing is current).
+
+- Brand row (48 px): zap mark, wordmark, aria-hidden ops tag, link to the list; below lg
+  the drawer close button (JS only, rendered hidden) sits at the right.
+- Main nav: Locations and Add location, aria-current on the active one.
+- Locations group: label and count (data-live=sidebar-count), the aria-hidden summary
+  (shell.sb_summary) and its sr sentence (data-live=summary-sr), then one link per
+  location in list order, each one click from its page, aria-current on the location the
+  page is about; "No locations yet" and no summary when there is none.
+- Each link carries data-location-id, data-status and data-delivery (the poll updates
+  them) and the full name as title; inside it: the LED dot (styled by data-status), the
+  name (one line, ellipsis; the full escaped name stays the text), the sr sentence
+  (data-live=sidebar-sr, shell.sb_sr), the aria-hidden mono cell (data-live=sidebar-cell
+  with data-cell age/off/mnt/wait and data-since, shell.sb_cell, rewritten by the
+  relative component), the failing triangle (data-live=sidebar-fail, rendered hidden
+  while delivery is OK, so the poll can show it) and the rail's Off badge (shown by CSS
+  from data-status, in the rail only). Every per-location live element names its
+  location with data-location-id.
+- The cells and sentences use sidebar.now (the processor's clock), the same instant as
+  the layout's body data-now, so the server text and the client rewrite agree.
+- Footer: the "Ops chat off" chip, only while the ops chat is not configured.
+
+Layout: below lg a fixed off-canvas drawer (min(240px, 100vw - 56px)), shown while html
+carries data-drawer=open (set by the sidebar component in admin.js), invisible otherwise so
+its links are never tabbable while closed; from lg a sticky full-height 240 px column; at
+xl a 56 px rail while html carries data-rail=collapsed (labels, group text, count and
+summary visually hidden but still in the DOM, cells hidden, links centred, the triangle
+and the Off mark as 12 px corner badges). The list scrolls inside the sidebar, never the
+page. Every class is spelled out: no class name is ever built from data.
+{% endcomment %}<aside id="sidebar" data-testid="sidebar" class="invisible fixed inset-y-0 left-0 z-40 flex w-[min(240px,100vw_-_56px)] -translate-x-full flex-col border-r border-sb-border bg-sb-bg text-body text-sb-fg [--focus:var(--sb-focus)] [color-scheme:dark] motion-safe:transition-[translate,visibility] motion-safe:duration-200 in-data-[drawer=open]:visible in-data-[drawer=open]:translate-x-0 in-data-[drawer=open]:shadow-modal lg:visible lg:sticky lg:top-0 lg:bottom-auto lg:z-auto lg:h-dvh lg:w-(--sb-w) lg:shrink-0 lg:translate-x-0 lg:shadow-none xl:in-data-[rail=collapsed]:w-(--sb-rail-w)">
+  <div class="flex h-12 shrink-0 items-center gap-1 border-b border-sb-border px-2">
+    <a href="{% url 'location-list' %}" class="flex min-h-11 min-w-0 flex-1 items-center gap-2 rounded-control px-2 font-semibold text-sb-fg lg:min-h-(--nav-item-h) xl:in-data-[rail=collapsed]:justify-center xl:in-data-[rail=collapsed]:px-0">{% icon "zap" class="size-5 shrink-0 text-brand" %}<span class="truncate xl:in-data-[rail=collapsed]:sr-only">Power Monitor</span><span aria-hidden="true" class="num shrink-0 rounded-control border border-sb-border px-1 text-label font-normal text-sb-fg-muted xl:in-data-[rail=collapsed]:hidden">ops</span></a>
+    <button type="button" data-testid="drawer-close" aria-controls="sidebar" aria-expanded="false" data-js-only hidden class="inline-flex size-11 shrink-0 items-center justify-center rounded-control text-sb-fg-muted hover:bg-sb-hover hover:text-sb-fg lg:hidden motion-safe:transition-colors motion-safe:duration-150">{% icon "x" class="size-5" %}<span class="sr-only">Close navigation</span></button>
+  </div>
+  <div class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-2">
+    <nav aria-label="Main">
+      <ul class="flex flex-col gap-1">
+        <li><a href="{% url 'location-list' %}" data-testid="nav-locations" title="Locations"{% if request.resolver_match.url_name == "location-list" %} aria-current="page"{% endif %} class="group flex min-h-11 items-center gap-2 rounded-control px-2 text-sb-fg hover:bg-sb-hover aria-[current=page]:bg-sb-active-bg aria-[current=page]:font-semibold aria-[current=page]:text-sb-active-fg aria-[current=page]:[box-shadow:inset_2px_0_0_var(--brand)] lg:min-h-(--nav-item-h) xl:in-data-[rail=collapsed]:justify-center motion-safe:transition-colors motion-safe:duration-150">{% icon "layout-grid" class="size-4 shrink-0 text-sb-fg-muted group-aria-[current=page]:text-current" %}<span class="truncate xl:in-data-[rail=collapsed]:sr-only">Locations</span></a></li>
+        <li><a href="{% url 'location-create' %}" data-testid="nav-add-location" title="Add location"{% if request.resolver_match.url_name == "location-create" %} aria-current="page"{% endif %} class="group flex min-h-11 items-center gap-2 rounded-control px-2 text-sb-fg hover:bg-sb-hover aria-[current=page]:bg-sb-active-bg aria-[current=page]:font-semibold aria-[current=page]:text-sb-active-fg aria-[current=page]:[box-shadow:inset_2px_0_0_var(--brand)] lg:min-h-(--nav-item-h) xl:in-data-[rail=collapsed]:justify-center motion-safe:transition-colors motion-safe:duration-150">{% icon "plus" class="size-4 shrink-0 text-sb-fg-muted group-aria-[current=page]:text-current" %}<span class="truncate xl:in-data-[rail=collapsed]:sr-only">Add location</span></a></li>
+      </ul>
+    </nav>
+    {% if sidebar %}{% with now=sidebar.now counts=sidebar.counts %}
+    <div class="flex flex-col gap-1">
+      <div class="flex items-center justify-between gap-2 px-2 xl:in-data-[rail=collapsed]:sr-only">
+        <p class="text-label font-semibold uppercase tracking-label text-sb-fg-muted">Locations</p>
+        <p data-live="sidebar-count" class="num text-label text-sb-fg-muted">{{ sidebar.rows|length }}</p>
+      </div>
+      {% if sidebar.rows %}
+      <p data-testid="sidebar-summary" data-live="summary" aria-hidden="true" class="num px-2 text-label text-sb-fg-muted xl:in-data-[rail=collapsed]:sr-only">{{ counts.on }} on · {{ counts.off }} off{% if counts.failing %} · {{ counts.failing }} fail{% endif %}</p>
+      <p data-live="summary-sr" class="sr-only">{{ counts.on }} on, {{ counts.off }} off{% if counts.failing %}, {{ counts.failing }} with delivery failing{% endif %}</p>
+      {% endif %}
+      <nav aria-label="Locations" data-testid="sidebar-locations">
+        {% if sidebar.rows %}
+        <ul class="flex flex-col gap-1">
+          {% for row in sidebar.rows %}
+          <li><a href="{% url 'location-detail' row.pk %}" data-testid="sidebar-location" data-location-id="{{ row.pk }}" data-status="{{ row.status }}" data-delivery="{% if row.delivery_failing %}failing{% else %}ok{% endif %}" title="{{ row.name }}"{% if row.pk == sidebar.current_pk %} aria-current="page"{% endif %} class="group relative flex min-h-11 items-center gap-1 rounded-control px-2 text-sb-fg hover:bg-sb-hover aria-[current=page]:bg-sb-active-bg aria-[current=page]:font-semibold aria-[current=page]:text-sb-active-fg aria-[current=page]:[box-shadow:inset_2px_0_0_var(--brand)] lg:min-h-(--nav-item-h) xl:in-data-[rail=collapsed]:justify-center motion-safe:transition-colors motion-safe:duration-150"><span aria-hidden="true" class="flex size-5 shrink-0 items-center justify-center"><span class="size-2 rounded-led group-data-[status=on]:bg-st-on group-data-[status=off]:bg-st-off group-data-[status=maintenance]:bg-hatch group-data-[status=waiting]:border-2 group-data-[status=waiting]:border-st-wait"></span></span><span class="min-w-0 flex-1 truncate xl:in-data-[rail=collapsed]:sr-only">{{ row.name }}</span><span data-live="sidebar-sr" data-location-id="{{ row.pk }}" class="sr-only">{% if row.status == "on" %}, On{% if row.last_heartbeat_at %}, last heartbeat {% relative_time row.last_heartbeat_at %}{% endif %}{% elif row.status == "off" %}, Off{% if row.outage_started_at %} for {% age_words_tag row.outage_started_at %}{% endif %}{% elif row.status == "maintenance" %}, Maintenance{% else %}, Waiting for first heartbeat{% endif %}{% if row.delivery_failing %}, delivery failing{% endif %}</span><span aria-hidden="true" data-live="sidebar-cell" data-location-id="{{ row.pk }}" data-cell="{% if row.status == "on" %}age{% elif row.status == "off" %}off{% elif row.status == "maintenance" %}mnt{% else %}wait{% endif %}" data-since="{% if row.status == "on" %}{{ row.last_heartbeat_at|iso }}{% elif row.status == "off" %}{{ row.outage_started_at|iso }}{% endif %}" class="num shrink-0 text-label text-sb-fg-muted data-[cell=off]:font-semibold data-[cell=off]:text-sb-off-text xl:in-data-[rail=collapsed]:hidden">{% if row.status == "on" %}{% compact_age_tag row.last_heartbeat_at %}{% elif row.status == "off" %}OFF{% if row.outage_started_at %} {% compact_age_tag row.outage_started_at %}{% endif %}{% elif row.status == "maintenance" %}MNT{% else %}—{% endif %}</span><span aria-hidden="true" data-live="sidebar-fail" data-location-id="{{ row.pk }}"{% if not row.delivery_failing %} hidden{% endif %} class="flex shrink-0 items-center xl:in-data-[rail=collapsed]:absolute xl:in-data-[rail=collapsed]:top-0.5 xl:in-data-[rail=collapsed]:right-0.5">{% icon "triangle-alert" class="size-3.5 text-st-fail xl:in-data-[rail=collapsed]:size-3" %}</span><span aria-hidden="true" class="absolute top-0.5 right-0.5 hidden group-data-[delivery=failing]:top-auto group-data-[delivery=failing]:bottom-0.5 xl:in-data-[rail=collapsed]:group-data-[status=off]:flex">{% icon "zap-off" class="size-3 text-sb-off-text" %}</span></a></li>
+          {% endfor %}
+        </ul>
+        {% else %}
+        <p data-testid="sidebar-empty" class="px-2 py-1 text-sb-fg-muted xl:in-data-[rail=collapsed]:sr-only">No locations yet</p>
+        {% endif %}
+      </nav>
+    </div>
+    {% endwith %}{% endif %}
+  </div>
+  {% if sidebar and not sidebar.ops_configured %}
+  <div class="shrink-0 border-t border-sb-border p-2">
+    <a href="{% url 'location-list' %}" data-testid="ops-chat-warning" title="Ops chat off" class="flex min-h-11 items-center gap-2 rounded-control border border-sb-border px-3 font-semibold text-sb-fg hover:border-st-fail hover:bg-sb-hover lg:min-h-(--nav-item-h) xl:in-data-[rail=collapsed]:justify-center xl:in-data-[rail=collapsed]:px-0 motion-safe:transition-colors motion-safe:duration-150">{% icon "message-square-warning" class="size-4 shrink-0 text-st-fail" %}<span class="truncate xl:in-data-[rail=collapsed]:sr-only">Ops chat off</span></a>
+  </div>
+  {% endif %}
+</aside>

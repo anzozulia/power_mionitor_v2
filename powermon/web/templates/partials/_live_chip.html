@@ -1,0 +1,19 @@
+{% load icons %}{% comment %}
+The live-chip slot of the meta line (06-UI-SPEC Components > Live chips; UI-05, UI-11).
+One parameter, reload_url: the page's canonical URL, built by the page with the url tag.
+Only the polling pages (S3, S5, S8) include it, as one item of the page_meta block:
+{% include "partials/_live_chip.html" with reload_url=reload_url only %}.
+
+JS only: the slot and its four chips are rendered hidden; the poll component reveals the
+slot and shows at most one chip at a time by its hidden attribute (data-chip, 06-11):
+- updated: "Updated {relative}" (muted, below md only; the age in mono, data-live-age);
+- paused: "Live updates paused" (warning, wifi-off), while polling retries after errors;
+- paused-reload: the same warning as a link to reload_url, after the session ended;
+- changed: "Status changed · Reload page" (info, refresh-cw), a link to reload_url.
+The warning chips carry a visually hidden "Warning: " prefix. Fixed copy only (R4).
+
+The slot shows (and so draws its meta-line separator) only while a chip it holds is
+visible: CSS checks the chips' hidden attribute, and from md ignores the updated chip,
+which is hidden there. The reload links keep a 44 px hit box below md and 24 px from md
+with a fine pointer. Every class is spelled out.
+{% endcomment %}<li data-testid="live-chip" data-js-only hidden class="hidden items-center has-[>[data-chip]:not([hidden]):not([data-chip=updated])]:flex max-md:has-[>[data-chip=updated]:not([hidden])]:flex"><span data-chip="updated" data-tone="muted" hidden class="inline-flex h-5 items-center gap-1 rounded-control border border-border bg-surface-sunken px-2.5 text-label text-fg-muted md:hidden">Updated <span data-live-age class="num">just now</span></span><span data-chip="paused" data-tone="warning" hidden class="inline-flex h-5 items-center gap-1 rounded-control border border-warn-border bg-warn-bg px-2.5 text-label font-semibold text-warn-text">{% icon "wifi-off" class="size-3.5 shrink-0 text-warn-icon" %}<span class="sr-only">Warning: </span>Live updates paused</span><a href="{{ reload_url }}" data-chip="paused-reload" data-tone="warning" hidden class="relative inline-flex h-5 items-center gap-1 rounded-control border border-warn-border bg-warn-bg px-2.5 text-label font-semibold whitespace-nowrap text-warn-text before:absolute before:inset-x-0 before:-inset-y-3 hover:underline md:pointer-fine:before:-inset-y-0.5">{% icon "wifi-off" class="size-3.5 shrink-0 text-warn-icon" %}<span class="sr-only">Warning: </span>Live updates paused · Reload page</a><a href="{{ reload_url }}" data-chip="changed" data-tone="info" hidden class="relative inline-flex h-5 items-center gap-1 rounded-control border border-info-border bg-info-bg px-2.5 text-label font-semibold whitespace-nowrap text-info-text before:absolute before:inset-x-0 before:-inset-y-3 hover:border-info-text hover:underline md:pointer-fine:before:-inset-y-0.5">{% icon "refresh-cw" class="size-3.5 shrink-0" %}Status changed · Reload page</a></li>

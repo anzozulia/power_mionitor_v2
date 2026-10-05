@@ -1,0 +1,26 @@
+{% load icons %}{% comment %}
+The account menu at the right of the top bar (06-UI-SPEC Layout Shell > Top bar > Account
+menu; UI-01, R2). Included by layouts/app.html; reads user (the auth context processor)
+and the CSRF token.
+
+- Trigger: a popovertarget button with the 20 px user icon and the visually hidden
+  "Account: {username}" (the full name, always); from sm the name shows too, capped at a
+  fixed width with an ellipsis (aria-hidden, the hidden text already names the button),
+  then a chevron.
+- Popover (native, so light dismiss gives outside click and Esc with focus return):
+  "Signed in as {username}" in full, a divider, then Sign out as its own CSRF POST form to
+  the logout route. Its button shows a loader-circle spinner in place of the log-out icon
+  while the submit guard marks it aria-busy (never the disabled attribute).
+- Placement: below the trigger, aligned to its right edge, by CSS anchor positioning
+  through static anchor-name and position-anchor classes, applied only where the browser
+  supports position-area; elsewhere the browser's default popover placement stays.
+{% endcomment %}<div class="flex shrink-0 items-center">
+<button type="button" popovertarget="account-menu" class="inline-flex min-h-11 min-w-11 items-center justify-center gap-2 rounded-control px-2 text-body text-fg hover:bg-surface-sunken md:min-h-(--control-h) md:min-w-(--control-h) [anchor-name:--account-menu] motion-safe:transition-colors motion-safe:duration-150">{% icon "user" class="size-5 shrink-0 text-icon" %}<span class="sr-only">Account: {{ user.get_username }}</span><span aria-hidden="true" class="hidden max-w-40 truncate sm:block">{{ user.get_username }}</span>{% icon "chevron-down" class="hidden size-4 shrink-0 text-icon sm:block" %}</button>
+<div popover id="account-menu" data-testid="account-menu" class="min-w-60 max-w-[min(320px,100vw_-_32px)] rounded-control border border-border bg-surface p-2 text-body text-fg shadow-pop supports-[position-area:bottom]:mx-0 supports-[position-area:bottom]:mt-1 supports-[position-area:bottom]:mb-0 supports-[position-area:bottom]:[inset:auto] supports-[position-area:bottom]:[position-anchor:--account-menu] supports-[position-area:bottom]:[position-area:bottom_span-left]">
+<p class="px-3 py-2 break-words text-fg-muted">Signed in as {{ user.get_username }}</p>
+<hr class="-mx-2 my-2 border-border">
+<form method="post" action="{% url 'logout' %}" data-testid="sign-out-form">{% csrf_token %}
+<button type="submit" class="group flex min-h-11 w-full items-center gap-2 rounded-control px-3 text-left text-body text-fg hover:bg-surface-sunken aria-busy:cursor-progress aria-busy:opacity-70 md:min-h-(--control-h) motion-safe:transition-colors motion-safe:duration-150">{% icon "log-out" class="size-4 shrink-0 text-icon group-aria-busy:hidden" %}{% icon "loader-circle" class="hidden size-4 shrink-0 text-icon group-aria-busy:inline-block motion-safe:animate-spin" %}Sign out</button>
+</form>
+</div>
+</div>

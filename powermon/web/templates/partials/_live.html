@@ -1,0 +1,18 @@
+{% comment %}
+The LIVE indicator in the top bar (06-UI-SPEC Layout Shell > Top bar > LIVE indicator;
+UI-05, UI-11). No parameters. Only the polling pages (S3, S5, S8) put it in the app
+layout's live_indicator block: {% include "partials/_live.html" %}. The sign-in and error
+pages never render it.
+
+JS only: rendered hidden with data-js-only, revealed by the poll component, which also sets
+data-live-state (live or paused) and the label's text (data-label: "Live" or "Paused").
+The relative component rewrites the age (data-live-age) from the last successful poll; the
+server renders it as at page render time. Fixed copy only: never a name or a secret (R4).
+
+- live: an 8 px round dot in the On colour, pulsing under motion-safe, the label "Live"
+  (uppercased by CSS) and, from md, " · updated {relative}" with the age in mono.
+- paused: the dot in the warning icon colour without the pulse, the label in the warning
+  text colour, the age hidden.
+
+The state styles key off data-live-state through group-data variants, spelled out in full.
+{% endcomment %}<div data-testid="live-status" data-live-state="live" data-js-only hidden class="group flex shrink-0 items-center gap-2 text-label"><span aria-hidden="true" class="size-2 shrink-0 rounded-full bg-st-on group-data-[live-state=paused]:bg-warn-icon motion-safe:group-data-[live-state=live]:animate-live-pulse"></span><span data-label class="font-semibold uppercase tracking-label text-st-on-text group-data-[live-state=paused]:text-warn-text">Live</span><span class="hidden text-fg-muted md:group-data-[live-state=live]:inline"> · updated <span data-live-age class="num">just now</span></span></div>
