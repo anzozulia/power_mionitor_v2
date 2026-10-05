@@ -13,6 +13,11 @@
 - With no locations the page shows the empty state and no table, no meta count and no
   header button. While the ops chat is not configured, the warning banner sits above the
   page header (Phase 2 D-09, INV-20). Every page escapes the user-typed name (R1).
+- Live hooks (UI-05, the 06-11 binding contract): ``main`` carries the poll component with
+  the status JSON URL, the page kind and the reload URL; every row's pill, last heartbeat
+  and delivery element carries ``data-live`` and the row's id; the count is
+  ``data-live="count"``. The LIVE indicator and the live-chip slot render on S3, empty or
+  not, and never on the sign-in or error pages. No meta refresh, no inline script.
 
 Rows and cells are read only through ``pages.table(page, "locations-table")`` or inside
 each ``tr[data-testid=location-row]``, never page-wide, because 06-18 adds the phone cards
@@ -32,9 +37,10 @@ from bs4 import BeautifulSoup, Tag
 from conftest import FakeClock
 from django.contrib.auth import get_user_model
 from django.contrib.staticfiles.storage import staticfiles_storage
-from django.db import DatabaseError
+from django.db import DatabaseError, transaction
 from django.http.response import HttpResponseBase
 from django.test import Client
+from django.urls import reverse
 from pages import (
     all_by_testid,
     assert_no_injected_script,
@@ -48,7 +54,9 @@ from pages import (
     table,
     text,
 )
+from secret_fixtures import MASKED, SECRETS, TOKEN
 
+from powermon.alerts import delivery
 from powermon.engine.models import LocationState
 from powermon.locations.models import Location
 from powermon.web.templatetags.display_time import display_time, display_time_compact
@@ -67,6 +75,9 @@ OPS_BANNER_TEXT = (
     "file and run the deploy command; until then, ops notices (monitoring gaps, all-silent, "
     "expired or unconfirmed alerts, database outages) go to the worker log only."
 )
+# The data-live values of S3 (06-UI-SPEC Test hooks > Attribute vocabularies).
+ROW_LIVE = {"status-pill": "status", "last-heartbeat": "last-heartbeat", "delivery": "delivery"}
+CHIPS = ["updated", "paused", "paused-reload", "changed"]
 EMPTY_TITLE = "No locations yet"
 EMPTY_BODY = "Add a location to get its heartbeat URL, device key and setup examples."
 
@@ -556,6 +567,105 @@ def test_UI11_list_times(
     assert never.find_all("time") == []
     assert never.find_all(attrs={"data-relative": True}) == []
     assert text(never) == "Never"
+
+
+# Live hooks (UI-05; 06-11 binding contract, "Live update targets")
+
+
+@pytest.mark.django_db
+def test_UI05_list_poll_hooks(
+    admin: Client,
+    list_clock: FakeClock,
+    location_factory: Callable[..., Any],
+    fixed_now: datetime,
+) -> None:
+    on = location_factory(name="A on", bot_token=TOKEN)
+    location_factory(name="B waiting", bot_token=TOKEN)
+    _set_state(on, status="on", last_heartbeat_at=fixed_now, on_since=fixed_now)
+    with transaction.atomic():
+        delivery.open_failing(on.pk, fixed_now, 403)
+
+    response = admin.get("/")
+
+    soup = parse(response)
+    page_main = main(soup)
+    assert page_main.get("x-data") == "poll"
+    assert page_main.get("data-poll-url") == reverse("location-status-json")
+    assert page_main.get("data-poll-page") == "list"
+    assert page_main.get("data-reload-url") == reverse("location-list") == "/"
+    rows = all_by_testid(by_testid(soup, "locations-table"), "location-row")
+    assert [row["data-delivery"] for row in rows] == ["failing", "ok"]
+    for row in rows:
+        for testid, live in ROW_LIVE.items():
+            [element] = all_by_testid(row, testid)
+            assert element.get("data-live") == live, testid
+            assert element.get("data-location-id") == row["data-location-id"], testid
+        # The rendered state the poll compares with the JSON.
+        [pill] = all_by_testid(row, "status-pill")
+        assert pill["data-status"] == row["data-status"]
+        [cell] = all_by_testid(row, "delivery")
+        assert cell["data-delivery"] == row["data-delivery"]
+        # Both delivery variants are rendered for the poll; only the inactive one is hidden.
+        variants = {
+            str(variant["data-delivery-variant"]): variant.has_attr("hidden")
+            for variant in cell.find_all(attrs={"data-delivery-variant": True})
+        }
+        assert variants == {
+            "ok": row["data-delivery"] != "ok",
+            "failing": row["data-delivery"] != "failing",
+        }
+    # The count: one element without a location id, the number and the noun in their own
+    # spans (the poll writes the number into the first, the noun into the second).
+    [count] = page_main.find_all(attrs={"data-live": "count"})
+    assert not count.has_attr("data-location-id")
+    [value] = count.find_all(attrs={"data-count-value": True})
+    [noun] = count.find_all(attrs={"data-count-noun": True})
+    assert (text(value), text(noun), text(count)) == ("2", "locations", "2 locations")
+    # Every other live element names its location, and no live element holds a secret.
+    live = page_main.find_all(attrs={"data-live": True})
+    ids = {row["data-location-id"] for row in rows}
+    for element in live:
+        if element["data-live"] != "count":
+            assert element.get("data-location-id") in ids, element["data-live"]
+    assert_no_secrets(
+        "".join(str(element) for element in live),
+        [*SECRETS, MASKED, on.device_key],
+        label="data-live",
+    )
+
+
+@pytest.mark.django_db
+def test_UI05_live_indicator_only_on_polling_pages(
+    admin: Client, location_factory: Callable[..., Any]
+) -> None:
+    empty = parse(admin.get("/"))
+    location_factory(name="Office")
+    listed = parse(admin.get("/"))
+
+    # Also on the empty list: a first location added elsewhere shows the changed chip.
+    for soup in (empty, listed):
+        assert main(soup).get("x-data") == "poll"
+        indicator = by_testid(soup, "live-status")
+        assert indicator.get("data-live-state") == "live"
+        assert indicator.has_attr("data-js-only")
+        assert indicator.has_attr("hidden")
+        assert indicator.find_parent(attrs={"data-testid": "topbar"}) is not None
+        slot = by_testid(soup, "live-chip")
+        assert slot.has_attr("data-js-only")
+        assert slot.has_attr("hidden")
+        assert slot.find_parent("main") is not None
+        chips = slot.find_all(attrs={"data-chip": True})
+        assert [chip["data-chip"] for chip in chips] == CHIPS
+        assert all(chip.has_attr("hidden") for chip in chips)
+        reloads = {str(chip["data-chip"]): chip.get("href") for chip in chips if chip.name == "a"}
+        assert reloads == {"paused-reload": "/", "changed": "/"}
+    # Never on the sign-in page or an error page.
+    not_found = admin.get("/locations/999999/")
+    assert not_found.status_code == 404
+    for soup in (parse(Client().get("/login/")), parse(not_found)):
+        assert all_by_testid(soup, "live-status") == []
+        assert all_by_testid(soup, "live-chip") == []
+        assert main(soup).get("x-data") is None
 
 
 # Static assets
