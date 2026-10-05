@@ -266,8 +266,8 @@ def test_list_empty_and_single_and_many(
         rows = _rows(html)
         assert len(rows) == count
         assert all(row[3] == "OK" for row in rows)
-        # No pagination; the meta line counts every row.
-        assert "page=" not in html
+        # No pagination link; the meta line counts every row.
+        assert not [a for a in parse(html).find_all("a", href=True) if "page=" in a["href"]]
         assert _count(html) == f"{count} {noun}"
         assert_no_injected_script(html, noun)
         assert all_by_testid(parse(html), "empty-state") == []

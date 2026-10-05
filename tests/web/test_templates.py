@@ -376,8 +376,9 @@ def test_list_shows_twenty_locations_on_one_page(
     response = admin.get("/")
 
     assert [row[0] for row in _rows(response)] == [f"Location {n:02d}" for n in range(20)]
-    # No pagination: every row on the one page, and the meta line counts them all.
-    assert "page=" not in response.content.decode()
+    # No pagination: every row on the one page, no page link, and the meta line counts all.
+    links = parse(response).find_all("a", href=True)
+    assert not [link for link in links if "page=" in link["href"]]
     assert _count(response) == "20 locations"
 
 

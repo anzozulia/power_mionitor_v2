@@ -20,14 +20,23 @@ of those rows), ops_configured and now (the view clock's reading, passed to ever
   tone bar on the first cell, from data-status / data-delivery.
 - With no rows: the empty state (map-pin in the accent circle, list.empty_title,
   list.empty_body, list.add) and no table.
+- Live (UI-05, the 06-11 binding contract): main carries the poll component with the
+  status JSON URL, the page kind list and the reload URL, all as data values; the top bar
+  gets the LIVE indicator and the meta line the live-chip slot, empty list included (a
+  first location added elsewhere then shows the changed chip). Every row's pill, last
+  heartbeat and delivery element carries data-live and the row's id. The count is
+  data-live count with the number in its mono span and the noun in its own span, and no
+  location id. Hooks carry ids and fixed vocabulary only, never a secret (R4).
 
 Partials are included with only, so no outer parameter leaks into them. Every class is
 spelled out; no class name is built from data.
 {% endcomment %}
 {% block title %}Locations{% endblock %}
+{% block main_attrs %}x-data="poll" data-poll-url="{% url 'location-status-json' %}" data-poll-page="list" data-reload-url="{% url 'location-list' %}"{% endblock %}
+{% block live_indicator %}{% include "partials/_live.html" only %}{% endblock %}
 {% block banners_above %}{% if not ops_configured %}{% include "partials/_alert.html" with tone="warning" testid="ops-chat-banner" title="The ops chat is not configured." body='Set <code>OPS_BOT_TOKEN</code> and <code>OPS_CHAT_ID</code> in the env file and run the deploy command; until then, ops notices (monitoring gaps, all-silent, expired or unconfirmed alerts, database outages) go to the worker log only.' only %}{% endif %}{% endblock %}
 {% block page_title %}Locations{% endblock %}
-{% block page_meta %}{% if rows %}<li><span class="num" data-count-value>{{ rows|length }}</span> <span data-count-noun>{% if rows|length == 1 %}location{% else %}locations{% endif %}</span></li>{% endif %}{% endblock %}
+{% block page_meta %}{% if rows %}<li><span data-live="count"><span class="num" data-count-value>{{ rows|length }}</span> <span data-count-noun>{% if rows|length == 1 %}location{% else %}locations{% endif %}</span></span></li>{% endif %}{% url 'location-list' as reload_url %}{% include "partials/_live_chip.html" with reload_url=reload_url only %}{% endblock %}
 {% block page_actions %}{% if rows %}{% url 'location-create' as add_url %}{% include "partials/_button.html" with variant="primary" label="Add location" href=add_url testid="add-location" icon="plus" only %}{% endif %}{% endblock %}
 {% block content %}{% if rows %}
 <section aria-labelledby="locations-table-title" class="hidden rounded-card border border-border bg-surface md:block">
@@ -46,9 +55,9 @@ spelled out; no class name is built from data.
 <tbody>
 {% for row in rows %}<tr data-testid="location-row" data-location-id="{{ row.pk }}" data-status="{{ row.status }}" data-delivery="{% if row.delivery_failing %}failing{% else %}ok{% endif %}" class="group/row relative hover:bg-surface-muted has-[a:focus-visible]:bg-surface-muted motion-safe:transition-colors motion-safe:duration-150">
 <th scope="row" class="border-t border-border py-2 pr-3 pl-4 text-left align-middle font-normal xl:py-1 group-data-[status=off]/row:[box-shadow:inset_2px_0_0_var(--st-off)] group-data-[delivery=failing]/row:[box-shadow:inset_2px_0_0_var(--st-fail)]"><a href="{% url 'location-detail' row.pk %}" data-testid="location-link" title="{{ row.name }}" class="font-semibold break-words text-fg after:absolute after:inset-0 group-hover/row:text-accent-text focus-visible:shadow-none focus-visible:outline-none focus-visible:after:outline-2 focus-visible:after:-outline-offset-2 focus-visible:after:outline-focus focus-visible:after:[box-shadow:inset_0_0_0_4px_var(--focus-halo)] motion-safe:transition-colors motion-safe:duration-150">{{ row.name }}</a></th>
-<td class="border-t border-border px-3 py-2 align-middle xl:py-1"><div class="flex flex-wrap items-center gap-x-2 gap-y-1">{% include "partials/_status_pill.html" with status=row.status label=row.status_label only %}{% if row.alerts_off %} {% include "partials/_tag.html" with tag="alerts-off" only %}{% endif %}{% if row.router_grace %} {% include "partials/_tag.html" with tag="router-grace" only %}{% endif %}</div></td>
-<td class="border-t border-border px-3 py-2 align-middle xl:py-1">{% include "partials/_time.html" with value=row.last_heartbeat_at variant="table" testid="last-heartbeat" now=now only %}</td>
-<td class="border-t border-border py-2 pr-4 pl-3 align-middle xl:py-1"><div class="flex items-center gap-1">{% include "partials/_delivery.html" with failing=row.delivery_failing text=row.delivery only %}{% icon "chevron-right" class="ml-auto size-4 shrink-0 text-icon group-hover/row:text-fg motion-safe:transition-colors motion-safe:duration-150" %}</div></td>
+<td class="border-t border-border px-3 py-2 align-middle xl:py-1"><div class="flex flex-wrap items-center gap-x-2 gap-y-1">{% include "partials/_status_pill.html" with status=row.status label=row.status_label live=True location_id=row.pk only %}{% if row.alerts_off %} {% include "partials/_tag.html" with tag="alerts-off" only %}{% endif %}{% if row.router_grace %} {% include "partials/_tag.html" with tag="router-grace" only %}{% endif %}</div></td>
+<td class="border-t border-border px-3 py-2 align-middle xl:py-1">{% include "partials/_time.html" with value=row.last_heartbeat_at variant="table" testid="last-heartbeat" live="last-heartbeat" location_id=row.pk now=now only %}</td>
+<td class="border-t border-border py-2 pr-4 pl-3 align-middle xl:py-1"><div class="flex items-center gap-1">{% include "partials/_delivery.html" with failing=row.delivery_failing text=row.delivery live=True location_id=row.pk only %}{% icon "chevron-right" class="ml-auto size-4 shrink-0 text-icon group-hover/row:text-fg motion-safe:transition-colors motion-safe:duration-150" %}</div></td>
 </tr>
 {% endfor %}</tbody>
 </table>
