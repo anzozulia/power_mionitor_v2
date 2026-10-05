@@ -1,0 +1,33 @@
+{% load static %}<!DOCTYPE html>
+<html lang="en" data-theme="system">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>{% block title %}{% endblock %} · Power Monitor</title>
+<link rel="stylesheet" href="{% static 'web/build/app.css' %}">
+</head>
+{% comment %}
+Error layout for E1 404, E2 403 CSRF and E3 500 (06-UI-SPEC Page Contracts, R11). It reads no
+context variable at all: Django renders 500.html with no context and no request, and 404 and
+403-CSRF with the request and every context processor, so each page must come out the same
+either way. Hence the hard-coded data-theme="system", no sidebar, top bar, toasts or theme
+control, no script, and fixed copy only (never the path, the CSRF reason or the exception).
+Blocks: title, code (the data-code value), code_label (the visible code: a block can appear
+only once), heading, body.
+{% endcomment %}
+<body class="min-h-dvh bg-main-bg text-fg">
+<a href="#main" data-testid="skip-link" class="sr-only focus:not-sr-only focus:fixed focus:top-2 focus:left-2 focus:z-60 focus:rounded-control focus:bg-surface focus:px-3 focus:py-2 focus:font-semibold focus:text-fg focus:shadow-pop">Skip to content</a>
+<main id="main" tabindex="-1" class="flex flex-col items-center gap-6 px-4 pt-8 pb-8 md:pt-16 focus:outline-none focus:shadow-none">
+<p class="flex items-center gap-2 text-title font-semibold text-fg">Power Monitor</p>
+<section data-testid="error-page" data-code="{% block code %}{% endblock %}" aria-labelledby="error-heading" class="flex w-full max-w-[400px] flex-col items-start gap-4 rounded-card border border-border bg-surface p-6">
+<div class="flex flex-col gap-1">
+<p class="num text-label font-semibold uppercase tracking-label text-fg-muted">{% block code_label %}{% endblock %}</p>
+<h1 id="error-heading" class="text-title font-semibold tracking-title text-fg break-words">{% block heading %}{% endblock %}</h1>
+</div>
+<p class="text-fg-muted">{% block body %}{% endblock %}</p>
+{% include "partials/_button.html" with variant="primary" label="Back to locations" href="/" testid="back-to-locations" only %}
+</section>
+</main>
+</body>
+</html>

@@ -26,10 +26,11 @@ from powermon.web.views import HeartbeatView
 from powermon.worker.detection import run_cycle
 from powermon.worker.io_loop import RelayState, run_iteration
 
-# UI-SPEC, Security-Bound UI Rules, rule 5.
+# 06-UI-SPEC security-bound rule R5 (brief §8), written out so a changed constant fails here.
 CSP = (
-    "default-src 'none'; style-src 'self'; img-src 'self'; "
-    "form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+    "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+    "font-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; "
+    "base-uri 'none'"
 )
 # A device key has the D-07 shape: 32 characters from [A-Za-z0-9].
 DEVICE_KEY = "Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4z"

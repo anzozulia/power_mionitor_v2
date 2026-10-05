@@ -7,3 +7,4 @@ docker_data
 .planning
 .claude
 staticfiles
+powermon/web/static/web/build

@@ -1,0 +1,527 @@
+@import "tailwindcss" source(none);
+@source "../../templates";
+@source "../../static/web/admin.js";
+/* Always built, even before a template uses them (the design is never missing from the file). */
+@source inline("num bg-hatch");
+@plugin "@tailwindcss/forms" {
+  strategy: "class";
+}
+
+/*
+ * Power Monitor admin stylesheet: the Tailwind CSS v4 entry (06-UI-SPEC "Design Tokens").
+ * Built only by the pinned standalone CLI in the Docker css stage or the local dev watcher;
+ * the output is powermon/web/static/web/build/app.css (gitignored), hashed by collectstatic.
+ * Raw token names never use a Tailwind namespace prefix (--color-, --shadow-, --font-,
+ * --text-, --radius-, --tracking-, --spacing-), so @theme inline can point at them.
+ */
+
+@custom-variant dark {
+  &:where([data-theme=dark], [data-theme=dark] *) {
+    @slot;
+  }
+  @media (prefers-color-scheme: dark) {
+    &:where([data-theme=system], [data-theme=system] *) {
+      @slot;
+    }
+  }
+}
+
+@theme {
+  --color-*: initial;
+  --text-*: initial;
+  --text-label: 12px;
+  --text-label--line-height: 16px;
+  --text-body: 13px;
+  --text-body--line-height: 20px;
+  --text-lead: 16px;
+  --text-lead--line-height: 24px;
+  --text-title: 20px;
+  --text-title--line-height: 28px;
+  --font-weight-*: initial;
+  --font-weight-normal: 400;
+  --font-weight-semibold: 600;
+  --tracking-label: 0.04em;
+  --tracking-title: -0.01em;
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --radius-card: 6px;
+  --radius-control: 4px;
+  --radius-modal: 8px;
+  --radius-led: 2px;
+  --animate-toast-in: toast-in 200ms ease-out;
+  --animate-modal-in: modal-in 180ms ease-out;
+  --animate-live-pulse: live-pulse 2s ease-in-out infinite;
+  --animate-toast-timer: toast-timer 10s linear forwards;
+
+  @keyframes toast-in {
+    from {
+      opacity: 0;
+      transform: translateY(8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+  @keyframes modal-in {
+    from {
+      opacity: 0;
+      transform: translateY(8px) scale(0.98);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+  @keyframes live-pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.35;
+    }
+  }
+  @keyframes toast-timer {
+    from {
+      width: 100%;
+    }
+    to {
+      width: 0%;
+    }
+  }
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-main-bg: var(--main-bg);
+  --color-surface: var(--surface);
+  --color-surface-muted: var(--surface-muted);
+  --color-surface-sunken: var(--surface-sunken);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-field-border: var(--field-border);
+  --color-fg: var(--fg);
+  --color-fg-muted: var(--fg-muted);
+  --color-fg-subtle: var(--fg-subtle);
+  --color-icon: var(--icon);
+  --color-tb-bg: var(--tb-bg);
+  --color-tb-border: var(--tb-border);
+  --color-brand: var(--brand);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-fg: var(--accent-fg);
+  --color-accent-text: var(--accent-text);
+  --color-accent-soft: var(--accent-soft);
+  --color-accent-border: var(--accent-border);
+  --color-focus: var(--focus);
+  --color-focus-halo: var(--focus-halo);
+  --color-danger: var(--danger);
+  --color-danger-hover: var(--danger-hover);
+  --color-danger-fg: var(--danger-fg);
+  --color-danger-text: var(--danger-text);
+  --color-danger-soft: var(--danger-soft);
+  --color-danger-border: var(--danger-border);
+  --color-info-text: var(--info-text);
+  --color-info-bg: var(--info-bg);
+  --color-info-border: var(--info-border);
+  --color-code-bg: var(--code-bg);
+  --color-code-fg: var(--code-fg);
+  --color-code-muted: var(--code-muted);
+  --color-switch-off: var(--switch-off);
+  --color-switch-off-border: var(--switch-off-border);
+  --color-switch-on: var(--switch-on);
+  --color-knob: var(--knob);
+  --color-overlay: var(--overlay);
+  --color-st-on: var(--st-on);
+  --color-st-on-bg: var(--st-on-bg);
+  --color-st-on-text: var(--st-on-text);
+  --color-st-off: var(--st-off);
+  --color-st-off-bg: var(--st-off-bg);
+  --color-st-off-text: var(--st-off-text);
+  --color-st-maint: var(--st-maint);
+  --color-st-maint-base: var(--st-maint-base);
+  --color-st-maint-bg: var(--st-maint-bg);
+  --color-st-maint-text: var(--st-maint-text);
+  --color-st-wait: var(--st-wait);
+  --color-st-wait-bg: var(--st-wait-bg);
+  --color-st-wait-text: var(--st-wait-text);
+  --color-st-fail: var(--st-fail);
+  --color-st-fail-bg: var(--st-fail-bg);
+  --color-st-fail-text: var(--st-fail-text);
+  --color-st-fail-border: var(--st-fail-border);
+  --color-ok-text: var(--ok-text);
+  --color-ok-bg: var(--ok-bg);
+  --color-ok-border: var(--ok-border);
+  --color-warn-text: var(--warn-text);
+  --color-warn-bg: var(--warn-bg);
+  --color-warn-border: var(--warn-border);
+  --color-warn-icon: var(--warn-icon);
+  --color-err-text: var(--err-text);
+  --color-err-bg: var(--err-bg);
+  --color-err-border: var(--err-border);
+  --color-sb-bg: var(--sb-bg);
+  --color-sb-border: var(--sb-border);
+  --color-sb-fg: var(--sb-fg);
+  --color-sb-fg-muted: var(--sb-fg-muted);
+  --color-sb-hover: var(--sb-hover);
+  --color-sb-active-bg: var(--sb-active-bg);
+  --color-sb-active-fg: var(--sb-active-fg);
+  --color-sb-focus: var(--sb-focus);
+  --color-sb-off-text: var(--sb-off-text);
+  --color-sb-fail-text: var(--sb-fail-text);
+  --shadow-pop: var(--sh-pop);
+  --shadow-modal: var(--sh-modal);
+  --shadow-knob: var(--sh-knob);
+}
+
+/* Raw tokens, light (the default). Density tokens follow the pointer, not the theme. */
+:root {
+  color-scheme: light;
+  --bg: #EEF1F5;
+  --main-bg: #F3F5F8;
+  --surface: #FFFFFF;
+  --surface-muted: #F6F8FA;
+  --surface-sunken: #EEF1F5;
+  --border: #D7DDE5;
+  --border-strong: #C2CAD5;
+  --field-border: #7C8799;
+  --fg: #0F172A;
+  --fg-muted: #475569;
+  --fg-subtle: #5B6678;
+  --icon: #5B6678;
+  --tb-bg: #FFFFFF;
+  --tb-border: #D7DDE5;
+  --brand: #22D3EE;
+  --accent: #0E7490;
+  --accent-hover: #155E75;
+  --accent-fg: #FFFFFF;
+  --accent-text: #0E7490;
+  --accent-soft: #ECFEFF;
+  --accent-border: #A5E4EE;
+  --focus: #0E7490;
+  --focus-halo: #0E749040;
+  --danger: #B42318;
+  --danger-hover: #912018;
+  --danger-fg: #FFFFFF;
+  --danger-text: #B42318;
+  --danger-soft: #FEF3F2;
+  --danger-border: #FECDCA;
+  --info-text: #155E75;
+  --info-bg: #ECFEFF;
+  --info-border: #A5E4EE;
+  --code-bg: #0B1220;
+  --code-fg: #E2E8F0;
+  --code-muted: #8A96A8;
+  --switch-off: #E2E8F0;
+  --switch-off-border: #7C8799;
+  --switch-on: #0E7490;
+  --knob: #FFFFFF;
+  --overlay: #0B12208C;
+  --st-on: #62C28A;
+  --st-on-bg: #EAF7EF;
+  --st-on-text: #166E45;
+  --st-off: #CC3434;
+  --st-off-bg: #FCEBEB;
+  --st-off-text: #A82A2A;
+  --st-maint: #A09D94;
+  --st-maint-base: #E2E0DA;
+  --st-maint-bg: #F1F0EC;
+  --st-maint-text: #57534E;
+  --st-hatch: repeating-linear-gradient(45deg, #A09D94 0 3px, #E2E0DA 3px 7px);
+  --st-wait: #98A2B3;
+  --st-wait-bg: #F2F4F7;
+  --st-wait-text: #475467;
+  --st-fail: #F79009;
+  --st-fail-bg: #FFFAEB;
+  --st-fail-text: #B54708;
+  --st-fail-border: #FEDF89;
+  --ok-text: #166E45;
+  --ok-bg: #EAF7EF;
+  --ok-border: #B7E3C8;
+  --warn-text: #B54708;
+  --warn-bg: #FFFAEB;
+  --warn-border: #FEDF89;
+  --warn-icon: #DC6803;
+  --err-text: #B42318;
+  --err-bg: #FEF3F2;
+  --err-border: #FECDCA;
+  --sb-bg: #0B1220;
+  --sb-border: #1C2636;
+  --sb-fg: #CBD5E1;
+  --sb-fg-muted: #8A96A8;
+  --sb-hover: #142033;
+  --sb-active-bg: #22D3EE1F;
+  --sb-active-fg: #67E8F9;
+  --sb-focus: #22D3EE;
+  --sb-off-text: #F97066;
+  --sb-fail-text: #FDB022;
+  --sh-pop: 0px 8px 24px #0206172E;
+  --sh-modal: 0px 24px 48px #0206174D;
+  --sh-knob: 0px 1px 2px #0206174D;
+  --tb-h: 48px;
+  --sb-w: 240px;
+  --sb-rail-w: 56px;
+  --control-h: 32px;
+  --control-h-sm: 28px;
+  --nav-item-h: 32px;
+  --row-h: 36px;
+}
+
+[data-theme=light] {
+  color-scheme: light;
+}
+
+/* Every dark value. The system-in-dark block below must stay identical (tests/web/test_assets.py). */
+[data-theme=dark] {
+  color-scheme: dark;
+  --bg: #070B12;
+  --main-bg: #0A0F17;
+  --surface: #0F1520;
+  --surface-muted: #131A27;
+  --surface-sunken: #0A0F17;
+  --border: #1F2937;
+  --border-strong: #2B3646;
+  --field-border: #6B7688;
+  --fg: #E5E9F0;
+  --fg-muted: #9BA6B5;
+  --fg-subtle: #8B95A5;
+  --icon: #8B95A5;
+  --tb-bg: #0F1520;
+  --tb-border: #1F2937;
+  --brand: #22D3EE;
+  --accent: #22D3EE;
+  --accent-hover: #67E8F9;
+  --accent-fg: #062A33;
+  --accent-text: #22D3EE;
+  --accent-soft: #22D3EE1F;
+  --accent-border: #22D3EE66;
+  --focus: #22D3EE;
+  --focus-halo: #22D3EE47;
+  --danger: #D92D20;
+  --danger-hover: #B42318;
+  --danger-fg: #FFFFFF;
+  --danger-text: #F97066;
+  --danger-soft: #F044381F;
+  --danger-border: #F0443866;
+  --info-text: #67E8F9;
+  --info-bg: #22D3EE1A;
+  --info-border: #22D3EE59;
+  --code-bg: #05080D;
+  --code-fg: #E2E8F0;
+  --code-muted: #8A96A8;
+  --switch-off: #1F2937;
+  --switch-off-border: #6B7688;
+  --switch-on: #0891B2;
+  --knob: #FFFFFF;
+  --overlay: #00000099;
+  --st-on: #62C28A;
+  --st-on-bg: #62C28A26;
+  --st-on-text: #62C28A;
+  --st-off: #CC3434;
+  --st-off-bg: #CC343433;
+  --st-off-text: #F97066;
+  --st-maint: #A09D94;
+  --st-maint-base: #E2E0DA;
+  --st-maint-bg: #A09D9429;
+  --st-maint-text: #B3B0A8;
+  --st-hatch: repeating-linear-gradient(45deg, #A09D94 0 3px, #5B5852 3px 7px);
+  --st-wait: #98A2B3;
+  --st-wait-bg: #98A2B326;
+  --st-wait-text: #A9B2C1;
+  --st-fail: #F79009;
+  --st-fail-bg: #F7900926;
+  --st-fail-text: #FDB022;
+  --st-fail-border: #F7900966;
+  --ok-text: #62C28A;
+  --ok-bg: #62C28A1F;
+  --ok-border: #62C28A59;
+  --warn-text: #FDB022;
+  --warn-bg: #F790091F;
+  --warn-border: #F7900966;
+  --warn-icon: #FDB022;
+  --err-text: #F97066;
+  --err-bg: #F044381F;
+  --err-border: #F0443866;
+  --sb-bg: #05080D;
+  --sb-border: #161E2B;
+  --sb-fg: #CBD5E1;
+  --sb-fg-muted: #8A96A8;
+  --sb-hover: #142033;
+  --sb-active-bg: #22D3EE1F;
+  --sb-active-fg: #67E8F9;
+  --sb-focus: #22D3EE;
+  --sb-off-text: #F97066;
+  --sb-fail-text: #FDB022;
+  --sh-pop: 0px 12px 32px #0000008C;
+  --sh-modal: 0px 24px 48px #000000A6;
+  --sh-knob: 0px 1px 2px #00000080;
+}
+
+[data-theme=system] {
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  [data-theme=system] {
+    color-scheme: dark;
+    --bg: #070B12;
+    --main-bg: #0A0F17;
+    --surface: #0F1520;
+    --surface-muted: #131A27;
+    --surface-sunken: #0A0F17;
+    --border: #1F2937;
+    --border-strong: #2B3646;
+    --field-border: #6B7688;
+    --fg: #E5E9F0;
+    --fg-muted: #9BA6B5;
+    --fg-subtle: #8B95A5;
+    --icon: #8B95A5;
+    --tb-bg: #0F1520;
+    --tb-border: #1F2937;
+    --brand: #22D3EE;
+    --accent: #22D3EE;
+    --accent-hover: #67E8F9;
+    --accent-fg: #062A33;
+    --accent-text: #22D3EE;
+    --accent-soft: #22D3EE1F;
+    --accent-border: #22D3EE66;
+    --focus: #22D3EE;
+    --focus-halo: #22D3EE47;
+    --danger: #D92D20;
+    --danger-hover: #B42318;
+    --danger-fg: #FFFFFF;
+    --danger-text: #F97066;
+    --danger-soft: #F044381F;
+    --danger-border: #F0443866;
+    --info-text: #67E8F9;
+    --info-bg: #22D3EE1A;
+    --info-border: #22D3EE59;
+    --code-bg: #05080D;
+    --code-fg: #E2E8F0;
+    --code-muted: #8A96A8;
+    --switch-off: #1F2937;
+    --switch-off-border: #6B7688;
+    --switch-on: #0891B2;
+    --knob: #FFFFFF;
+    --overlay: #00000099;
+    --st-on: #62C28A;
+    --st-on-bg: #62C28A26;
+    --st-on-text: #62C28A;
+    --st-off: #CC3434;
+    --st-off-bg: #CC343433;
+    --st-off-text: #F97066;
+    --st-maint: #A09D94;
+    --st-maint-base: #E2E0DA;
+    --st-maint-bg: #A09D9429;
+    --st-maint-text: #B3B0A8;
+    --st-hatch: repeating-linear-gradient(45deg, #A09D94 0 3px, #5B5852 3px 7px);
+    --st-wait: #98A2B3;
+    --st-wait-bg: #98A2B326;
+    --st-wait-text: #A9B2C1;
+    --st-fail: #F79009;
+    --st-fail-bg: #F7900926;
+    --st-fail-text: #FDB022;
+    --st-fail-border: #F7900966;
+    --ok-text: #62C28A;
+    --ok-bg: #62C28A1F;
+    --ok-border: #62C28A59;
+    --warn-text: #FDB022;
+    --warn-bg: #F790091F;
+    --warn-border: #F7900966;
+    --warn-icon: #FDB022;
+    --err-text: #F97066;
+    --err-bg: #F044381F;
+    --err-border: #F0443866;
+    --sb-bg: #05080D;
+    --sb-border: #161E2B;
+    --sb-fg: #CBD5E1;
+    --sb-fg-muted: #8A96A8;
+    --sb-hover: #142033;
+    --sb-active-bg: #22D3EE1F;
+    --sb-active-fg: #67E8F9;
+    --sb-focus: #22D3EE;
+    --sb-off-text: #F97066;
+    --sb-fail-text: #FDB022;
+    --sh-pop: 0px 12px 32px #0000008C;
+    --sh-modal: 0px 24px 48px #000000A6;
+    --sh-knob: 0px 1px 2px #00000080;
+  }
+}
+
+/* Touch targets (UI-12): 44 px on any coarse pointer, whatever the width. */
+@media (pointer: coarse) {
+  :root {
+    --control-h: 44px;
+    --control-h-sm: 44px;
+    --nav-item-h: 44px;
+    --row-h: 44px;
+  }
+}
+
+/* Every data value is mono, with its unit (06-UI-SPEC Typography, mono rule). */
+@utility num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The maintenance hatch: dots, the bar segment and the banner stripe. */
+@utility bg-hatch {
+  background-image: var(--st-hatch);
+}
+
+@layer base {
+  [x-cloak] {
+    display: none !important;
+  }
+  /* Weights 400 and 600 only: preflight's bolder and the UA's bold would compute to 700. */
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6,
+  th,
+  dt,
+  b,
+  strong,
+  caption,
+  legend,
+  summary {
+    font-weight: 600;
+  }
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
+  }
+  body {
+    font-size: var(--text-body);
+    line-height: var(--text-body--line-height);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  :focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: 2px;
+    box-shadow: 0 0 0 4px var(--focus-halo);
+  }
+}
+
+/* Reduced motion: the success-toast timer keeps its 10 s, so auto-dismiss still fires on
+   animationend, but the bar no longer moves. */
+@keyframes toast-timer-static {
+  from {
+    width: 100%;
+  }
+  to {
+    width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-toast-timer {
+    animation-name: toast-timer-static;
+  }
+}
