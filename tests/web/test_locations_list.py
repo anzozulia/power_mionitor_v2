@@ -325,7 +325,8 @@ def test_UI04_fleet_showing_copy(
     for n in range(count):
         location_factory(name=f"Location {n}")
 
-    soup = _page(admin.get("/"))
+    response = admin.get("/")
+    soup = _page(response)
 
     card = by_testid(soup, "fleet-summary")
     heading = card.find("h2")
@@ -333,10 +334,83 @@ def test_UI04_fleet_showing_copy(
     assert text(heading) == "Fleet health"
     assert card.get("aria-labelledby") == heading.get("id")
     description = by_testid(card, "fleet-showing")
-    assert text(description) == showing
+    # The visible sentence: the parts the filter shows later are rendered hidden.
+    assert text(by_testid(_shown(response), "fleet-showing")) == showing
     assert description.get("data-total") == str(count)
     assert description.get("aria-live") == "polite"
     assert _value(by_testid(card, "fleet-total")) == count
+
+
+# The description's parts (W6-A3, W6-A4): what fleetFilter shows or hides, and its text.
+SHOWING_PARTS = (
+    "data-showing-all",
+    "data-showing-shown",
+    "data-showing-of",
+    "data-showing-total",
+    "data-showing-noun",
+)
+
+
+def _showing_parts(description: Tag) -> dict[str, tuple[str, bool, bool]]:
+    """Each part of the description by its hook: (text, hidden, mono)."""
+    parts = {}
+    for hook in SHOWING_PARTS:
+        found = description.find_all(attrs={hook: True})
+        assert len(found) == 1, f"expected one [{hook}], found {len(found)}"
+        part = found[0]
+        parts[hook] = (part.get_text(), part.has_attr("hidden"), "num" in part.get("class", []))
+    return parts
+
+
+def _mono(string: Any) -> bool:
+    return any("num" in parent.get("class", []) for parent in string.parents)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("count", "showing", "all_hidden", "noun"),
+    [
+        (1, "Showing 1 location", True, "location"),
+        (2, "Showing all 2 locations", False, "locations"),
+        (6, "Showing all 6 locations", False, "locations"),
+    ],
+)
+def test_W6A3_fleet_showing_counts_are_mono(
+    admin: Client,
+    location_factory: Callable[..., Any],
+    count: int,
+    showing: str,
+    all_hidden: bool,
+    noun: str,
+) -> None:
+    for n in range(count):
+        location_factory(name=f"Location {n}")
+
+    response = admin.get("/")
+
+    # Expected: the visible sentence is the copy row list.fleet_showing, unchanged; the shown
+    # count and the total sit in mono spans and every word stays Inter (the mono rule), so
+    # fleetFilter can rewrite the spans' texts and hidden flags and keep both.
+    description = by_testid(_page(response), "fleet-showing")
+    assert text(by_testid(_shown(response), "fleet-showing")) == showing
+    assert _showing_parts(description) == {
+        "data-showing-all": ("all ", all_hidden, False),
+        "data-showing-shown": (str(count), False, True),
+        "data-showing-of": (f" of {count}", True, False),
+        "data-showing-total": (str(count), False, True),
+        "data-showing-noun": (noun, False, False),
+    }
+    total = description.find(attrs={"data-showing-total": True})
+    assert total is not None and total.find_parent(attrs={"data-showing-of": True}) is not None
+    # Every digit is mono, and nothing else is.
+    for string in description.find_all(string=True):
+        if string.strip():
+            assert _mono(string) == string.strip().isdigit(), repr(str(string))
+    assert "num" not in description.get("class", [])
+    # The region reads its whole sentence on a change, not only the part that changed.
+    assert (description.get("aria-live"), description.get("aria-atomic")) == ("polite", "true")
+    # Failure guard: the server never renders the filtered sentence.
+    assert " of " not in text(by_testid(_shown(response), "fleet-showing"))
 
 
 # The filter cells (N13)
