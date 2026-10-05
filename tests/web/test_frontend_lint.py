@@ -39,6 +39,12 @@ the real tree must pass:
   DOMParser, else navigates; the clipboard is only written, in the copy click listener;
   the reveal guard empties the key on pagehide and replaces a restored page; the only style
   write is the fleet bar's flexGrow; the OFF-after bounds are the model's.
+- admin.js wave-4 audit pins: setOpen keeps aria-expanded of every drawer control the shell
+  templates render (the hamburger and the close button) in step with the drawer (W4-A1),
+  and retries the first nav link's focus once on the next frame while still open (W4-A3);
+  the poll writes S3's count number only into its mono [data-count-value] span and the noun
+  into [data-count-noun] (W4-A2); fillInstant never fills a "Never" wrapper, which has no
+  <time>, so the poll shows the changed chip instead.
 - CSS entries (powermon/web/assets/css/*.css): @import only "tailwindcss" or a ./ or ../ path;
   every url() relative or data: (comments skipped).
 - Python (powermon/web/**/*.py), read with the stdlib ast module: SafeString, SafeText,
@@ -1240,6 +1246,8 @@ CONTRACT_HOOKS: dict[str, tuple[str, ...]] = {
         '[data-live="summary"]',
         '[data-live="summary-sr"]',
         '[data-live="count"]',
+        "[data-count-value]",
+        "[data-count-noun]",
         '[data-testid="fleet-tile"]',
         '[data-testid="fleet-count"]',
         '[data-testid="fleet-bar"]',
@@ -1836,6 +1844,397 @@ def test_js_masking_keeps_offsets() -> None:
     assert _try_catch_blocks(source) == [(masked.index("{"), masked.index("}"))]
     # Failure: an unterminated string blanks to the end instead of raising.
     assert _mask_js("x = 'open {") == "x = '      "
+
+
+# admin.js wave-4 audit pins (W4-A1, W4-A2, W4-A3 and the "Never" fill)
+
+
+def function_body(source: str, name: str) -> str:
+    """The text of the first ``function <name>(...) {...}`` declaration in code, or ""."""
+    code = _mask_js(source)
+    match = next(_code_matches(re.compile(rf"\bfunction\s+{name}\s*\("), source), None)
+    if match is None:
+        return ""
+    end = _closing(code, code.index(")", match.start()) + 1, "{", "}")
+    return source[match.start() : end + 1]
+
+
+def text_writes(block: str, target: str) -> list[str]:
+    """The right-hand side of every ``<target>.textContent = ...;`` in code, whitespace
+    collapsed."""
+    code = _mask_js(block)
+    pattern = re.compile(rf"(?<![\w$.]){re.escape(target)}\s*\.\s*textContent\s*=(?!=)")
+    writes = []
+    for match in pattern.finditer(code):
+        end = code.find(";", match.end())
+        writes.append(" ".join(block[match.end() : len(block) if end < 0 else end].split()))
+    return writes
+
+
+# The drawer controls: the templates that render them and the one control with
+# aria-controls="sidebar" whose aria-expanded reports the rail, not the drawer.
+DRAWER_TEMPLATES = ("partials/sidebar.html", "layouts/app.html")
+RAIL_TOGGLE = "rail-toggle"
+_BUTTON_TAG = re.compile(r"<button\b[^>]*>")
+_TESTID_ATTRIBUTE = re.compile(r"\bdata-testid=\"([\w-]+)\"")
+_TESTID_LOOKUP = re.compile(
+    r"([\w$]+)\s*=\s*[\w$]+\s*\.\s*querySelector\(\s*'\[data-testid=\"([\w-]+)\"\]'\s*\)"
+)
+_EXPANDED_FROM_OPEN = (
+    r"(?<![\w$.]){control}\s*\.\s*setAttribute\(\s*\"aria-expanded\"\s*,"
+    r"\s*open\s*\?\s*\"true\"\s*:\s*\"false\"\s*\)"
+)
+
+
+def drawer_expanded_controls() -> list[str]:
+    """The testids of the buttons the shell templates render with aria-controls="sidebar"
+    and aria-expanded, the rail toggle aside: the controls that report the drawer's state."""
+    found = set()
+    for name in DRAWER_TEMPLATES:
+        for tag in _BUTTON_TAG.findall((TEMPLATES / name).read_text(encoding="utf-8")):
+            testid = _TESTID_ATTRIBUTE.search(tag)
+            if 'aria-controls="sidebar"' in tag and "aria-expanded=" in tag and testid:
+                found.add(testid.group(1))
+    return sorted(found - {RAIL_TOGGLE})
+
+
+def drawer_synced_controls(source: str) -> list[str]:
+    """The testids whose element the sidebar component's setOpen gives aria-expanded from
+    the drawer state ("true" open, "false" closed), in code (not a comment)."""
+    body = component_bodies(source).get("sidebar", "")
+    set_open = function_body(body, "setOpen")
+    controls = {variable: testid for variable, testid in _TESTID_LOOKUP.findall(body)}
+    return sorted(
+        testid
+        for variable, testid in controls.items()
+        if any(
+            True
+            for _ in _code_matches(
+                re.compile(_EXPANDED_FROM_OPEN.format(control=re.escape(variable))), set_open
+            )
+        )
+    )
+
+
+def drawer_focus_violations(source: str) -> list[str]:
+    """W4-A3: on open, setOpen focuses the first nav link; when the drawer refused it (still
+    hidden at that instant), it tries once more on the next frame, only while still open."""
+    code = _mask_js(function_body(component_bodies(source).get("sidebar", ""), "setOpen"))
+    focus = re.compile(r"\bfirst\s*\.\s*focus\s*\(")
+    found = set()
+    if focus.search(code) is None:
+        found.add("first nav link never focused")
+    if re.search(r"\bdocument\s*\.\s*activeElement\s*!==?\s*first\b", code) is None:
+        found.add("focus never checked")
+    frames = [
+        code[match.start() : _closing(code, match.start()) + 1]
+        for match in re.finditer(r"\brequestAnimationFrame\s*\(", code)
+    ]
+    retries = [frame for frame in frames if focus.search(frame)]
+    if not retries:
+        found.add("no retry on the next frame")
+    elif not all(re.search(r"\bif\s*\(\s*open\s*\)", frame) for frame in retries):
+        found.add("retry while the drawer is closed")
+    return sorted(found)
+
+
+_COUNT_LOOP = re.compile(
+    r"\bquerySelectorAll\(\s*'\[data-live=\"count\"\]'\s*\)\s*\.\s*forEach\s*\("
+)
+_COUNT_HOOK = re.compile(
+    r"\bvar\s+([\w$]+)\s*=\s*[\w$]+\s*\.\s*querySelector\(\s*\"(\[data-count-(?:value|noun)\])\"\s*\)"
+)
+COUNT_VALUE = "[data-count-value]"
+COUNT_NOUN = "[data-count-noun]"
+
+
+def count_loop(source: str) -> str:
+    """The poll's ``[data-live="count"]`` forEach call, or ""."""
+    body = component_bodies(source).get("poll", "")
+    code = _mask_js(body)
+    match = next(_code_matches(_COUNT_LOOP, body), None)
+    if match is None:
+        return ""
+    start = code.index("forEach", match.start())
+    return body[start : _closing(code, start) + 1]
+
+
+def count_write_violations(source: str) -> list[str]:
+    """W4-A2 and the mono rule: a poll writes the S3 count's number, and nothing else, into
+    its mono [data-count-value] span and the noun into [data-count-noun]; the whole text of
+    the [data-live="count"] element is written only when it has no number span."""
+    loop = count_loop(source)
+    if not loop:
+        return ["no count loop"]
+    code = _mask_js(loop)
+    parameter = re.match(r"forEach\s*\(\s*function\s*\(\s*([\w$]+)\s*\)", code)
+    element = parameter.group(1) if parameter else "element"
+    hooks = {hook: variable for variable, hook in _COUNT_HOOK.findall(loop)}
+    value, noun = hooks.get(COUNT_VALUE), hooks.get(COUNT_NOUN)
+    found = set()
+    if value is None:
+        found.add(f"no {COUNT_VALUE} hook")
+    elif text_writes(loop, value) != ["String(total)"]:
+        found.add("number span gets more than the number")
+    if noun is None:
+        found.add(f"no {COUNT_NOUN} hook")
+    else:
+        writes = text_writes(loop, noun)
+        words = {a or b for write in writes for a, b in _JS_STRING.findall(write)}
+        if words != {"location", "locations"} or any("+" in write for write in writes):
+            found.add("noun span gets more than the noun")
+    guards = []
+    if value is not None:
+        for match in re.finditer(rf"\bif\s*\(\s*!\s*{re.escape(value)}\s*\)\s*\{{", code):
+            guards.append((match.end() - 1, _closing(code, match.end() - 1, "{", "}")))
+    whole = re.compile(rf"(?<![\w$.]){re.escape(element)}\s*\.\s*textContent\s*=(?!=)")
+    if any(not any(a < m.start() < b for a, b in guards) for m in whole.finditer(code)):
+        found.add("whole text written over the number span")
+    return sorted(found)
+
+
+_NO_TIME_GUARD = re.compile(r"\bif\s*\(\s*!\s*time\s*\)\s*\{\s*return\s+false\s*;\s*\}")
+_DOM_WRITE = re.compile(r"\.\s*textContent\s*=(?!=)|\.\s*setAttribute\s*\(")
+
+
+def never_fill_violations(source: str) -> list[str]:
+    """A wrapper rendered as "Never" has no <time>: fillInstant cannot show an instant there,
+    so it returns false (the poll then shows the changed chip) before any write, and no
+    element is marked to hold an instant."""
+    body = function_body(source, "fillInstant")
+    if not body:
+        return ["no fillInstant"]
+    code = _mask_js(body)
+    no_instant = re.search(r"\bif\s*\(\s*!\s*instant\s*\)\s*\{", code)
+    after = _closing(code, no_instant.end() - 1, "{", "}") + 1 if no_instant else 0
+    guard = _NO_TIME_GUARD.search(code, after)
+    writes = [match.start() for match in _DOM_WRITE.finditer(code, after)]
+    found = set()
+    if guard is None or (writes and writes[0] < guard.start()):
+        found.add("instant written into a wrapper without <time>")
+    if "data-instant-text" in source:
+        found.add("Never holder marked to hold an instant")
+    return sorted(found)
+
+
+DRAWER_SAMPLE = """Alpine.data("sidebar", function () {
+  function setOpen(value) {
+    open = value;
+    if (toggle) {
+      toggle.setAttribute("aria-expanded", open ? "true" : "false");
+    }
+    // closer.setAttribute("aria-expanded", open ? "true" : "false");
+    if (open) {
+      var first = aside.querySelector("nav a[href]");
+      first.focus();
+      if (document.activeElement !== first) {
+        window.requestAnimationFrame(function () {
+          if (open) {
+            first.focus();
+          }
+        });
+      }
+    }
+  }
+  return { init: function () {
+    toggle = shell.querySelector('[data-testid="sidebar-toggle"]');
+    closer = shell.querySelector('[data-testid="drawer-close"]');
+  } };
+})
+"""
+
+
+def test_W4A1_both_drawer_controls_report_the_drawer_state() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+    rendered = drawer_expanded_controls()
+
+    # Expected: the hamburger and the drawer's close button carry aria-expanded for the
+    # drawer, and setOpen writes it on both from the drawer state ("true" open, "false"
+    # closed); the rail toggle reports the rail and is synced by syncRail.
+    assert rendered == ["drawer-close", "sidebar-toggle"]
+    assert drawer_synced_controls(source) == rendered
+    # Edge: a write in a comment is not one.
+    assert drawer_synced_controls(DRAWER_SAMPLE) == ["sidebar-toggle"]
+    # Failure: the wave-4 setOpen, which synced only the hamburger, misses the close button.
+    fixed = DRAWER_SAMPLE.replace("// closer.", "closer.")
+    assert drawer_synced_controls(fixed) == ["drawer-close", "sidebar-toggle"]
+    assert drawer_synced_controls(fixed.replace('open ? "true"', 'value ? "true"')) == []
+
+
+def test_W4A3_drawer_focus_retries_once_on_the_next_frame() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+    retry = (
+        "      if (document.activeElement !== first) {\n"
+        "        window.requestAnimationFrame(function () {\n"
+        "          if (open) {\n"
+        "            first.focus();\n"
+        "          }\n"
+        "        });\n"
+        "      }\n"
+    )
+    assert retry in DRAWER_SAMPLE
+
+    # Expected: the real setOpen and the sample focus the first link and retry once.
+    assert drawer_focus_violations(source) == []
+    assert drawer_focus_violations(DRAWER_SAMPLE) == []
+    # Edge: a retry that ignores a drawer closed in between is caught.
+    unguarded = DRAWER_SAMPLE.replace("if (open) {\n            first", "{\n            first")
+    assert drawer_focus_violations(unguarded) == ["retry while the drawer is closed"]
+    # Failure: the wave-4 setOpen focused once and never checked.
+    assert drawer_focus_violations(DRAWER_SAMPLE.replace(retry, "")) == [
+        "focus never checked",
+        "no retry on the next frame",
+    ]
+
+
+GOOD_COUNT = """Alpine.data("poll", function () {
+  function updateCounts(counts, total) {
+    main.querySelectorAll('[data-live="count"]').forEach(function (element) {
+      var value = element.querySelector("[data-count-value]");
+      var noun = element.querySelector("[data-count-noun]");
+      if (!value) {
+        element.textContent = total === 1 ? "1 location" : total + " locations";
+        return;
+      }
+      value.textContent = String(total);
+      if (noun) {
+        noun.textContent = total === 1 ? "location" : "locations";
+      }
+    });
+  }
+})
+"""
+WHOLE_OVER_SPAN = "whole text written over the number span"
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    [
+        pytest.param("", "", [], id="good"),
+        # Edge: a whole-text write in a comment is not one.
+        pytest.param(
+            "      value.textContent = String(total);\n",
+            "      value.textContent = String(total);\n      // element.textContent = x;\n",
+            [],
+            id="comment",
+        ),
+        # Failure: the whole text written after the spans, the noun in the number span, a
+        # number in the noun span, no spans at all (the wave-4 shape).
+        pytest.param(
+            "      if (noun) {",
+            '      element.textContent = total + " locations";\n      if (noun) {',
+            [WHOLE_OVER_SPAN],
+            id="whole-after-spans",
+        ),
+        pytest.param(
+            "value.textContent = String(total);",
+            'value.textContent = total + " locations";',
+            ["number span gets more than the number"],
+            id="noun-in-number",
+        ),
+        pytest.param(
+            'noun.textContent = total === 1 ? "location" : "locations";',
+            'noun.textContent = total + " locations";',
+            ["noun span gets more than the noun"],
+            id="number-in-noun",
+        ),
+        pytest.param(
+            '      var value = element.querySelector("[data-count-value]");\n'
+            '      var noun = element.querySelector("[data-count-noun]");\n',
+            "",
+            [f"no {COUNT_NOUN} hook", f"no {COUNT_VALUE} hook", WHOLE_OVER_SPAN],
+            id="no-spans",
+        ),
+    ],
+)
+def test_count_write_rule(old: str, new: str, expected: list[str]) -> None:
+    assert old in GOOD_COUNT
+    assert count_write_violations(GOOD_COUNT.replace(old, new)) == expected
+
+
+def test_W4A2_poll_keeps_the_count_number_in_its_mono_span() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+
+    # Expected: S3's "{N} locations" keeps N in the mono [data-count-value] span and the
+    # noun in [data-count-noun] after a poll; an element without the spans gets the whole
+    # text as before.
+    assert count_write_violations(source) == []
+    assert count_loop(source) != ""
+    # Failure: no poll component, or no count loop in it.
+    assert count_write_violations("var x = 1;") == ["no count loop"]
+
+
+GOOD_FILL = """function fillInstant(wrapper, instant) {
+  var time = wrapper.querySelector("time");
+  if (!instant) {
+    if (time) {
+      return false;
+    }
+    return true;
+  }
+  if (typeof instant.iso !== "string") {
+    return false;
+  }
+  if (!time) {
+    // A "Never" wrapper: nothing to fill in place.
+    return false;
+  }
+  time.setAttribute("datetime", instant.iso);
+  return true;
+}
+"""
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    [
+        pytest.param("", "", [], id="good"),
+        # Failure: the wave-4 shape, which wrote the display text into the "Never" span and
+        # marked it; a guard placed after the first write.
+        pytest.param(
+            '  if (!time) {\n    // A "Never" wrapper: nothing to fill in place.\n'
+            "    return false;\n  }\n",
+            '  if (!time) {\n    var holder = wrapper.querySelector("[data-instant-text]");\n'
+            '    holder.setAttribute("data-instant-text", "");\n'
+            "    holder.textContent = instant.display;\n    return true;\n  }\n",
+            [
+                "Never holder marked to hold an instant",
+                "instant written into a wrapper without <time>",
+            ],
+            id="never-filled",
+        ),
+        pytest.param(
+            '  time.setAttribute("datetime", instant.iso);\n',
+            "",
+            [],
+            id="no-write-after",
+        ),
+        pytest.param(
+            '  if (!time) {\n    // A "Never" wrapper: nothing to fill in place.\n'
+            "    return false;\n  }\n",
+            '  wrapper.setAttribute("data-x", "");\n  if (!time) {\n    return false;\n  }\n',
+            ["instant written into a wrapper without <time>"],
+            id="write-before-guard",
+        ),
+    ],
+)
+def test_never_fill_rule(old: str, new: str, expected: list[str]) -> None:
+    assert old in GOOD_FILL
+    assert never_fill_violations(GOOD_FILL.replace(old, new)) == expected
+
+
+def test_never_time_shows_the_changed_chip_instead_of_a_half_time() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+    poll = component_bodies(source).get("poll", "")
+
+    # Expected: a wrapper rendered as "Never" (a waiting location's first heartbeat) is
+    # not patched with a bare absolute time; fillInstant returns false and the poll turns
+    # that into the changed chip, as for an id-set change.
+    assert never_fill_violations(source) == []
+    assert re.search(r"if\s*\(\s*!\s*fillInstant\s*\(", poll) is not None
+    assert "changed = true" in poll
+    # Failure: no fillInstant at all.
+    assert never_fill_violations("var x = 1;") == ["no fillInstant"]
 
 
 # CSS entries

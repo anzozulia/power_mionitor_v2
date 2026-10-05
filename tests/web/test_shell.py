@@ -350,10 +350,10 @@ def test_UI01_drawer_and_rail_hooks(admin: Client) -> None:
     sidebar = by_testid(soup, "sidebar")
     topbar = by_testid(soup, "topbar")
 
-    for hook, region, label in (
-        ("sidebar-toggle", topbar, "Open navigation"),
-        ("drawer-close", sidebar, "Close navigation"),
-        ("rail-toggle", topbar, "Collapse sidebar"),
+    for hook, region, label, expanded in (
+        ("sidebar-toggle", topbar, "Open navigation", "false"),
+        ("drawer-close", sidebar, "Close navigation", "false"),
+        ("rail-toggle", topbar, "Collapse sidebar", "true"),
     ):
         button = by_testid(region, hook)
         assert (button.name, button["type"], button["aria-controls"]) == (
@@ -361,7 +361,10 @@ def test_UI01_drawer_and_rail_hooks(admin: Client) -> None:
             "button",
             "sidebar",
         ), hook
-        assert button["aria-expanded"] in ("true", "false"), hook
+        # The drawer renders closed and the rail expanded; the sidebar component keeps both
+        # drawer controls' aria-expanded in step with the drawer (W4-A1) and the rail
+        # toggle's with the rail.
+        assert button["aria-expanded"] == expanded, hook
         # JS only: rendered hidden, revealed by the sidebar component.
         assert button.has_attr("data-js-only") and button.has_attr("hidden"), hook
         assert text(button) == label, hook
