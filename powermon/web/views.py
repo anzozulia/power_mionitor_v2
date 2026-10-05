@@ -8,7 +8,6 @@ Every admin page relies on LoginRequiredMiddleware; only sign-in, sign-out, ``/h
 import logging
 import re
 import threading
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -26,7 +25,6 @@ from django.db import (
     connection,
     transaction,
 )
-from django.db.models.functions import Lower
 from django.http import HttpRequest, HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils.cache import add_never_cache_headers
@@ -37,7 +35,6 @@ from django.views.decorators.common import no_append_slash
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET
 
-from powermon.alerts import delivery
 from powermon.clock import Clock, SystemClock
 from powermon.engine import transitions
 from powermon.engine.models import LocationState
@@ -45,7 +42,11 @@ from powermon.locations import examples, keys, validators
 from powermon.locations.models import LANGUAGE_CHOICES, Location
 from powermon.throttle import rules, store
 from powermon.web.forms import LocationForm, SignInForm
-from powermon.web.status import failing_since_text, location_status
+
+# delivery_text lives in live.py now; the redundant alias keeps it importable from here.
+from powermon.web.live import delivery_text as delivery_text
+from powermon.web.live import fleet_counts, live_rows
+from powermon.web.status import location_status
 
 log = logging.getLogger(__name__)
 
@@ -156,77 +157,37 @@ class SignOutView(LogoutView):
         return response
 
 
-@dataclass(frozen=True)
-class LocationRow:
-    """One row of the location list (Phase 4 UI-SPEC screen A, D-13, UI-D1)."""
-
-    pk: int
-    name: str
-    # The Phase 4 status (``status.location_status``): "maintenance" whenever the flag is
-    # on, else the stored status "on", "off" or "waiting".
-    status: str
-    status_label: str
-    last_heartbeat_at: datetime | None
-    # The Status cell's tags, shown in this order: "Alerts off", "Router grace".
-    alerts_off: bool
-    router_grace: bool
-    # The Delivery cell: None for "OK", else "Failing since {time} ({code})" (D-13, UI-D6).
-    delivery: str | None = None
-
-
-def delivery_text(failing: delivery.Failing | None, now: datetime) -> str | None:
-    """The list's Delivery cell text for an open failing incident, or None ("OK").
-
-    ``{time}`` is HH:MM in the display TZ when the incident started today, else with its
-    date (UI-D6); ``{code}`` is ``http_{status}`` of the refusal the incident describes.
-    """
-    if failing is None:
-        return None
-    since = failing_since_text(failing.started_at, now, settings.TIME_ZONE)
-    return f"Failing since {since} (http_{failing.http_status})"
-
-
 class LocationListView(View):
-    """``/``: every location that is not deleted, sorted by name (Phase 4 UI-SPEC screen A).
+    """``/``: every location that is not deleted, sorted by name (06-UI-SPEC S3; UI-01, UI-04).
 
-    Read-only, one server-rendered response with no live refresh: the admin reloads to
-    see a new status. Names sort without regard to case, ties by the lower id. The status
-    uses the one Phase 4 vocabulary of the admin pages (``status.location_status``), with
-    the switch tags after it; the Language column is gone (UI-D1). The last column is the
-    delivery health (D-13): "OK", or "Failing since …" while the location's
-    ``delivery_failing`` incident is open, the badge's single source (D-10), read for
-    every row in one query. There is no pagination (at most about 20 locations). While
-    the ops chat is not configured, the page says so (Phase 2 D-09, INV-20).
+    One server-rendered response; the poll keeps it live from the status JSON afterwards
+    (UI-05), and nothing is ever written. The rows are ``live.live_rows``, the same rows
+    the status JSON and the sidebar read, from the same two queries whatever the number of
+    locations: names sort without regard to case, ties by the lower id; the status uses the
+    one Phase 4 vocabulary of the admin pages (``status.location_status``) with the switch
+    tags after it; the Delivery column is "OK", or "Failing since …" while the location's
+    ``delivery_failing`` incident is open (D-10, D-13). ``counts`` are the fleet counts of
+    those rows (UI-04). There is no pagination (at most about 20 locations). While the ops
+    chat is not configured, the page says so (Phase 2 D-09, INV-20).
+
+    Context: ``rows`` (``live.LiveRow``), ``counts``, ``ops_configured`` and ``now``, the
+    clock's reading, which decides the delivery text's "today" (UI-D6) and the relative
+    times (UI-11).
     """
 
     template_name = "web/location_list.html"
-    # Tests inject a FakeClock with LocationListView.as_view(clock=...): "today" (UI-D6).
+    # Tests inject a FakeClock with LocationListView.as_view(clock=...).
     clock: Clock = SystemClock()
 
     def get(self, request: HttpRequest) -> HttpResponse:
-        locations = list(
-            Location.objects.filter(deleted_at__isnull=True)
-            .select_related("state")
-            .order_by(Lower("name"), "pk")
-        )
-        failing = delivery.failing_incidents([location.pk for location in locations])
         now = self.clock.now()
-        rows = []
-        for location in locations:
-            status = location_status(location)
-            rows.append(
-                LocationRow(
-                    pk=location.pk,
-                    name=location.name,
-                    status=status.key,
-                    status_label=status.label,
-                    last_heartbeat_at=status.last_heartbeat_at,
-                    alerts_off=not location.alerts_enabled,
-                    router_grace=location.router_grace,
-                    delivery=delivery_text(failing.get(location.pk), now),
-                )
-            )
-        context = {"rows": rows, "ops_configured": settings.CFG.ops_configured}
+        rows = live_rows(now)
+        context = {
+            "rows": rows,
+            "counts": fleet_counts(rows),
+            "ops_configured": settings.CFG.ops_configured,
+            "now": now,
+        }
         return render(request, self.template_name, context)
 
 
