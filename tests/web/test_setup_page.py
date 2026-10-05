@@ -31,9 +31,11 @@ from bs4 import Tag
 from conftest import FakeClock
 from django.contrib.auth import get_user_model
 from django.test import Client
+from django.urls import reverse
 from pages import (
     all_by_testid,
     assert_no_injected_script,
+    assert_no_secrets,
     assert_page,
     breadcrumbs,
     by_testid,
@@ -61,6 +63,7 @@ from powermon.locations.examples import (
     wget_busybox,
     wget_gnu,
 )
+from powermon.locations.keys import generate_device_key
 from powermon.locations.models import Location
 from powermon.web import context_processors
 from powermon.web.location_views import ALREADY_REGENERATED_MESSAGE, REGENERATED_MESSAGE
@@ -133,6 +136,25 @@ RESPONSES = (
 )
 WAITING_LINE = "Waiting for the first heartbeat… This updates on its own when the device sends it."
 RECEIVED_LINE = "First heartbeat received."
+# Copy buttons (UI-08) in DOM order: target id -> (accessible name, polite message); copy
+# rows shell.copy, shell.copy_sr and shell.copied_msg.
+COPY_BUTTONS = {
+    "heartbeat-url": ("Copy heartbeat URL", "Heartbeat URL copied."),
+    "device-key": ("Copy device key", "Device key copied."),
+    "example-curl": ("Copy curl example", "Example copied."),
+    "example-cron": ("Copy cron lines", "Example copied."),
+    "example-wget-gnu": ("Copy GNU wget example", "Example copied."),
+    "example-wget-busybox": ("Copy BusyBox wget example", "Example copied."),
+}
+# The elements whose text may hold the key (R4).
+KEY_TARGETS = ("device-key", *EXAMPLE_BLOCKS)
+# The tabs (copy row setup.tabs) and the code block of each panel.
+TABS = [
+    ("curl (recommended)", "example-curl"),
+    ("Cron", "example-cron"),
+    ("GNU wget", "example-wget-gnu"),
+    ("BusyBox wget", "example-wget-busybox"),
+]
 
 
 @pytest.fixture
@@ -814,3 +836,333 @@ def test_breadcrumbs_on_location_and_setup_pages_on_setup(
     ]
     assert order == sorted(order)
     assert by_testid(page, "breadcrumbs").find_parent("main") is None
+
+
+# Copy (UI-08), the key's placement (R4, INV-23 #2), tabs, the reveal guard, the live
+# first-heartbeat step (UI-05) and the regenerate entry (UI-07, R7)
+
+
+def _first_text(element: Tag) -> str:
+    """The first non-blank text of ``element``: the copy component's visible label."""
+    for string in element.find_all(string=True):
+        if str(string).strip():
+            return str(string).strip()
+    raise AssertionError("the element has no text")
+
+
+def _assert_copy_button(page: Tag, button: Tag) -> str:
+    """One copy button keeps the 06-11 binding; returns its target id."""
+    target = str(button["data-copy-target"])
+    assert len(page.find_all(id=target)) == 1, f"copy target {target!r} is not one element"
+    name, copied = COPY_BUTTONS[target]
+    assert (button.name, button.get("type"), text(button), button.get("data-copied-msg")) == (
+        "button",
+        "button",
+        name,
+        copied,
+    )
+    assert button.get("x-data") == "copy"
+    assert button.has_attr("data-js-only")
+    assert button.has_attr("hidden")
+    # "Copy" is the first text, the sr-only suffix comes after it.
+    assert _first_text(button) == "Copy"
+    return target
+
+
+@pytest.mark.django_db
+def test_UI08_masked_copy_only_url(admin: Client, location: Any) -> None:
+    key = location.device_key
+
+    page = parse(admin.get(_url(location)))
+
+    # Expected: exactly one copy button, for the heartbeat URL.
+    buttons = all_by_testid(page, "copy")
+    assert [_assert_copy_button(page, button) for button in buttons] == ["heartbeat-url"]
+    assert code_block(page, "heartbeat-url") == heartbeat_url(BASE_URL)
+    # The key field is masked: the mask hidden from screen readers, which hear the tail.
+    field = by_testid(page, "device-key")
+    assert field["data-state"] == "masked"
+    value = field.find(id="device-key")
+    assert isinstance(value, Tag)
+    assert (value.get_text(), value.get("aria-hidden")) == (_masked(key), "true")
+    assert f"Hidden key ending in {key[-4:]}" in text(field)
+    # The Reveal form posts to this page with a filled CSRF token.
+    reveal = by_testid(field, "reveal-form")
+    assert reveal is post_form(page, _url(location))
+    assert hidden_value(reveal, "csrfmiddlewaretoken") != ""
+    # Edge: the examples hold the mask, the note says how to fill them, none is copyable.
+    assert text(by_testid(page, "examples-masked-note")) == REVEAL_NOTE
+    assert by_testid(page, "examples-masked-note")["data-tone"] == "info"
+    for block in EXAMPLE_BLOCKS:
+        assert _masked(key) in code_block(page, block)
+    assert key not in str(page)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(("period", "lines"), [(60, 1), (30, 2), (10, 6)])
+def test_UI08_revealed_copy_buttons(
+    admin: Client, location_factory: Callable[..., Any], period: int, lines: int
+) -> None:
+    location = location_factory(name="Office", period_s=period)
+    key = location.device_key
+    url = heartbeat_url(BASE_URL)
+
+    page = parse(admin.post(_url(location)))
+
+    # Six copy buttons in DOM order, each aimed at one existing element, named uniquely.
+    buttons = all_by_testid(page, "copy")
+    assert [_assert_copy_button(page, button) for button in buttons] == list(COPY_BUTTONS)
+    assert len({text(button) for button in buttons}) == len(COPY_BUTTONS)
+    # Each target's text is its generator's output exactly: nothing added around it.
+    expected = {
+        "heartbeat-url": url,
+        "device-key": key,
+        "example-curl": curl_cmd(url, key, multiline=True),
+        "example-cron": "\n".join(cron_lines(url, key, period)),
+        "example-wget-gnu": wget_gnu(url, key),
+        "example-wget-busybox": wget_busybox(url, key),
+    }
+    for target, value in expected.items():
+        assert code_block(page, target) == value, target
+    # One cron line per offset below a minute (examples.cron_lines), one line from a minute.
+    assert len(code_block(page, "example-cron").split("\n")) == lines
+    # The examples scroll inside their own block and keep their line breaks.
+    for block in EXAMPLE_BLOCKS:
+        code = page.find(id=block)
+        assert isinstance(code, Tag)
+        assert code.name == "code"
+        assert code.parent is not None
+        assert code.parent.name == "pre"
+
+
+@pytest.mark.django_db
+def test_UI08_key_only_in_its_elements(admin: Client, location_factory: Callable[..., Any]) -> None:
+    # A tail with letters no hex hash or other page text holds.
+    location = location_factory(
+        name="Office", period_s=10, device_key=generate_device_key()[:28] + "QZXK"
+    )
+    key = location.device_key
+    cron = len(cron_lines(heartbeat_url(BASE_URL), key, 10))
+    assert cron == 6
+
+    response = admin.post(_url(location))
+    html = response.content.decode()
+
+    # The key once in #device-key, once in curl, GNU and BusyBox wget, once per cron line.
+    assert html.count(key) == 4 + cron
+    # Removing the text of those five elements leaves no key: no attribute, no title, no
+    # data-*, no Location header (R4).
+    assert_no_secrets(
+        html,
+        [key],
+        label="revealed setup page",
+        allow=[(key, f"#{target}") for target in KEY_TARGETS],
+        headers=[str(response.get("Location", ""))],
+    )
+    soup = parse(response)
+    for element in soup.find_all(True):
+        for attribute, value in element.attrs.items():
+            assert key not in str(value), f"<{element.name} {attribute}> holds the key"
+    assert key not in str(by_testid(soup, "sidebar"))
+    for live in soup.select("[data-live]"):
+        assert key not in str(live)
+
+    # Masked: the mask only in #device-key and the examples, the tail only in the sr text.
+    masked = admin.get(_url(location))
+    page = parse(masked)
+    mask = _masked(key)
+    for token in page.find_all("input", attrs={"name": "csrfmiddlewaretoken"}):
+        token["value"] = ""
+    assert_no_secrets(
+        str(page),
+        [mask],
+        label="masked setup page",
+        allow=[(mask, f"#{target}") for target in KEY_TARGETS],
+    )
+    for target in KEY_TARGETS:
+        element = page.find(id=target)
+        assert isinstance(element, Tag)
+        element.clear()
+    rest = str(page)
+    assert rest.count(key[-4:]) == 1
+    assert f"Hidden key ending in {key[-4:]}" in text(page)
+    assert key not in masked.content.decode()
+
+
+@pytest.mark.django_db
+def test_tabs_and_warning(admin: Client, location: Any) -> None:
+    for response in (admin.get(_url(location)), admin.post(_url(location))):
+        page = parse(response)
+        examples = _step(page, "examples")
+        tablist = by_testid(examples, "example-tabs")
+        # The tablist is JS only: rendered hidden, revealed by the tabs component.
+        assert (tablist.get("role"), tablist.get("aria-label")) == ("tablist", "Device examples")
+        assert tablist.has_attr("data-js-only")
+        assert tablist.has_attr("hidden")
+        wrapper = tablist.find_parent(attrs={"x-data": "tabs"})
+        assert isinstance(wrapper, Tag)
+        assert wrapper.find_parent(attrs={"data-step": "examples"}) is examples
+        tabs = [
+            found for found in tablist.find_all(attrs={"role": "tab"}) if isinstance(found, Tag)
+        ]
+        assert [text(tab) for tab in tabs] == [label for label, _ in TABS]
+        assert [tab.get("aria-selected") for tab in tabs] == ["true", "false", "false", "false"]
+        assert [tab.get("tabindex") for tab in tabs] == ["0", "-1", "-1", "-1"]
+        panels = [
+            found
+            for found in wrapper.find_all(attrs={"role": "tabpanel"})
+            if isinstance(found, Tag)
+        ]
+        assert len(panels) == len(TABS)
+        for tab, panel, (_, block) in zip(tabs, panels, TABS, strict=True):
+            assert (tab.name, tab.get("type")) == ("button", "button")
+            # aria-controls names the panel; every panel is in the server HTML, visible.
+            assert page.find(id=str(tab["aria-controls"])) is panel
+            assert not panel.has_attr("hidden")
+            # The panel starts with its full h3 caption, which names it, then its code.
+            heading = next(child for child in panel.children if isinstance(child, Tag))
+            assert heading.name == "h3"
+            assert text(heading) == H3_CAPTIONS[block]
+            assert page.find(id=str(panel["aria-labelledby"])) is heading
+            assert panel.find(id=block) is not None
+        assert CRON_HELP.format(period=60) in text(panels[1])
+        assert BUSYBOX_HELP in text(panels[3])
+        # The previewer warning: always visible, after the panels, outside every tabpanel.
+        warning = by_testid(examples, "previewer-warning")
+        assert warning["data-tone"] == "warning"
+        assert text(warning) == PREVIEWER_WARNING
+        assert warning.find_parent(attrs={"role": "tabpanel"}) is None
+        assert not warning.has_attr("hidden")
+        elements = list(examples.find_all(True))
+        assert elements.index(panels[-1]) < elements.index(warning)
+
+
+@pytest.mark.django_db
+def test_reveal_guard_hooks(admin: Client, location: Any) -> None:
+    key = location.device_key
+    setup = _url(location)
+
+    revealed = parse(admin.post(setup))
+    masked = parse(admin.get(setup))
+
+    # The revealed key region starts the reveal guard with the masked URL, which holds no key.
+    region = by_testid(revealed, "device-key")
+    assert (region["data-state"], region.get("x-data"), region.get("data-masked-url")) == (
+        "revealed",
+        "revealGuard",
+        setup,
+    )
+    assert key not in str(region["data-masked-url"])
+    assert region.find(id="device-key") is not None
+    assert len(revealed.select('[x-data="revealGuard"]')) == 1
+    # "Hide key" is a plain GET link to the setup page, which answers masked.
+    hide = by_testid(region, "hide-key")
+    assert (hide.name, hide["href"], text(hide)) == ("a", setup, "Hide key")
+    assert key not in admin.get(str(hide["href"])).content.decode()
+    # Failure guard: the masked page has neither the guard nor the hide link.
+    assert masked.select('[x-data="revealGuard"]') == []
+    assert all_by_testid(masked, "hide-key") == []
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("power", "maintenance", "received"),
+    [
+        ("waiting", False, False),
+        ("on", False, True),
+        ("off", False, True),
+        ("on", True, True),
+        ("waiting", True, False),
+    ],
+)
+def test_UI05_first_heartbeat_step(
+    admin: Client, location: Any, power: str, maintenance: bool, received: bool
+) -> None:
+    if power != "waiting":
+        LocationState.objects.filter(location=location).update(
+            status=power,
+            last_heartbeat_at=BEAT,
+            on_since=BEAT if power == "on" else None,
+            outage_started_at=BEAT if power == "off" else None,
+        )
+    Location.objects.filter(pk=location.pk).update(maintenance=maintenance)
+
+    page = parse(admin.get(_url(location)))
+
+    # Step 5 holds the live element: polite, with this location's id.
+    step = by_testid(page, "first-heartbeat")
+    assert step.find_parent(attrs={"data-step": "first-heartbeat"}) is _step(
+        page, "first-heartbeat"
+    )
+    assert (step["data-live"], step["data-location-id"], step["aria-live"]) == (
+        "first-heartbeat",
+        str(location.pk),
+        "polite",
+    )
+    [waiting] = step.select('[data-fh="waiting"]')
+    [heard] = step.select('[data-fh="received"]')
+    # The waiting line is JS only (it promises an update): hidden until the poll starts.
+    assert waiting.has_attr("data-js-only")
+    assert waiting.has_attr("hidden")
+    assert text(waiting) == WAITING_LINE
+    if received:
+        assert not heard.has_attr("hidden")
+        assert text(heard) == f"{RECEIVED_LINE} Last heartbeat {BEAT_TEXT} (12 s ago)"
+        [stamp] = heard.find_all("time")
+        assert datetime.fromisoformat(str(stamp["datetime"])) == BEAT
+        [relative] = heard.select("[data-relative]")
+        assert relative["data-relative"] == stamp["datetime"]
+    else:
+        # Edge: never heard from, so no time to show; the poll flips the variants.
+        assert heard.has_attr("hidden")
+        assert text(heard) == RECEIVED_LINE
+        assert heard.find("time") is None
+    # Step 5 never wraps the key region, and no live element holds the key field; every
+    # live element of the page content is about this location.
+    assert step.find(id="device-key") is None
+    for live in page.select("[data-live]"):
+        assert live.find(id="device-key") is None
+    for live in main(page).select("[data-live]"):
+        assert live.get("data-location-id") == str(location.pk)
+    # main polls the status JSON as the setup page and reloads to the masked setup URL.
+    shell = main(page)
+    assert (shell.get("x-data"), shell.get("data-poll-page")) == ("poll", "setup")
+    assert shell["data-poll-url"] == reverse("location-status-json")
+    assert shell["data-reload-url"] == _url(location)
+    indicator = by_testid(by_testid(page, "topbar"), "live-status")
+    assert indicator.has_attr("data-js-only")
+    assert indicator.has_attr("hidden")
+    chip = by_testid(_header(page), "live-chip")
+    assert [link["href"] for link in chip.find_all("a")] == [_url(location), _url(location)]
+
+
+@pytest.mark.django_db
+def test_UI07_setup_regenerate_entry(admin: Client, location: Any) -> None:
+    regenerate = _regenerate(location)
+
+    for response in (admin.get(_url(location)), admin.post(_url(location))):
+        page = parse(response)
+        link = by_testid(page, "regenerate-key")
+        assert (link.name, link["href"], text(link)) == ("a", regenerate, "Regenerate key…")
+        assert link.has_attr("data-confirm")
+        # One dialog shell, named by the fragment's title, after main (the dialog block).
+        dialogs = [found for found in page.find_all("dialog") if isinstance(found, Tag)]
+        assert [(d.get("data-testid"), d.get("aria-labelledby")) for d in dialogs] == [
+            ("confirm-dialog", "confirm-title")
+        ]
+        assert dialogs[0].find_parent("main") is None
+        elements = list(page.find_all(True))
+        assert elements.index(main(page)) < elements.index(dialogs[0])
+        # One [data-confirm-scope] in main, starting confirmDialog, around the entry.
+        scopes = page.select("[data-confirm-scope]")
+        assert [scope.get("x-data") for scope in scopes] == ["confirmDialog"]
+        assert scopes[0].find_parent("main") is main(page)
+        assert link.find_parent(attrs={"data-confirm-scope": True}) is scopes[0]
+        # Every confirmation entry is that same-origin link (R7).
+        assert page.select("[data-confirm]") == [link]
+
+    # The link's GET answers the shared confirmation partial as a fragment for the modal.
+    fragment = admin.get(regenerate, HTTP_X_PM_FRAGMENT="1")
+    assert fragment.status_code == 200
+    assert fragment["X-PM-Fragment"] == "1"
+    assert text(by_testid(parse(fragment), "confirm-title")) == "Regenerate the device key?"
