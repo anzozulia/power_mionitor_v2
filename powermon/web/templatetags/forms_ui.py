@@ -48,11 +48,11 @@ def whole_seconds(value: object) -> int | None:
     """``value`` as whole seconds within the form's bounds, or None.
 
     An int (an initial value) or a string of ASCII digits with optional surrounding
-    whitespace (a posted value). Anything else, or a number outside 10-3600, is None.
+    whitespace (a posted value). Anything else, or a number outside 10-3600, is None (a
+    bool reads as 0 or 1, so it is outside the bounds too).
     """
-    if isinstance(value, bool):
-        number = None
-    elif isinstance(value, int):
+    number: int | None
+    if isinstance(value, int):
         number = value
     elif isinstance(value, str) and _WHOLE.fullmatch(value.strip()):
         digits = value.strip().lstrip("0") or "0"
