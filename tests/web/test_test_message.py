@@ -625,3 +625,107 @@ def test_failed_test_message_never_opens_failing(
     assert OutboxMessage.objects.filter(channel=outbox.CHANNEL_OPS).count() == notices
     for row in alerts.values():
         assert _row(row).next_attempt_at == held
+
+
+# The test message on the rebuilt location page (06-UI-SPEC S5 Controls and the
+# delivery-failing banner; UI-01, UI-09, amendments A1 and A5)
+
+PENDING_LABEL = "Sending… up to 15 s"
+# Django level -> (the toast's data-level, the region role it is announced through).
+TOASTS = {
+    messages.SUCCESS: ("success", "status"),
+    messages.WARNING: ("warning", "status"),
+    messages.ERROR: ("error", "alert"),
+}
+
+
+def _test_forms(html: str, location: Any) -> list[tuple[str, str, str, str]]:
+    """Each POST form to the location's test message, in DOM order: (testid, its one
+    button's variant, pending label and label); each carries the CSRF token."""
+    shown = []
+    for form in page_parse(html).find_all("form"):
+        if form.get("action") != _url(location):
+            continue
+        assert str(form.get("method")).lower() == "post"
+        assert form.find("input", attrs={"name": "csrfmiddlewaretoken"}) is not None
+        [button] = form.find_all("button")
+        shown.append(
+            (
+                str(form.get("data-testid")),
+                str(button.get("data-variant")),
+                str(button.get("data-pending-label")),
+                page_text(button),
+            )
+        )
+    return shown
+
+
+@pytest.mark.django_db
+def test_UI01_test_message_forms(
+    admin: Client, location_factory: Callable[..., Any], fake_telegram: FakeTelegram
+) -> None:
+    location = location_factory(name="Office")
+
+    healthy = admin.get(f"/locations/{location.pk}/").content.decode()
+
+    # The Controls card's form: a secondary button with its pending label (loc.test_pending);
+    # the submit guard shows it and blocks a second send.
+    assert _test_forms(healthy, location) == [
+        ("test-message-form", "secondary", PENDING_LABEL, "Send test message")
+    ]
+
+    with transaction.atomic():
+        delivery.open_failing(location.pk, T0, 403)
+    failing = admin.get(f"/locations/{location.pk}/").content.decode()
+
+    # While delivery fails, the banner carries its own primary fix, before the Controls card.
+    assert _test_forms(failing, location) == [
+        ("banner-test-message-form", "primary", PENDING_LABEL, "Send test message"),
+        ("test-message-form", "secondary", PENDING_LABEL, "Send test message"),
+    ]
+    assert len(fake_telegram.calls) == 0
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("case", list(FLASH_TABLE))
+def test_UI09_test_message_toast_per_result(
+    admin: Client, location_factory: Callable[..., Any], fake_telegram: FakeTelegram, case: str
+) -> None:
+    answer, level, flash = FLASH_TABLE[case]
+    location = location_factory()
+    fake_telegram.fail(DEFAULT_BOT_TOKEN, **answer)
+
+    response = admin.post(_url(location), follow=True)
+
+    # One toast on the location page: warnings warning-toned (A5), errors in the alert
+    # region, the HTTP 5xx answer as the server-error copy (A1).
+    assert response.redirect_chain == [(f"/locations/{location.pk}/", 302)]
+    data_level, role = TOASTS[level]
+    assert [(m.level, m.role, m.text) for m in page_messages(response)] == [
+        (data_level, role, flash)
+    ]
+    if case == "http_503":
+        assert flash == TEST_SERVER_ERROR_MESSAGE.format(code="http_503")
+    assert len(fake_telegram.calls) == 1
+
+
+@pytest.mark.django_db
+def test_UI01_test_message_recovery_clears_the_banner(
+    admin: Client, location_factory: Callable[..., Any], fake_telegram: FakeTelegram
+) -> None:
+    location = location_factory(name="Office")
+    with transaction.atomic():
+        delivery.open_failing(location.pk, T0, 403)
+    fake_telegram.accept(DEFAULT_BOT_TOKEN)
+    page = page_parse(admin.get(f"/locations/{location.pk}/"))
+    banner_form = by_testid(page, "banner-test-message-form")
+
+    response = admin.post(str(banner_form["action"]), follow=True)
+
+    # The fix from the banner: a success toast, the banner gone, Delivery OK again.
+    assert [(m.level, m.text) for m in page_messages(response)] == [("success", RECOVERED_FLASH)]
+    after = page_parse(response)
+    assert not all_by_testid(after, "delivery-banner")
+    [value] = by_testid(after, "status-panel").select("[data-delivery]")
+    assert value["data-delivery"] == "ok"
+    assert fake_telegram.sent == [_test_body("en")]

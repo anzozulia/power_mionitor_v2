@@ -36,7 +36,12 @@ from powermon.engine import transitions
 from powermon.engine.models import LocationState, PowerInterval
 from powermon.locations import actions
 from powermon.locations.models import Location
-from powermon.web.location_views import MaintenanceSwitchView
+from powermon.web.location_views import (
+    ALERTS_COPY,
+    MAINTENANCE_COPY,
+    ROUTER_GRACE_COPY,
+    MaintenanceSwitchView,
+)
 
 User = get_user_model()
 
@@ -567,3 +572,77 @@ def test_alerts_and_router_grace_switches_need_the_signed_in_admin(
         assert response.url == f"/login/?next={url}"
 
     assert _ctid(location) == row
+
+
+# UI-10 end to end on the page: each switch posts its target, flips, and repeats safely
+
+
+# (route segment, data-switch, the flashes)
+SWITCHES = {
+    "maintenance": ("maintenance", MAINTENANCE_COPY),
+    "alerts": ("alerts", ALERTS_COPY),
+    "router-grace": ("router-grace", ROUTER_GRACE_COPY),
+}
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("name", list(SWITCHES))
+def test_UI10_switch_flip_and_repeat(
+    admin: Client, location_factory: Callable[..., Any], fake_telegram: FakeTelegram, name: str
+) -> None:
+    switch, copy = SWITCHES[name]
+    location = location_factory(name="Office", period_s=45, grace_s=20)
+    assert transitions.record_heartbeat(location.pk, _at(8, 0)) == "started"
+    url = f"/locations/{location.pk}/{name}/"
+
+    def form_on(page: Any) -> Tag:
+        found = [form for form in all_by_testid(page, "switch") if form["data-switch"] == switch]
+        assert len(found) == 1
+        assert found[0] is post_form(page, url)
+        return found[0]
+
+    def toasts(response: Any) -> list[tuple[str | None, str]]:
+        return [(message.level, message.text) for message in messages(response)]
+
+    def flash(key: str) -> str:
+        return copy[key].format(off_after_s=65)
+
+    # The form posts the target (the opposite of data-state); aria-checked is the current state.
+    form = form_on(_get(admin, location))
+    state = str(form["data-state"])
+    target = "off" if state == "on" else "on"
+    assert hidden_value(form, "value") == target
+    assert _button(form)["aria-checked"] == ("true" if state == "on" else "false")
+
+    # POST the target: 302 to the page, which shows the flipped state and a success toast.
+    response = admin.post(url, {"value": target})
+    assert (response.status_code, response.url) == (302, _page(location))
+    followed = admin.get(response.url)
+    assert toasts(followed) == [("success", flash(target))]
+    flipped = form_on(parse(followed))
+    assert (flipped["data-state"], hidden_value(flipped, "value")) == (target, state)
+    assert _button(flipped)["aria-checked"] == ("true" if target == "on" else "false")
+
+    # The same value again (a double click, a stale page): nothing changes, an info toast.
+    again = admin.post(url, {"value": target}, follow=True)
+    assert toasts(again) == [("info", flash(f"already_{target}"))]
+    assert flash(f"already_{target}").endswith("Nothing changed.")
+    assert form_on(parse(again))["data-state"] == target
+
+    # Two tabs loaded before the change, both posting the old target back: one change only,
+    # the second gets the "already" flash (R16).
+    first = admin.post(url, {"value": state}, follow=True)
+    second = admin.post(url, {"value": state}, follow=True)
+    assert toasts(first) == [("success", flash(state))]
+    assert toasts(second) == [("info", flash(f"already_{state}"))]
+    assert form_on(parse(second))["data-state"] == state
+
+    # Failure: GET is 405, a bad value 400 with an empty body, a missing CSRF token 403.
+    assert admin.get(url).status_code == 405
+    bad = admin.post(url, {"value": "toggle"})
+    assert (bad.status_code, bad.content) == (400, b"")
+    browser = Client(enforce_csrf_checks=True)
+    browser.force_login(User.objects.get(username="admin"))
+    assert browser.post(url, {"value": target}).status_code == 403
+    assert form_on(_get(admin, location))["data-state"] == state
+    assert len(fake_telegram.calls) == 0

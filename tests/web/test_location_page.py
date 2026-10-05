@@ -36,14 +36,19 @@ from conftest import FakeClock
 from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.test import Client
+from django.urls import reverse
 from pages import (
     all_by_testid,
     assert_no_injected_script,
+    assert_no_secrets,
     assert_page,
     breadcrumbs,
     by_testid,
+    code_block,
     definitions,
     h1,
+    hidden_value,
+    main,
     messages,
     parse,
     post_form,
@@ -56,8 +61,8 @@ from secret_fixtures import SECRET, TOKEN
 
 from powermon.alerts import delivery
 from powermon.engine import rules
-from powermon.engine.models import LocationState
-from powermon.locations import keys
+from powermon.engine.models import LocationState, PowerInterval
+from powermon.locations import examples, keys
 from powermon.locations.models import Location
 from powermon.web.location_views import (
     ALERTS_COPY,
@@ -708,3 +713,448 @@ def test_location_page_shows_the_switch_flash_as_a_toast(
         ("success", "status", ALERTS_COPY["off"])
     ]
     assert _tags(page) == ["alerts-off"]
+
+
+# S5 behaviour (06-UI-SPEC Page Contracts › S5; UI-01, UI-05, UI-07, UI-08, UI-12, R4, R7,
+# R13). Histories are seeded straight into the timeline, as the engine would leave them.
+
+RESET_REFUSED_IN_PROGRESS = (
+    "An outage is in progress. Reset the history after power returns, or delete the location."
+)
+RESET_REFUSED_NO_HISTORY = "There is no power history to reset."
+
+
+def _timeline(location: Any, *pieces: tuple[str, datetime, datetime | None]) -> None:
+    """Seed the location's timeline; each off piece is its own outage."""
+    for state, start, end in pieces:
+        PowerInterval.objects.create(
+            location=location,
+            state=state,
+            start_at=start,
+            end_at=end,
+            outage_start_at=start if state == "off" else None,
+        )
+
+
+def _power(location: Any, power: str) -> None:
+    """Leave the location on since 07:30 or off since 07:58 (UTC), with that history; or
+    waiting with none."""
+    if power == "on":
+        _timeline(location, ("on", _at(6, 0), _at(7, 0)), ("off", _at(7, 0), _at(7, 30)))
+        _timeline(location, ("on", _at(7, 30), None))
+        _set_state(location, status="on", on_since=_at(7, 30), last_heartbeat_at=_at(8, 0))
+    elif power == "off":
+        _timeline(location, ("on", _at(6, 0), _at(7, 58)), ("off", _at(7, 58), None))
+        _set_state(
+            location,
+            status="off",
+            on_since=_at(6, 0),
+            outage_started_at=_at(7, 58),
+            last_heartbeat_at=_at(7, 58),
+        )
+    else:
+        assert power == "waiting"
+
+
+def _fail(location: Any, status: int, migrate_to: int | None = None) -> None:
+    """Open the location's delivery-failing incident at 07:58 (UTC)."""
+    with transaction.atomic():
+        delivery.open_failing(location.pk, _at(7, 58), status, migrate_to)
+
+
+def _order(page: Any, *elements: Tag) -> list[int]:
+    """The document positions of ``elements``."""
+    every = list(page.find_all(True))
+    return [every.index(element) for element in elements]
+
+
+# (power, delivery failing (status, migrate_to) or None, maintenance, delivery cause or None,
+# maintenance help line or None)
+BANNER_CASES: dict[str, tuple[str, tuple[int, int | None] | None, bool, str | None, str | None]] = {
+    "http_400": ("on", (400, None), False, DELIVERY_NOT_IN_CHAT_CAUSE, None),
+    "http_401": ("on", (401, None), False, DELIVERY_BOT_REJECTED_CAUSE, None),
+    "http_403": ("on", (403, None), False, DELIVERY_CANNOT_POST_CAUSE, None),
+    "http_404": ("on", (404, None), False, DELIVERY_BOT_REJECTED_CAUSE, None),
+    "http_418": ("on", (418, None), False, DELIVERY_OTHER_CAUSE, None),
+    # The supergroup line replaces the cause line (D-10).
+    "migrate": ("on", (400, MIGRATED_CHAT_ID), False, MIGRATE_LINE, None),
+    "maintenance-power-on": ("on", None, True, None, HELP_POWER_ON),
+    "maintenance-waiting": ("waiting", None, True, None, HELP_POWER_ON),
+    "maintenance-power-off": ("off", None, True, None, HELP_POWER_OFF),
+    # Both banners at once: delivery failing first, then maintenance.
+    "both": ("off", (403, None), True, DELIVERY_CANNOT_POST_CAUSE, HELP_POWER_OFF),
+    "none": ("on", None, False, None, None),
+}
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("case", list(BANNER_CASES))
+def test_UI01_banners(
+    admin: Client, kyiv: Any, clock: FakeClock, location_factory: Callable[..., Any], case: str
+) -> None:
+    power, failing, paused, cause, help_line = BANNER_CASES[case]
+    location = location_factory(name="Office", bot_token=TOKEN, maintenance=paused)
+    _power(location, power)
+    if failing is not None:
+        _fail(location, *failing)
+
+    soup = assert_page(admin.get(_page(location)), title="Office", app=True)
+
+    shown = all_by_testid(soup, "delivery-banner") + all_by_testid(soup, "maintenance-banner")
+    # Banners sit after the header and before the section nav, in this order.
+    header, nav = by_testid(soup, "location-header"), by_testid(soup, "section-nav")
+    assert _order(soup, header, *shown, nav) == sorted(_order(soup, header, *shown, nav))
+    delivery_banners = all_by_testid(soup, "delivery-banner")
+    if cause is None:
+        assert delivery_banners == []
+    else:
+        assert failing is not None
+        [banner] = delivery_banners
+        code = f"http_{failing[0]}"
+        assert (banner["data-tone"], banner["data-delivery"]) == ("warning", "failing")
+        assert not banner.has_attr("data-live")
+        assert text(by_testid(banner, "delivery-cause")) == cause
+        assert text(by_testid(banner, "delivery-retry")) == DELIVERY_RETRY_LINE
+        assert text(banner) == (
+            f"Warning: Delivery failing Failing since 2026-10-01 10:58:00 EEST ({code}) "
+            f"· 2 min ago {cause} {DELIVERY_RETRY_LINE} Send test message"
+        )
+        # The since line: the full time as <time datetime> with its relative time.
+        stamp = banner.find("time")
+        assert isinstance(stamp, Tag)
+        assert datetime.fromisoformat(str(stamp["datetime"])) == _at(7, 58)
+        relatives = [found["data-relative"] for found in banner.select("[data-relative]")]
+        assert relatives == [stamp["datetime"]]
+        # The fix: a POST form with the CSRF token to the test message, a primary button.
+        form = by_testid(banner, "banner-test-message-form")
+        assert form is post_form(banner, reverse("location-test-message", args=[location.pk]))
+        assert form.find("input", attrs={"name": "csrfmiddlewaretoken"}) is not None
+        buttons = [found for found in form.find_all("button") if isinstance(found, Tag)]
+        assert [
+            (b.get("type"), b.get("data-variant"), b.get("data-pending-label"), text(b))
+            for b in buttons
+        ] == [("submit", "primary", "Sending… up to 15 s", "Send test message")]
+    maintenance_banners = all_by_testid(soup, "maintenance-banner")
+    if help_line is None:
+        assert maintenance_banners == []
+    else:
+        [banner] = maintenance_banners
+        assert banner["data-tone"] == "muted"
+        assert text(banner) == f"Maintenance is on {help_line}"
+    assert len(shown) == (cause is not None) + (help_line is not None)
+
+
+@pytest.mark.django_db
+def test_UI01_status_card(
+    admin: Client, kyiv: Any, clock: FakeClock, location_factory: Callable[..., Any]
+) -> None:
+    location = location_factory(name="Office")
+    _power(location, "on")
+
+    page = _get(admin, location)
+
+    assert _status_rows(page) == [
+        ("Status", "On"),
+        ("On since", "2026-10-01 10:30:00 EEST (30 min ago)"),
+        ("Last heartbeat", "2026-10-01 11:00:00 EEST (12 s ago)"),
+        DELIVERY_OK_ROW,
+    ]
+    # Live elements: the pills and the times, each with this location's id; never the
+    # delivery row, whose full-format text the poll's list-format text must not replace.
+    live = main(page).select("[data-live]")
+    assert {str(found["data-location-id"]) for found in live} == {str(location.pk)}
+    assert sorted({str(found["data-live"]) for found in live}) == [
+        "last-heartbeat",
+        "since",
+        "status",
+    ]
+    panel = by_testid(page, "status-panel")
+    assert [found["data-live"] for found in panel.select("[data-live]")] == [
+        "status",
+        "since",
+        "last-heartbeat",
+    ]
+    since = panel.select_one('[data-live="since"]')
+    assert since is not None
+    assert text(since.select_one("[data-since-label]") or since) == "On since"
+    assert not _delivery_value(page).has_attr("data-live")
+    # Every instant on the card is a <time datetime> with one [data-relative] of its value.
+    for stamp in panel.find_all("time"):
+        assert len(panel.select(f'[data-relative="{stamp["datetime"]}"]')) == 1
+
+    # Delivery failing: the pill (all Inter) with the full start, then its relative time.
+    _fail(location, 403)
+    failing = _get(admin, location)
+    value = _delivery_value(failing)
+    label = value.select_one("[data-label]")
+    assert label is not None
+    assert text(label) == "Failing since 2026-10-01 10:58:00 EEST (http_403)"
+    stamp = label.find("time")
+    assert isinstance(stamp, Tag)
+    assert datetime.fromisoformat(str(stamp["datetime"])) == _at(7, 58)
+    relative = value.select("[data-relative]")
+    assert [(found["data-relative"], text(found)) for found in relative] == [
+        (stamp["datetime"], "2 min ago")
+    ]
+    assert relative[0] not in label.descendants
+    assert not value.has_attr("data-live")
+    # The cause, migrate and retry lines live in the banner only.
+    assert DELIVERY_RETRY_LINE not in text(by_testid(failing, "status-panel"))
+
+    # Maintenance: the Power state row (pill only) and no live since row, because the poll
+    # does not read the power state.
+    Location.objects.filter(pk=location.pk).update(maintenance=True)
+    paused = _get(admin, location)
+    assert [term for term, _value in _status_rows(paused)] == [
+        "Status",
+        "Power state",
+        "On since",
+        "Last heartbeat",
+        "Delivery",
+    ]
+    power = by_testid(paused, "status-panel").select("[data-power]")
+    assert [(found["data-power"], text(found)) for found in power] == [("on", "On")]
+    assert not power[0].select("[data-live]")
+    assert not main(paused).select('[data-live="since"]')
+    assert not main(paused).select("[data-since-label]")
+    assert sorted({str(found["data-live"]) for found in main(paused).select("[data-live]")}) == [
+        "last-heartbeat",
+        "status",
+    ]
+
+
+@pytest.mark.django_db
+def test_UI05_detail_poll_hooks(
+    admin: Client, clock: FakeClock, location_factory: Callable[..., Any]
+) -> None:
+    location = location_factory(name="Office")
+    _power(location, "on")
+
+    page = _get(admin, location)
+
+    shell = main(page)
+    assert shell["x-data"] == "poll"
+    assert shell["data-poll-url"] == reverse("location-status-json")
+    assert shell["data-poll-page"] == "detail"
+    assert shell["data-reload-url"] == reverse("location-detail", args=[location.pk])
+    # The LIVE indicator in the top bar and the chip slot in the meta line, JS only.
+    indicator = by_testid(by_testid(page, "topbar"), "live-status")
+    assert indicator.has_attr("data-js-only")
+    assert indicator.has_attr("hidden")
+    chip = by_testid(by_testid(page, "location-meta"), "live-chip")
+    assert chip.has_attr("data-js-only")
+    assert chip.has_attr("hidden")
+    # The reload chips ("Live updates paused · Reload page", "Status changed · Reload page")
+    # link to this page.
+    assert [link["href"] for link in chip.find_all("a")] == [_page(location), _page(location)]
+    assert "Status changed · Reload page" in text(chip)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("state", ["available", "in-progress", "no-history"])
+def test_UI07_kebab_and_dialog(
+    admin: Client, clock: FakeClock, location_factory: Callable[..., Any], state: str
+) -> None:
+    location = location_factory(name="Office")
+    _power(location, {"available": "on", "in-progress": "off", "no-history": "waiting"}[state])
+    base = _page(location)
+
+    soup = assert_page(admin.get(base), title="Office", app=True)
+
+    actions = by_testid(soup, "page-actions")
+    edit = by_testid(actions, "header-edit-location")
+    assert (edit["href"], text(edit)) == (f"{base}edit/", "Edit location")
+    [kebab] = actions.select('button[popovertarget="location-menu"]')
+    assert (kebab.get("type"), text(kebab)) == ("button", "More actions")
+    menu = actions.find(id="location-menu")
+    assert isinstance(menu, Tag)
+    assert menu.has_attr("popover")
+    assert [link["data-testid"] for link in menu.find_all("a")] == [
+        "menu-device-setup",
+        "menu-reset-history",
+        "menu-delete-location",
+    ]
+    setup = by_testid(menu, "menu-device-setup")
+    assert (setup["href"], text(setup)) == (f"{base}setup/", "Device setup")
+    delete = by_testid(menu, "menu-delete-location")
+    assert (delete["href"], text(delete)) == (f"{base}delete/", "Delete location…")
+    assert delete.has_attr("data-confirm")
+    reset = by_testid(menu, "menu-reset-history")
+    assert text(reset) == "Reset history…"
+    if state == "available":
+        assert reset["href"] == f"{base}reset/"
+        assert reset.has_attr("data-confirm")
+        assert not all_by_testid(soup, "reset-unavailable")
+    else:
+        # No dead control: a plain link to the danger-zone row, described by its refusal.
+        assert (reset["href"], reset["data-reason"]) == ("#reset-history", state)
+        assert not reset.has_attr("data-confirm")
+        assert reset["aria-describedby"] == "reset-unavailable"
+        refusal = by_testid(soup, "reset-unavailable")
+        assert soup.find(id="reset-unavailable") is refusal
+        assert refusal["data-reason"] == state
+    # One dialog shell, named by the fragment's title, in the layout's dialog block after main.
+    dialogs = [found for found in soup.find_all("dialog") if isinstance(found, Tag)]
+    assert [(d.get("data-testid"), d.get("aria-labelledby")) for d in dialogs] == [
+        ("confirm-dialog", "confirm-title")
+    ]
+    assert dialogs[0].find_parent("main") is None
+    assert _order(soup, main(soup), dialogs[0]) == sorted(_order(soup, main(soup), dialogs[0]))
+    # One [data-confirm-scope], in main, starting confirmDialog.
+    scopes = soup.select("[data-confirm-scope]")
+    assert [scope.get("x-data") for scope in scopes] == ["confirmDialog"]
+    assert scopes[0].find_parent("main") is main(soup)
+    # Every confirmation entry is a same-origin link to its location's confirmation GET,
+    # the kebab's entries outside the scope wrapper included (R7).
+    entries = soup.select("[data-confirm]")
+    assert entries
+    for entry in entries:
+        assert entry.name == "a"
+        assert str(entry["href"]).startswith(base)
+    assert by_testid(menu, "menu-delete-location") in entries
+    assert not scopes[0].find(id="location-menu")
+
+
+@pytest.mark.django_db
+def test_UI08_device_setup_card(
+    admin: Client, settings: Any, location_factory: Callable[..., Any]
+) -> None:
+    settings.PUBLIC_BASE_URL = "https://power.example.org"
+    settings.ALLOWED_HOSTS = ["testserver", "other.example.org"]
+    location = location_factory(name="Office")
+    key = location.device_key
+
+    # Another allowed Host: the URL still comes from PUBLIC_BASE_URL (R13).
+    response = admin.get(_page(location), HTTP_HOST="other.example.org")
+
+    soup = assert_page(response, title="Office", app=True)
+    card = section(soup, "device-setup")
+    assert DEVICE_SETUP_SENTENCE in text(card)
+    url = card.find(id="heartbeat-url")
+    assert isinstance(url, Tag)
+    assert url.name == "code"
+    assert code_block(card, "heartbeat-url") == examples.heartbeat_url("https://power.example.org")
+    assert "other.example.org" not in response.content.decode()
+    [copy] = card.select('button[data-testid="copy"]')
+    assert (copy.get("type"), copy["data-copy-target"], text(copy)) == (
+        "button",
+        "heartbeat-url",
+        "Copy heartbeat URL",
+    )
+    assert copy["data-copied-msg"] == "Heartbeat URL copied."
+    assert copy.has_attr("data-js-only")
+    assert copy.has_attr("hidden")
+    # The one polite region the copy component announces in.
+    assert len(soup.select('[data-copy-status][aria-live="polite"]')) == 1
+    setup = by_testid(card, "open-setup")
+    assert (setup.name, setup["href"]) == ("a", f"/locations/{location.pk}/setup/")
+    # Never the device key, not even masked (R4).
+    html = response.content.decode()
+    assert key not in html
+    assert keys.mask_key(key) not in html
+    assert "Hidden key ending in" not in html
+    assert not soup.select("#device-key")
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("state", ["available", "in-progress", "no-history"])
+def test_danger_zone_states(
+    admin: Client, clock: FakeClock, location_factory: Callable[..., Any], state: str
+) -> None:
+    location = location_factory(name="Office")
+    _power(location, {"available": "on", "in-progress": "off", "no-history": "waiting"}[state])
+    base = _page(location)
+
+    page = _get(admin, location)
+
+    danger = section(page, "danger-zone")
+    assert text(danger.find("h2") or danger) == "Danger zone"
+    rows = [section(page, "reset-history"), section(page, "delete-location")]
+    for row in rows:
+        assert row.find_parent("section") is danger
+        assert row.get("tabindex") == "-1"
+    reset_row, delete_row = rows
+    links = all_by_testid(reset_row, "reset-history")
+    refusals = all_by_testid(reset_row, "reset-unavailable")
+    if state == "available":
+        assert [(link.name, link["href"], text(link)) for link in links] == [
+            ("a", f"{base}reset/", "Reset history…")
+        ]
+        assert links[0].has_attr("data-confirm")
+        assert refusals == []
+    else:
+        line = RESET_REFUSED_IN_PROGRESS if state == "in-progress" else RESET_REFUSED_NO_HISTORY
+        assert links == []
+        assert [(found["data-reason"], text(found)) for found in refusals] == [(state, line)]
+    delete = by_testid(delete_row, "delete-location")
+    assert (delete.name, delete["href"], text(delete)) == (
+        "a",
+        f"{base}delete/",
+        "Delete location…",
+    )
+    assert delete.has_attr("data-confirm")
+    # Nothing here acts: no form and no button; destructive entries are links (R7).
+    assert danger.find("form") is None
+    assert danger.find("button") is None
+
+
+# Every state of the page keeps the page invariants and holds no secret (TEST-STRATEGY
+# §7.1 S5; UI-01, UI-12, R3, R4, INV-23 #2).
+
+RENDER_STATES = [
+    "outages-listed",
+    "in-progress",
+    "no-outage-in-14-days",
+    "no-history",
+    "failing-403",
+    "failing-migrate",
+    "maintenance-power-on",
+    "maintenance-power-off",
+]
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("state", RENDER_STATES)
+def test_UI12_location_page_render_matrix(
+    admin: Client, kyiv: Any, clock: FakeClock, location_factory: Callable[..., Any], state: str
+) -> None:
+    location = location_factory(name="Office", bot_token=TOKEN)
+    key = location.device_key
+    if state in ("outages-listed", "failing-403", "failing-migrate", "maintenance-power-on"):
+        _power(location, "on")
+    elif state in ("in-progress", "maintenance-power-off"):
+        _power(location, "off")
+    elif state == "no-outage-in-14-days":
+        month_ago = NOW.replace(day=1, month=9)
+        _timeline(location, ("on", month_ago, None))
+        _set_state(location, status="on", on_since=month_ago, last_heartbeat_at=_at(8, 0))
+    if state == "failing-403":
+        _fail(location, 403)
+    elif state == "failing-migrate":
+        _fail(location, 400, MIGRATED_CHAT_ID)
+    if state.startswith("maintenance"):
+        Location.objects.filter(pk=location.pk).update(maintenance=True)
+
+    response = admin.get(_page(location))
+
+    soup = assert_page(response, title="Office", app=True)
+    assert_no_secrets(
+        response.content.decode(),
+        [TOKEN, SECRET, key, keys.mask_key(key)],
+        label=state,
+        headers=[str(response.get("Location", ""))],
+    )
+    # The settings list shows the token only as its mask.
+    mask = by_testid(soup, "masked-token").find("code")
+    assert isinstance(mask, Tag)
+    assert mask.get_text() == MASKED_TOKEN
+    # The seven cards in their pinned order, in every state.
+    assert [found.get("id") for found in soup.find_all("section")] == [
+        card_id for card_id, _ in CARDS
+    ]
+    # Each POST form on the page posts back to this location with the CSRF token.
+    for form in soup.find_all("form"):
+        if form.get("data-testid") in ("theme-form", "sign-out-form"):
+            continue
+        assert str(form["action"]).startswith(_page(location))
+        assert hidden_value(form, "csrfmiddlewaretoken")
