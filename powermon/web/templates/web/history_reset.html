@@ -1,39 +1,21 @@
-{% extends "base.html" %}
-{% comment %}
-05-UI-SPEC screen C (D-05, D-06, D-07, D-08; UI5-D7, UI5-D9, UI5-D11): the reset
-confirmation. A GET page that changes nothing: the lead, the five consequences (ul.list),
-the alternative paragraph that points to Recent outages, then the button row. The page
-holds exactly one form, the destructive Reset history POST (CSRF); "Keep history" is a
-plain link back to the location page. No autofocus on a page whose action is destructive.
-The name is auto-escaped and wraps (.name). Secrets (SEC-04): no settings panel, no device
-key and no bot token, not even masked. No script, no inline style.
+{% extends "layouts/app.html" %}{% comment %}
+S11, the reset history confirmation page (06-UI-SPEC Page Contracts > Confirmations,
+Components > Modal and confirmation focus card; UI-07, UI-01, UI-12, D6-05, R7). The no-JS
+and deep-link fallback of the modal: a GET that changes nothing, answered never_cache with
+Vary: X-PM-Fragment (fragments.confirm_response). With the fragment header the view renders
+web/_confirm_reset.html alone instead of this page. While the power is off, or when there
+is no history, the view redirects to the location page instead.
+
+- Title "{name} · Reset history"; the breadcrumbs Locations > {name} > Reset history come
+  from the layout (top bar from md, the compact copy below md).
+- The page header is only the compact breadcrumbs: the h1 lives in the shared partial.
+- Content: the shared partial, with fragment unset (the 20 px title), inside a centred
+  576 px focus card.
 {% endcomment %}
 {% block title %}{{ location.name }} · Reset history{% endblock %}
-{% block crumbs %}
-<nav aria-label="Breadcrumb">
-  <ol class="crumbs">
-    <li><a href="{% url 'location-list' %}">Locations</a></li>
-    <li><a class="name" href="{% url 'location-detail' location.pk %}">{{ location.name }}</a></li>
-    <li aria-current="page">Reset history</li>
-  </ol>
-</nav>
-{% endblock %}
+{% block page_header %}{% include "partials/_crumbs.html" with variant="compact" trail=trail only %}{% endblock %}
 {% block content %}
-<h1 class="name">Reset the history of {{ location.name }}?</h1>
-<p>This cannot be undone. Resetting the history:</p>
-<ul class="list">
-  <li>deletes all recorded power history of this location: the chart and the daily totals show no data for the time before the reset, and Recent outages is empty;</li>
-  <li>unpins its weekly chart in the channel if the bot can still pin there; otherwise unpin it by hand in Telegram (the posted messages stay in the channel);</li>
-  <li>sets it to Waiting for first heartbeat: nothing is detected until the next heartbeat, which restarts monitoring as On without an alert and posts and pins a new chart;</li>
-  <li>still sends the alerts already queued, because they report real events;</li>
-  <li>keeps the settings, the device key, the switches and the Delivery status.</li>
-</ul>
-<p>To remove a single false outage instead, use Recent outages on the location page.</p>
-<div class="actions">
-  <form method="post" action="{% url 'location-reset' location.pk %}">
-    {% csrf_token %}
-    <button class="btn btn--danger" type="submit">Reset history</button>
-  </form>
-  <a class="btn btn--secondary" href="{% url 'location-detail' location.pk %}">Keep history</a>
+<div class="mx-auto flex w-full max-w-144 flex-col overflow-clip rounded-card border border-border bg-surface">
+{% include "web/_confirm_reset.html" %}
 </div>
 {% endblock %}

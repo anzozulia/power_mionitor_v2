@@ -14,9 +14,10 @@ shorter than the outage's span); fragment (set only for the modal).
   each value mono; the label above the value on phones, a 96 px label column from sm), the
   lead, ul[data-testid=consequences] (consequence 2 only when shows_unmonitored), then the
   chart sentence.
-- Footer strip: Keep (back to the location page's Recent outages) first, then
-  form[data-testid=confirm-form] (POST to the stored start, CSRF) holding only the danger
-  submit [data-testid=confirm-submit].
+- Footer strip: Keep first, a secondary link back to the location page's Recent outages
+  (the button partial renders it as a[data-testid="keep"]), then
+  form[data-testid="confirm-form"] (POST to the stored start, CSRF) holding only the danger
+  submit, rendered by the button partial as button[data-testid="confirm-submit"].
 - No secret, not even masked. No autofocus.
 {% endcomment %}{% url 'location-detail' location.pk as detail_url %}{% with keep_url=detail_url|add:"#recent-outages" %}<div data-testid="confirm" class="flex min-h-0 flex-1 flex-col">
 <div class="flex shrink-0 items-center gap-2 border-b border-border bg-surface-muted py-2 pl-6 {% if fragment %}min-h-15 pr-15 md:min-h-[calc(var(--control-h-sm)_+_1rem)] md:pr-[calc(var(--control-h-sm)_+_1rem)]{% else %}pr-2{% endif %}">

@@ -806,7 +806,10 @@ def test_UI07_reset_page_and_fragment(
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.parametrize(
     ("case", "level", "flash"),
-    [("power-off", "error", RESET_REFUSED_MESSAGE), ("no-history", "info", NOTHING_TO_RESET_MESSAGE)],
+    [
+        ("power-off", "error", RESET_REFUSED_MESSAGE),
+        ("no-history", "info", NOTHING_TO_RESET_MESSAGE),
+    ],
 )
 def test_UI07_reset_fragment_and_refusals(
     admin: Client,
@@ -1024,7 +1027,11 @@ def test_UI07_posts_ignore_the_header(
             _detail(location),
             OUTAGE_REMOVED_MESSAGE.format(start="2026-10-01 12:00"),
         ),
-        (Call("location-reset", "post", _reset(location), {}), _detail(location), HISTORY_RESET_MESSAGE),
+        (
+            Call("location-reset", "post", _reset(location), {}),
+            _detail(location),
+            HISTORY_RESET_MESSAGE,
+        ),
     ]
 
     for call, target, flash in posts:
@@ -1112,9 +1119,7 @@ def test_INV23_2_confirmations_have_no_secrets(
     location_factory: Callable[..., Any],
 ) -> None:
     location = _two_outages(location_factory, name="Office", bot_token=TOKEN, device_key=KEY)
-    off = _off_since_9(
-        location_factory, name="Off", bot_token=TOKEN, device_key=KEY[::-1].upper()
-    )
+    off = _off_since_9(location_factory, name="Off", bot_token=TOKEN, device_key=KEY[::-1].upper())
     _pin(monkeypatch, _at(16, 0))
     secrets = [TOKEN, SECRET, MASKED]
     for key in (KEY, off.device_key):

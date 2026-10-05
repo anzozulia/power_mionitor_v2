@@ -13,10 +13,11 @@ keeps room for the dialog's own close button at its top-right).
   dialog's name, aria-labelledby); the name is escaped (R1) and wraps anywhere.
 - Body: the lead, ul[data-testid=consequences] with the five consequences (4 px dots), the
   pause info alert, the re-create paragraph.
-- Footer strip: Keep (a[data-testid=keep], secondary, back to the location page) first,
-  then form[data-testid=confirm-form] (POST, CSRF) holding only the danger submit
-  [data-testid=confirm-submit], whose pending spinner comes from the button partial (the
-  submit guard sets aria-busy). Phones: both full width, the destructive one on top; from
+- Footer strip: Keep first, a secondary link back to the location page (the button partial
+  renders it as a[data-testid="keep"]), then form[data-testid="confirm-form"] (POST, CSRF)
+  holding only the danger submit, rendered by the button partial as
+  button[data-testid="confirm-submit"], whose pending spinner shows while the submit guard
+  sets aria-busy. Phones: both full width, the destructive one on top; from
   sm a right-aligned row.
 - No autofocus attribute: the dialog loader focuses Keep, and the full page, a destructive
   page, focuses nothing. No secret, not even masked: no settings, no key, no token.

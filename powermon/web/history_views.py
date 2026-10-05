@@ -28,7 +28,7 @@ from datetime import datetime, timedelta
 from django.conf import settings
 from django.contrib import messages
 from django.http import Http404, HttpRequest, HttpResponse
-from django.shortcuts import redirect, render
+from django.shortcuts import redirect
 from django.views import View
 
 from powermon.alerts import ops
@@ -163,14 +163,22 @@ class HistoryResetView(View):
     clock: Clock = SystemClock()
 
     def get(self, request: HttpRequest, pk: int) -> HttpResponse:
+        """The confirmation page, or its partial alone for the modal (UI-07).
+
+        A refusal is the same redirect in both variants; only the full page queues its flash.
+        """
         location = location_or_404(pk)
         if location_status(location).power_key == "off":
-            messages.error(request, RESET_REFUSED_MESSAGE)
-            return redirect("location-detail", pk=pk)
+            return refusal_redirect(
+                request, messages.ERROR, RESET_REFUSED_MESSAGE, "location-detail", pk=pk
+            )
         if not history.has_history(pk):
-            messages.info(request, NOTHING_TO_RESET_MESSAGE)
-            return redirect("location-detail", pk=pk)
-        return render(request, self.template_name, {"location": location})
+            return refusal_redirect(
+                request, messages.INFO, NOTHING_TO_RESET_MESSAGE, "location-detail", pk=pk
+            )
+        return confirm_response(
+            request, self.template_name, "web/_confirm_reset.html", {"location": location}
+        )
 
     def post(self, request: HttpRequest, pk: int) -> HttpResponse:
         location_or_404(pk)

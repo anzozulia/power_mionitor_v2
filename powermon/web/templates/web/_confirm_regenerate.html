@@ -15,8 +15,10 @@ characters); fragment (set only for the modal, as in web/_confirm_delete.html).
   power-off, waiting gives waiting and maintenance gives maintenance (info alerts). The
   value with its unit is mono. The "maintenance first" path is that plain link, never a
   second form (UI-D9).
-- Footer strip: Keep (back to the device setup page) first, then form[data-testid=confirm-form]
-  (POST, CSRF, the hidden marker) holding only the danger submit [data-testid=confirm-submit].
+- Footer strip: Keep first, a secondary link back to the device setup page (the button
+  partial renders it as a[data-testid="keep"]), then form[data-testid="confirm-form"] (POST,
+  CSRF, the hidden marker) holding only the danger submit, rendered by the button partial
+  as button[data-testid="confirm-submit"].
 - Never the key, its mask or its tail, not even in the fragment (R4). No autofocus.
 {% endcomment %}{% url 'location-detail' location.pk as detail_url %}{% url 'location-setup' location.pk as setup_url %}<div data-testid="confirm" class="flex min-h-0 flex-1 flex-col">
 <div class="flex shrink-0 items-center gap-2 border-b border-border bg-surface-muted py-2 pl-6 {% if fragment %}min-h-15 pr-15 md:min-h-[calc(var(--control-h-sm)_+_1rem)] md:pr-[calc(var(--control-h-sm)_+_1rem)]{% else %}pr-2{% endif %}">
@@ -30,7 +32,7 @@ characters); fragment (set only for the modal, as in web/_confirm_delete.html).
 {% icon "triangle-alert" class="size-5 shrink-0 text-warn-icon" %}
 <div class="flex min-w-0 flex-1 flex-col gap-2">
 <p class="break-words"><span class="sr-only">Warning: </span>While maintenance is off, this location can be reported OFF as soon as <span class="num">{{ off_after_s }} seconds</span> after its last heartbeat, and subscribers then get an OFF alert if alerts are on. Turn maintenance on first on the location page, update the device, then turn maintenance off there.</p>
-<p><a href="{{ detail_url }}" class="font-semibold text-accent-text underline underline-offset-3 hover:text-fg">Open the location page</a></p>
+<p><a href="{{ detail_url }}" class="text-accent-text underline underline-offset-3 hover:text-fg">Open the location page</a></p>
 </div>
 </div>
 {% elif state_block == "off" %}
