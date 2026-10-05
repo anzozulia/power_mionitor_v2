@@ -1,0 +1,37 @@
+{% load icons %}{% comment %}
+The location page's Weekly chart card (06-UI-SPEC Page Contracts > S5 Weekly chart; UI-06,
+D6-04): the header strip and the body of section#weekly-chart, which the page renders
+around this include. Context: the detail view's (location, has_history, language_label).
+
+- With stored history: the header action "Open full size" (chart-full-size) and
+  figure[data-testid=weekly-chart] bound to the chartImage component. A link (new tab,
+  noopener) around a 32:25 frame on the muted surface, with a CSS ring spinner behind the
+  image; the image is the location-chart route, 1280 x 1000, loading lazy and decoding
+  async, so the box is reserved and the PNG is only requested once the card scrolls into
+  view. The PNG is shown whole, scaled to the card width and never cropped, filtered or
+  recoloured (in dark mode it stays the light picture inside its border). The caption
+  names the channel's language. The hidden [data-testid=weekly-chart-error] warning is
+  revealed by chartImage when the image fails to load; without JavaScript the browser shows
+  the alt text.
+- Without stored history (has_history false): the empty state weekly-chart-empty, no image
+  (so no PNG request) and no header action. A waiting location with history, for example
+  after a restore, shows the image.
+- The poll never touches this card, so the image is never requested again by it.
+{% endcomment %}<div class="flex items-center justify-between gap-4 rounded-t-[5px] border-b border-border bg-surface-muted px-4 py-2">
+<div class="flex min-w-0 flex-wrap items-baseline gap-x-2"><h2 id="weekly-chart-title" class="text-label font-semibold tracking-label text-fg-muted uppercase">Weekly chart</h2>
+<p class="text-label text-fg-subtle">The chart pinned in the channel</p></div>
+{% if has_history %}<div class="-my-1 flex shrink-0 items-center"><a href="{% url 'location-chart' location.pk %}" target="_blank" rel="noopener" data-testid="chart-full-size" data-variant="ghost" class="-mr-2 inline-flex min-h-11 items-center justify-center gap-2 rounded-control border border-transparent bg-transparent px-2 text-body font-semibold whitespace-nowrap text-fg no-underline hover:bg-surface-sunken md:min-h-(--control-h-sm) motion-safe:transition-colors motion-safe:duration-150">{% icon "maximize-2" class="size-3.5 shrink-0 text-icon" %}Open full size<span class="sr-only"> (opens in a new tab)</span></a></div>{% endif %}
+</div>
+<div class="p-4">
+{% if has_history %}<figure data-testid="weekly-chart" x-data="chartImage" class="flex min-w-0 flex-col gap-2">
+<a href="{% url 'location-chart' location.pk %}" target="_blank" rel="noopener" aria-label="Open the weekly chart at full size (opens in a new tab)" class="group/chart block cursor-zoom-in rounded-control">
+<span class="relative block aspect-[32/25] overflow-hidden rounded-control border border-border bg-surface-muted group-hover/chart:border-border-strong motion-safe:transition-colors motion-safe:duration-150"><span aria-hidden="true" class="absolute top-1/2 left-1/2 size-6 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-border-strong border-t-fg-subtle motion-safe:animate-spin"></span><img src="{% url 'location-chart' location.pk %}" width="1280" height="1000" class="relative block h-auto w-full" loading="lazy" decoding="async" alt="Weekly power chart for {{ location.name }}, the same image as the chart pinned in the Telegram channel" aria-describedby="chart-caption"></span>
+</a>
+<figcaption id="chart-caption" class="text-label text-fg-muted">Shown in the channel's language ({{ language_label }}). The same outages are listed under Recent outages.</figcaption>
+<div data-testid="weekly-chart-error" hidden>{% include "partials/_alert.html" with tone="warning" body="The chart could not be drawn right now. Reload the page to try again." only %}</div>
+</figure>{% else %}<div data-testid="weekly-chart-empty" class="flex flex-col items-center gap-4 px-4 py-8 text-center">
+<span aria-hidden="true" class="flex size-12 shrink-0 items-center justify-center rounded-full bg-surface-sunken text-icon">{% icon "calendar-days" class="size-6" %}</span>
+<p class="text-lead font-semibold break-words text-fg">No chart yet</p>
+<p class="max-w-100 text-body break-words text-fg-muted">The weekly chart appears here once the device has sent its first heartbeat.</p>
+</div>{% endif %}
+</div>
