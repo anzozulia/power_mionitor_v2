@@ -573,3 +573,65 @@ def test_reset_section_states(
     assert LocationState.objects.get(location=off).status == "waiting"
     shows(on, None)
     shows(off, None)
+
+
+# The Recent outages header stats and the range markup (06-UI-SPEC S5 Recent outages;
+# loc.outages_stats; UI-11, UI-12)
+
+
+def _one_outage(location_factory: Callable[..., Any], **fields: Any) -> Any:
+    """On since 08:00, one outage 09:00-10:00 (UTC), on again since 10:00."""
+    _no_anchors()
+    location = location_factory(**fields)
+    assert transitions.record_heartbeat(location.pk, _at(8, 0)) == "started"
+    assert transitions.record_heartbeat(location.pk, _at(9, 0)) == "plain"
+    assert detection.run_cycle(_at(9, 1, 31)) == 1
+    assert transitions.record_heartbeat(location.pk, _at(10, 0)) == "restored"
+    return location
+
+
+@pytest.mark.django_db(transaction=True)
+def test_recent_outages_stats_count_and_total(
+    admin: Client, monkeypatch: pytest.MonkeyPatch, location_factory: Callable[..., Any]
+) -> None:
+    two = _two_outages(location_factory, name="Two")
+    one = _one_outage(location_factory, name="One")
+    _clock(monkeypatch, _at(16, 0))
+
+    # "{n} outages · {total}", the total the summed off time of the listed outages
+    # (outages_total_text: 1h + 30m); "1 outage" at one.
+    for location, stats in ((two, "2 outages · 1h 30m"), (one, "1 outage · 1h")):
+        card = _section(_get(admin, location))
+        found = by_testid(card, "outages-stats")
+        assert text(found) == stats
+        # The stats sit in the card's header strip, beside the title, before the table.
+        elements = list(card.find_all(True))
+        assert elements.index(found) < elements.index(by_testid(card, "outages-table"))
+        assert len(_rows(card)) == int(stats[0])
+
+
+@pytest.mark.django_db(transaction=True)
+def test_recent_outages_range_keeps_the_dash_with_the_end(
+    admin: Client, monkeypatch: pytest.MonkeyPatch, location_factory: Callable[..., Any]
+) -> None:
+    location = _two_outages(location_factory)
+    assert transitions.record_heartbeat(location.pk, _at(16, 0)) == "plain"
+    assert detection.run_cycle(_at(16, 1, 31)) == 1
+    _clock(monkeypatch, _at(16, 30))
+
+    rows = all_by_testid(_get(admin, location), "outage-row")
+
+    # Ended: no-break space, dash, word joiner, no-break space, so the range never breaks
+    # after the dash; in progress: "– in progress" on one line after a no-break space.
+    cells = [row.find("td") for row in rows]
+    assert all(isinstance(cell, Tag) for cell in cells)
+    raw = [cell.get_text() for cell in cells if isinstance(cell, Tag)]
+    assert raw[0].endswith("19:00\xa0–\xa0in progress")
+    assert all(value.endswith(end) for value, end in zip(raw[1:], ("18:30", "13:00"), strict=True))
+    for value in raw[1:]:
+        assert "\xa0–\u2060\xa0" in value
+    # Dates and times are local minutes from OutageRow, not instants: no <time>, and the
+    # card has no relative time.
+    card = _section(_get(admin, location))
+    assert card.find("time") is None
+    assert not card.select("[data-relative]")
