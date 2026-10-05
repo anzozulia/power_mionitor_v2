@@ -1,0 +1,17 @@
+{% load icons %}{% comment %}
+The confirmation dialog shell (06-UI-SPEC Components > Modal and confirmation focus card;
+UI-07, D6-05, R7). No context. Exactly one per page that has confirmation entry points (S5,
+S8), in the layout's dialog block after main.
+
+- A closed native dialog[data-testid=confirm-dialog], named by the fragment's
+  h1#confirm-title once it is moved in: max 480 px, radius 8, the modal shadow, 1 px border,
+  the overlay token on its backdrop, modal-in under motion-safe. It never grows past the
+  viewport, so the fragment's body scrolls between its header and footer strips.
+- [data-dialog-close]: the "Close" button (type=button) at the top-right of the header strip.
+- [data-dialog-loading]: the centred spinner with the sr text "Loading…" while the fragment
+  loads.
+- [data-dialog-body]: empty; the confirmDialog component moves the one [data-testid=confirm]
+  root of the server's confirmation GET into it, or falls back to loading the full page.
+- Data hooks only: no Alpine directive and no form here; the component (bound on the page's
+  [data-confirm-scope]) finds this dialog by its testid and binds its listeners itself.
+{% endcomment %}<dialog data-testid="confirm-dialog" aria-labelledby="confirm-title" class="m-auto max-h-[calc(100dvh_-_2rem)] w-[calc(100%_-_2rem)] max-w-120 flex-col overflow-hidden rounded-modal border border-border bg-surface p-0 text-fg shadow-modal backdrop:bg-overlay open:flex motion-safe:open:animate-modal-in"><button type="button" data-dialog-close class="absolute top-2 right-2 z-10 inline-flex size-11 items-center justify-center rounded-control text-icon hover:bg-surface-sunken md:size-(--control-h-sm) motion-safe:transition-colors motion-safe:duration-150">{% icon "x" class="size-5 shrink-0" %}<span class="sr-only">Close</span></button><div data-dialog-loading class="flex items-center justify-center px-6 py-8">{% icon "loader-circle" class="size-4 shrink-0 text-icon motion-safe:animate-spin" %}<span class="sr-only">Loading…</span></div><div data-dialog-body class="flex min-h-0 flex-1 flex-col"></div></dialog>

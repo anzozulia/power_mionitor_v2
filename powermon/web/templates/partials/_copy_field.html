@@ -1,0 +1,20 @@
+{% load icons %}{% comment %}
+Copy field (06-UI-SPEC Components > Copy field and code block; UI-08, R13). Context: label
+(the micro label, e.g. "Heartbeat URL"), value (the exact text to copy, e.g. heartbeat_url
+built from PUBLIC_BASE_URL), element_id (the code element's id, e.g. heartbeat-url),
+copy_sr (the sr-only suffix after "Copy", e.g. "heartbeat URL", copy row shell.copy_sr) and
+copied_msg (the copy component's polite message, copy row shell.copied_msg). The page renders
+the one [data-copy-status][aria-live=polite] sr-only region the message goes to.
+
+- Header row: the micro label (id "{element_id}-label") and the small secondary Copy button,
+  button[data-testid=copy][data-copy-target][data-copied-msg][data-js-only][hidden] bound to
+  the copy component, which reveals it, copies the target's exact textContent on a click and
+  sets data-copied for 2 s (the check icon then replaces the copy icon). The button never
+  holds the value.
+- The value box: code#{element_id}, mono on the sunken fill, select-all as the no-JS
+  fallback, breaking anywhere. Its text is the value exactly: no whitespace inside it, and
+  the break opportunities are empty wbr elements that add no text. For an absolute http or
+  https URL they sit after the scheme separator (found by its position in the value, never
+  by writing the scheme here), and before every path slash: after the host and before
+  /hb. Any other value is shown as it is, with no break point.
+{% endcomment %}<div class="flex min-w-0 flex-col gap-1"><div class="flex items-center justify-between gap-2"><span id="{{ element_id }}-label" class="text-label font-semibold tracking-label text-fg-muted uppercase">{{ label }}</span><button type="button" data-testid="copy" data-copy-target="{{ element_id }}" data-copied-msg="{{ copied_msg }}" data-js-only hidden x-data="copy" class="group/copy inline-flex min-h-11 shrink-0 items-center justify-center gap-2 rounded-control border border-border-strong bg-surface px-3 text-body font-semibold whitespace-nowrap text-fg hover:bg-surface-sunken md:min-h-(--control-h-sm) motion-safe:transition-colors motion-safe:duration-150">{% icon "copy" class="size-3.5 shrink-0 group-data-copied/copy:hidden" %}{% icon "check" class="hidden size-3.5 shrink-0 text-ok-text group-data-copied/copy:block" %}Copy<span class="sr-only"> {{ copy_sr }}</span></button></div>{% firstof "" as copy_scheme %}{% if value|slice:"5:8" == "://" %}{% firstof ":8" as copy_scheme %}{% firstof "8:" as copy_rest %}{% elif value|slice:"4:7" == "://" %}{% firstof ":7" as copy_scheme %}{% firstof "7:" as copy_rest %}{% endif %}<code id="{{ element_id }}" class="block rounded-control border border-border bg-surface-sunken px-3 py-2.5 num text-body text-fg select-all [overflow-wrap:anywhere]">{% if copy_scheme %}{{ value|slice:copy_scheme }}<wbr>{% for char in value|slice:copy_rest|make_list %}{% if char == "/" %}<wbr>{% endif %}{{ char }}{% endfor %}{% else %}{{ value }}{% endif %}</code></div>
