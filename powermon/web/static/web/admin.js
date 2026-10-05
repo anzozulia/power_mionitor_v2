@@ -194,7 +194,6 @@
   // into data-status and data-delivery; texts go through textContent.
   var STATUS_KEYS = ["on", "off", "maintenance", "waiting"];
   var DELIVERY_STATES = ["ok", "failing"];
-  var NEVER = "Never";
   // The sidebar cell kind per status (data-cell).
   var CELL_KINDS = { on: "age", off: "off", maintenance: "mnt", waiting: "wait" };
 
@@ -221,35 +220,17 @@
     });
   }
 
-  // The innermost element of a time wrapper whose whole text is "Never" (no <time>).
-  function neverHolder(wrapper) {
-    if (wrapper.children.length === 0 && wrapper.textContent.trim() === NEVER) {
-      return wrapper;
-    }
-    var elements = wrapper.querySelectorAll("*");
-    for (var index = elements.length - 1; index >= 0; index -= 1) {
-      var element = elements[index];
-      if (element.children.length === 0 && element.textContent.trim() === NEVER) {
-        return element;
-      }
-    }
-    return null;
-  }
-
   // Writes one instant of the status JSON ({iso, display, compact}, or null) into a time
   // wrapper rendered by partials/_time.html: the <time datetime>, its display parts (full,
-  // or compact plus the tail) and the [data-relative] sibling. A wrapper rendered as
-  // "Never" gets the display text in place of that word. Returns false when the wrapper
-  // cannot show the value in place (the caller then offers a reload).
+  // or compact plus the tail) and the [data-relative] sibling. Returns false when the
+  // wrapper cannot show the value in place (the caller then offers a reload): a time that
+  // became null, or an instant for a wrapper rendered as "Never", which has no <time> and
+  // no mono or relative part to fill. A "Never" wrapper with no instant stays as it is.
   function fillInstant(wrapper, instant) {
     var time = wrapper.querySelector("time");
     if (!instant) {
       if (time) {
         return false;
-      }
-      var filled = wrapper.querySelector("[data-instant-text]");
-      if (filled) {
-        filled.textContent = NEVER;
       }
       return true;
     }
@@ -257,13 +238,7 @@
       return false;
     }
     if (!time) {
-      var holder = wrapper.querySelector("[data-instant-text]") || neverHolder(wrapper);
-      if (!holder) {
-        return false;
-      }
-      holder.setAttribute("data-instant-text", "");
-      holder.textContent = instant.display;
-      return true;
+      return false;
     }
     var compact = typeof instant.compact === "string" ? instant.compact : "";
     var display = instant.display;
@@ -378,7 +353,9 @@
     // which the CSS uses for the scroll lock and the slide-in), the body column and the skip
     // link become inert, Tab wraps inside the drawer, and Esc, the overlay and the close
     // button close it with the focus back on the hamburger; following a link closes it too.
-    // On open the focus goes to the first nav link. Reaching lg closes it. At xl the rail
+    // The hamburger's and the close button's aria-expanded follow the drawer. On open the
+    // focus goes to the first nav link (once more on the next frame if the drawer was not
+    // shown yet and is still open). Reaching lg closes it. At xl the rail
     // toggle collapses the sidebar (<html data-rail="collapsed">) and remembers the choice
     // under the one allowed key. toggleDrawer, closeDrawer and toggleRail can also be bound
     // by directives; the component binds its own hooks.
@@ -478,12 +455,25 @@
           toggle.setAttribute("aria-expanded", open ? "true" : "false");
           setLabel(toggle, open ? "Close navigation" : "Open navigation");
         }
+        // The close button also carries aria-expanded for the drawer.
+        if (closer) {
+          closer.setAttribute("aria-expanded", open ? "true" : "false");
+        }
         syncAside();
         if (open) {
           document.addEventListener("keydown", onKeydown);
           var first = aside.querySelector("nav a[href]") || aside.querySelector("a[href]");
           if (first) {
             first.focus();
+            // A drawer not yet shown refuses the focus: try once more on the next frame,
+            // while it is still open.
+            if (document.activeElement !== first) {
+              window.requestAnimationFrame(function () {
+                if (open) {
+                  first.focus();
+                }
+              });
+            }
           }
         } else {
           document.removeEventListener("keydown", onKeydown);
@@ -645,8 +635,11 @@
     // never read. A success writes attributes and text of the live elements only (unknown
     // ids are ignored), shows the "Status changed" reload chip when the page can no longer
     // match the data (list: another set of locations; location page: another status or
-    // delivery state; any page: its location gone or a time it cannot show in place), and
-    // dispatches pm:status on window.
+    // delivery state; any page: its location gone or a time it cannot show in place, such
+    // as a first heartbeat where the page rendered "Never"), and dispatches pm:status on
+    // window. The list's count ([data-live="count"]) gets the number in its mono
+    // [data-count-value] span and "location" or "locations" in its [data-count-noun] span,
+    // or its whole text when it has no number span.
     window.Alpine.data("poll", function () {
       var POLL_INTERVAL_MS = 30000;
       var POLL_BACKOFF_MS = [60000, 120000, 240000, 300000];
@@ -808,8 +801,19 @@
             element.textContent = on + " on, " + off + " off" + failingWords;
           });
         }
+        // The count keeps its number in the mono [data-count-value] span and the noun in
+        // [data-count-noun]; an element without the number span gets the whole text.
         main.querySelectorAll('[data-live="count"]').forEach(function (element) {
-          element.textContent = total === 1 ? "1 location" : total + " locations";
+          var value = element.querySelector("[data-count-value]");
+          var noun = element.querySelector("[data-count-noun]");
+          if (!value) {
+            element.textContent = total === 1 ? "1 location" : total + " locations";
+            return;
+          }
+          value.textContent = String(total);
+          if (noun) {
+            noun.textContent = total === 1 ? "location" : "locations";
+          }
         });
         var setCount = function (element, value) {
           if (value === null) {

@@ -19,6 +19,9 @@ TEST-STRATEGY §7.2 and 06-RESEARCH Pitfalls 7 and 13:
   crossorigin. The error layout still reads no context as its head grows (R11).
 - admin.js applies the stored rail flag first; the button partial renders a link or a button
   with data-variant and never the disabled attribute.
+- The drawer (W4-A3): the sidebar is invisible while closed; opening makes it visible at once
+  (only its translate transitions in the open state), closing keeps it visible until the
+  slide-out ends, and the built CSS orders the open-state rule after the closed one.
 - Pending (UI-09): every button, never a link, holds a hidden loader-circle spinner that
   aria-busy shows in the leading icon's place (the icon hides), spinning under motion-safe,
   and the built CSS has those group-aria-busy and motion-safe spin rules.
@@ -107,6 +110,29 @@ ERROR_TITLES = {"404": "Page not found", "403": "Form expired", "500": "Server e
 # The icon in each card's 48 px circle (06-UI-SPEC Iconography and E1-E3).
 ERROR_ICONS = {"404": "file-question-mark", "403": "clock", "500": "circle-alert"}
 WORDMARK = "Power Monitor"
+# The drawer's visibility (W4-A3): the aside's tokens and the built rules they make, in
+# _compact form. The open-state rule transitions translate only, so visibility flips at once.
+SIDEBAR = "partials/sidebar.html"
+DRAWER_MOTION = frozenset(
+    {
+        "invisible",
+        "in-data-[drawer=open]:visible",
+        "motion-safe:transition-[translate,visibility]",
+        "motion-safe:in-data-[drawer=open]:transition-[translate]",
+        "motion-safe:duration-200",
+    }
+)
+DRAWER_CLOSED_RULE = (
+    r".motion-safe\:transition-\[translate\,visibility\]"
+    r"{transition-property:translate,visibility;"
+)
+DRAWER_OPEN_RULE = (
+    r":where([data-drawer=open]).motion-safe\:in-data-\[drawer\=open\]\:transition-\[translate\]"
+    r"{transition-property:translate;"
+)
+DRAWER_OPEN_TRANSITION = re.compile(
+    r"@media\(prefers-reduced-motion:no-preference\)\{[^@]*" + re.escape(DRAWER_OPEN_RULE)
+)
 
 
 # CSS helpers
@@ -631,6 +657,32 @@ def test_UI01_admin_js_applies_the_rail_flag_first() -> None:
         '"data-rail", "collapsed"); } } catch (error) {'
     )
     assert code.endswith("})();")
+
+
+# The drawer's visibility (UI-01, UI-12; wave-4 audit W4-A3)
+
+
+def test_W4A3_drawer_shows_at_once_on_open_and_hides_after_the_slide() -> None:
+    aside = parse_html(render_to_string(SIDEBAR, {}))
+    compact = _compact(_built_css())
+
+    # Expected: the closed drawer is invisible (never tabbable) and the open one visible.
+    # Closed, both translate and visibility transition, so the drawer stays visible while it
+    # slides out; open, only translate does, so it is visible at once and the first nav
+    # link can take the focus while it slides in.
+    assert isinstance(aside, Element) and aside.name == "aside"
+    assert DRAWER_MOTION <= _classes(aside)
+    assert DRAWER_CLOSED_RULE in compact
+    open_rule = DRAWER_OPEN_TRANSITION.search(compact)
+    assert open_rule is not None
+    # Edge: both rules weigh one class (:where() adds nothing), so the open rule wins only
+    # because it comes later; it transitions translate and nothing else.
+    start = compact.index(DRAWER_OPEN_RULE)
+    assert compact.index(DRAWER_CLOSED_RULE) < start
+    assert "visibility" not in compact[start + len(DRAWER_OPEN_RULE) : compact.index("}", start)]
+    # Failure: without the open-state rule the drawer's visibility would wait for the
+    # transition to start, and the check sees it.
+    assert DRAWER_OPEN_TRANSITION.search(compact.replace(DRAWER_OPEN_RULE, "")) is None
 
 
 # The button partial (06-UI-SPEC Components > Button)
