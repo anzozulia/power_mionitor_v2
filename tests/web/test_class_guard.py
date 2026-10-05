@@ -171,7 +171,57 @@ def class_lookups(source: str) -> list[tuple[int, str]]:
 def class_couplings(source: str, *, old_names: bool = True) -> list[tuple[int, str]]:
     """(line, rule) of each other coupling to a class: the ``class_`` keyword, a class
     selector in a literal passed to ``.select(``/``.select_one(``, an old class name."""
-    return []
+    tokens = [
+        token
+        for token in _tokens(source)
+        if token.type not in (tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE)
+    ]
+    found: list[tuple[int, str]] = []
+    for index, token in enumerate(tokens):
+        line = token.start[0]
+        if token.type == tokenize.NAME and token.string == "class_":
+            found.append((line, "class_ keyword"))
+        called = (
+            token.type == tokenize.NAME
+            and token.string in SELECT_CALLS
+            and index > 0
+            and tokens[index - 1].string == "."
+            and index + 2 < len(tokens)
+            and tokens[index + 1].string == "("
+        )
+        selector = _literal_text(tokens, index + 2) if called else None
+        if selector is not None:
+            bare = re.sub(r"\[[^\]]*\]|\"[^\"]*\"|'[^']*'", "", selector)
+            if CLASS_SELECTOR.search(bare):
+                found.append((tokens[index + 2].start[0], "class selector"))
+        old = _OLD_CLASS.search(token.string) or _OLD_BLOCK.search(token.string)
+        if old_names and token.type in LITERAL_TOKENS and old:
+            found.append((line, "old class name"))
+    return found
+
+
+def _literal_text(tokens: list[tokenize.TokenInfo], index: int) -> str | None:
+    """The text of the literal starting at ``tokens[index]``: a plain string's value, or an
+    f-string's (t-string's) literal parts joined, its replacement fields left out; None for
+    anything else (a name, a call)."""
+    first = tokens[index]
+    if first.type == tokenize.STRING:
+        value = ast.literal_eval(first.string)
+        return value.decode() if isinstance(value, bytes) else str(value)
+    if first.type not in STRING_STARTS:
+        return None
+    parts: list[str] = []
+    depth = 0
+    for token in tokens[index:]:
+        if token.type in STRING_STARTS:
+            depth += 1
+        elif token.type in STRING_ENDS:
+            depth -= 1
+            if depth == 0:
+                break
+        elif token.type in LITERAL_TOKENS and depth == 1:
+            parts.append(token.string)
+    return "".join(parts)
 
 
 def _sample(*lines: str) -> str:

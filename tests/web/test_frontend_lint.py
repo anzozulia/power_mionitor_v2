@@ -1486,14 +1486,31 @@ def test_admin_js_relative_floors_match_timefmt() -> None:
     assert relative_mismatches(source.replace('min: " min ago"', 'min: " m ago"')) != []
 
 
+# An x-data attribute and its quoted value; the CSP build takes a registered name only.
+_X_DATA = re.compile(r"(?<![\w:@.-])x-data\s*=\s*(\"[^\"]*\"|'[^']*')")
+_COMPONENT_NAME = re.compile(r"[A-Za-z_$][\w$]*")
+
+
 def template_components(text: str) -> list[str]:
     """Every x-data value of a template, in order (template comments skipped)."""
-    return []
+    return [m.group(1)[1:-1] for m in _X_DATA.finditer(_TEMPLATE_COMMENT.sub("", text))]
 
 
 def alpine_name_gaps(templates: Mapping[str, str], source: str) -> list[str]:
-    """Where the templates' x-data values and admin.js's Alpine.data names disagree."""
-    return []
+    """Where the templates' x-data values and admin.js's Alpine.data names disagree: a
+    value that is not a bare name, a name nobody registered, a registered name nobody binds."""
+    registered = set(registered_names(source))
+    used: set[str] = set()
+    gaps: list[str] = []
+    for relpath, text in sorted(templates.items()):
+        for name in template_components(text):
+            used.add(name)
+            if not _COMPONENT_NAME.fullmatch(name):
+                gaps.append(f"{relpath}: x-data {name!r} is not a component name")
+            elif name not in registered:
+                gaps.append(f"{relpath}: x-data {name!r} is not registered")
+    gaps += [f"Alpine.data {name!r} is bound by no template" for name in sorted(registered - used)]
+    return gaps
 
 
 def test_alpine_names_cross_check() -> None:

@@ -118,12 +118,15 @@ def matrix_gaps(
 ) -> list[str]:
     """What keeps the route table and the matrix lists apart (TEST-STRATEGY §5.6): the
     render matrix or the POST-only list, and the INV-23 matrix (``scanned``)."""
-    rendered, post_only = set(rendered), set(post_only)
-    listed = rendered | post_only | NOT_HTML | NOT_ADMIN
-    gaps = [
-        f"{name}: neither rendered by the matrix nor POST-only" for name in sorted(names - listed)
-    ]
-    gaps += [f"{name}: listed but not a route" for name in sorted(listed - names)]
+    rendered, post_only, scanned = set(rendered), set(post_only), set(scanned)
+    covered = rendered | post_only | NOT_HTML | NOT_ADMIN
+    gaps: list[str] = []
+    for name in sorted(names - NOT_ADMIN):
+        if name not in covered:
+            gaps.append(f"{name}: neither rendered by the matrix nor POST-only")
+        if name not in scanned:
+            gaps.append(f"{name}: not in the INV-23 matrix")
+    gaps += [f"{name}: listed but not a route" for name in sorted((covered | scanned) - names)]
     gaps += [f"{name}: both rendered and POST-only" for name in sorted(rendered & post_only)]
     return gaps
 

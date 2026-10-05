@@ -44,6 +44,7 @@ The scans run through the signed-in test client, Telegram faked at the HTTP boun
 (``fake_telegram``); the 429 page comes from five failed sign-ins in a separate client.
 """
 
+import importlib
 from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -719,7 +720,25 @@ def inv23_gaps(
     rows: Mapping[str, tuple[frozenset[str], tuple[Proof, ...]]], doc: list[str]
 ) -> list[str]:
     """Where the mapping and the §9 table disagree, and each proof that does not exist."""
-    return []
+    gaps = [f"row {row!r} has no proof" for row in doc if not rows.get(row, ((), ()))[1]]
+    for row, (_routes, proofs) in rows.items():
+        if row not in doc:
+            gaps.append(f"row {row!r} is not in the §9 table")
+        gaps += [
+            f"row {row!r}: {module}.{function} does not exist"
+            for module, function in proofs
+            if not _test_exists(module, function)
+        ]
+    return gaps
+
+
+def _test_exists(module: str, function: str) -> bool:
+    """The test module imports and defines ``function`` (tests/web is on sys.path)."""
+    try:
+        found = importlib.import_module(module)
+    except ModuleNotFoundError:
+        return False
+    return callable(getattr(found, function, None))
 
 
 def test_INV23_2_matrix_is_complete() -> None:
