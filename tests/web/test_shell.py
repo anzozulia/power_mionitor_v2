@@ -16,6 +16,10 @@ page template uses the layout (the brief §13 tracer).
   RequestFactory request (the shape view tests use).
 - The drawer and rail controls are JS-only buttons rendered hidden; the sign-in page and
   the error pages have no shell; every location is one sidebar link to its page.
+- The live probe (``/_shell/live/``) fills the ``live_indicator`` block with
+  ``partials/_live.html`` and puts ``partials/_live_chip.html`` in the meta line: the LIVE
+  indicator and the chip slot with its four chips, all JS only and rendered hidden, with
+  fixed copy and no secret (UI-05). No other page renders either.
 """
 
 from collections.abc import Callable
@@ -35,6 +39,7 @@ from pages import (
     CSP,
     STATIC_ASSET,
     all_by_testid,
+    assert_no_secrets,
     assert_page,
     breadcrumbs,
     by_testid,
@@ -44,6 +49,7 @@ from pages import (
     post_form,
     text,
 )
+from secret_fixtures import SECRETS, TOKEN
 from urls_shell import PROBE_PATH, PROBE_TEMPLATE, PROBE_TITLE, render_probe
 
 from powermon.web import context_processors
@@ -59,6 +65,16 @@ DISTINCT_NAME = "Shell Probe Zhytomyr"
 LONG_NAME = ("Very long location name " * 5)[:100]
 THEMES = ("light", "dark", "system")
 ONE_ITEM = [("Locations", None)]
+# The live probe of urls_shell: the live_indicator block and the chip slot filled.
+LIVE_PROBE_PATH = "/_shell/live/"
+LIVE_PROBE_TITLE = "Live probe"
+# The chip slot's four chips (06-11 binding contract), in order, with their tone and text.
+CHIPS = [
+    ("updated", "muted", "Updated just now"),
+    ("paused", "warning", "Warning: Live updates paused"),
+    ("paused-reload", "warning", "Warning: Live updates paused · Reload page"),
+    ("changed", "info", "Status changed · Reload page"),
+]
 
 
 @pytest.fixture
@@ -428,3 +444,69 @@ def test_UI01_shell_with_zero_locations(admin: Client, clock: FakeClock) -> None
     assert all_by_testid(sidebar, "sidebar-location") == []
     assert all_by_testid(sidebar, "sidebar-summary") == []
     assert [count.get_text() for count in sidebar.select('[data-live="sidebar-count"]')] == ["0"]
+
+
+# The LIVE indicator and the live-chip slot (UI-05, UI-11)
+
+
+@pytest.mark.django_db
+def test_UI05_live_indicator_on_the_live_probe(admin: Client, clock: FakeClock) -> None:
+    soup = assert_page(admin.get(LIVE_PROBE_PATH), title=LIVE_PROBE_TITLE, app=True)
+
+    # In the top bar: JS only, rendered hidden and live until the poll says otherwise.
+    topbar = by_testid(soup, "topbar")
+    live = by_testid(topbar, "live-status")
+    assert live["data-live-state"] == "live"
+    assert live.has_attr("data-js-only") and live.has_attr("hidden")
+    assert [label.get_text() for label in live.select("[data-label]")] == ["Live"]
+    ages = live.select("[data-live-age]")
+    assert [age.get_text() for age in ages] == ["just now"]
+    assert text(live) == "Live · updated just now"
+    # Before the theme control, as the 06-UI-SPEC top bar orders them.
+    order = [element for element in topbar.find_all(True) if element.get("data-testid")]
+    hooks = [element["data-testid"] for element in order]
+    assert hooks.index("live-status") < hooks.index("theme-switch")
+    # The chip slot: one meta item in main holding exactly the four chips, each hidden.
+    slot = by_testid(main(soup), "live-chip")
+    assert slot.name == "li"
+    assert slot.has_attr("data-js-only") and slot.has_attr("hidden")
+    chips = slot.find_all(attrs={"data-chip": True})
+    assert [(chip["data-chip"], chip["data-tone"], text(chip)) for chip in chips] == CHIPS
+    assert [chip.has_attr("hidden") for chip in chips] == [True] * 4
+    # The two reload chips link to the page's own URL, as passed in.
+    links = {chip["data-chip"]: chip for chip in chips if chip.name == "a"}
+    assert sorted(links) == ["changed", "paused-reload"]
+    assert {chip["href"] for chip in links.values()} == {LIVE_PROBE_PATH}
+    assert [age.get_text() for age in chips[0].select("[data-live-age]")] == ["just now"]
+
+
+@pytest.mark.django_db
+def test_UI05_no_live_slots_elsewhere(admin: Client) -> None:
+    # The probe leaves the live_indicator block empty; the 404 and sign-in pages are bare.
+    pages = {
+        "probe": admin.get(PROBE_PATH),
+        "404": admin.get("/no-such-page-xyz/"),
+    }
+    admin.logout()
+    pages["sign-in"] = admin.get("/login/")
+
+    for name, page in pages.items():
+        soup = parse(page)
+        assert all_by_testid(soup, "live-status") == [], name
+        assert all_by_testid(soup, "live-chip") == [], name
+        assert soup.select("[data-chip]") == [], name
+
+
+@pytest.mark.django_db
+def test_UI05_live_slots_hold_no_secret(
+    admin: Client, clock: FakeClock, location_factory: Callable[..., Any]
+) -> None:
+    location_factory(name="Secret holder", bot_token=TOKEN)
+
+    soup = assert_page(admin.get(LIVE_PROBE_PATH), title=LIVE_PROBE_TITLE, app=True)
+
+    # Fixed copy only (R4): neither slot carries a token, its secret part or its mask.
+    for hook in ("live-status", "live-chip"):
+        assert_no_secrets(str(by_testid(soup, hook)), SECRETS, label=hook)
+    assert "Secret holder" not in str(by_testid(soup, "live-status"))
+    assert "Secret holder" not in str(by_testid(soup, "live-chip"))
