@@ -1,0 +1,66 @@
+{% load icons forms_ui %}{% comment %}
+The three form sections shared by S4 Add location and S6 Edit location (06-UI-SPEC Page
+Contracts > S4 / S6, Test hooks > S4 Add / S6 Edit; UI-01, UI-12, N8, R3). Context: form
+(LocationForm or LocationEditForm); included with only.
+
+- Sections [data-testid="form-section"][data-section="basics|monitoring|telegram"], each
+  labelled by its h2 (the micro-label title) with its one-line description; stacked below
+  lg, from lg a 1/3 title column and a 2/3 fields column. The page puts the 1 px dividers
+  between them.
+- Every field renders through the project field group (django/forms/field.html), so the
+  label, error, note and help ids and Django's aria-describedby / aria-invalid wiring are
+  the same on both pages:
+  - Basics: Name (autofocus comes from the form's widget).
+  - Monitoring: Heartbeat period and Grace period side by side from sm, each with the "s"
+    add-on and inputmode numeric, then the OFF-after hint.
+  - Telegram: the bot token (password input, never a value, the key-round icon inside it,
+    autocomplete and spellcheck off from the form, the password-manager ignore hints from
+    the field group), the channel chat ID with its long Python help in a disclosure, and
+    the language select. The disclosure is details[data-testid="chat-id-help"] with the
+    summary "How to find the chat ID"; the field group renders it from help_in_details
+    and help_testid, with #id_chat_id_helptext inside it.
+- The OFF-after hint (N8, [data-testid="off-after-hint"]): the monitoring section binds
+  x-data="offAfterHint", which recomputes it from #id_period_s and #id_grace_s while the
+  admin types. The server renders its first state from off_after_initial: the sentence
+  with the sum in [data-off-after-value] when both values are whole seconds from 10 to
+  3600, otherwise the [data-off-after-fallback] sentence; the other one is hidden. The
+  value slot holds the number only (empty in the fallback state, so the component writes
+  the whole slot), and the unit stays next to it in the same mono span.
+- The S6 token help is the form's format_html string with the mask in a code element; the
+  token field's wrapper styles that code element from here (mono), never from Python.
+- Every class is spelled out, never built from a variable, so the Tailwind scan finds it.
+{% endcomment %}{% off_after_initial form as off_after %}<section data-testid="form-section" data-section="basics" aria-labelledby="form-section-basics" class="flex flex-col gap-4 px-4 py-6 lg:grid lg:grid-cols-3 lg:gap-6">
+  <div class="flex flex-col gap-1">
+    <h2 id="form-section-basics" class="text-label font-semibold uppercase tracking-label text-fg-muted">Basics</h2>
+    <p class="text-label text-fg-subtle">What this location is called.</p>
+  </div>
+  <div class="flex min-w-0 flex-col gap-4 lg:col-span-2">
+    {% include "django/forms/field.html" with field=form.name only %}
+  </div>
+</section>
+<section data-testid="form-section" data-section="monitoring" aria-labelledby="form-section-monitoring" x-data="offAfterHint" class="flex flex-col gap-4 px-4 py-6 lg:grid lg:grid-cols-3 lg:gap-6">
+  <div class="flex flex-col gap-1">
+    <h2 id="form-section-monitoring" class="text-label font-semibold uppercase tracking-label text-fg-muted">Monitoring</h2>
+    <p class="text-label text-fg-subtle">How often the device reports, and when OFF is reported.</p>
+  </div>
+  <div class="flex min-w-0 flex-col gap-4 lg:col-span-2">
+    <div class="grid gap-4 sm:grid-cols-2">
+      {% include "django/forms/field.html" with field=form.period_s suffix="s" control="seconds" only %}
+      {% include "django/forms/field.html" with field=form.grace_s suffix="s" control="seconds" only %}
+    </div>
+    <p data-testid="off-after-hint" class="flex items-start gap-1 text-body text-fg-muted">{% icon "clock" class="mt-[3px] size-3.5 shrink-0 text-info-text" %}<span{% if off_after is None %} hidden{% endif %}>Reported OFF after <span class="num whitespace-nowrap"><span data-off-after-value>{{ off_after|default_if_none:"" }}</span> s</span> without a heartbeat.</span><span data-off-after-fallback{% if off_after is not None %} hidden{% endif %}>Reported OFF after period + grace seconds without a heartbeat.</span></p>
+  </div>
+</section>
+<section data-testid="form-section" data-section="telegram" aria-labelledby="form-section-telegram" class="flex flex-col gap-4 px-4 py-6 lg:grid lg:grid-cols-3 lg:gap-6">
+  <div class="flex flex-col gap-1">
+    <h2 id="form-section-telegram" class="text-label font-semibold uppercase tracking-label text-fg-muted">Telegram</h2>
+    <p class="text-label text-fg-subtle">The bot and channel that get this location's alerts and weekly chart.</p>
+  </div>
+  <div class="flex min-w-0 flex-col gap-4 lg:col-span-2">
+    <div class="[&_code]:num [&_code]:break-all [&_code]:text-fg">
+      {% include "django/forms/field.html" with field=form.bot_token leading_icon="key-round" control="secret" only %}
+    </div>
+    {% include "django/forms/field.html" with field=form.chat_id help_in_details="How to find the chat ID" help_testid="chat-id-help" only %}
+    {% include "django/forms/field.html" with field=form.language only %}
+  </div>
+</section>

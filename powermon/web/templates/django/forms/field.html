@@ -1,4 +1,4 @@
-{% load icons %}{% comment %}
+{% load icons forms_ui %}{% comment %}
 Field group (06-UI-SPEC Components > Form field; UI-01, UI-12, R1, R3). The TemplatesSetting
 renderer uses it for {{ field.as_field_group }}; a page can also include it with
 field=form.x. Its only context is field (the BoundField); the form is field.form.
@@ -12,10 +12,24 @@ and only while form.show_token_note is true), the help at id_<name>_helptext.
 - The help text is printed as {{ field.help_text }}, never with the safe filter: plain
   strings are escaped, and the edit form's token help is already a format_html string.
 - The note is the form's own copy (form.token_note), never a template literal.
+
+Optional include parameters (06-17; with none of them the group renders exactly as above):
+- suffix: the add-on text after the control, e.g. "s" for the seconds fields. It is
+  aria-hidden: the label already names the unit.
+- leading_icon: the name of an icon drawn inside the control at its left edge, e.g.
+  key-round for the bot token; the control gets the room for it.
+- control: the kind of extra control attributes (forms_ui CONTROL_ATTRS): "seconds" adds
+  inputmode numeric, "secret" adds the password-manager ignore hints. The control is still
+  Django's widget render with Django's own attributes.
+- help_in_details: the summary text of a details disclosure the help moves into (the chat
+  ID's long help). The help keeps its id inside the disclosure, so aria-describedby still
+  resolves; help_testid is the disclosure's data-testid.
+The add-on and the icon sit in one row with the control; the row's arbitrary variants square
+the control's right corners next to the add-on and widen its left padding for the icon.
 {% endcomment %}<div class="flex flex-col gap-1">
 {% if field.label %}<label for="{{ field.id_for_label }}" class="text-body font-semibold text-fg">{{ field.label }}</label>{% endif %}
-{{ field }}
+{% if suffix or leading_icon %}<div class="relative flex min-w-0 [&>input]:min-w-0{% if suffix %} [&>input]:rounded-r-none{% endif %}{% if leading_icon %} [&>input]:pl-9{% endif %}">{% if leading_icon %}<span aria-hidden="true" class="pointer-events-none absolute inset-y-0 left-3 flex items-center text-icon">{% icon leading_icon class="size-4 shrink-0" %}</span>{% endif %}{% if control %}{% field_control field control %}{% else %}{{ field }}{% endif %}{% if suffix %}<span aria-hidden="true" class="flex shrink-0 items-center rounded-r-control border border-l-0 border-field-border bg-surface-muted px-3 text-body text-fg-muted">{{ suffix }}</span>{% endif %}</div>{% elif control %}{% field_control field control %}{% else %}{{ field }}{% endif %}
 {% if field.errors %}<p id="{{ field.auto_id }}_error" class="flex items-start gap-1 text-body font-semibold text-err-text">{% icon "circle-alert" class="mt-[3px] size-3.5 shrink-0" %}<span>{{ field.errors.0 }}</span></p>{% endif %}
 {% if field.name == "bot_token" and field.form.show_token_note %}<p id="{{ field.auto_id }}_note" class="text-body text-fg-muted">{{ field.form.token_note }}</p>{% endif %}
-{% if field.help_text %}<p id="{{ field.auto_id }}_helptext" class="text-body text-fg-muted">{{ field.help_text }}</p>{% endif %}
+{% if field.help_text %}{% if help_in_details %}<details{% if help_testid %} data-testid="{{ help_testid }}"{% endif %} class="group text-body text-fg-muted"><summary class="inline-flex min-h-11 cursor-pointer list-none items-center gap-1 rounded-control text-accent-text hover:underline md:pointer-fine:min-h-6 [&::-webkit-details-marker]:hidden">{% icon "chevron-right" class="size-3.5 shrink-0 group-open:rotate-90 motion-safe:transition-transform motion-safe:duration-150" %}{{ help_in_details }}</summary><p id="{{ field.auto_id }}_helptext" class="mt-1 text-body text-fg-muted">{{ field.help_text }}</p></details>{% else %}<p id="{{ field.auto_id }}_helptext" class="text-body text-fg-muted">{{ field.help_text }}</p>{% endif %}{% endif %}
 </div>
