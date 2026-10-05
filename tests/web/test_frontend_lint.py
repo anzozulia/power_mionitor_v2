@@ -57,6 +57,13 @@ the real tree must pass:
   into the description's mono spans and the noun into its own, and the whole sentence only
   when the spans are absent (W6-A3); it writes a text or a hidden flag of that polite
   region only when the value differs (W6-A4).
+- admin.js code-review pins (06-REVIEW WR-02, IN-05): the submit guard releases a submit
+  whose navigation never completed GUARD_RELEASE_MS (30 s, at least twice the test
+  message's connect + read timeouts) after it started, through one idempotent release that
+  clears the entry's timer and undoes every mark; pageshow releases a copy of every pending
+  entry before it runs the registered handlers (WR-02); a submit is refused while a pending
+  entry's form has the same non-null action, which S5's two test-message forms share while
+  delivery fails (IN-05).
 - CSS entries (powermon/web/assets/css/*.css): @import only "tailwindcss" or a ./ or ../ path;
   every url() relative or data: (comments skipped).
 - Python (powermon/web/**/*.py), read with the stdlib ast module: SafeString, SafeText,
@@ -86,12 +93,18 @@ from collections import Counter
 from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 from django.conf import settings
+from django.contrib.auth import get_user_model
 from django.contrib.staticfiles.storage import staticfiles_storage
-from django.test import RequestFactory
+from django.db import transaction
+from django.test import Client, RequestFactory
+from django.urls import reverse
+from pages import by_testid, parse
 
+from powermon.alerts import delivery
 from powermon.engine.models import STATUSES
 from powermon.locations.models import MAX_SECONDS, MIN_SECONDS
 from powermon.web.context_processors import THEME_COOKIE, THEMES
@@ -3505,6 +3518,287 @@ def test_W6A4_fleet_showing_writes_only_what_changed() -> None:
     assert showing_announce_violations(source) == []
     # Failure: no fleetFilter at all.
     assert showing_announce_violations("var x = 1;") == ["no setHidden", "no setText"]
+
+
+# admin.js code-review pins (06-REVIEW WR-02 and IN-05: the submit guard)
+
+_SUBMIT_LISTENER = re.compile(r"\bdocument\s*\.\s*addEventListener\s*\(\s*([\"'])submit\1")
+_PAGESHOW_LISTENER = re.compile(r"\bwindow\s*\.\s*addEventListener\s*\(\s*([\"'])pageshow\1")
+_INDEX_OF_ENTRY = r"\bpending\s*\.\s*indexOf\s*\(\s*entry\s*\)"
+# release returns at once for an entry no longer pending: through a variable that holds the
+# entry's index, or with the lookup in the condition itself.
+_ALREADY_RELEASED = re.compile(
+    rf"\bvar\s+(?P<index>[\w$]+)\s*=\s*{_INDEX_OF_ENTRY}\s*;"
+    r"\s*if\s*\(\s*(?P=index)\s*===?\s*-1\s*\)\s*\{?\s*return\b"
+    rf"|\bif\s*\(\s*{_INDEX_OF_ENTRY}\s*===?\s*-1\s*\)\s*\{{?\s*return\b"
+)
+_ENTRY_REMOVED = re.compile(r"\bpending\s*\.\s*splice\s*\(|\bpending\s*=\s*pending\s*\.\s*filter\(")
+_TIMER_SET = re.compile(r"\bentry\s*\.\s*timer\s*=\s*window\s*\.\s*setTimeout\s*\(")
+_TIMER_CLEARED = re.compile(r"\bwindow\s*\.\s*clearTimeout\s*\(\s*entry\s*\.\s*timer\s*\)")
+_UNMARKED = re.compile(r"\bentry\s*\.\s*form\s*\.\s*removeAttribute\(\s*\"data-submitted\"\s*\)")
+_LABEL_RESTORED = re.compile(r"\bentry\s*\.\s*label\s*\.\s*textContent\s*=\s*entry\s*\.\s*text\b")
+_RELEASE_ALL = re.compile(r"\bpending\s*\.\s*slice\s*\(\s*\)\s*\.\s*forEach\s*\(\s*release\s*\)")
+_RUN_HANDLERS = re.compile(r"\bpageshowHandlers\s*\.\s*forEach\s*\(")
+_PENDING_SOME = re.compile(r"\bpending\s*\.\s*some\s*\(")
+_ACTION_READ = re.compile(r"\.\s*getAttribute\s*\(\s*([\"'])action\1\s*\)")
+# The submitter's two attributes the guard sets, each restored to its value from before.
+GUARD_RESTORES = (
+    ["entry.button", '"aria-busy"', "entry.ariaBusy"],
+    ["entry.button", '"aria-disabled"', "entry.ariaDisabled"],
+)
+
+GUARD_SHORT_DELAY = "release delay under twice the test message's timeouts"
+GUARD_NO_TIMER = "no release timer per submit"
+GUARD_NOT_IDEMPOTENT = "release acts on an entry already released"
+GUARD_TIMER_KEPT = "release keeps the entry's timer"
+GUARD_MARK_KEPT = "release leaves a mark"
+GUARD_PAGESHOW = "pageshow does not release a copy of pending before its handlers"
+GUARD_NO_SAME_ACTION = "no same-action check across pending submits"
+
+
+def listener_call(source: str, pattern: re.Pattern[str]) -> str:
+    """The text of the first ``addEventListener(...)`` call in code that ``pattern`` finds,
+    up to its closing parenthesis, or ""."""
+    code = _mask_js(source)
+    match = next(_code_matches(pattern, source), None)
+    if match is None:
+        return ""
+    return source[match.start() : _closing(code, match.start()) + 1]
+
+
+def first_in_code(pattern: re.Pattern[str], block: str) -> int:
+    """The offset of the first match of ``pattern`` that starts in code, or -1."""
+    match = next(_code_matches(pattern, block), None)
+    return -1 if match is None else match.start()
+
+
+def guard_release_floor_ms() -> float:
+    """The least release delay, in ms: twice the test message's connect + read timeouts
+    (the Telegram client's DEFAULT_TIMEOUT), the slowest POST the guard holds."""
+    from powermon.telegram.client import DEFAULT_TIMEOUT
+
+    return 2 * sum(DEFAULT_TIMEOUT) * 1000
+
+
+def guard_violations(source: str) -> list[str]:
+    """WR-02 / IN-05: how admin.js's submit guard can stay stuck or let a duplicate through.
+
+    Each submit stores a timer that calls release(entry) after GUARD_RELEASE_MS, at least
+    twice the test message's timeouts. release returns at once for an entry no longer
+    pending, else takes it out of pending, clears its timer and undoes every mark
+    (data-submitted, the submitter's aria-busy and aria-disabled, the label's text).
+    pageshow releases a copy of pending (release edits the list) before it runs the
+    registered handlers. A submit is refused while a pending entry's form has the same
+    non-null action.
+    """
+    found: set[str] = set()
+    delay = re.search(r"\bvar\s+GUARD_RELEASE_MS\s*=\s*(\d+)\s*;", _mask_js(source))
+    if delay is None or int(delay.group(1)) < guard_release_floor_ms():
+        found.add(GUARD_SHORT_DELAY)
+    submit = listener_call(source, _SUBMIT_LISTENER)
+    if first_in_code(_TIMER_SET, submit) < 0 or not any(
+        "release(entry)" in arguments[0] and arguments[1:] == ["GUARD_RELEASE_MS"]
+        for _, arguments in call_arguments(submit, "window.setTimeout")
+    ):
+        found.add(GUARD_NO_TIMER)
+    code = _mask_js(submit)
+    checks = [
+        submit[match.start() : _closing(code, match.start()) + 1]
+        for match in _code_matches(_PENDING_SOME, submit)
+    ]
+    if not any(
+        _ACTION_READ.search(check) and re.search(r"!==?\s*null\b", check) for check in checks
+    ):
+        found.add(GUARD_NO_SAME_ACTION)
+    release = function_body(source, "release")
+    released = _ALREADY_RELEASED.search(_mask_js(release))
+    removed = first_in_code(_ENTRY_REMOVED, release)
+    if released is None or removed < released.start():
+        found.add(GUARD_NOT_IDEMPOTENT)
+    if first_in_code(_TIMER_CLEARED, release) < 0:
+        found.add(GUARD_TIMER_KEPT)
+    restores = [arguments for _, arguments in call_arguments(release, "restore")]
+    if (
+        first_in_code(_UNMARKED, release) < 0
+        or first_in_code(_LABEL_RESTORED, release) < 0
+        or any(expected not in restores for expected in GUARD_RESTORES)
+    ):
+        found.add(GUARD_MARK_KEPT)
+    pageshow = listener_call(source, _PAGESHOW_LISTENER)
+    release_all = first_in_code(_RELEASE_ALL, pageshow)
+    handlers = first_in_code(_RUN_HANDLERS, pageshow)
+    if release_all < 0 or handlers < 0 or release_all > handlers:
+        found.add(GUARD_PAGESHOW)
+    return sorted(found)
+
+
+def test_WR02_submit_guard_releases_a_stopped_navigation() -> None:
+    from powermon.telegram.client import DEFAULT_TIMEOUT
+
+    source = ADMIN_JS.read_text(encoding="utf-8")
+    submit = listener_call(source, _SUBMIT_LISTENER)
+    release = function_body(source, "release")
+    pageshow = listener_call(source, _PAGESHOW_LISTENER)
+
+    # Expected: a submit whose navigation never completes while the page stays shown (Stop,
+    # Esc, a dropped navigation) is released 30 s after it started: data-submitted removed,
+    # aria-busy and aria-disabled back to their values from before, the label's text back.
+    # So the confirm dialog, which refuses Keep, Esc and a backdrop click while aria-busy,
+    # lets the admin out too.
+    assert guard_violations(source) == []
+    assert int(js_var(source, "GUARD_RELEASE_MS")) == 30_000
+    assert "window.setTimeout(" in submit
+    assert "release(entry)" in submit and "GUARD_RELEASE_MS" in submit
+    for hook in (
+        "indexOf(entry)",
+        "window.clearTimeout(entry.timer)",
+        'removeAttribute("data-submitted")',
+    ):
+        assert hook in release, hook
+    assert release.count("restore(") == 2
+    # pageshow still releases every pending entry first, then runs the handlers.
+    assert 0 <= pageshow.find("forEach(release)") < pageshow.find("pageshowHandlers.forEach")
+    # Edge: the delay is at least twice the test message's connect + read timeouts (5 s +
+    # 10 s), so the guard never lets go of a POST that may still answer.
+    assert int(js_var(source, "GUARD_RELEASE_MS")) >= 2 * sum(DEFAULT_TIMEOUT) * 1000
+    # Failure: no guard at all breaks every rule.
+    assert guard_violations("var x = 1;") == sorted(
+        [
+            GUARD_SHORT_DELAY,
+            GUARD_NO_TIMER,
+            GUARD_NOT_IDEMPOTENT,
+            GUARD_TIMER_KEPT,
+            GUARD_MARK_KEPT,
+            GUARD_PAGESHOW,
+            GUARD_NO_SAME_ACTION,
+        ]
+    )
+
+
+def test_IN05_submit_guard_refuses_a_second_form_with_the_same_action() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+    submit = listener_call(source, _SUBMIT_LISTENER)
+
+    # Expected: until a submit is released, a new one is refused when its form is marked
+    # or when a pending entry's form has the same non-null action attribute; forms without
+    # an action never match each other.
+    assert GUARD_NO_SAME_ACTION not in guard_violations(source)
+    assert first_in_code(_PENDING_SOME, submit) >= 0
+    assert 'getAttribute("action")' in submit
+    assert 'form.hasAttribute("data-submitted")' in submit
+
+
+# The guard's text the mutations below take out or change.
+GUARD_TIMER_JS = (
+    "    entry.timer = window.setTimeout(function () {\n"
+    "      release(entry);\n"
+    "    }, GUARD_RELEASE_MS);\n"
+)
+GUARD_SAME_ACTION_JS = (
+    '      form.hasAttribute("data-submitted") ||\n'
+    "      pending.some(function (other) {\n"
+    '        return action !== null && other.form.getAttribute("action") === action;\n'
+    "      });\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    [
+        # Edge: a release timer only in a comment is not one.
+        pytest.param(
+            GUARD_TIMER_JS,
+            "    // entry.timer = window.setTimeout(function () { release(entry); }, 30000);\n",
+            [GUARD_NO_TIMER],
+            id="timer-in-comment",
+        ),
+        # Failure: a delay the test message can outlast; no clearTimeout; no early return
+        # for an entry already released (a stale timer would unmark a newer submit); a mark
+        # left in place; pageshow that drops pending without releasing it, or releases the
+        # live list (release edits it, so every other entry would stay marked); the
+        # same-action check removed, or matching forms without an action (IN-05).
+        pytest.param(
+            "GUARD_RELEASE_MS = 30000",
+            "GUARD_RELEASE_MS = 5000",
+            [GUARD_SHORT_DELAY],
+            id="short-delay",
+        ),
+        pytest.param(
+            "    window.clearTimeout(entry.timer);\n", "", [GUARD_TIMER_KEPT], id="timer-kept"
+        ),
+        pytest.param(
+            "    if (index === -1) {\n      return;\n    }\n",
+            "",
+            [GUARD_NOT_IDEMPOTENT],
+            id="not-idempotent",
+        ),
+        pytest.param(
+            '    entry.form.removeAttribute("data-submitted");\n',
+            "",
+            [GUARD_MARK_KEPT],
+            id="mark-kept",
+        ),
+        pytest.param(
+            "pending.slice().forEach(release);",
+            "pending = [];",
+            [GUARD_PAGESHOW],
+            id="pageshow-drops-pending",
+        ),
+        pytest.param(
+            "pending.slice().forEach(release);",
+            "pending.forEach(release);",
+            [GUARD_PAGESHOW],
+            id="pageshow-live-list",
+        ),
+        pytest.param(
+            GUARD_SAME_ACTION_JS,
+            '      form.hasAttribute("data-submitted");\n',
+            [GUARD_NO_SAME_ACTION],
+            id="no-same-action",
+        ),
+        pytest.param(
+            "return action !== null && other",
+            "return other",
+            [GUARD_NO_SAME_ACTION],
+            id="null-actions-match",
+        ),
+    ],
+)
+def test_submit_guard_rule(old: str, new: str, expected: list[str]) -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+
+    assert source.count(old) == 1, old
+    assert guard_violations(source.replace(old, new)) == expected
+
+
+# When S5's delivery-failing incident opened (UTC).
+FAILING_SINCE = datetime(2026, 10, 1, 7, 58, tzinfo=UTC)
+
+
+@pytest.mark.django_db
+def test_IN05_failing_delivery_renders_two_test_message_forms_with_one_action(
+    client: Client, location_factory: Callable[..., Any]
+) -> None:
+    client.force_login(get_user_model().objects.create_user("admin", password="not-used-here"))
+    location = location_factory(name="Office")
+    url = reverse("location-test-message", args=[location.pk])
+    healthy = parse(client.get(f"/locations/{location.pk}/"))
+    with transaction.atomic():
+        delivery.open_failing(location.pk, FAILING_SINCE, 403)
+
+    page = parse(client.get(f"/locations/{location.pk}/"))
+
+    # Expected: while delivery fails, the banner and the Controls card each render a
+    # test-message form, both with the same action attribute, the one value the guard's
+    # same-action check compares, so a press on one while the other is pending is refused.
+    banner = by_testid(page, "banner-test-message-form")
+    controls = by_testid(page, "test-message-form")
+    assert banner["action"] == controls["action"] == url
+    # Edge: a healthy page renders only the Controls form, with that same action.
+    assert by_testid(healthy, "test-message-form")["action"] == url
+    assert [form for form in healthy.find_all("form") if form.get("action") == url] == [
+        by_testid(healthy, "test-message-form")
+    ]
 
 
 # CSS entries
