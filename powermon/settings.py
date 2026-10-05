@@ -43,6 +43,9 @@ INSTALLED_APPS = [
     "django.contrib.postgres",
     "powermon",
     "powermon.web",
+    # Django's own form templates, for the TemplatesSetting renderer below. After
+    # powermon.web, so the project's django/forms/ templates in powermon/web win.
+    "django.forms",
     # Hosts the run_worker management command (no models, no apps.py).
     "powermon.worker",
 ]
@@ -84,6 +87,10 @@ TEMPLATES = [
         },
     },
 ]
+
+# Forms render through the template engine above, so the project's field group and widget
+# templates (powermon/web/templates/django/forms/) style every form (06-UI-SPEC Form field).
+FORM_RENDERER = "django.forms.renderers.TemplatesSetting"
 
 # D-16: every session is bounded, so a partitioned or slow database surfaces as an error,
 # never as a silent hang. Without tcp_user_timeout a query with unacknowledged data waits

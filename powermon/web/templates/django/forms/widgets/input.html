@@ -1,0 +1,21 @@
+{% comment %}
+Input widget (06-UI-SPEC Components > Form field; UI-01, UI-12, R3). Django 5.2.17's stock
+template with one added class attribute right after name, so every attribute keeps its stock
+order: type, name, class, value, then the widget attrs (maxlength, autofocus, autocomplete,
+aria-describedby, aria-invalid, ...) from Django's own attrs.html.
+
+- value comes only from widget.value, as in the stock template: a PasswordInput with
+  render_value=False has no value, so a typed bot token or password never comes back (R3).
+- The class is the @tailwindcss/forms form-input (class strategy) plus the field utilities:
+  44 px below md and the control height from md, 12 px inline padding, radius 4, a 1 px
+  field border, the surface fill, 16/24 text below sm and 13/20 from sm, a muted border on
+  hover, the focus border and 4 px halo as field variants (the plugin's focus rule outranks
+  the base focus ring, 06-RESEARCH Pitfall 1), and on an invalid field the error border and
+  an error-tinted halo while it is not focused. The invalid variants are spelled
+  aria-[invalid=true], the same selector as the short form, so the page text names the
+  attribute only where a field really is invalid.
+- Hidden, checkbox, radio and file inputs keep the stock markup: the field look is for
+  text-like inputs only.
+- No placeholder styling: no project form shows a placeholder.
+- Every class is spelled out, never built from a variable, so the Tailwind scan finds it.
+{% endcomment %}<input type="{{ widget.type }}" name="{{ widget.name }}"{% if widget.type != "hidden" and widget.type != "checkbox" and widget.type != "radio" and widget.type != "file" %} class="form-input block w-full min-h-11 md:min-h-(--control-h) rounded-control border border-field-border bg-surface px-3 py-0 text-lead text-fg sm:text-body hover:border-fg-muted focus:border-focus focus:[box-shadow:0_0_0_4px_var(--focus-halo)] aria-[invalid=true]:border-err-text aria-[invalid=true]:not-focus:[box-shadow:0_0_0_4px_var(--err-bg)]"{% endif %}{% if widget.value != None %} value="{{ widget.value|stringformat:'s' }}"{% endif %}{% include "django/forms/widgets/attrs.html" %}>

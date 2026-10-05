@@ -1,27 +1,37 @@
-{% extends "base.html" %}
+{% extends "layouts/auth.html" %}{% load icons %}
+{% comment %}
+S1 Sign in (06-UI-SPEC Page Contracts > S1, Test hooks > S1; UI-01, UI-12, R9, R10). One
+card: the h1, then at most one inline alert, then the sign-in form. Fixed copy only
+(signin.*), plus SIGN_IN_ERROR and THROTTLE_MESSAGE from Python.
+
+- Wrong, blank or NUL credentials (form.errors): the error alert form-error, role alert,
+  with SIGN_IN_ERROR (the form's invalid_login message). The username keeps its typed value,
+  escaped; the password never comes back.
+- Throttled (429, the view's throttled, throttle_message and retry_after): the warning alert
+  throttle-message, role alert, with the clock icon, THROTTLE_MESSAGE and data-retry-after
+  (the Retry-After value). The form is unbound, so no credential was checked (R9). Neither
+  message is ever a flash or a toast.
+- The fields render through the project field group (django/forms/field.html); the hidden
+  next is the view's validated same-host target. The full-width primary "Sign in" is
+  rendered enabled in every state; the submit guard marks it busy (spinner) while pending.
+{% endcomment %}
 {% block title %}Sign in{% endblock %}
-{% block header %}<header class="site-header"><span class="wordmark">Power Monitor</span></header>{% endblock %}
-{% block main_class %} main--single{% endblock %}
 {% block content %}
-<h1>Sign in</h1>
-<form method="post" action="{% url 'login' %}">
-  {% csrf_token %}
-  {% if throttled %}
-  <p class="callout callout--error" role="alert">{{ throttle_message }}</p>
-  {% elif form.errors %}
-  <p class="callout callout--error" role="alert">{{ form.error_messages.invalid_login }}</p>
-  {% endif %}
-  <div class="field">
-    <label for="{{ form.username.id_for_label }}">Username</label>
-    {{ form.username }}
-  </div>
-  <div class="field">
-    <label for="{{ form.password.id_for_label }}">Password</label>
-    {{ form.password }}
-  </div>
-  <input type="hidden" name="next" value="{{ next }}">
-  <div class="actions">
-    <button class="btn btn--primary" type="submit">Sign in</button>
-  </div>
+<section aria-labelledby="sign-in-heading" class="flex w-full max-w-[400px] flex-col gap-6 rounded-card border border-border bg-surface p-6">
+<h1 id="sign-in-heading" class="text-title font-semibold tracking-title text-fg">Sign in</h1>
+{% if throttled %}
+<div data-testid="throttle-message" role="alert" data-tone="warning" data-retry-after="{{ retry_after }}" class="flex items-start gap-2 rounded-control border border-warn-border bg-warn-bg p-4 text-body [box-shadow:inset_3px_0_0_var(--warn-icon)]">{% icon "clock" class="size-5 shrink-0 text-warn-icon" %}<p class="min-w-0 flex-1 break-words text-fg"><span class="sr-only">Warning: </span>{{ throttle_message }}</p></div>
+{% elif form.errors %}
+<div data-testid="form-error" role="alert" data-tone="error" class="flex items-start gap-2 rounded-control border border-err-border bg-err-bg p-4 text-body [box-shadow:inset_3px_0_0_var(--err-text)]">{% icon "circle-alert" class="size-5 shrink-0 text-err-text" %}<p class="min-w-0 flex-1 break-words text-fg"><span class="sr-only">Error: </span>{{ form.error_messages.invalid_login }}</p></div>
+{% endif %}
+<form method="post" action="{% url 'login' %}" data-testid="sign-in-form" class="flex flex-col gap-6">
+{% csrf_token %}
+<div class="flex flex-col gap-4">
+{{ form.username.as_field_group }}
+{{ form.password.as_field_group }}
+</div>
+<input type="hidden" name="next" value="{{ next }}">
+<div class="flex flex-col">{% include "partials/_button.html" with variant="primary" label="Sign in" only %}</div>
 </form>
+</section>
 {% endblock %}

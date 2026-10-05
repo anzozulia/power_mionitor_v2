@@ -9,43 +9,57 @@ normal page during the cool-down.
 
 The Django test client sends every request from REMOTE_ADDR 127.0.0.1 unless a test sets
 another one. Cases that need exact times inject a FakeClock into SignInView.
+
+S1 is read only through tests/web/pages.py and the 06-UI-SPEC hooks (``throttle-message``,
+``form-error``, ``sign-in-form``, ``#id_username``, ``#id_password``); the copy is the
+Python constants. An alert is read as a screen reader announces it, with its visually
+hidden "Warning: " / "Error: " prefix.
 """
 
-# class-guard: pending migration
-
 import logging
-import re
 from datetime import datetime, timedelta
 from typing import Any
 
 import pytest
+from bs4 import Tag
 from conftest import FakeClock
 from django.contrib.auth import get_user
 from django.contrib.auth.models import AnonymousUser
 from django.contrib.messages.storage.fallback import FallbackStorage
 from django.contrib.sessions.backends.db import SessionStore
 from django.test import Client, RequestFactory
+from pages import (
+    Page,
+    assert_no_injected_script,
+    assert_page,
+    by_testid,
+    field,
+    hidden_value,
+    parse,
+    text,
+)
 
 from powermon.throttle import store
 from powermon.throttle.models import LoginFailure
+from powermon.throttle.rules import RETRY_AFTER, THROTTLE_MESSAGE
 from powermon.web.admin_sync import sync_admin
+from powermon.web.forms import SIGN_IN_ERROR
 from powermon.web.views import SignInView
 
-SIGN_IN_ERROR = "Wrong username or password. Check both and try again."
-THROTTLE_MESSAGE = "Too many failed sign-ins. Try again in 5 minutes."
 US = timedelta(microseconds=1)
+# 06-UI-SPEC Components > Alert: the visually hidden prefixes of error and warning alerts.
+ERROR_PREFIX = "Error: "
+WARNING_PREFIX = "Warning: "
 
 
-def _input_tag(html: str, name: str) -> str:
-    """The rendered ``<input ...>`` tag whose name attribute is ``name``."""
-    match = re.search(rf'<input\b[^>]*\bname="{re.escape(name)}"[^>]*>', html)
-    assert match is not None, f"no input named {name!r} in the page"
-    return match.group(0)
+def _alerts(page: Page) -> list[str]:
+    """The text of every ``role="alert"`` element that holds text, as a screen reader reads it.
 
-
-def _role_text(html: str, role: str) -> list[str]:
-    """The text directly inside each element that carries ``role="<role>"``."""
-    return [t.strip() for t in re.findall(rf'role="{role}"[^>]*>([^<]*)<', html)]
+    The toast regions are always on the page and empty here, so an empty region is left
+    out. A message keeps its visually hidden prefix.
+    """
+    soup = page if isinstance(page, Tag) else parse(page)
+    return [found for element in soup.find_all(attrs={"role": "alert"}) if (found := text(element))]
 
 
 def _sign_in(client: Client, username: str, password: str, **extra: Any) -> Any:
@@ -61,7 +75,7 @@ def _fail(client: Client, times: int, **extra: Any) -> None:
     for _ in range(times):
         response = _sign_in(client, "admin", "wrong-pw-xyz", **extra)
         assert response.status_code == 200
-        assert _role_text(response.content.decode(), "alert") == [SIGN_IN_ERROR]
+        assert _alerts(response) == [ERROR_PREFIX + SIGN_IN_ERROR]
 
 
 @pytest.mark.django_db
@@ -72,7 +86,7 @@ def test_INV21_2_five_failures_then_429_even_with_the_right_password(client: Cli
     response = _sign_in(client, "admin", "pw-one")
 
     assert response.status_code == 429
-    assert _role_text(response.content.decode(), "alert") == [THROTTLE_MESSAGE]
+    assert _alerts(response) == [WARNING_PREFIX + THROTTLE_MESSAGE]
     assert response["Retry-After"] == "300"
     assert not _signed_in(client)
     assert LoginFailure.objects.filter(client_ip="127.0.0.1").count() == 5
@@ -97,7 +111,7 @@ def test_INV21_2_get_of_the_sign_in_page_stays_200_during_the_cool_down(client: 
     response = client.get("/login/")
 
     assert response.status_code == 200
-    assert _role_text(response.content.decode(), "alert") == []
+    assert _alerts(response) == []
 
 
 # The store (DB): what is read, what is pruned, exact instants
@@ -228,8 +242,8 @@ def test_throttled_page_checks_no_credentials(
         response = _sign_in(client, "admin", password)
         assert response.status_code == 429
         html = response.content.decode()
-        assert _role_text(html, "alert") == [THROTTLE_MESSAGE]
-        assert "Wrong username or password" not in html
+        assert _alerts(html) == [WARNING_PREFIX + THROTTLE_MESSAGE]
+        assert SIGN_IN_ERROR not in html
     assert calls == []
 
     # The patch does sit on the path: an unthrottled IP's sign-in goes through it.
@@ -262,7 +276,7 @@ def test_cool_down_ends_after_five_minutes(
     response = _sign_in(client, "admin", "wrong-pw-xyz")
 
     assert response.status_code == 200
-    assert _role_text(response.content.decode(), "alert") == [SIGN_IN_ERROR]
+    assert _alerts(response) == [ERROR_PREFIX + SIGN_IN_ERROR]
     # The throttled POSTs were never recorded, so the cool-down was not extended.
     assert LoginFailure.objects.count() == 6
 
@@ -275,17 +289,19 @@ def test_throttled_page_keeps_the_username_and_no_password(client: Client) -> No
     throttled = _sign_in(client, "admin", "pw-one")
 
     # E9 partial: the 5th failure's page and the 429 page alike.
-    for response in (fifth, throttled):
+    for response, status in ((fifth, 200), (throttled, 429)):
         html = response.content.decode()
-        assert 'value="admin"' in _input_tag(html, "username")
-        assert "value=" not in _input_tag(html, "password")
+        # E9 long-text: the single sign-in column on the auth layout, nothing of the app
+        # layout (the page invariants with app=False).
+        page = assert_page(response, status=status, title="Sign in", app=False)
+        assert field(page, "username").get("value") == "admin"
+        assert not field(page, "password").has_attr("value")
         assert "wrong-pw-xyz" not in html
         assert "pw-one" not in html
-        # E9 loading: no script; E9 long-text: the P1 single sign-in column.
-        assert "<script" not in html
-        assert 'class="main flow main--single"' in html
-    assert throttled.status_code == 429
-    assert _role_text(throttled.content.decode(), "alert") == [THROTTLE_MESSAGE]
+        # E9 loading: no injected or inline script, only the two static scripts.
+        assert_no_injected_script(html)
+    assert _alerts(throttled) == [WARNING_PREFIX + THROTTLE_MESSAGE]
+    assert by_testid(throttled, "throttle-message").get("data-retry-after") == RETRY_AFTER
 
 
 @pytest.mark.django_db
@@ -298,8 +314,9 @@ def test_throttled_page_keeps_a_same_host_next(client: Client) -> None:
     unsafe = client.post("/login/", {**form, "next": "https://evil.example/"})
 
     assert response.status_code == 429
-    assert 'value="/locations/new/"' in _input_tag(response.content.decode(), "next")
+    assert hidden_value(by_testid(response, "sign-in-form"), "next") == "/locations/new/"
     assert "evil.example" not in unsafe.content.decode()
+    assert hidden_value(by_testid(unsafe, "sign-in-form"), "next") == ""
 
 
 @pytest.mark.django_db
@@ -309,7 +326,7 @@ def test_blank_credentials_count_as_a_failure(client: Client) -> None:
     response = _sign_in(client, "", "pw-one")
 
     assert response.status_code == 200
-    assert _role_text(response.content.decode(), "alert") == [SIGN_IN_ERROR]
+    assert _alerts(response) == [ERROR_PREFIX + SIGN_IN_ERROR]
     assert LoginFailure.objects.filter(client_ip="127.0.0.1").count() == 1
 
 
