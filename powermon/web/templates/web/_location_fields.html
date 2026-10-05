@@ -1,7 +1,7 @@
 {% load icons forms_ui %}{% comment %}
 The three form sections shared by S4 Add location and S6 Edit location (06-UI-SPEC Page
 Contracts > S4 / S6, Test hooks > S4 Add / S6 Edit; UI-01, UI-12, N8, R3). Context: form
-(LocationForm or LocationEditForm); included with only.
+(LocationForm or LocationEditForm) and edit (true on S6 only); included with only.
 
 - Sections [data-testid="form-section"][data-section="basics|monitoring|telegram"], each
   labelled by its h2 (the micro-label title) with its one-line description; stacked below
@@ -28,6 +28,11 @@ Contracts > S4 / S6, Test hooks > S4 Add / S6 Edit; UI-01, UI-12, N8, R3). Conte
   the whole slot), and the unit stays next to it in the same mono span.
 - The S6 token help is the form's format_html string with the mask in a code element; the
   token field's wrapper styles that code element from here (mono), never from Python.
+- S6 only (edit): the old Note callout split by topic (06-UI-SPEC amendment A6, same
+  words): [data-testid="edit-note-monitoring"] under the hint and
+  [data-testid="edit-note-telegram"] at the end of the Telegram section, each an info
+  alert (the Alert component's info tone, no role: not a live message). The third
+  sentence, edit-intro, is in the page's meta line (web/location_edit.html).
 - Every class is spelled out, never built from a variable, so the Tailwind scan finds it.
 {% endcomment %}{% off_after_initial form as off_after %}<section data-testid="form-section" data-section="basics" aria-labelledby="form-section-basics" class="flex flex-col gap-4 px-4 py-6 lg:grid lg:grid-cols-3 lg:gap-6">
   <div class="flex flex-col gap-1">
@@ -49,6 +54,7 @@ Contracts > S4 / S6, Test hooks > S4 Add / S6 Edit; UI-01, UI-12, N8, R3). Conte
       {% include "django/forms/field.html" with field=form.grace_s suffix="s" control="seconds" only %}
     </div>
     <p data-testid="off-after-hint" class="flex items-start gap-1 text-body text-fg-muted">{% icon "clock" class="mt-[3px] size-3.5 shrink-0 text-info-text" %}<span{% if off_after is None %} hidden{% endif %}>Reported OFF after <span class="num whitespace-nowrap"><span data-off-after-value>{{ off_after|default_if_none:"" }}</span> s</span> without a heartbeat.</span><span data-off-after-fallback{% if off_after is not None %} hidden{% endif %}>Reported OFF after period + grace seconds without a heartbeat.</span></p>
+    {% if edit %}<div data-testid="edit-note-monitoring" data-tone="info" class="relative flex items-start gap-2 rounded-control border border-info-border bg-info-bg p-4 text-body [box-shadow:inset_3px_0_0_var(--info-text)]">{% icon "info" class="size-5 shrink-0 text-info-text" %}<p class="min-w-0 flex-1 break-words text-fg">New period and grace values apply from the next check and never change past history. Lower values can report OFF at the next check if the device has already been silent that long.</p></div>{% endif %}
   </div>
 </section>
 <section data-testid="form-section" data-section="telegram" aria-labelledby="form-section-telegram" class="flex flex-col gap-4 px-4 py-6 lg:grid lg:grid-cols-3 lg:gap-6">
@@ -62,5 +68,6 @@ Contracts > S4 / S6, Test hooks > S4 Add / S6 Edit; UI-01, UI-12, N8, R3). Conte
     </div>
     {% include "django/forms/field.html" with field=form.chat_id help_in_details="How to find the chat ID" help_testid="chat-id-help" only %}
     {% include "django/forms/field.html" with field=form.language only %}
+    {% if edit %}<div data-testid="edit-note-telegram" data-tone="info" class="relative flex items-start gap-2 rounded-control border border-info-border bg-info-bg p-4 text-body [box-shadow:inset_3px_0_0_var(--info-text)]">{% icon "info" class="size-5 shrink-0 text-info-text" %}<p class="min-w-0 flex-1 break-words text-fg">A new chat ID or bot token moves the weekly chart: a new one is posted and pinned, and the old one is unpinned if this location's bot is an admin of the old channel. Otherwise the old pin stays: unpin it by hand in Telegram.</p></div>{% endif %}
   </div>
 </section>

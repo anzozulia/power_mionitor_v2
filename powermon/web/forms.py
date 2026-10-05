@@ -51,9 +51,11 @@ HELP_LANGUAGE = "Language of this location's alerts and weekly chart."
 EDIT_FORM_ERROR = "The changes were not saved. Fix the fields marked below."
 NEW_TOKEN_LABEL = "New bot token"  # noqa: S105
 # {masked} is validators.mask_token of the current token, in inline monospace; format_html
-# escapes it. The rest is fixed copy.
+# escapes it. The rest is fixed copy. data-testid="masked-token" is the 06-UI-SPEC test
+# hook on the mask (S6 token help); the template styles the code element, never Python.
 HELP_NEW_BOT_TOKEN = (
-    "Leave this empty to keep the current token, <code>{masked}</code>. To use another "  # noqa: S105
+    "Leave this empty to keep the current token, "  # noqa: S105
+    '<code data-testid="masked-token">{masked}</code>. To use another '
     "bot, paste its token from @BotFather. The token is saved but never shown again."
 )
 
