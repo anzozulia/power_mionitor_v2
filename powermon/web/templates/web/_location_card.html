@@ -1,0 +1,31 @@
+{% load icons %}{% comment %}
+One phone-width location card of the Locations page (06-UI-SPEC Page Contracts > S3 >
+Stacked cards; UI-01, UI-05, UI-12). Parameters: row (a live.LiveRow) and now (the view
+clock's reading, passed on to the time). The page renders one per row below md, in the
+table's order, inside the [data-fleet] wrapper.
+
+- The list item carries the row's data-status and data-delivery: fleetFilter filters the
+  items by them (and hides an item that does not match), and the poll rewrites them on the
+  item it finds from the card link. The item is a named group, so the card's Off and
+  failing tone bars follow those attributes (Off wins, as on the table rows); a focused
+  card keeps its tone bar next to the focus halo.
+- The item holds one link, a[data-testid=location-card] with data-location-id, to the
+  location's page: the name (wraps at word boundaries, never truncated) with the chevron;
+  the status pill, then the tags Alerts off and Router grace; "Last heartbeat {relative} ·
+  {absolute}" (copy row list.card_hb, the card variant of partials/_time.html) or "Last
+  heartbeat Never"; "Delivery" (list.card_delivery) with OK, or the failing pill on its
+  own line.
+- The pill, the time and the delivery carry the same data-live and data-location-id as the
+  table's, so the poll updates both copies. Nothing here has an element id, so the second
+  copy repeats none. The name is autoescaped (R1).
+
+Partials are included with only, now passed to the time. Every class is spelled out; no
+class name is built from data.
+{% endcomment %}<li data-status="{{ row.status }}" data-delivery="{% if row.delivery_failing %}failing{% else %}ok{% endif %}" class="group/card">
+<a href="{% url 'location-detail' row.pk %}" data-testid="location-card" data-location-id="{{ row.pk }}" class="flex flex-col gap-1 rounded-card border border-border bg-surface p-3 text-fg hover:border-border-strong hover:bg-surface-muted group-data-[delivery=failing]/card:[box-shadow:inset_2px_0_0_var(--st-fail)] group-data-[status=off]/card:[box-shadow:inset_2px_0_0_var(--st-off)] focus-visible:group-data-[delivery=failing]/card:[box-shadow:inset_2px_0_0_var(--st-fail),0_0_0_4px_var(--focus-halo)] focus-visible:group-data-[status=off]/card:[box-shadow:inset_2px_0_0_var(--st-off),0_0_0_4px_var(--focus-halo)] motion-safe:transition-colors motion-safe:duration-150">
+<span class="flex items-center justify-between gap-2"><span class="min-w-0 font-semibold break-words">{{ row.name }}</span>{% icon "chevron-right" class="size-4 shrink-0 text-icon group-hover/card:text-fg motion-safe:transition-colors motion-safe:duration-150" %}</span>
+<span class="flex flex-wrap items-center gap-x-2 gap-y-1">{% include "partials/_status_pill.html" with status=row.status label=row.status_label live=True location_id=row.pk only %}{% if row.alerts_off %} {% include "partials/_tag.html" with tag="alerts-off" only %}{% endif %}{% if row.router_grace %} {% include "partials/_tag.html" with tag="router-grace" only %}{% endif %}</span>
+<span class="text-fg-muted [&_[data-relative]]:text-fg">{% include "partials/_time.html" with value=row.last_heartbeat_at variant="card" label="Last heartbeat" testid="last-heartbeat" live="last-heartbeat" location_id=row.pk now=now only %}</span>
+<span class="flex flex-wrap items-center gap-x-2 gap-y-1 text-fg-muted has-[[data-delivery=failing]]:flex-col has-[[data-delivery=failing]]:items-start"><span>Delivery</span> {% include "partials/_delivery.html" with failing=row.delivery_failing text=row.delivery live=True location_id=row.pk only %}</span>
+</a>
+</li>
