@@ -1,4 +1,4 @@
-"""Default-deny over every named route (R14; TEST-STRATEGY §5.6).
+"""Default-deny over every named route, and matrix completeness (R14; TEST-STRATEGY §5.6).
 
 - The login-exempt routes are read from the views themselves (``login_not_required``
   sets ``login_required = False``), and they are exactly {login, logout, heartbeat,
@@ -7,6 +7,13 @@
   anonymous GET and an anonymous POST with 302 to ``/login/?next=<path>`` (a POST-only
   view may answer 405 to GET instead), so no new endpoint slips past sign-in.
 - The Phase 6 server surfaces are in the route table, so they are part of the walk.
+- Matrix completeness: every named admin route is rendered by the render matrix
+  (``test_render_matrix.MATRIX_ROUTES``) or is in the explicit POST-only list, whose
+  routes answer a signed-in GET with 405; the status JSON and the chart PNG are the two
+  admin surfaces that are not HTML pages. Every admin route is also in the INV-23
+  secret-scan matrix (``test_inv23_pages.INV23_ROUTES``, from its TEST-STRATEGY §9 rows).
+  The device endpoint and the health check are not admin routes. A new route missing from
+  either matrix, and a listed name that is no route, fail here.
 """
 
 from collections.abc import Callable, Iterable
@@ -14,14 +21,36 @@ from datetime import datetime
 from typing import Any
 
 import pytest
+from django.contrib.auth import get_user_model
 from django.test import Client
 from django.urls import URLPattern, URLResolver, get_resolver, reverse
+from test_inv23_pages import INV23_ROUTES
+from test_render_matrix import MATRIX_ROUTES
 
 from powermon.alerts import ops
 
 EXEMPT = {"login", "logout", "heartbeat", "healthz"}
 # Phase 6 surfaces that must be in the walk (UI-02, UI-05, UI-06).
 NEW_SURFACES = {"location-status-json", "theme", "location-chart"}
+# Not admin routes: the device's heartbeat and the container health check (no page).
+NOT_ADMIN = frozenset({"heartbeat", "healthz"})
+# The admin surfaces that are not HTML pages (the poll's JSON and the chart preview PNG):
+# their own suites and the INV-23 matrix cover them, the render matrix cannot.
+NOT_HTML = frozenset({"location-status-json", "location-chart"})
+# The admin routes that take only a POST and answer with a redirect; the matrix renders the
+# page each redirects to (the switch and test-message flashes on S5, sign-in after sign-out,
+# the list after the theme switch). The POSTs of create, edit, delete, reveal, regenerate,
+# remove and reset share a route with a page the matrix renders.
+POST_ONLY = frozenset(
+    {
+        "logout",
+        "theme",
+        "location-maintenance",
+        "location-alerts",
+        "location-router-grace",
+        "location-test-message",
+    }
+)
 
 
 def _named_routes(patterns: Iterable[Any] | None = None) -> list[URLPattern]:
@@ -82,3 +111,63 @@ def test_R14_every_named_route_is_login_required(
 
     assert NEW_SURFACES <= set(checked)
     assert not EXEMPT & set(checked)
+
+
+def matrix_gaps(
+    names: set[str], rendered: Iterable[str], post_only: Iterable[str], scanned: Iterable[str]
+) -> list[str]:
+    """What keeps the route table and the matrix lists apart (TEST-STRATEGY §5.6): the
+    render matrix or the POST-only list, and the INV-23 matrix (``scanned``)."""
+    rendered, post_only, scanned = set(rendered), set(post_only), set(scanned)
+    covered = rendered | post_only | NOT_HTML | NOT_ADMIN
+    gaps: list[str] = []
+    for name in sorted(names - NOT_ADMIN):
+        if name not in covered:
+            gaps.append(f"{name}: neither rendered by the matrix nor POST-only")
+        if name not in scanned:
+            gaps.append(f"{name}: not in the INV-23 matrix")
+    gaps += [f"{name}: listed but not a route" for name in sorted((covered | scanned) - names)]
+    gaps += [f"{name}: both rendered and POST-only" for name in sorted(rendered & post_only)]
+    return gaps
+
+
+def test_R14_matrix_completeness() -> None:
+    names = {str(pattern.name) for pattern in _named_routes()}
+
+    # Expected: every named admin route is rendered by the matrix or is POST-only, and is
+    # in the INV-23 secret-scan matrix.
+    assert matrix_gaps(names, MATRIX_ROUTES, POST_ONLY, INV23_ROUTES) == []
+    assert NOT_ADMIN | {"login", "logout"} == EXEMPT
+    # Failure: a new route that no list names fails both checks.
+    assert matrix_gaps(names | {"location-export"}, MATRIX_ROUTES, POST_ONLY, INV23_ROUTES) == [
+        "location-export: neither rendered by the matrix nor POST-only",
+        "location-export: not in the INV-23 matrix",
+    ]
+    # Failure: a rendered route the INV-23 matrix forgot fails.
+    assert matrix_gaps(names, MATRIX_ROUTES, POST_ONLY, INV23_ROUTES - {"theme"}) == [
+        "theme: not in the INV-23 matrix"
+    ]
+    # Edge: a listed name that is no route fails too, and so does a route on two lists.
+    assert matrix_gaps(names - {"theme"}, MATRIX_ROUTES, POST_ONLY, INV23_ROUTES) == [
+        "theme: listed but not a route"
+    ]
+    assert matrix_gaps(names, MATRIX_ROUTES | {"theme"}, POST_ONLY, INV23_ROUTES) == [
+        "theme: both rendered and POST-only"
+    ]
+
+
+@pytest.mark.django_db
+def test_R14_post_only_routes_refuse_get(
+    client: Client, location_factory: Callable[..., Any], fixed_now: datetime
+) -> None:
+    client.force_login(get_user_model().objects.create_user("admin", password="not-used-here"))
+    location = location_factory(name="Office")
+    values = {"pk": location.pk, "start_us": ops.instant_us(fixed_now)}
+    routes = {str(pattern.name): pattern for pattern in _named_routes()}
+
+    # Expected: a signed-in GET of every POST-only route answers 405 (no page to render).
+    for name in sorted(POST_ONLY):
+        url = reverse(name, kwargs=_kwargs(routes[name], values))
+        assert client.get(url).status_code == 405, name
+    # Failure: a route with a page is not POST-only: the same client gets the list.
+    assert client.get(reverse("location-list")).status_code == 200

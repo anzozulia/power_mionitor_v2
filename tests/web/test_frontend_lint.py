@@ -69,8 +69,10 @@ Not scanned: the vendored files under static/web/vendor/, which test_vendor_mani
 verifies by sha256 (the Alpine build legitimately holds https:// warning strings), and the
 licence texts under vendor/LICENSES/ (06-RESEARCH Pitfall 5).
 
-Later plans extend the rule tables through ``violations(text, rules)``: 06-20 adds the Alpine
-directive check (every x-data name registered in admin.js and every registered name used).
+The Alpine names cross-check (06-20, TEST-STRATEGY §5.5): every x-data value in the templates
+(comments skipped) is a bare component name registered with Alpine.data in admin.js, and every
+registered name is bound by some template; no directive holds a Django tag or variable.
+Later plans extend the rule tables through ``violations(text, rules)``.
 
 No string literal in this file (this docstring included) spells the class attribute with its
 equals sign, which 06-09's class guard rejects: patterns and samples that name the class
@@ -1482,6 +1484,62 @@ def test_admin_js_relative_floors_match_timefmt() -> None:
     # Failure: a drifted floor or unit is caught.
     assert relative_mismatches(source.replace("hour: 3600", "hour: 3601")) != []
     assert relative_mismatches(source.replace('min: " min ago"', 'min: " m ago"')) != []
+
+
+# An x-data attribute and its quoted value; the CSP build takes a registered name only.
+_X_DATA = re.compile(r"(?<![\w:@.-])x-data\s*=\s*(\"[^\"]*\"|'[^']*')")
+_COMPONENT_NAME = re.compile(r"[A-Za-z_$][\w$]*")
+
+
+def template_components(text: str) -> list[str]:
+    """Every x-data value of a template, in order (template comments skipped)."""
+    return [m.group(1)[1:-1] for m in _X_DATA.finditer(_TEMPLATE_COMMENT.sub("", text))]
+
+
+def alpine_name_gaps(templates: Mapping[str, str], source: str) -> list[str]:
+    """Where the templates' x-data values and admin.js's Alpine.data names disagree: a
+    value that is not a bare name, a name nobody registered, a registered name nobody binds."""
+    registered = set(registered_names(source))
+    used: set[str] = set()
+    gaps: list[str] = []
+    for relpath, text in sorted(templates.items()):
+        for name in template_components(text):
+            used.add(name)
+            if not _COMPONENT_NAME.fullmatch(name):
+                gaps.append(f"{relpath}: x-data {name!r} is not a component name")
+            elif name not in registered:
+                gaps.append(f"{relpath}: x-data {name!r} is not registered")
+    gaps += [f"Alpine.data {name!r} is bound by no template" for name in sorted(registered - used)]
+    return gaps
+
+
+def test_alpine_names_cross_check() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+    templates = {
+        path.relative_to(TEMPLATES).as_posix(): path.read_text(encoding="utf-8")
+        for path in template_files()
+    }
+    used = {name for text in templates.values() for name in template_components(text)}
+
+    # Expected: every x-data value names a registered component and every registered
+    # component is bound by some template (FRONTEND-STACK §3; the render matrix checks the
+    # set each page binds). Server values never enter a directive.
+    assert alpine_name_gaps(templates, source) == []
+    assert used == set(registered_names(source)) == CONTRACT_NAMES
+    assert [name for name, text in templates.items() if _django_in_directive(text)] == []
+    # Failure: a template binding an unregistered name, and a registered name nobody binds.
+    sample = {**templates, "web/sample.html": '<div x-data="ghost" hidden></div>'}
+    assert alpine_name_gaps(sample, source) == ["web/sample.html: x-data 'ghost' is not registered"]
+    orphan = source + '\nwindow.Alpine.data("orphan", function () { return {}; });\n'
+    assert alpine_name_gaps(templates, orphan) == ["Alpine.data 'orphan' is bound by no template"]
+    # Edge: a binding inside a template comment is none; a value that is not a bare
+    # component name (an object literal or a call) is refused.
+    commented = '{# <div x-data="ghost"> #}{% comment %}<p x-data="g2"></p>{% endcomment %}'
+    assert template_components(commented) == []
+    called = {**templates, "web/called.html": '<div x-data="copy()"></div>'}
+    assert alpine_name_gaps(called, source) == [
+        "web/called.html: x-data 'copy()' is not a component name"
+    ]
 
 
 @pytest.mark.parametrize("name", sorted(CONTRACT_HOOKS))
