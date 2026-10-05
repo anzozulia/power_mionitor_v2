@@ -15,19 +15,21 @@ the real tree must pass:
   javascript: URL; no {{ or {% inside an x-*, @* or :* attribute, and nothing outside the
   @alpinejs/csp grammar in a directive value (arrow function, template literal, browser
   global, the keywords new, typeof, function, void, delete, in and instanceof, a second
-  statement, an assignment to a dotted path); no http(s):// except the SVG namespace and no protocol-relative URL; no hard-coded /static/
-  path; a <script> only in the two exact empty-body forms and only in layouts/app.html and
-  layouts/auth.html; every {% icon %} literal name has a file and every {% icon %} a class;
-  every {% static %} literal path has a manifest entry (comments are skipped for those two).
+  statement, an assignment to a dotted path); no http(s):// except the SVG namespace and no
+  protocol-relative URL; no hard-coded /static/ path; a <script> only in the two exact
+  empty-body forms and only in layouts/app.html and layouts/auth.html; every {% icon %}
+  literal name has a file and every {% icon %} a class; every {% static %} literal path has
+  a manifest entry (comments are skipped for those two).
 - Icon SVGs (templates/icons/*.svg): no <script, on*=, style= or <style, href (xlink:href
   too) or foreignObject.
 - admin.js: no eval(, new Function, string timers, document.write, innerHTML, outerHTML,
   insertAdjacentHTML, createContextualFragment, setHTMLUnsafe, parseHTMLUnsafe, srcdoc,
   sessionStorage, indexedDB, caches., serviceWorker, pushState, replaceState, window.name,
   XMLHttpRequest, sendBeacon, confirm(, alert(, prompt(, import/export, http(s)://,
-  hard-coded /static/ path, FormData or the bot token field; localStorage only inside a try block that has a catch, and only as
-  getItem/setItem/removeItem with the literal key powermon.sidebar.rail; document.cookie only
-  as an assignment of a string starting with theme= (R4).
+  hard-coded /static/ path, FormData or the bot token field; localStorage only inside a try
+  block that has a catch, and only as getItem/setItem/removeItem with the literal key
+  powermon.sidebar.rail; document.cookie only as an assignment of a string starting with
+  theme= (R4).
 - admin.js components (06-11): the Alpine.data names are exactly the 15 of the binding
   contract and each component names its contract hooks; the theme cookie carries exactly
   the attributes ThemeView sets (Secure only on https); the relative-time floors and units
@@ -1478,13 +1480,16 @@ def test_admin_js_fetch_rules() -> None:
         ),
         # Edge: a fetch in a comment or a string is not code.
         pytest.param(
-            '// fetch("/x")\nvar s = "fetch(1)";\nfetch(main.dataset.pollUrl, {redirect: "manual"});',
+            '// fetch("/x")\nvar s = "fetch(1)";\n'
+            'fetch(main.dataset.pollUrl, {redirect: "manual"});',
             [],
             id="comment",
         ),
         # Failure: a literal or built URL, a followed redirect, a write, an alias.
         pytest.param(
-            'fetch("/locations/status.json", { redirect: "manual" });', [FETCH_URL_RULE], id="literal"
+            'fetch("/locations/status.json", { redirect: "manual" });',
+            [FETCH_URL_RULE],
+            id="literal",
         ),
         pytest.param(
             'fetch(main.dataset.pollUrl + "?all=1", { redirect: "manual" });',
@@ -1501,7 +1506,9 @@ def test_admin_js_fetch_rules() -> None:
             id="post",
         ),
         pytest.param(
-            'fetch(link.href, { redirect: "manual", body: data });', ["fetch with a body"], id="body"
+            'fetch(link.href, { redirect: "manual", body: data });',
+            ["fetch with a body"],
+            id="body",
         ),
         pytest.param(
             "var get = fetch; get(link.href);", ["fetch used other than as a call"], id="alias"
@@ -1515,7 +1522,11 @@ def test_fetch_rule(sample: str, expected: list[str]) -> None:
 def test_admin_js_poll_schedule() -> None:
     source = ADMIN_JS.read_text(encoding="utf-8")
     body = component_bodies(source).get("poll", "")
-    expected = {"interval": 30_000, "backoff": [60_000, 120_000, 240_000, 300_000], "pause_after": 3}
+    expected = {
+        "interval": 30_000,
+        "backoff": [60_000, 120_000, 240_000, 300_000],
+        "pause_after": 3,
+    }
 
     # Expected: 30 s while visible; 60 -> 120 -> 240 -> 300 s after failures; paused after
     # 3 failures in a row; polls at once on becoming visible; stops on an opaque redirect.
@@ -1559,8 +1570,7 @@ OUTSIDE_CLICK = "clipboard write outside the copy component's click listener"
             COPY_OK.replace('"copy"', '"revealGuard"'), [OUTSIDE_CLICK], id="no-copy-component"
         ),
         pytest.param(
-            COPY_OK
-            + 'Alpine.data("revealGuard", function () { return { init: function () {'
+            COPY_OK + 'Alpine.data("revealGuard", function () { return { init: function () {'
             ' b.addEventListener("click", function () { navigator.clipboard.writeText(k); });'
             " } }; });",
             [OUTSIDE_CLICK],
@@ -1641,7 +1651,7 @@ def test_admin_js_fragment_protocol() -> None:
     ("old", "new", "expected"),
     [
         pytest.param(
-            '|| response.status !== 200 ', "", ["no status 200 check"], id="no-status-check"
+            "|| response.status !== 200 ", "", ["no status 200 check"], id="no-status-check"
         ),
         pytest.param(
             '||\n              response.headers.get("X-PM-Fragment") !== "1"',
@@ -1650,13 +1660,13 @@ def test_admin_js_fragment_protocol() -> None:
             id="no-header-check",
         ),
         pytest.param(
-            "if (roots.length !== 1) { throw new Error(\"full\"); }",
+            'if (roots.length !== 1) { throw new Error("full"); }',
             "",
             ["no single-root check"],
             id="no-root-count",
         ),
         pytest.param(
-            '.catch(function () { window.location.assign(link.href); });',
+            ".catch(function () { window.location.assign(link.href); });",
             ";",
             ["no location.assign fallback"],
             id="no-fallback",

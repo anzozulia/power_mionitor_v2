@@ -1224,6 +1224,436 @@
         },
       };
     });
+
+    // confirmDialog (UI-07, D6-05): bound by x-data="confirmDialog" on the page's one
+    // [data-confirm-scope] wrapper (location and setup pages), which only starts it. One
+    // click listener on document handles a plain click on any same-origin a[data-confirm],
+    // wherever it is (the kebab entries sit outside the wrapper); the dialog is the page's
+    // one dialog[data-testid="confirm-dialog"] after main, found on document. A click opens
+    // the dialog with its spinner and fetches the link's confirmation page as a fragment
+    // (the fragment request header, no redirect followed). Only a 200 response that carries
+    // the fragment header back and parses (DOMParser) to exactly one [data-testid="confirm"]
+    // root is shown: the root is moved into the dialog body and Keep gets the focus. Any other
+    // outcome closes the dialog and loads the confirmation page itself (location.assign),
+    // which also shows a refusal's flash once. The dialog shell has only data-* hooks, so
+    // its close button, Keep, the backdrop and Esc (cancel) are bound here; while the
+    // destructive button is pending (the submit guard's aria-busy) they do nothing. On close
+    // the focus goes back to the link, or to the menu button of the popover it was in.
+    window.Alpine.data("confirmDialog", function () {
+      return {
+        init: function () {
+          var dialog = document.querySelector('dialog[data-testid="confirm-dialog"]');
+          if (!dialog || typeof dialog.showModal !== "function") {
+            return;
+          }
+          var body = dialog.querySelector("[data-dialog-body]");
+          var loading = dialog.querySelector("[data-dialog-loading]");
+          var closeButton = dialog.querySelector("[data-dialog-close]");
+          if (!body) {
+            return;
+          }
+          var request = 0;
+          var returnTo = null;
+          var pressOnBackdrop = false;
+
+          var pending = function () {
+            var submit = body.querySelector('[data-testid="confirm-submit"]');
+            return submit !== null && submit.getAttribute("aria-busy") === "true";
+          };
+
+          var close = function () {
+            if (!pending() && dialog.open) {
+              dialog.close();
+            }
+          };
+
+          var outside = function (event) {
+            var box = dialog.getBoundingClientRect();
+            return (
+              event.target === dialog &&
+              (event.clientX < box.left ||
+                event.clientX > box.right ||
+                event.clientY < box.top ||
+                event.clientY > box.bottom)
+            );
+          };
+
+          // The element that gets the focus back: the link, or the button that opens the
+          // popover menu the link sits in (the menu closes when the dialog opens).
+          var focusTarget = function (link) {
+            var popover = link.closest("[popover]");
+            if (!popover || !popover.id) {
+              return link;
+            }
+            try {
+              if (popover.matches(":popover-open")) {
+                popover.hidePopover();
+              }
+            } catch (error) {
+              // No popover API: the menu is a plain list.
+            }
+            var openers = document.querySelectorAll("[popovertarget]");
+            for (var index = 0; index < openers.length; index += 1) {
+              if (openers[index].getAttribute("popovertarget") === popover.id) {
+                return openers[index];
+              }
+            }
+            return link;
+          };
+
+          var open = function (link) {
+            var url = link.href;
+            request += 1;
+            var current = request;
+            returnTo = focusTarget(link);
+            body.textContent = "";
+            reveal(loading);
+            if (!dialog.open) {
+              dialog.showModal();
+            }
+            fetch(link.href, { redirect: "manual", headers: { "X-PM-Fragment": "1" } })
+              .then(function (response) {
+                if (
+                  response.type === "opaqueredirect" ||
+                  response.status !== 200 ||
+                  response.headers.get("X-PM-Fragment") !== "1"
+                ) {
+                  throw new Error("not a confirmation fragment");
+                }
+                return response.text();
+              })
+              .then(function (html) {
+                if (current !== request) {
+                  return;
+                }
+                var parsed = new DOMParser().parseFromString(html, "text/html");
+                var roots = parsed.querySelectorAll('[data-testid="confirm"]');
+                if (roots.length !== 1) {
+                  throw new Error("not one confirmation root");
+                }
+                var root = roots[0];
+                // Parsed scripts never run; they are dropped all the same.
+                root.querySelectorAll("script").forEach(function (script) {
+                  script.remove();
+                });
+                if (loading) {
+                  loading.hidden = true;
+                }
+                body.appendChild(root);
+                var keep = root.querySelector('[data-testid="keep"]');
+                if (keep) {
+                  keep.focus();
+                }
+              })
+              .catch(function () {
+                if (current !== request) {
+                  return;
+                }
+                if (dialog.open) {
+                  dialog.close();
+                }
+                window.location.assign(url);
+              });
+          };
+
+          document.addEventListener("click", function (event) {
+            if (event.defaultPrevented || event.button !== 0) {
+              return;
+            }
+            if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+              return;
+            }
+            var link = event.target instanceof Element ? event.target.closest("a[data-confirm]") : null;
+            if (!link || dialog.contains(link) || !link.href || !sameOrigin(link.href)) {
+              return;
+            }
+            if ((link.target && link.target !== "_self") || link.hasAttribute("download")) {
+              return;
+            }
+            event.preventDefault();
+            open(link);
+          });
+
+          if (closeButton) {
+            closeButton.addEventListener("click", close);
+          }
+          dialog.addEventListener("click", function (event) {
+            var keep = event.target instanceof Element ? event.target.closest('[data-testid="keep"]') : null;
+            if (keep && dialog.contains(keep)) {
+              event.preventDefault();
+              close();
+            } else if (pressOnBackdrop && outside(event)) {
+              close();
+            }
+          });
+          dialog.addEventListener("pointerdown", function (event) {
+            pressOnBackdrop = outside(event);
+          });
+          // Esc: cancel is prevented while pending; so is the keydown, for browsers whose
+          // second Esc ignores the prevented cancel (06-RESEARCH Pitfall 10).
+          dialog.addEventListener("cancel", function (event) {
+            if (pending()) {
+              event.preventDefault();
+            }
+          });
+          dialog.addEventListener("keydown", function (event) {
+            if (event.key === "Escape" && pending()) {
+              event.preventDefault();
+            }
+          });
+          dialog.addEventListener("close", function () {
+            // A load still running belongs to the closed dialog: it is ignored.
+            request += 1;
+            body.textContent = "";
+            reveal(loading);
+            if (returnTo && document.contains(returnTo)) {
+              returnTo.focus();
+            }
+            returnTo = null;
+          });
+        },
+      };
+    });
+
+    // fleetFilter (UI-04, N13): bound by x-data="fleetFilter" on the Locations page's
+    // [data-fleet] wrapper (fleet card, table and phone cards). It reveals the filter cells
+    // and the proportional bar (each segment's flex-grow is its data-count; empty segments
+    // are hidden). Pressing a cell shows only the matching locations: a status cell by
+    // data-status, Delivery failing by data-delivery; pressing the active cell or All shows
+    // every location. Rows get data-filtered (the CSS collapses them, so columns never
+    // move), cards get hidden, the description says how many are shown, and the no-match
+    // line's "show all" resets the filter and focuses All. The filter is never in the URL;
+    // it is applied again after each poll (pm:status).
+    window.Alpine.data("fleetFilter", function () {
+      var FILTERS = ["all", "on", "off", "maintenance", "waiting", "failing"];
+      return {
+        init: function () {
+          var root = this.$el;
+          var chips = Array.prototype.slice.call(
+            root.querySelectorAll('button[data-testid="filter-chip"][data-filter]')
+          );
+          var bar = root.querySelector('[data-testid="fleet-bar"]');
+          var showing = root.querySelector('[data-testid="fleet-showing"]');
+          var active = "all";
+
+          var matches = function (element) {
+            if (active === "all") {
+              return true;
+            }
+            if (active === "failing") {
+              return element.getAttribute("data-delivery") === "failing";
+            }
+            return element.getAttribute("data-status") === active;
+          };
+
+          var sizeBar = function () {
+            if (!bar) {
+              return;
+            }
+            bar.querySelectorAll("[data-count]").forEach(function (segment) {
+              var count = parseInt(segment.getAttribute("data-count"), 10);
+              count = isNaN(count) || count < 0 ? 0 : count;
+              segment.style.flexGrow = String(count);
+              segment.hidden = count === 0;
+            });
+          };
+
+          var describe = function (shown, total) {
+            var noun = total === 1 ? " location" : " locations";
+            if (active !== "all") {
+              return "Showing " + shown + " of " + total + noun;
+            }
+            return total === 1 ? "Showing 1 location" : "Showing all " + total + noun;
+          };
+
+          var apply = function () {
+            chips.forEach(function (chip) {
+              chip.setAttribute("aria-pressed", chip.getAttribute("data-filter") === active ? "true" : "false");
+            });
+            var rows = root.querySelectorAll('tr[data-testid="location-row"]');
+            var cards = root.querySelectorAll("li[data-status][data-delivery]");
+            var rowsShown = 0;
+            var cardsShown = 0;
+            rows.forEach(function (row) {
+              if (matches(row)) {
+                rowsShown += 1;
+                row.removeAttribute("data-filtered");
+              } else {
+                row.setAttribute("data-filtered", "");
+              }
+            });
+            cards.forEach(function (card) {
+              var keep = matches(card);
+              card.hidden = !keep;
+              cardsShown += keep ? 1 : 0;
+            });
+            var shown = rows.length > 0 ? rowsShown : cardsShown;
+            var counted = rows.length > 0 ? rows.length : cards.length;
+            var declared = showing ? parseInt(showing.getAttribute("data-total"), 10) : NaN;
+            var total = isNaN(declared) ? counted : declared;
+            root.querySelectorAll('[data-testid="no-match"]').forEach(function (line) {
+              line.hidden = shown !== 0;
+            });
+            if (showing) {
+              showing.textContent = describe(shown, total);
+            }
+          };
+
+          var press = function (filter) {
+            if (FILTERS.indexOf(filter) < 0) {
+              return;
+            }
+            active = filter === active || filter === "all" ? "all" : filter;
+            apply();
+          };
+
+          chips.forEach(reveal);
+          reveal(bar);
+          root.addEventListener("click", function (event) {
+            var target = event.target instanceof Element ? event.target : null;
+            var chip = target ? target.closest('button[data-testid="filter-chip"][data-filter]') : null;
+            var reset = target ? target.closest("[data-filter-reset]") : null;
+            if (chip && root.contains(chip)) {
+              press(chip.getAttribute("data-filter"));
+            } else if (reset && root.contains(reset)) {
+              event.preventDefault();
+              active = "all";
+              apply();
+              var all = root.querySelector('button[data-testid="filter-chip"][data-filter="all"]');
+              if (all) {
+                all.focus();
+              }
+            }
+          });
+          window.addEventListener("pm:status", function () {
+            sizeBar();
+            apply();
+          });
+          sizeBar();
+          apply();
+        },
+      };
+    });
+
+    // offAfterHint (N8): bound by x-data="offAfterHint" on the location form's monitoring
+    // section. While both seconds fields (#id_period_s, #id_grace_s) hold whole numbers from
+    // 10 to 3600 (the form's own bounds), the hint shows their sum in [data-off-after-value];
+    // otherwise it shows the [data-off-after-fallback] sentence. The server stays the
+    // source of truth: the form validates the values again.
+    window.Alpine.data("offAfterHint", function () {
+      var OFF_AFTER_MIN = 10;
+      var OFF_AFTER_MAX = 3600;
+
+      var seconds = function (input) {
+        var text = input.value.trim();
+        if (!/^\d+$/.test(text)) {
+          return null;
+        }
+        var value = parseInt(text, 10);
+        return value >= OFF_AFTER_MIN && value <= OFF_AFTER_MAX ? value : null;
+      };
+
+      // Writes the number into the value element: in place of the first number in its text,
+      // or as its whole text when it is a bare slot. False when there is no place for it.
+      var writeNumber = function (element, number) {
+        var walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+        for (var node = walker.nextNode(); node; node = walker.nextNode()) {
+          if (/\d/.test(node.textContent)) {
+            node.textContent = node.textContent.replace(/\d+/, String(number));
+            return true;
+          }
+        }
+        if (element.children.length === 0) {
+          element.textContent = String(number);
+          return true;
+        }
+        return false;
+      };
+
+      return {
+        init: function () {
+          var section = this.$el;
+          var period = document.getElementById("id_period_s");
+          var grace = document.getElementById("id_grace_s");
+          var value = section.querySelector("[data-off-after-value]");
+          var fallback = section.querySelector("[data-off-after-fallback]");
+          if (!period || !grace || !value || !fallback) {
+            return;
+          }
+          // The sentence shown instead of the fallback: the value element, or its ancestor
+          // that sits next to the fallback.
+          var sentence = value;
+          while (sentence.parentElement && sentence.parentElement !== fallback.parentElement) {
+            if (sentence.parentElement === section) {
+              sentence = value;
+              break;
+            }
+            sentence = sentence.parentElement;
+          }
+          var update = function () {
+            var periodSeconds = seconds(period);
+            var graceSeconds = seconds(grace);
+            var valid =
+              periodSeconds !== null &&
+              graceSeconds !== null &&
+              writeNumber(value, periodSeconds + graceSeconds);
+            sentence.hidden = !valid;
+            fallback.hidden = valid;
+          };
+          period.addEventListener("input", update);
+          grace.addEventListener("input", update);
+          update();
+        },
+      };
+    });
+
+    // errorSummary (N10, UI-12): bound by x-data="errorSummary" on the form's error summary
+    // ([tabindex="-1"]): it takes the focus on load, so its jump links are read first.
+    window.Alpine.data("errorSummary", function () {
+      return {
+        init: function () {
+          this.$el.focus();
+        },
+      };
+    });
+
+    // throttleCountdown (N11): bound by x-data="throttleCountdown" on the sign-in card in
+    // the throttled state. It counts down from the throttle message's data-retry-after
+    // seconds in the [data-testid="throttle-countdown"] slot, "({m:ss} left)", with the
+    // sign-in button aria-disabled (the submit guard refuses an aria-disabled submitter),
+    // then reads "(you can try again now)" and removes aria-disabled. The button is never
+    // disabled; without JS a POST simply gets the 429 again.
+    window.Alpine.data("throttleCountdown", function () {
+      return {
+        init: function () {
+          var root = this.$el;
+          var message = root.querySelector("[data-retry-after]");
+          var output = root.querySelector('[data-testid="throttle-countdown"]');
+          var button = root.querySelector('button[type="submit"]');
+          var total = message ? parseInt(message.getAttribute("data-retry-after"), 10) : NaN;
+          if (!output || !button || isNaN(total) || total <= 0) {
+            return;
+          }
+          var deadline = window.performance.now() + total * MS_PER_SECOND;
+          var timer = null;
+          var tick = function () {
+            var left = Math.ceil((deadline - window.performance.now()) / MS_PER_SECOND);
+            if (left <= 0) {
+              window.clearInterval(timer);
+              output.textContent = "(you can try again now)";
+              button.removeAttribute("aria-disabled");
+              return;
+            }
+            var rest = left % 60;
+            output.textContent = "(" + Math.floor(left / 60) + ":" + (rest < 10 ? "0" : "") + rest + " left)";
+          };
+          button.setAttribute("aria-disabled", "true");
+          reveal(output);
+          tick();
+          timer = window.setInterval(tick, MS_PER_SECOND);
+        },
+      };
+    });
   });
 
   // The submit guard (UI-09): one delegated listener for every POST form. The first submit
