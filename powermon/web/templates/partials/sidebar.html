@@ -29,12 +29,14 @@ nav's aria-current (None for a bare request: nothing is current).
 
 Layout: below lg a fixed off-canvas drawer (min(240px, 100vw - 56px)), shown while html
 carries data-drawer=open (set by the sidebar component in admin.js), invisible otherwise so
-its links are never tabbable while closed; from lg a sticky full-height 240 px column; at
+its links are never tabbable while closed. Opening shows it at once (in the open state only
+translate transitions), so the first nav link can take the focus while it slides in; closing
+keeps it visible until the slide-out ends. From lg a sticky full-height 240 px column; at
 xl a 56 px rail while html carries data-rail=collapsed (labels, group text, count and
 summary visually hidden but still in the DOM, cells hidden, links centred, the triangle
 and the Off mark as 12 px corner badges). The list scrolls inside the sidebar, never the
 page. Every class is spelled out: no class name is ever built from data.
-{% endcomment %}<aside id="sidebar" data-testid="sidebar" class="invisible fixed inset-y-0 left-0 z-40 flex w-[min(240px,100vw_-_56px)] -translate-x-full flex-col border-r border-sb-border bg-sb-bg text-body text-sb-fg [--focus:var(--sb-focus)] [color-scheme:dark] motion-safe:transition-[translate,visibility] motion-safe:duration-200 in-data-[drawer=open]:visible in-data-[drawer=open]:translate-x-0 in-data-[drawer=open]:shadow-modal lg:visible lg:sticky lg:top-0 lg:bottom-auto lg:z-auto lg:h-dvh lg:w-(--sb-w) lg:shrink-0 lg:translate-x-0 lg:shadow-none xl:in-data-[rail=collapsed]:w-(--sb-rail-w)">
+{% endcomment %}<aside id="sidebar" data-testid="sidebar" class="invisible fixed inset-y-0 left-0 z-40 flex w-[min(240px,100vw_-_56px)] -translate-x-full flex-col border-r border-sb-border bg-sb-bg text-body text-sb-fg [--focus:var(--sb-focus)] [color-scheme:dark] motion-safe:transition-[translate,visibility] motion-safe:in-data-[drawer=open]:transition-[translate] motion-safe:duration-200 in-data-[drawer=open]:visible in-data-[drawer=open]:translate-x-0 in-data-[drawer=open]:shadow-modal lg:visible lg:sticky lg:top-0 lg:bottom-auto lg:z-auto lg:h-dvh lg:w-(--sb-w) lg:shrink-0 lg:translate-x-0 lg:shadow-none xl:in-data-[rail=collapsed]:w-(--sb-rail-w)">
   <div class="flex h-12 shrink-0 items-center gap-1 border-b border-sb-border px-2">
     <a href="{% url 'location-list' %}" class="flex min-h-11 min-w-0 flex-1 items-center gap-2 rounded-control px-2 font-semibold text-sb-fg lg:min-h-(--nav-item-h) xl:in-data-[rail=collapsed]:justify-center xl:in-data-[rail=collapsed]:px-0">{% icon "zap" class="size-5 shrink-0 text-brand" %}<span class="truncate xl:in-data-[rail=collapsed]:sr-only">Power Monitor</span><span aria-hidden="true" class="num shrink-0 rounded-control border border-sb-border px-1 text-label font-normal text-sb-fg-muted xl:in-data-[rail=collapsed]:hidden">ops</span></a>
     <button type="button" data-testid="drawer-close" aria-controls="sidebar" aria-expanded="false" data-js-only hidden class="inline-flex size-11 shrink-0 items-center justify-center rounded-control text-sb-fg-muted hover:bg-sb-hover hover:text-sb-fg lg:hidden motion-safe:transition-colors motion-safe:duration-150">{% icon "x" class="size-5" %}<span class="sr-only">Close navigation</span></button>
