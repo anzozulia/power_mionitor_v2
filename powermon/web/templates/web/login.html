@@ -11,16 +11,24 @@ card: the h1, then at most one inline alert, then the sign-in form. Fixed copy o
   throttle-message, role alert, with the clock icon, THROTTLE_MESSAGE and data-retry-after
   (the Retry-After value). The form is unbound, so no credential was checked (R9). Neither
   message is ever a flash or a toast.
+- N11, throttled state only: the card is the throttleCountdown scope (admin.js). Next to
+  the alert, outside it, the JS-only throttle-countdown slot is rendered hidden and empty;
+  the component reveals it, writes "({m:ss} left)" each second from data-retry-after
+  (signin.countdown), keeps the submit button aria-disabled until 0, then writes "(you can
+  try again now)" (signin.countdown_done). Without JavaScript a POST simply gets 429 again.
 - The fields render through the project field group (django/forms/field.html); the hidden
   next is the view's validated same-host target. The full-width primary "Sign in" is
   rendered enabled in every state; the submit guard marks it busy (spinner) while pending.
 {% endcomment %}
 {% block title %}Sign in{% endblock %}
 {% block content %}
-<section aria-labelledby="sign-in-heading" class="flex w-full max-w-[400px] flex-col gap-6 rounded-card border border-border bg-surface p-6">
+<section aria-labelledby="sign-in-heading"{% if throttled %} x-data="throttleCountdown"{% endif %} class="flex w-full max-w-[400px] flex-col gap-6 rounded-card border border-border bg-surface p-6">
 <h1 id="sign-in-heading" class="text-title font-semibold tracking-title text-fg">Sign in</h1>
 {% if throttled %}
+<div class="flex flex-col gap-2">
 <div data-testid="throttle-message" role="alert" data-tone="warning" data-retry-after="{{ retry_after }}" class="flex items-start gap-2 rounded-control border border-warn-border bg-warn-bg p-4 text-body [box-shadow:inset_3px_0_0_var(--warn-icon)]">{% icon "clock" class="size-5 shrink-0 text-warn-icon" %}<p class="min-w-0 flex-1 break-words text-fg"><span class="sr-only">Warning: </span>{{ throttle_message }}</p></div>
+<p data-testid="throttle-countdown" data-js-only hidden class="num text-body text-fg-muted"></p>
+</div>
 {% elif form.errors %}
 <div data-testid="form-error" role="alert" data-tone="error" class="flex items-start gap-2 rounded-control border border-err-border bg-err-bg p-4 text-body [box-shadow:inset_3px_0_0_var(--err-text)]">{% icon "circle-alert" class="size-5 shrink-0 text-err-text" %}<p class="min-w-0 flex-1 break-words text-fg"><span class="sr-only">Error: </span>{{ form.error_messages.invalid_login }}</p></div>
 {% endif %}
