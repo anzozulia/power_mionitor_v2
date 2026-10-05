@@ -10,6 +10,8 @@
 - The bot token is shown only as ``{bot_id}:••••••••``.
 """
 
+# class-guard: pending migration
+
 import re
 from collections.abc import Callable
 from datetime import UTC, datetime

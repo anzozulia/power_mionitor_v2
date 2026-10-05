@@ -27,6 +27,8 @@ compared after ``html.unescape``. Flashes are read through ``pages.messages()`` 
 (role, text), toast or legacy callout alike (UI-09).
 """
 
+# class-guard: pending migration
+
 import re
 from collections.abc import Callable
 from datetime import UTC, datetime

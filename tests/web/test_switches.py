@@ -12,6 +12,8 @@ Edges (UI-SPEC screen H, E3 error): the same state again writes nothing and gets
 400 with an empty body; a POST without a CSRF token is refused; an unknown location is 404.
 """
 
+# class-guard: pending migration
+
 import re
 from collections.abc import Callable
 from datetime import UTC, datetime

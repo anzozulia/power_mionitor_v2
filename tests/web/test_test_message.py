@@ -20,6 +20,8 @@ LOC-02 injection pattern); Telegram is faked at the HTTP boundary (``fake_telegr
 ``ops_settings`` configures the admin chat.
 """
 
+# class-guard: pending migration
+
 import dataclasses
 import re
 from collections.abc import Callable

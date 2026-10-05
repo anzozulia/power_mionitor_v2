@@ -11,6 +11,8 @@ While the admin ops chat is not configured, both states show a warning callout (
 INV-20). Every page escapes the user-typed location name (UI-SPEC security rule 1).
 """
 
+# class-guard: pending migration
+
 import re
 from collections.abc import Callable
 from dataclasses import replace

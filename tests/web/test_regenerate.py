@@ -16,6 +16,8 @@ No admin action here makes a Telegram call (KD2). The heartbeat endpoint is serv
 ``RequestFactory`` with an injected ``FakeClock``, as in tests/web/test_heartbeat.py.
 """
 
+# class-guard: pending migration
+
 import re
 from collections.abc import Callable
 from datetime import UTC, date, datetime

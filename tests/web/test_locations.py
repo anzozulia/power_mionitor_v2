@@ -7,6 +7,8 @@ add-location form tests: K-6 at form level, the UI-SPEC validation copy, the wri
 token and the create itself (one transaction, no Telegram call).
 """
 
+# class-guard: pending migration
+
 import logging
 import re
 import string
