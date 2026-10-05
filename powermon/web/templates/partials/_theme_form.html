@@ -1,0 +1,21 @@
+{% load icons %}{% comment %}
+The Light / Dark / System control in the top bar (06-UI-SPEC Layout Shell > Top bar > Theme
+control; UI-02, D6-03, R2, R8). Included by layouts/app.html; reads theme (the allowlisted
+cookie value from the theme context processor) and the CSRF token.
+
+A native POST form to the theme route with three submit buttons, so it works without
+JavaScript (the POST sets the theme cookie and redirects to the fixed list page). aria-pressed
+is rendered from the cookie, so the pressed button is right on first paint. With JavaScript
+the theme component (x-data="theme", choose on submit) prevents the submit, writes the
+same cookie, sets data-theme on html and aria-pressed in place, and never navigates.
+
+Each button keeps a 44 px hit box below md and on a coarse pointer and is 28 px from md
+with a fine pointer; the 28 px visual inside it carries the frame, the pressed fill and the
+focus ring. Icons sun, moon and monitor; the names are visually hidden text and titles.
+{% endcomment %}<div data-testid="theme-switch" class="flex shrink-0 items-center">
+<form method="post" action="{% url 'theme' %}" data-testid="theme-form" role="group" aria-label="Theme" x-data="theme" @submit="choose" class="flex items-center">{% csrf_token %}
+<button type="submit" name="theme" value="light" title="Light" aria-pressed="{% if theme == "light" %}true{% else %}false{% endif %}" class="group inline-flex size-11 shrink-0 items-center justify-center focus-visible:outline-none focus-visible:shadow-none md:pointer-fine:size-7"><span class="flex size-7 items-center justify-center rounded-control border border-border text-icon group-hover:bg-surface-sunken group-hover:text-fg group-aria-pressed:bg-accent-soft group-aria-pressed:text-accent-text group-focus-visible:outline-2 group-focus-visible:outline-offset-2 group-focus-visible:outline-focus group-focus-visible:shadow-[0_0_0_4px_var(--focus-halo)] md:pointer-fine:rounded-r-none motion-safe:transition-colors motion-safe:duration-150">{% icon "sun" class="size-4" %}</span><span class="sr-only">Light</span></button>
+<button type="submit" name="theme" value="dark" title="Dark" aria-pressed="{% if theme == "dark" %}true{% else %}false{% endif %}" class="group inline-flex size-11 shrink-0 items-center justify-center focus-visible:outline-none focus-visible:shadow-none md:pointer-fine:size-7"><span class="flex size-7 items-center justify-center rounded-control border border-border text-icon group-hover:bg-surface-sunken group-hover:text-fg group-aria-pressed:bg-accent-soft group-aria-pressed:text-accent-text group-focus-visible:outline-2 group-focus-visible:outline-offset-2 group-focus-visible:outline-focus group-focus-visible:shadow-[0_0_0_4px_var(--focus-halo)] md:pointer-fine:rounded-none md:pointer-fine:border-l-0 motion-safe:transition-colors motion-safe:duration-150">{% icon "moon" class="size-4" %}</span><span class="sr-only">Dark</span></button>
+<button type="submit" name="theme" value="system" title="System" aria-pressed="{% if theme == "system" %}true{% else %}false{% endif %}" class="group inline-flex size-11 shrink-0 items-center justify-center focus-visible:outline-none focus-visible:shadow-none md:pointer-fine:size-7"><span class="flex size-7 items-center justify-center rounded-control border border-border text-icon group-hover:bg-surface-sunken group-hover:text-fg group-aria-pressed:bg-accent-soft group-aria-pressed:text-accent-text group-focus-visible:outline-2 group-focus-visible:outline-offset-2 group-focus-visible:outline-focus group-focus-visible:shadow-[0_0_0_4px_var(--focus-halo)] md:pointer-fine:rounded-l-none md:pointer-fine:border-l-0 motion-safe:transition-colors motion-safe:duration-150">{% icon "monitor" class="size-4" %}</span><span class="sr-only">System</span></button>
+</form>
+</div>

@@ -1,0 +1,25 @@
+{% comment %}
+Breadcrumbs (06-UI-SPEC Layout Shell > Top bar > Breadcrumbs; UI-01). Included with only:
+{% include "partials/_crumbs.html" with variant="topbar" trail=trail only %}, where trail
+comes from {% breadcrumb_trail as trail %} (templatetags/crumbs.py), a list of
+Crumb(label, href) whose last item, the current page, has no href.
+
+- variant "topbar": nav[aria-label=Breadcrumb][data-testid=breadcrumbs] in the top bar
+  from md, one line; every item ellipsizes when it does not fit (a long location name
+  shows in full in the compact copy and the h1), links have a 24 px hit height.
+- variant "compact": the same items under the h1 below md
+  (data-testid=breadcrumbs-compact), wrapping at word boundaries, links 44 px tall; not
+  rendered for a one-item trail. Exactly one of the two navs shows at any width.
+
+The current item is a span with aria-current="page", never a link. Separators are CSS
+chevrons drawn by each later item's before pseudo-element, so no separator text exists
+and each item's text is exactly its label. Names are escaped (R1).
+{% endcomment %}{% if variant == "compact" %}{% if trail|length > 1 %}<nav aria-label="Breadcrumb" data-testid="breadcrumbs-compact" class="md:hidden">
+<ol class="flex flex-wrap items-center gap-x-2 text-body text-fg-subtle">
+{% for crumb in trail %}<li class="flex min-w-0 items-center gap-2 not-first:before:size-1.5 not-first:before:shrink-0 not-first:before:rotate-45 not-first:before:border-t-[1.5px] not-first:before:border-r-[1.5px] not-first:before:border-current">{% if crumb.href %}<a href="{{ crumb.href }}" class="inline-flex min-h-11 min-w-0 items-center break-words hover:text-fg hover:underline">{{ crumb.label }}</a>{% else %}<span aria-current="page" class="min-w-0 py-3 break-words text-fg">{{ crumb.label }}</span>{% endif %}</li>{% endfor %}
+</ol>
+</nav>{% endif %}{% else %}<nav aria-label="Breadcrumb" data-testid="breadcrumbs" class="hidden min-w-0 flex-1 md:block">
+<ol class="flex min-w-0 items-center gap-2 whitespace-nowrap text-body text-fg-subtle">
+{% for crumb in trail %}<li class="flex min-w-0 items-center gap-2 first:shrink-0 not-first:before:size-1.5 not-first:before:shrink-0 not-first:before:rotate-45 not-first:before:border-t-[1.5px] not-first:before:border-r-[1.5px] not-first:before:border-current">{% if crumb.href %}<a href="{{ crumb.href }}" class="block min-w-0 truncate py-0.5 hover:text-fg hover:underline">{{ crumb.label }}</a>{% else %}<span aria-current="page" class="block min-w-0 truncate text-fg">{{ crumb.label }}</span>{% endif %}</li>{% endfor %}
+</ol>
+</nav>{% endif %}

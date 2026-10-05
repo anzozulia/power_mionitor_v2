@@ -1,0 +1,47 @@
+{% load icons %}{% comment %}
+The always-dark sidebar of the app layout (06-UI-SPEC Layout Shell > Sidebar; UI-01, UI-03,
+UI-12). Included once by layouts/app.html, never by the auth or error layouts (R11).
+
+Reads sidebar (the lazy context processor of 06-02: rows, counts, current_pk, now,
+ops_configured; absent for a request without a signed-in user, and then no location group
+renders and no query runs) and request.resolver_match.url_name for the main nav's
+aria-current (None for a bare request: nothing is current).
+
+- Brand row (48 px): zap mark, wordmark, aria-hidden ops tag, link to the list; below lg
+  the drawer close button (JS only, rendered hidden) sits at the right.
+- Main nav: Locations and Add location, aria-current on the active one.
+- Locations group: label and count, then one link per location in list order, each one
+  click from its page, aria-current on the location the page is about.
+
+Layout: below lg a fixed off-canvas drawer (min(240px, 100vw - 56px)), shown while html
+carries data-drawer=open (set by the sidebar component in admin.js), invisible otherwise so
+its links are never tabbable while closed; from lg a sticky full-height 240 px column; at
+xl a 56 px rail while html carries data-rail=collapsed (labels visually hidden, still in
+the DOM). The list scrolls inside the sidebar, never the page. Every class is spelled out:
+no class name is ever built from data.
+{% endcomment %}<aside id="sidebar" data-testid="sidebar" class="invisible fixed inset-y-0 left-0 z-40 flex w-[min(240px,100vw_-_56px)] -translate-x-full flex-col border-r border-sb-border bg-sb-bg text-body text-sb-fg [--focus:var(--sb-focus)] [color-scheme:dark] motion-safe:transition-[translate,visibility] motion-safe:duration-200 in-data-[drawer=open]:visible in-data-[drawer=open]:translate-x-0 in-data-[drawer=open]:shadow-modal lg:visible lg:sticky lg:top-0 lg:bottom-auto lg:z-auto lg:h-dvh lg:w-(--sb-w) lg:shrink-0 lg:translate-x-0 lg:shadow-none xl:in-data-[rail=collapsed]:w-(--sb-rail-w)">
+  <div class="flex h-12 shrink-0 items-center gap-1 border-b border-sb-border px-2">
+    <a href="{% url 'location-list' %}" class="flex min-h-11 min-w-0 flex-1 items-center gap-2 rounded-control px-2 font-semibold text-sb-fg lg:min-h-(--nav-item-h) xl:in-data-[rail=collapsed]:justify-center xl:in-data-[rail=collapsed]:px-0">{% icon "zap" class="size-5 shrink-0 text-brand" %}<span class="truncate xl:in-data-[rail=collapsed]:sr-only">Power Monitor</span><span aria-hidden="true" class="num shrink-0 rounded-control border border-sb-border px-1 text-label font-normal text-sb-fg-muted xl:in-data-[rail=collapsed]:hidden">ops</span></a>
+    <button type="button" data-testid="drawer-close" aria-controls="sidebar" aria-expanded="false" data-js-only hidden class="inline-flex size-11 shrink-0 items-center justify-center rounded-control text-sb-fg-muted hover:bg-sb-hover hover:text-sb-fg lg:hidden motion-safe:transition-colors motion-safe:duration-150">{% icon "x" class="size-5" %}<span class="sr-only">Close navigation</span></button>
+  </div>
+  <div class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-2">
+    <nav aria-label="Main">
+      <ul class="flex flex-col gap-1">
+        <li><a href="{% url 'location-list' %}" data-testid="nav-locations" title="Locations"{% if request.resolver_match.url_name == "location-list" %} aria-current="page"{% endif %} class="group flex min-h-11 items-center gap-2 rounded-control px-2 text-sb-fg hover:bg-sb-hover aria-[current=page]:bg-sb-active-bg aria-[current=page]:font-semibold aria-[current=page]:text-sb-active-fg aria-[current=page]:[box-shadow:inset_2px_0_0_var(--brand)] lg:min-h-(--nav-item-h) xl:in-data-[rail=collapsed]:justify-center motion-safe:transition-colors motion-safe:duration-150">{% icon "layout-grid" class="size-4 shrink-0 text-sb-fg-muted group-aria-[current=page]:text-current" %}<span class="truncate xl:in-data-[rail=collapsed]:sr-only">Locations</span></a></li>
+        <li><a href="{% url 'location-create' %}" data-testid="nav-add-location" title="Add location"{% if request.resolver_match.url_name == "location-create" %} aria-current="page"{% endif %} class="group flex min-h-11 items-center gap-2 rounded-control px-2 text-sb-fg hover:bg-sb-hover aria-[current=page]:bg-sb-active-bg aria-[current=page]:font-semibold aria-[current=page]:text-sb-active-fg aria-[current=page]:[box-shadow:inset_2px_0_0_var(--brand)] lg:min-h-(--nav-item-h) xl:in-data-[rail=collapsed]:justify-center motion-safe:transition-colors motion-safe:duration-150">{% icon "plus" class="size-4 shrink-0 text-sb-fg-muted group-aria-[current=page]:text-current" %}<span class="truncate xl:in-data-[rail=collapsed]:sr-only">Add location</span></a></li>
+      </ul>
+    </nav>
+    {% if sidebar %}
+    <div class="flex flex-col gap-1">
+      <p id="sidebar-group-label" class="px-2 text-label font-semibold uppercase tracking-label text-sb-fg-muted xl:in-data-[rail=collapsed]:sr-only">Locations</p>
+      <nav aria-label="Locations" data-testid="sidebar-locations">
+        <ul class="flex flex-col gap-1">
+          {% for row in sidebar.rows %}
+          <li><a href="{% url 'location-detail' row.pk %}" data-testid="sidebar-location" data-location-id="{{ row.pk }}" title="{{ row.name }}"{% if row.pk == sidebar.current_pk %} aria-current="page"{% endif %} class="group relative flex min-h-11 items-center gap-1 rounded-control px-2 text-sb-fg hover:bg-sb-hover aria-[current=page]:bg-sb-active-bg aria-[current=page]:font-semibold aria-[current=page]:text-sb-active-fg aria-[current=page]:[box-shadow:inset_2px_0_0_var(--brand)] lg:min-h-(--nav-item-h) xl:in-data-[rail=collapsed]:justify-center motion-safe:transition-colors motion-safe:duration-150"><span class="min-w-0 flex-1 truncate xl:in-data-[rail=collapsed]:sr-only">{{ row.name }}</span></a></li>
+          {% endfor %}
+        </ul>
+      </nav>
+    </div>
+    {% endif %}
+  </div>
+</aside>
