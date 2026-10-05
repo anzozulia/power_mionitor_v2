@@ -8,3 +8,5 @@ docker_data
 .claude
 staticfiles
 powermon/web/static/web/build
+.github
+deploy

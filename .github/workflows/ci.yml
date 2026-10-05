@@ -1,0 +1,107 @@
+# CI for every push to master and every pull request into master; CD to the VPS after CI
+# passes on master (README section 17). No third-party actions: only actions/checkout,
+# pinned by commit SHA. Values reach run: scripts only through env:, never through
+# expressions inside a script.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A newer push to a pull request cancels its older run. Every other run has its own
+  # group, so a master run is never cancelled.
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Lint, types, tests, coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Write the env files from .env.example
+        # The test stack's local settings, and a production file that only lets the
+        # compose check below resolve env_file. Both hold the example values, no secret.
+        run: |
+          set -euo pipefail
+          sed -e 's/^APP_ENV=.*/APP_ENV=local/' -e 's/^DEBUG=.*/DEBUG=0/' .env.example > .env.docker_local
+          cp .env.example .env.docker_production
+
+      - name: Check the VPS compose files
+        run: docker compose -f docker-compose.prod.yml -f docker-compose.vps.yml config --quiet
+
+      - name: Smoke-test the deploy tooling
+        # deploy/ is not in the image (.dockerignore), so the gate below cannot see it.
+        run: |
+          set -euo pipefail
+          bash -n deploy/powermon-deploy
+          ms="$RUNNER_TEMP/make-secrets"
+          mkdir -p "$ms"
+          cp .env.example "$ms/"
+          python3 deploy/make-secrets.py --repo "$ms"
+          python3 deploy/make-secrets.py --check --repo "$ms"
+          if python3 deploy/make-secrets.py --repo "$ms"; then
+            echo "make-secrets.py overwrote an existing env file" >&2
+            exit 1
+          fi
+
+      - name: Lint, types, tests and coverage (the project gate)
+        env:
+          COMPOSE_FILE: docker-compose.local.yml:docker-compose.ci.yml
+          COMPOSE_PROJECT_NAME: powermon-ci
+        run: |
+          docker compose run --build --rm -T web sh -c "ruff check . && ruff format --check . && mypy powermon && pytest -q --cov=powermon --cov-report=term-missing:skip-covered && coverage report --include='powermon/engine/*,powermon/alerts/*,powermon/i18n/*,powermon/telegram/*,powermon/chart/*,powermon/worker/detection.py,powermon/worker/io_loop.py,powermon/worker/lease.py,powermon/worker/supervision.py,powermon/web/*.py,powermon/web/templatetags/*.py' --omit='powermon/web/gunicorn_conf.py' --fail-under=80"
+
+      - name: db and migrate logs
+        if: failure()
+        env:
+          COMPOSE_FILE: docker-compose.local.yml:docker-compose.ci.yml
+          COMPOSE_PROJECT_NAME: powermon-ci
+        run: docker compose logs --no-color db migrate
+
+  deploy:
+    name: Deploy to production
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions: {}
+    environment:
+      name: production
+      url: https://powermonitor.anzozulia.com
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      # No checkout: the server builds from its own clone. The key can only run
+      # /usr/local/sbin/powermon-deploy (forced command), which deploys this commit.
+      - name: Deploy this commit over SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          umask 077
+          key="$RUNNER_TEMP/deploy_key"
+          known_hosts="$RUNNER_TEMP/deploy_known_hosts"
+          trap 'rm -f "$key" "$known_hosts"' EXIT
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$known_hosts"
+          ssh -F /dev/null -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts" \
+            -o ConnectTimeout=20 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
+            "root@$DEPLOY_HOST" "deploy $DEPLOY_SHA"

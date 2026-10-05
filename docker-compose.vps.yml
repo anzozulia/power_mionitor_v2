@@ -1,0 +1,25 @@
+# Override for the shared Hetzner VPS behind powermonitor.anzozulia.com (README section 17).
+# Always used together with the production file, from /root/powermonitor:
+#   docker compose -f docker-compose.prod.yml -f docker-compose.vps.yml <command>
+# The host's nginx already owns ports 80/443 and terminates TLS for every site on this
+# server (deploy/nginx/powermonitor.anzozulia.com.conf). So the bundled caddy never starts
+# here (bundled-proxy profile), and web publishes one loopback-only port for nginx. This is
+# the one deviation from SEC-02; the README records it. Memory caps keep the stack inside
+# its share of the 4 GB host. Plain YAML, no !override tags: ports and mem_limit add to the
+# production file, and the profile is new. tests/test_compose.py checks this file.
+services:
+  caddy:
+    profiles: ["bundled-proxy"]
+    mem_limit: 128m
+  web:
+    ports:
+      - "127.0.0.1:8091:8000"
+    mem_limit: 512m
+  worker:
+    mem_limit: 384m
+  db:
+    mem_limit: 512m
+  migrate:
+    mem_limit: 384m
+  backup:
+    mem_limit: 256m
