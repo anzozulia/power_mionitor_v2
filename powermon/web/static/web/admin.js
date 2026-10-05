@@ -70,6 +70,11 @@
     }
   }
 
+  // The element matching selector at or above the event's target, or null.
+  function closestTo(event, selector) {
+    return event.target instanceof Element ? event.target.closest(selector) : null;
+  }
+
   // Relative times (UI-11): a port of powermon/web/templatetags/timefmt.py. The age is the
   // difference of two instants, floored to the unit of its range; under 1 s or in the future
   // it is "just now". "now" is the client clock corrected by the server's own instant (the
@@ -561,8 +566,7 @@
             }
             // Following a link closes the drawer; the navigation takes the focus.
             aside.addEventListener("click", function (event) {
-              var link = event.target instanceof Element ? event.target.closest("a[href]") : null;
-              if (open && link) {
+              if (open && closestTo(event, "a[href]")) {
                 setOpen(false, false);
               }
             });
@@ -693,7 +697,8 @@
         } else if (changed) {
           chip = "changed";
         }
-        document.querySelectorAll('[data-testid="live-chip"] [data-chip]').forEach(function (element) {
+        var chips = document.querySelectorAll('[data-testid="live-chip"] [data-chip]');
+        chips.forEach(function (element) {
           element.hidden = element.getAttribute("data-chip") !== chip;
         });
       }
@@ -756,7 +761,8 @@
       }
 
       function updateSidebar(locations, now) {
-        document.querySelectorAll('a[data-testid="sidebar-location"][data-location-id]').forEach(function (link) {
+        var rows = 'a[data-testid="sidebar-location"][data-location-id]';
+        document.querySelectorAll(rows).forEach(function (link) {
           var entry = own(locations, link.getAttribute("data-location-id"));
           if (!entry) {
             return;
@@ -789,12 +795,13 @@
         var failing = number(counts.failing);
         if (on !== null && off !== null && failing !== null) {
           var dot = " \u00b7 ";
+          var failingShort = failing > 0 ? dot + failing + " fail" : "";
+          var failingWords = failing > 0 ? ", " + failing + " with delivery failing" : "";
           document.querySelectorAll('[data-live="summary"]').forEach(function (element) {
-            element.textContent = on + " on" + dot + off + " off" + (failing > 0 ? dot + failing + " fail" : "");
+            element.textContent = on + " on" + dot + off + " off" + failingShort;
           });
           document.querySelectorAll('[data-live="summary-sr"]').forEach(function (element) {
-            element.textContent =
-              on + " on, " + off + " off" + (failing > 0 ? ", " + failing + " with delivery failing" : "");
+            element.textContent = on + " on, " + off + " off" + failingWords;
           });
         }
         main.querySelectorAll('[data-live="count"]').forEach(function (element) {
@@ -893,9 +900,8 @@
         schedule(POLL_INTERVAL_MS);
         apply(payload);
         showState();
-        window.dispatchEvent(
-          new CustomEvent("pm:status", { detail: { generatedAt: payload.generated_at, page: page } })
-        );
+        var detail = { generatedAt: payload.generated_at, page: page };
+        window.dispatchEvent(new CustomEvent("pm:status", { detail: detail }));
       }
 
       function failed() {
@@ -973,16 +979,18 @@
           }
           snapshot();
           var reloadUrl = main.dataset.reloadUrl;
-          document.querySelectorAll('[data-testid="live-status"], [data-testid="live-chip"]').forEach(reveal);
+          var liveSlots = '[data-testid="live-status"], [data-testid="live-chip"]';
+          document.querySelectorAll(liveSlots).forEach(reveal);
           if (reloadUrl && sameOrigin(reloadUrl)) {
-            document
-              .querySelectorAll('[data-testid="live-chip"] [data-chip="paused-reload"], [data-testid="live-chip"] [data-chip="changed"]')
-              .forEach(function (chip) {
-                var link = chip.matches("a") ? chip : chip.querySelector("a");
-                if (link) {
-                  link.setAttribute("href", reloadUrl);
-                }
-              });
+            var reloadChips =
+              '[data-testid="live-chip"] [data-chip="paused-reload"],' +
+              ' [data-testid="live-chip"] [data-chip="changed"]';
+            document.querySelectorAll(reloadChips).forEach(function (chip) {
+              var link = chip.matches("a") ? chip : chip.querySelector("a");
+              if (link) {
+                link.setAttribute("href", reloadUrl);
+              }
+            });
           }
           // Step 5 of the setup page: the waiting line is JS only (it promises an update).
           document.querySelectorAll('[data-live="first-heartbeat"]').forEach(function (step) {
@@ -1137,7 +1145,13 @@
     // copy holds no key; when such a copy is shown again (pageshow with persisted) it
     // replaces it with the masked setup page.
     window.Alpine.data("revealGuard", function () {
-      var REVEALED_IDS = ["device-key", "example-curl", "example-cron", "example-wget-gnu", "example-wget-busybox"];
+      var REVEALED_IDS = [
+        "device-key",
+        "example-curl",
+        "example-cron",
+        "example-wget-gnu",
+        "example-wget-busybox",
+      ];
       return {
         init: function () {
           var maskedUrl = this.$el.dataset.maskedUrl;
@@ -1202,7 +1216,7 @@
           var nav = this.$el;
           var reduced = window.matchMedia("(prefers-reduced-motion: reduce)");
           nav.addEventListener("click", function (event) {
-            var link = event.target instanceof Element ? event.target.closest('a[href^="#"]') : null;
+            var link = closestTo(event, 'a[href^="#"]');
             if (!link || !nav.contains(link) || event.button !== 0) {
               return;
             }
@@ -1218,7 +1232,10 @@
             if (!target.hasAttribute("tabindex")) {
               target.setAttribute("tabindex", "-1");
             }
-            target.scrollIntoView({ behavior: reduced.matches ? "auto" : "smooth", block: "start" });
+            target.scrollIntoView({
+              behavior: reduced.matches ? "auto" : "smooth",
+              block: "start",
+            });
             target.focus({ preventScroll: true });
           });
         },
@@ -1363,7 +1380,7 @@
             if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
               return;
             }
-            var link = event.target instanceof Element ? event.target.closest("a[data-confirm]") : null;
+            var link = closestTo(event, "a[data-confirm]");
             if (!link || dialog.contains(link) || !link.href || !sameOrigin(link.href)) {
               return;
             }
@@ -1378,7 +1395,7 @@
             closeButton.addEventListener("click", close);
           }
           dialog.addEventListener("click", function (event) {
-            var keep = event.target instanceof Element ? event.target.closest('[data-testid="keep"]') : null;
+            var keep = closestTo(event, '[data-testid="keep"]');
             if (keep && dialog.contains(keep)) {
               event.preventDefault();
               close();
@@ -1468,7 +1485,8 @@
 
           var apply = function () {
             chips.forEach(function (chip) {
-              chip.setAttribute("aria-pressed", chip.getAttribute("data-filter") === active ? "true" : "false");
+              var pressed = chip.getAttribute("data-filter") === active;
+              chip.setAttribute("aria-pressed", pressed ? "true" : "false");
             });
             var rows = root.querySelectorAll('tr[data-testid="location-row"]');
             var cards = root.querySelectorAll("li[data-status][data-delivery]");
@@ -1510,9 +1528,8 @@
           chips.forEach(reveal);
           reveal(bar);
           root.addEventListener("click", function (event) {
-            var target = event.target instanceof Element ? event.target : null;
-            var chip = target ? target.closest('button[data-testid="filter-chip"][data-filter]') : null;
-            var reset = target ? target.closest("[data-filter-reset]") : null;
+            var chip = closestTo(event, 'button[data-testid="filter-chip"][data-filter]');
+            var reset = closestTo(event, "[data-filter-reset]");
             if (chip && root.contains(chip)) {
               press(chip.getAttribute("data-filter"));
             } else if (reset && root.contains(reset)) {
@@ -1645,7 +1662,8 @@
               return;
             }
             var rest = left % 60;
-            output.textContent = "(" + Math.floor(left / 60) + ":" + (rest < 10 ? "0" : "") + rest + " left)";
+            var clock = Math.floor(left / 60) + ":" + (rest < 10 ? "0" : "") + rest;
+            output.textContent = "(" + clock + " left)";
           };
           button.setAttribute("aria-disabled", "true");
           reveal(output);
