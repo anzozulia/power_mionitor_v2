@@ -18,20 +18,25 @@ survives. The edit form is posted as the browser would post the page it loaded
 ``FakeClock`` by constructor injection through ``RequestFactory`` (``_save``). The chart
 helpers (``_monitor``, the detection cursor in ``_pass``, ``_chart_steps``) are copied from
 tests/chart, not imported: tests have no ``__init__.py``.
+
+The edit page is S6 of the 06-UI-SPEC (UI-01, UI-12, R3, R16): the app layout, the add
+form's three sections with the stored values, the write-only "New bot token" whose help
+shows only the mask in ``masked-token``, and the old Note callout split by topic
+(amendment A6): ``edit-intro`` in the meta line, ``edit-note-monitoring`` and
+``edit-note-telegram`` as info alerts. Its tests read the page only through
+tests/web/pages.py and the S6 hooks; the Python copy (form errors, help, flashes) is
+imported, and the template-owned copy is pinned against the 06-UI-SPEC copy table (form.*).
 """
 
-# class-guard: pending migration
-
 import dataclasses
-import re
 import threading
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
-from html import unescape
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
+from bs4 import Tag
 from conftest import (
     DEFAULT_BOT_TOKEN,
     DEFAULT_CHAT_ID,
@@ -49,7 +54,23 @@ from django.db.models import F, Value
 from django.db.models.functions import Greatest
 from django.http import HttpResponse
 from django.test import Client, RequestFactory
-from pages import message_texts
+from pages import (
+    all_by_testid,
+    assert_no_injected_script,
+    assert_no_secrets,
+    assert_page,
+    breadcrumbs,
+    by_testid,
+    field,
+    field_error,
+    form_values,
+    h1,
+    message_texts,
+    parse,
+    section,
+    text,
+    title,
+)
 
 from powermon.alerts import outbox
 from powermon.alerts.models import OutboxMessage
@@ -60,39 +81,49 @@ from powermon.engine.models import LocationState, PowerInterval, SystemState
 from powermon.i18n import chart_texts
 from powermon.locations import actions
 from powermon.locations.models import Location
-from powermon.locations.validators import TOKEN_FORMAT
+from powermon.locations.validators import CHAT_ID_EMPTY, TOKEN_FORMAT
 from powermon.web import location_views
-from powermon.web.location_views import LocationEditView
+from powermon.web.forms import (
+    EDIT_FORM_ERROR,
+    GRACE_TOO_SHORT,
+    HELP_NEW_BOT_TOKEN,
+    NAME_EMPTY,
+    NAME_TOO_LONG,
+    NEW_TOKEN_LABEL,
+    PERIOD_TOO_SHORT,
+    SECONDS_TOO_LONG,
+    TOKEN_REPASTE_NOTE,
+)
+from powermon.web.location_views import (
+    CHANGES_SAVED_MESSAGE,
+    CHANNEL_CHANGED_MESSAGE,
+    LocationEditView,
+)
 from powermon.worker import detection, io_loop
 
 User = get_user_model()
 
 KYIV = "Europe/Kyiv"
-CHANGES_SAVED = "Changes saved."
-CHANNEL_CHANGED = (
-    "Changes saved. The weekly chart is posted again with the new bot or chat. The old one is "
-    "unpinned if this location's bot is an admin of the old channel."
+CHANGES_SAVED = CHANGES_SAVED_MESSAGE
+CHANNEL_CHANGED = CHANNEL_CHANGED_MESSAGE
+# Template-owned copy (06-UI-SPEC copy table, form.*; the A6 split of the old Note callout).
+EDIT_TITLE = "{} · Edit"
+EDIT_H1 = "Edit location"
+EDIT_INTRO = "Maintenance, alerts and router grace are switched on the location page."
+EDIT_NOTE_MONITORING = (
+    "New period and grace values apply from the next check and never change past history. "
+    "Lower values can report OFF at the next check if the device has already been silent "
+    "that long."
 )
-FORM_ERROR = "The changes were not saved. Fix the fields marked below."
-REPASTE_NOTE = "Paste the token again: it is never sent back to the browser."
-PERIOD_TOO_SHORT = "The heartbeat period must be at least 10 seconds."
-GRACE_TOO_SHORT = "The grace period must be at least 10 seconds."
-SECONDS_TOO_LONG = "Use at most 3600 seconds (1 hour)."
-NAME_EMPTY = "Enter a name."
-NAME_TOO_LONG = "Use at most 100 characters."
-CHAT_ID_EMPTY = "Enter the channel's numeric chat ID."
-TOKEN_HELP = (
-    "Leave this empty to keep the current token, <code>{masked}</code>. To use another bot, "
-    "paste its token from @BotFather. The token is saved but never shown again."
+EDIT_NOTE_TELEGRAM = (
+    "A new chat ID or bot token moves the weekly chart: a new one is posted and pinned, and "
+    "the old one is unpinned if this location's bot is an admin of the old channel. "
+    "Otherwise the old pin stays: unpin it by hand in Telegram."
 )
-EDIT_NOTE = (
-    "<strong>Note:</strong> New period and grace values apply from the next check and never "
-    "change past history. Lower values can report OFF at the next check if the device has "
-    "already been silent that long. A new chat ID or bot token moves the weekly chart: a new "
-    "one is posted and pinned, and the old one is unpinned if this location's bot is an admin "
-    "of the old channel. Otherwise the old pin stays: unpin it by hand in Telegram. "
-    "Maintenance, alerts and router grace are switched on the location page."
-)
+OFF_AFTER = "Reported OFF after {} s without a heartbeat."
+SAVE = "Save changes"
+DISCARD = "Discard changes"
+SECTIONS = ["basics", "monitoring", "telegram"]
 CHAT_B = -1009876543210
 SECRET = "Sx_9-Qw7Lm" * 4
 TOKEN = f"987654321:{SECRET}"
@@ -129,27 +160,16 @@ def _anchors(resumed: datetime) -> None:
     )
 
 
-def _loaded_form(page: str) -> dict[str, str]:
-    """What the edit page's form posts as loaded: every input's value and the selected language.
+def _loaded_form(page: Any) -> dict[str, str]:
+    """What the edit page's form posts as loaded: every control's value, the language too.
 
     The CSRF token is left out (the test client does not enforce it). An input without a
-    value attribute posts "".
+    value attribute posts "". The language select has exactly one selected option.
     """
-    form = page[page.index('<form class="form"') :]
-    form = form[: form.index("</form>")]
-    values: dict[str, str] = {}
-    for tag in re.findall(r"<input\b[^>]*>", form):
-        name = re.search(r'\bname="([^"]*)"', tag)
-        if name is None or name.group(1) == "csrfmiddlewaretoken":
-            continue
-        value = re.search(r'\bvalue="([^"]*)"', tag)
-        values[name.group(1)] = unescape(value.group(1)) if value else ""
-    select = re.search(r'<select name="language"[^>]*>(.*?)</select>', form, re.S)
-    assert select is not None, "no language select"
-    selected = re.findall(r'<option value="([^"]*)" selected>', select.group(1))
-    assert len(selected) == 1
-    values["language"] = selected[0]
-    return values
+    soup = page if isinstance(page, Tag) else parse(page)
+    options = field(by_testid(soup, "location-form"), "language").find_all("option")
+    assert len([option for option in options if option.has_attr("selected")]) == 1
+    return form_values(soup, "location-form")
 
 
 def _flashes(admin: Client, url: str) -> list[str]:
@@ -202,27 +222,28 @@ def _held_alert(location: Any, recorded_at: datetime, held_until: datetime) -> O
     return row
 
 
-def _input(page: str, name: str) -> str:
-    """The rendered ``<input>`` tag whose name attribute is ``name``."""
-    match = re.search(rf'<input\b[^>]*\bname="{name}"[^>]*>', page)
-    assert match is not None, f"no input named {name!r}"
-    return match.group(0)
+def _refused(response: Any) -> Tag:
+    """An invalid edit POST's answer: 200 with S6 and the error summary as its only alert.
+
+    The title keeps the stored name, whatever was posted.
+    """
+    page = assert_page(response, app=True)
+    summary = by_testid(page, "error-summary")
+    assert text(summary).startswith(f"Error: {EDIT_FORM_ERROR}")
+    alerts = (text(element) for element in page.find_all(attrs={"role": "alert"}))
+    assert [found for found in alerts if found] == [text(summary)]
+    return page
 
 
-def _field_error(page: str, field: str) -> str | None:
-    match = re.search(rf'<p class="error" id="id_{field}_error">(.*?)</p>', page, re.S)
-    return unescape(match.group(1)) if match else None
-
-
-def _help(page: str, field: str) -> str:
-    """The inner HTML of the field's help paragraph."""
-    match = re.search(rf'<p class="help" id="id_{field}_helptext">(.*?)</p>', page, re.S)
-    assert match is not None, f"no help for {field!r}"
-    return match.group(1)
-
-
-def _alerts(page: str) -> list[str]:
-    return [unescape(t.strip()) for t in re.findall(r'role="alert"[^>]*>([^<]*)<', page)]
+def _token_help(page: Tag, masked: str) -> None:
+    """The token help is HELP_NEW_BOT_TOKEN with ``masked`` alone in ``masked-token``."""
+    help_text = section(page, "id_bot_token_helptext")
+    assert text(help_text) == text(parse(HELP_NEW_BOT_TOKEN.format(masked=masked)))
+    mask = by_testid(page, "masked-token")
+    assert mask.name == "code"
+    assert text(mask) == masked
+    # The mask sits inside the help the token input is described by.
+    assert by_testid(help_text, "masked-token") is mask
 
 
 def _intervals(location: Any) -> list[tuple[str, datetime, datetime | None, datetime | None]]:
@@ -463,18 +484,19 @@ def test_edit_token_is_write_only(
     admin: Client, location_factory: Callable[..., Any], fake_telegram: FakeTelegram
 ) -> None:
     location = location_factory(name="Office", bot_token=TOKEN)
-    pages: list[str] = []
+    bodies: list[str] = []
     redirects: list[str] = []
 
-    page = admin.get(_edit(location)).content.decode()
-    pages.append(page)
-    tag = _input(page, "bot_token")
-    assert 'type="password"' in tag
-    assert "value=" not in tag
-    assert 'autocomplete="off"' in tag
-    assert 'spellcheck="false"' in tag
-    assert '<label for="id_bot_token">New bot token</label>' in page
-    assert _help(page, "bot_token") == TOKEN_HELP.format(masked=MASKED_TOKEN)
+    response = admin.get(_edit(location))
+    page = assert_page(response, app=True, title=EDIT_TITLE.format("Office"))
+    bodies.append(response.content.decode())
+    tag = field(page, "bot_token")
+    assert tag.get("type") == "password"
+    assert not tag.has_attr("value")
+    assert (tag.get("autocomplete"), tag.get("spellcheck")) == ("off", "false")
+    labels = page.find_all("label", attrs={"for": "id_bot_token"})
+    assert [text(label) for label in labels] == [NEW_TOKEN_LABEL]
+    _token_help(page, MASKED_TOKEN)
     loaded = _loaded_form(page)
     assert loaded["bot_token"] == ""
 
@@ -483,13 +505,15 @@ def test_edit_token_is_write_only(
     assert kept.status_code == 302
     redirects.append(kept.url)
     assert Location.objects.get(pk=location.pk).bot_token == TOKEN
-    pages.append(admin.get(kept.url).content.decode())
+    bodies.append(admin.get(kept.url).content.decode())
 
     # An invalid submit with a new token typed: the input is empty again, nothing saved.
     invalid = admin.post(_edit(location), {**loaded, "bot_token": NEW_TOKEN, "period_s": "9"})
-    assert invalid.status_code == 200
-    pages.append(invalid.content.decode())
-    assert "value=" not in _input(invalid.content.decode(), "bot_token")
+    invalid_page = _refused(invalid)
+    bodies.append(invalid.content.decode())
+    assert not field(invalid_page, "bot_token").has_attr("value")
+    # The help still shows only the stored token's mask, never the typed one's.
+    _token_help(invalid_page, MASKED_TOKEN)
     assert Location.objects.get(pk=location.pk).bot_token == TOKEN
 
     # A new valid token replaces the current one, and only its mask is ever shown.
@@ -497,15 +521,15 @@ def test_edit_token_is_write_only(
     assert replaced.status_code == 302
     redirects.append(replaced.url)
     assert Location.objects.get(pk=location.pk).bot_token == NEW_TOKEN
-    pages.append(admin.get(replaced.url).content.decode())
-    again = admin.get(_edit(location)).content.decode()
-    pages.append(again)
-    assert _help(again, "bot_token") == TOKEN_HELP.format(masked=NEW_MASKED_TOKEN)
-    assert "value=" not in _input(again, "bot_token")
+    bodies.append(admin.get(replaced.url).content.decode())
+    again = admin.get(_edit(location))
+    bodies.append(again.content.decode())
+    again_page = assert_page(again, app=True, title=EDIT_TITLE.format("Office"))
+    _token_help(again_page, NEW_MASKED_TOKEN)
+    assert not field(again_page, "bot_token").has_attr("value")
 
-    for html in pages:
-        for secret in (TOKEN, SECRET, NEW_TOKEN, NEW_SECRET):
-            assert secret not in html
+    for number, html in enumerate(bodies):
+        assert_no_secrets(html, (TOKEN, SECRET, NEW_TOKEN, NEW_SECRET), label=f"body {number}")
     for url in redirects:
         assert SECRET not in url
         assert NEW_SECRET not in url
@@ -521,31 +545,34 @@ def test_edit_invalid_token_shows_the_repaste_note_only_when_typed(
 
     # A typed token that is not a token: its field error, an empty input and the note.
     typed = admin.post(_edit(location), {**loaded, "bot_token": "not-a-token"})
-    assert typed.status_code == 200
-    page = typed.content.decode()
-    assert _alerts(page) == [FORM_ERROR]
-    assert _field_error(page, "bot_token") == TOKEN_FORMAT
-    tag = _input(page, "bot_token")
-    assert "value=" not in tag
-    assert f'<p class="help" id="id_bot_token_note">{REPASTE_NOTE}</p>' in page
-    assert "id_bot_token_note" in tag
-    assert "not-a-token" not in page
+    page = _refused(typed)
+    assert field_error(page, "bot_token") == TOKEN_FORMAT
+    tag = field(page, "bot_token")
+    assert not tag.has_attr("value")
+    assert text(section(page, "id_bot_token_note")) == TOKEN_REPASTE_NOTE
+    assert "id_bot_token_note" in str(tag.get("aria-describedby")).split()
+    assert "not-a-token" not in typed.content.decode()
     assert Location.objects.get(pk=location.pk).bot_token == TOKEN
 
-    # An invalid period with no token typed (or only spaces): no note to re-paste.
+    # An invalid period with no token typed (or only spaces): no note to re-paste, and the
+    # visible note follows the form's show_token_note just as aria-describedby does.
     for blank in ("", "   "):
         untyped = admin.post(_edit(location), {**loaded, "bot_token": blank, "period_s": "9"})
-        assert untyped.status_code == 200
-        page = untyped.content.decode()
-        assert _alerts(page) == [FORM_ERROR]
-        assert _field_error(page, "period_s") == PERIOD_TOO_SHORT
-        assert _field_error(page, "bot_token") is None
-        assert REPASTE_NOTE not in page
-        assert "id_bot_token_note" not in _input(page, "bot_token")
+        page = _refused(untyped)
+        assert field_error(page, "period_s") == PERIOD_TOO_SHORT
+        assert field_error(page, "bot_token") is None
+        assert page.find_all(id="id_bot_token_note") == []
+        assert TOKEN_REPASTE_NOTE not in text(page)
+        described = str(field(page, "bot_token").get("aria-describedby")).split()
+        assert "id_bot_token_note" not in described
         # E5 error: every value is kept except the token.
-        assert 'value="Office"' in _input(page, "name")
-        assert 'value="9"' in _input(page, "period_s")
-        assert f'value="{DEFAULT_CHAT_ID}"' in _input(page, "chat_id")
+        values = _loaded_form(page)
+        assert (values["name"], values["period_s"], values["chat_id"]) == (
+            "Office",
+            "9",
+            str(DEFAULT_CHAT_ID),
+        )
+        assert values["bot_token"] == ""
     assert Location.objects.get(pk=location.pk).period_s == 60
 
 
@@ -554,7 +581,7 @@ def test_edit_invalid_token_shows_the_repaste_note_only_when_typed(
 
 @pytest.mark.django_db
 @pytest.mark.parametrize(
-    ("field", "value", "message"),
+    ("field_name", "value", "message"),
     [
         ("period_s", "9", PERIOD_TOO_SHORT),
         ("grace_s", "9", GRACE_TOO_SHORT),
@@ -566,18 +593,19 @@ def test_K6_edit_rejects_short_period_and_grace(
     admin: Client,
     location_factory: Callable[..., Any],
     fake_telegram: FakeTelegram,
-    field: str,
+    field_name: str,
     value: str,
     message: str,
 ) -> None:
     location = location_factory(name="Office", period_s=60, grace_s=30)
 
-    response = admin.post(_edit(location), _form(location, name="Renamed", **{field: value}))
+    response = admin.post(_edit(location), _form(location, name="Renamed", **{field_name: value}))
 
-    assert response.status_code == 200
-    page = response.content.decode()
-    assert _alerts(page) == [FORM_ERROR]
-    assert _field_error(page, field) == message
+    page = _refused(response)
+    assert field_error(page, field_name) == message
+    # The title and the crumbs keep the stored name, not the posted one.
+    assert title(page) == f"{EDIT_TITLE.format('Office')} · Power Monitor"
+    assert breadcrumbs(page)[1][0] == "Office"
     saved = Location.objects.get(pk=location.pk)
     assert (saved.name, saved.period_s, saved.grace_s) == ("Office", 60, 30)
     assert len(fake_telegram.calls) == 0
@@ -588,20 +616,22 @@ def test_edit_rejects_blank_fields_and_a_long_name(
     admin: Client, location_factory: Callable[..., Any]
 ) -> None:
     location = location_factory(name="Office")
-    page = admin.get(_edit(location)).content.decode()
-    assert 'maxlength="100"' in _input(page, "name")
-    assert "autofocus" in _input(page, "name")
+    name = field(parse(admin.get(_edit(location))), "name")
+    assert name.get("maxlength") == "100"
+    assert name.has_attr("autofocus")
 
     blank = admin.post(_edit(location), _form(location, name="", chat_id=""))
-    page = blank.content.decode()
-    assert blank.status_code == 200
-    assert _field_error(page, "name") == NAME_EMPTY
-    assert _field_error(page, "chat_id") == CHAT_ID_EMPTY
-    assert "This field is required." not in page
+    page = _refused(blank)
+    assert field_error(page, "name") == NAME_EMPTY
+    assert field_error(page, "chat_id") == CHAT_ID_EMPTY
+    assert "This field is required." not in blank.content.decode()
 
     long = admin.post(_edit(location), _form(location, name="x" * 101))
-    assert long.status_code == 200
-    assert _field_error(long.content.decode(), "name") == NAME_TOO_LONG
+    page = _refused(long)
+    assert field_error(page, "name") == NAME_TOO_LONG
+    # Long-text: the h1 stays the fixed "Edit location"; the stored name stays in the title.
+    assert text(h1(page)) == EDIT_H1
+    assert title(page) == f"{EDIT_TITLE.format('Office')} · Power Monitor"
     assert Location.objects.get(pk=location.pk).name == "Office"
 
 
@@ -880,16 +910,21 @@ def test_edit_escapes_the_name_and_has_no_script(
     admin: Client, location_factory: Callable[..., Any]
 ) -> None:
     location = location_factory(name=XSS_NAME)
+    detail = f"/locations/{location.pk}/"
 
-    page = admin.get(_edit(location)).content.decode()
-    invalid = admin.post(_edit(location), _form(location, period_s="9")).content.decode()
+    shown = admin.get(_edit(location))
+    invalid = admin.post(_edit(location), _form(location, period_s="9"))
 
-    for html in (page, invalid):
-        assert f"<title>{ESCAPED_XSS_NAME} · Edit · Power Monitor</title>" in html
-        assert f'<a class="name" href="/locations/{location.pk}/">{ESCAPED_XSS_NAME}</a>' in html
-        assert f'value="{ESCAPED_XSS_NAME}"' in _input(html, "name")
-        assert "<script" not in html
-    assert "<h1>Edit location</h1>" in page
+    for response in (shown, invalid):
+        # The page invariants include "no injected script" (the name is that payload).
+        page = assert_page(response, status=200, app=True, title=EDIT_TITLE.format(XSS_NAME))
+        html = response.content.decode()
+        assert XSS_NAME not in html
+        assert ESCAPED_XSS_NAME in html
+        assert_no_injected_script(html, "edit page")
+        assert breadcrumbs(page)[1] == (XSS_NAME, detail)
+        assert field(page, "name").get("value") == XSS_NAME
+        assert text(h1(page)) == EDIT_H1
 
 
 @pytest.mark.django_db
@@ -898,17 +933,20 @@ def test_edit_page_layout(admin: Client, location_factory: Callable[..., Any]) -
     location = location_factory(name=name, language="ru")
     detail = f"/locations/{location.pk}/"
 
-    page = admin.get(_edit(location)).content.decode()
+    page = assert_page(admin.get(_edit(location)), app=True, title=EDIT_TITLE.format(name))
 
-    # Long-text: the 100-character name is whole in the title and the breadcrumbs.
-    assert f"<title>{name} · Edit · Power Monitor</title>" in page
-    trail = re.search(r'<ol class="crumbs">(.*?)</ol>', page, re.S)
-    assert trail is not None
-    assert re.findall(r"<li\b([^>]*)>(.*?)</li>", trail.group(1), re.S) == [
-        ("", '<a href="/">Locations</a>'),
-        ("", f'<a class="name" href="{detail}">{name}</a>'),
-        (' aria-current="page"', "Edit"),
+    # Long-text: the 100-character name is whole in the title, both crumb trails and the
+    # sidebar's current row; the h1 is the fixed "Edit location".
+    trail = [("Locations", "/"), (name, detail), ("Edit", None)]
+    assert breadcrumbs(page) == trail
+    assert breadcrumbs(page, "breadcrumbs-compact") == trail
+    assert text(h1(page)) == EDIT_H1
+    current = [
+        link
+        for link in all_by_testid(page, "sidebar-location")
+        if link.get("aria-current") == "page"
     ]
+    assert [link.get("title") for link in current] == [name]
     # The stored values are the initial values; the only hidden field is CSRF's.
     assert _loaded_form(page) == {
         "name": name,
@@ -918,10 +956,112 @@ def test_edit_page_layout(admin: Client, location_factory: Callable[..., Any]) -
         "chat_id": str(DEFAULT_CHAT_ID),
         "language": "ru",
     }
-    form = page[page.index('<form class="form"') :]
-    form = form[: form.index("</form>")]
-    assert re.findall(r'<input type="hidden" name="([^"]*)"', form) == ["csrfmiddlewaretoken"]
-    assert f'<p class="callout">{EDIT_NOTE}</p>' in form
-    assert '<button class="btn btn--primary" type="submit">Save changes</button>' in form
-    assert f'<a class="btn btn--secondary" href="{detail}">Discard changes</a>' in form
-    assert "btn--danger" not in page
+    form = by_testid(page, "location-form")
+    hidden = [
+        found.get("name") for found in form.find_all("input") if found.get("type") == "hidden"
+    ]
+    assert hidden == ["csrfmiddlewaretoken"]
+    # No destructive control on the edit page: switches and deletion live elsewhere.
+    assert page.select('[data-variant="danger"], [data-variant="outline-danger"]') == []
+    assert form.find_all(attrs={"role": "switch"}) == []
+
+
+def _shown(element: Tag) -> str:
+    """The element's text without its ``hidden`` parts: what shows before any script runs."""
+    copy = parse(str(element))
+    while (hidden := copy.find(hidden=True)) is not None:
+        hidden.decompose()
+    return text(copy)
+
+
+@pytest.mark.django_db
+def test_UI01_edit_form_renders(admin: Client, location_factory: Callable[..., Any]) -> None:
+    location = location_factory(
+        name="Office", period_s=120, grace_s=45, language="ru", bot_token=TOKEN
+    )
+    detail = f"/locations/{location.pk}/"
+
+    # Expected (E5 populated): the app layout with the edit trail, the fixed h1, the intro
+    # in the meta line, the add form's sections with the stored values, the masked token
+    # help, the two topic notes, the hint for the stored P + G, discard then save.
+    response = admin.get(_edit(location))
+    page = assert_page(response, app=True, title=EDIT_TITLE.format("Office"))
+    assert text(h1(page)) == EDIT_H1
+    assert breadcrumbs(page) == [("Locations", "/"), ("Office", detail), ("Edit", None)]
+    intro = by_testid(page, "edit-intro")
+    assert text(intro) == EDIT_INTRO
+    assert (intro.name, intro.find_parent("header") is not None) == ("li", True)
+    form = by_testid(page, "location-form")
+    assert (form.name, form.get("method"), form.get("action")) == ("form", "post", _edit(location))
+    assert form.has_attr("novalidate")
+    sections = all_by_testid(form, "form-section")
+    assert [found.get("data-section") for found in sections] == SECTIONS
+    assert _loaded_form(page) == {
+        "name": "Office",
+        "period_s": "120",
+        "grace_s": "45",
+        "bot_token": "",
+        "chat_id": str(DEFAULT_CHAT_ID),
+        "language": "ru",
+    }
+    hidden = [
+        found.get("name") for found in form.find_all("input") if found.get("type") == "hidden"
+    ]
+    assert hidden == ["csrfmiddlewaretoken"]
+    assert all_by_testid(page, "error-summary") == []
+
+    # The write-only "New bot token": empty, its help shows only the mask (R3).
+    token = field(page, "bot_token")
+    assert (token.get("type"), token.has_attr("value")) == ("password", False)
+    _token_help(page, MASKED_TOKEN)
+    assert_no_secrets(response.content.decode(), (TOKEN, SECRET), label="edit GET")
+
+    # The hint for the stored values, and the two notes (A6) in their sections: the
+    # monitoring note after the hint, the Telegram note in the Telegram section.
+    monitoring, telegram = sections[1], sections[2]
+    assert _shown(by_testid(monitoring, "off-after-hint")) == OFF_AFTER.format(165)
+    order = monitoring.find_all(attrs={"data-testid": ["off-after-hint", "edit-note-monitoring"]})
+    assert [found["data-testid"] for found in order] == ["off-after-hint", "edit-note-monitoring"]
+    for parent, testid, copy in (
+        (monitoring, "edit-note-monitoring", EDIT_NOTE_MONITORING),
+        (telegram, "edit-note-telegram", EDIT_NOTE_TELEGRAM),
+    ):
+        note = by_testid(parent, testid)
+        assert note.get("data-tone") == "info"
+        assert not note.has_attr("role")
+        assert text(note) == copy
+
+    # The action bar: discard (secondary, back to the location page) first, save last.
+    cancel, submit = by_testid(form, "cancel"), by_testid(form, "submit")
+    assert (cancel.name, cancel.get("href"), cancel.get("data-variant"), text(cancel)) == (
+        "a",
+        detail,
+        "secondary",
+        DISCARD,
+    )
+    assert (submit.name, submit.get("type"), submit.get("data-variant"), text(submit)) == (
+        "button",
+        "submit",
+        "primary",
+        SAVE,
+    )
+    order = form.find_all(attrs={"data-testid": ["cancel", "submit"]})
+    assert [found["data-testid"] for found in order] == ["cancel", "submit"]
+    assert form.find_all("button")[-1] is submit
+
+    # After a rename the page shows the new stored name in the title and the crumbs.
+    renamed = admin.post(_edit(location), _form(location, name="Office, 2nd floor"))
+    assert renamed.status_code == 302
+    again = assert_page(
+        admin.get(_edit(location)), app=True, title=EDIT_TITLE.format("Office, 2nd floor")
+    )
+    assert breadcrumbs(again)[1] == ("Office, 2nd floor", detail)
+    assert text(h1(again)) == EDIT_H1
+
+
+@pytest.mark.django_db
+def test_UI01_edit_page_notes_only_on_the_edit_page(admin: Client) -> None:
+    # Edge: the add page shares the sections but has none of S6's notes or intro.
+    page = parse(admin.get("/locations/new/"))
+    for testid in ("edit-intro", "edit-note-monitoring", "edit-note-telegram", "masked-token"):
+        assert all_by_testid(page, testid) == [], testid

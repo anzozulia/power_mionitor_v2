@@ -1,34 +1,34 @@
-{% extends "base.html" %}
+{% extends "layouts/app.html" %}
 {% comment %}
-UI-SPEC screen 3 (D-10, D-11, D-12). novalidate: every message comes from the server in
-the contract's wording. Django links each input to its "<id>_helptext" and "<id>_error"
-elements (aria-describedby) and marks invalid inputs aria-invalid="true". The bot token
-input never carries a value; after an invalid submit it shows the re-paste note.
+S4 Add location (06-UI-SPEC Page Contracts > S4 / S6, Test hooks > S4 Add / S6 Edit; UI-01,
+UI-09, UI-12, N10, R3, R10). Context: form (LocationForm), from LocationCreateView. The
+trail Locations > Add location comes from the layout.
+
+- One card, at most 896 px wide: form[method=post][novalidate][data-testid=location-form].
+  novalidate: every message comes from the server in the contract's wording.
+- After an invalid POST: the error summary at the top of the card (title
+  LOCATION_FORM_ERROR, one jump link per invalid field; the errorSummary component focuses
+  it), the field errors, and the bot token input empty again with the re-paste note.
+- The three sections come from web/_location_fields.html, divided by 1 px rules.
+- The sticky action bar: "Back to locations" (secondary link to the list) first, then
+  "Create location" (primary submit). The submit guard marks the clicked submit busy with
+  its spinner and blocks a second submit, so one click creates one location.
+- Inputs and selects keep 64 px of room under the sticky top bar when a jump link scrolls
+  to them.
+- No script, no inline style; every class is spelled out.
 {% endcomment %}
 {% block title %}Add location{% endblock %}
-{% block content %}
-<h1>Add location</h1>
-<form class="form" method="post" action="{% url 'location-create' %}" novalidate>
+{% block page_title %}Add location{% endblock %}
+{% block content %}{% url 'location-list' as list_url %}
+<form method="post" action="{% url 'location-create' %}" novalidate data-testid="location-form" class="w-full max-w-4xl rounded-card border border-border bg-surface [&_input]:scroll-mt-16 [&_select]:scroll-mt-16">
   {% csrf_token %}
-  {% if form.errors %}
-  <p class="callout callout--error" role="alert">{{ form.form_error }}</p>
-  {% endif %}
-  {% for field in form %}
-  <div class="field">
-    <label for="{{ field.id_for_label }}">{{ field.label }}</label>
-    {{ field }}
-    {% if field.errors %}
-    <p class="error" id="{{ field.auto_id }}_error">{{ field.errors|join:" " }}</p>
-    {% endif %}
-    {% if field.name == "bot_token" and form.errors %}
-    <p class="help" id="{{ field.auto_id }}_note">{{ form.token_note }}</p>
-    {% endif %}
-    <p class="help" id="{{ field.auto_id }}_helptext">{{ field.help_text }}</p>
+  {% if form.errors %}<div class="px-4 pt-4">{% include "partials/_error_summary.html" with form=form title=form.form_error only %}</div>{% endif %}
+  <div class="divide-y divide-border">
+    {% include "web/_location_fields.html" with form=form only %}
   </div>
-  {% endfor %}
-  <div class="actions">
-    <button class="btn btn--primary" type="submit">Create location</button>
-    <a class="btn btn--secondary" href="{% url 'location-list' %}">Back to locations</a>
+  <div class="sticky bottom-0 z-10 flex flex-wrap items-center justify-end gap-2 rounded-b-[5px] border-t border-border bg-surface-muted px-4 py-3">
+    {% include "partials/_button.html" with href=list_url variant="secondary" label="Back to locations" testid="cancel" only %}
+    {% include "partials/_button.html" with variant="primary" label="Create location" testid="submit" only %}
   </div>
 </form>
 {% endblock %}

@@ -1,0 +1,22 @@
+{% load icons forms_ui %}{% comment %}
+Error summary (06-UI-SPEC Components > Form field, N10; UI-01, UI-12). Parameters: form (the
+bound, invalid form) and title (the form's Python error, LOCATION_FORM_ERROR or
+EDIT_FORM_ERROR). The page includes it at the top of the form only when the form has
+errors, so a valid form never shows one.
+
+- An error alert (the Alert component's error tone: the 3 px inset tone bar, the 20 px
+  circle-alert, the visually hidden "Error: " prefix) with role="alert" and tabindex="-1":
+  the errorSummary component focuses it on load, so its links are read first, and the
+  focus shows as the tone bar plus the focus halo and outline.
+- One jump link per invalid field, in field order: "{label}: {first error}", linking to
+  the control's id (#id_<name>). Labels and errors are the form's Python copy, escaped.
+- Every class is spelled out, never built from a variable, so the Tailwind scan finds it.
+{% endcomment %}{% summary_links form as links %}<div data-testid="error-summary" data-tone="error" role="alert" tabindex="-1" x-data="errorSummary" class="relative flex items-start gap-2 rounded-control border border-err-border bg-err-bg p-4 text-body [box-shadow:inset_3px_0_0_var(--err-text)] focus:outline-2 focus:outline-offset-2 focus:outline-focus focus:[box-shadow:inset_3px_0_0_var(--err-text),0_0_0_4px_var(--focus-halo)]">
+  {% icon "circle-alert" class="size-5 shrink-0 text-err-text" %}
+  <div class="flex min-w-0 flex-1 flex-col gap-1">
+    <p class="font-semibold break-words text-err-text"><span class="sr-only">Error: </span>{{ title }}</p>
+    {% if links %}<ul class="flex flex-col gap-1">{% for control_id, label, error in links %}
+      <li><a href="#{{ control_id }}" class="break-words text-fg underline underline-offset-2 hover:text-err-text">{{ label }}: {{ error }}</a></li>{% endfor %}
+    </ul>{% endif %}
+  </div>
+</div>

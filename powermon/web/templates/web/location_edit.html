@@ -1,50 +1,40 @@
-{% extends "base.html" %}
+{% extends "layouts/app.html" %}
 {% comment %}
-Phase 4 UI-SPEC screen C (D-07, D-08; UI-D2, UI-D12): edit a location's settings. The add
-form's layout and field loop: novalidate, so every message comes from the server; Django
-links each input to its "<id>_helptext" and "<id>_error" elements (aria-describedby).
-The title, the breadcrumbs and the h1 use the stored location (location), never the
-posted values. The form holds the six configuration fields and the CSRF token only: no
-switch, no device key, no state and no other hidden field (D-05, D-07).
-Secrets (SEC-04): the "New bot token" input never carries a value, not even after an
-invalid submit; its help shows the current token masked. The re-paste note shows only
-when the invalid submit contained a non-empty token (form.show_token_note, UI-D12).
-No script, no inline style.
+S6 Edit location (06-UI-SPEC Page Contracts > S4 / S6, Test hooks > S4 Add / S6 Edit, amendment
+A6; UI-01, UI-09, UI-12, N10, R3, R16). Context: location (the stored location) and form
+(LocationEditForm), from LocationEditView. The trail Locations > {name} > Edit comes from the
+layout; the title and the trail use the stored name, never the posted values, and the h1 is
+the fixed "Edit location", so a long name shows only in the title, the trail and the
+sidebar.
+
+- The meta line holds edit-intro, the third sentence of the old Note callout; the other two
+  are the topic notes inside the sections (web/_location_fields.html with edit=True).
+- One card, at most 896 px wide: form[method=post][novalidate][data-testid=location-form]
+  with the CSRF token and the six configuration fields only: no switch, no device key, no
+  state and no other hidden field. The view saves it with one configuration-only update, so
+  a stale form never reverts a switch, the status or the key (R16).
+- "New bot token" is write-only: its input never carries a value, not even after an invalid
+  submit, and its help shows the current token only as its mask (R3). The re-paste note
+  shows only when the invalid submit carried a non-empty token (form.show_token_note).
+- After an invalid POST: the error summary at the top of the card (title EDIT_FORM_ERROR,
+  one jump link per invalid field) and the field errors.
+- The sticky action bar: "Discard changes" (secondary link to the location page) first,
+  then "Save changes" (primary submit, pending spinner, guarded against a second submit).
+- No script, no inline style; every class is spelled out.
 {% endcomment %}
 {% block title %}{{ location.name }} · Edit{% endblock %}
-{% block crumbs %}
-<nav aria-label="Breadcrumb">
-  <ol class="crumbs">
-    <li><a href="{% url 'location-list' %}">Locations</a></li>
-    <li><a class="name" href="{% url 'location-detail' location.pk %}">{{ location.name }}</a></li>
-    <li aria-current="page">Edit</li>
-  </ol>
-</nav>
-{% endblock %}
-{% block content %}
-<h1>Edit location</h1>
-<form class="form" method="post" action="{% url 'location-edit' location.pk %}" novalidate>
+{% block page_title %}Edit location{% endblock %}
+{% block page_meta %}<li data-testid="edit-intro">Maintenance, alerts and router grace are switched on the location page.</li>{% endblock %}
+{% block content %}{% url 'location-detail' location.pk as detail_url %}
+<form method="post" action="{% url 'location-edit' location.pk %}" novalidate data-testid="location-form" class="w-full max-w-4xl rounded-card border border-border bg-surface [&_input]:scroll-mt-16 [&_select]:scroll-mt-16">
   {% csrf_token %}
-  {% if form.errors %}
-  <p class="callout callout--error" role="alert">{{ form.form_error }}</p>
-  {% endif %}
-  {% for field in form %}
-  <div class="field">
-    <label for="{{ field.id_for_label }}">{{ field.label }}</label>
-    {{ field }}
-    {% if field.errors %}
-    <p class="error" id="{{ field.auto_id }}_error">{{ field.errors|join:" " }}</p>
-    {% endif %}
-    {% if field.name == "bot_token" and form.show_token_note %}
-    <p class="help" id="{{ field.auto_id }}_note">{{ form.token_note }}</p>
-    {% endif %}
-    <p class="help" id="{{ field.auto_id }}_helptext">{{ field.help_text }}</p>
+  {% if form.errors %}<div class="px-4 pt-4">{% include "partials/_error_summary.html" with form=form title=form.form_error only %}</div>{% endif %}
+  <div class="divide-y divide-border">
+    {% include "web/_location_fields.html" with form=form edit=True only %}
   </div>
-  {% endfor %}
-  <p class="callout"><strong>Note:</strong> New period and grace values apply from the next check and never change past history. Lower values can report OFF at the next check if the device has already been silent that long. A new chat ID or bot token moves the weekly chart: a new one is posted and pinned, and the old one is unpinned if this location's bot is an admin of the old channel. Otherwise the old pin stays: unpin it by hand in Telegram. Maintenance, alerts and router grace are switched on the location page.</p>
-  <div class="actions">
-    <button class="btn btn--primary" type="submit">Save changes</button>
-    <a class="btn btn--secondary" href="{% url 'location-detail' location.pk %}">Discard changes</a>
+  <div class="sticky bottom-0 z-10 flex flex-wrap items-center justify-end gap-2 rounded-b-[5px] border-t border-border bg-surface-muted px-4 py-3">
+    {% include "partials/_button.html" with href=detail_url variant="secondary" label="Discard changes" testid="cancel" only %}
+    {% include "partials/_button.html" with variant="primary" label="Save changes" testid="submit" only %}
   </div>
 </form>
 {% endblock %}
