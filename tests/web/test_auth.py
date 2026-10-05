@@ -1,26 +1,59 @@
 """The env-defined single admin account (LOC-01, INV-21 #3), the ``release`` command (D-02),
-and signing in and out (D-09 surface 1, UI-SPEC screen 1).
+and signing in and out on S1 (D-09 surface 1; UI-01, UI-09, UI-12).
 
 ``release`` runs in the one-shot migrate service on every deploy: it applies migrations and
 then syncs the one admin account from ADMIN_USERNAME / ADMIN_PASSWORD. The admin then signs
 in at /login/ with exactly that account and signs out with a POST to /logout/.
+
+S1 is read only through tests/web/pages.py and the 06-UI-SPEC hooks (``sign-in-form``,
+``form-error``, ``#id_username``, ``#id_password``, the hidden ``next``, the toast
+regions), never through classes or raw markup. Python-owned copy is imported; template copy
+is pinned against the 06-UI-SPEC copy table (signin.*).
 """
 
-import re
 from io import StringIO
 from typing import Any
 
 import pytest
+from bs4 import Tag
 from django.conf import settings
 from django.contrib.auth import authenticate, get_user, get_user_model
+from django.contrib.staticfiles.storage import staticfiles_storage
 from django.core.management import call_command
 from django.test import Client
+from django.test.html import Element, parse_html
+from pages import (
+    Message,
+    Page,
+    all_by_testid,
+    assert_no_injected_script,
+    assert_page,
+    by_testid,
+    field,
+    field_error,
+    h1,
+    hidden_value,
+    messages,
+    parse,
+    text,
+    title,
+)
 
 from powermon.web.admin_sync import sync_admin
+from powermon.web.forms import SIGN_IN_ERROR
+from powermon.web.templatetags.icons import ICONS
+from powermon.web.views import SIGNED_OUT_MESSAGE
 
 User = get_user_model()
 
-SIGN_IN_ERROR = "Wrong username or password. Check both and try again."
+# 06-UI-SPEC copy rows signin.title / h1 / submit, signin.username, signin.password.
+SIGN_IN = "Sign in"
+USERNAME_LABEL = "Username"
+PASSWORD_LABEL = "Password"
+# Components > Alert: an error alert starts with this visually hidden prefix.
+ERROR_PREFIX = "Error: "
+# The S1 hooks of the app layout that the auth layout never has (Test hooks > S1, Absent).
+APP_ONLY_HOOKS = ("sidebar", "sidebar-locations", "topbar", "theme-switch")
 
 
 def _snapshot() -> list[tuple[Any, ...]]:
@@ -146,19 +179,7 @@ def test_release_command_migrates_and_syncs() -> None:
     assert settings.CFG.admin_password not in out.getvalue() + err.getvalue()
 
 
-# sign in / sign out (UI-SPEC screen 1)
-
-
-def _input_tag(html: str, name: str) -> str:
-    """The rendered ``<input ...>`` tag whose name attribute is ``name``."""
-    match = re.search(rf'<input\b[^>]*\bname="{re.escape(name)}"[^>]*>', html)
-    assert match is not None, f"no input named {name!r} in the page"
-    return match.group(0)
-
-
-def _role_text(html: str, role: str) -> list[str]:
-    """The text directly inside each element that carries ``role="<role>"``."""
-    return [t.strip() for t in re.findall(rf'role="{role}"[^>]*>([^<]*)<', html)]
+# Sign in / sign out (S1, 06-UI-SPEC Page Contracts > S1, Test hooks > S1)
 
 
 def _sign_in(client: Client, username: str, password: str, **extra: str) -> Any:
@@ -169,25 +190,190 @@ def _signed_in(client: Client) -> bool:
     return bool(get_user(client).is_authenticated)  # type: ignore[arg-type]
 
 
+def _alerts(page: Page) -> list[str]:
+    """The text of every ``role="alert"`` element that holds text, as a screen reader reads it.
+
+    The toast regions are always on the page and empty unless an error flash is queued, so
+    an empty region is left out. A message keeps its visually hidden "Error: " / "Warning: "
+    prefix, which is part of what is announced.
+    """
+    soup = page if isinstance(page, Tag) else parse(page)
+    return [found for element in soup.find_all(attrs={"role": "alert"}) if (found := text(element))]
+
+
+def _is_icon(svg: Tag, name: str) -> bool:
+    """A parsed inline ``<svg>`` draws the shapes of the vendored icon ``name``."""
+    drawn = parse_html(f"<g>{svg.decode_contents()}</g>")
+    vendored = parse_html(f"<g>{ICONS[name]}</g>")
+    assert isinstance(drawn, Element) and isinstance(vendored, Element)
+    return drawn.children == vendored.children
+
+
+@pytest.mark.django_db
+def test_UI01_sign_in_page_renders(client: Client) -> None:
+    page = assert_page(client.get("/login/"), title=SIGN_IN, app=False)
+
+    assert text(h1(page)) == SIGN_IN
+    form = by_testid(page, "sign-in-form")
+    assert (form.get("method"), form.get("action")) == ("post", "/login/")
+    # Two field groups, each input with its label.
+    labels = [(label.get("for"), text(label)) for label in form.find_all("label")]
+    assert labels == [("id_username", USERNAME_LABEL), ("id_password", PASSWORD_LABEL)]
+    username, password = field(form, "username"), field(form, "password")
+    assert (username.get("autocomplete"), username.has_attr("autofocus")) == ("username", True)
+    assert (password.get("type"), password.get("autocomplete")) == ("password", "current-password")
+    assert not username.has_attr("value") and not password.has_attr("value")
+    assert hidden_value(form, "next") == ""
+    # One full-width primary submit, rendered enabled, with the hidden pending spinner.
+    (submit,) = form.find_all("button")
+    assert (submit.get("type"), submit.get("data-variant"), text(submit)) == (
+        "submit",
+        "primary",
+        SIGN_IN,
+    )
+    assert not submit.has_attr("disabled") and not submit.has_attr("aria-disabled")
+    (spinner,) = submit.find_all("svg")
+    assert _is_icon(spinner, "loader-circle")
+    assert (spinner.get("aria-hidden"), spinner.get("focusable")) == ("true", "false")
+    # E1 empty: no alert and nothing of the app layout; both toast regions, empty.
+    assert all_by_testid(page, "form-error") == all_by_testid(page, "throttle-message") == []
+    assert _alerts(page) == []
+    for hook in APP_ONLY_HOOKS:
+        assert all_by_testid(page, hook) == [], hook
+    for region in ("toasts-status", "toasts-alert"):
+        assert len(all_by_testid(page, region)) == 1, region
+    assert messages(page) == []
+
+
+@pytest.mark.django_db
+def test_UI01_sign_in_head(client: Client) -> None:
+    page = parse(client.get("/login/"))
+    head = page.find("head")
+    assert isinstance(head, Tag)
+
+    # The two scripts the CSP allows, both in the head: admin.js render-blocking first,
+    # then the Alpine CSP build deferred (06-UI-SPEC Interaction Contract > JavaScript rules).
+    scripts = page.find_all("script")
+    assert [(script.get("src"), script.has_attr("defer")) for script in scripts] == [
+        (staticfiles_storage.url("web/admin.js"), False),
+        (staticfiles_storage.url("web/vendor/alpine-csp-3.17.4.min.js"), True),
+    ]
+    assert all(script.find_parent("head") is head for script in scripts)
+    # Font preloads (latin, cyrillic) with crossorigin, the stylesheet, both favicons.
+    links = [
+        (
+            " ".join(link.get("rel", [])),
+            link.get("href"),
+            link.get("as"),
+            link.get("type"),
+            link.has_attr("crossorigin"),
+            link.get("sizes"),
+        )
+        for link in head.find_all("link")
+    ]
+    assert links == [
+        (
+            "preload",
+            staticfiles_storage.url("web/fonts/inter-latin-wght-normal.woff2"),
+            "font",
+            "font/woff2",
+            True,
+            None,
+        ),
+        (
+            "preload",
+            staticfiles_storage.url("web/fonts/inter-cyrillic-wght-normal.woff2"),
+            "font",
+            "font/woff2",
+            True,
+            None,
+        ),
+        ("stylesheet", staticfiles_storage.url("web/build/app.css"), None, None, False, None),
+        ("icon", staticfiles_storage.url("web/favicon.svg"), None, "image/svg+xml", False, None),
+        ("icon", staticfiles_storage.url("web/favicon.ico"), None, None, False, "32x32"),
+    ]
+    # The skip link is the first focusable element and leads to main.
+    skip = by_testid(page, "skip-link")
+    assert (skip.get("href"), text(skip)) == ("#main", "Skip to content")
+    assert page.find(["a", "button", "input"]) is skip
+
+
+@pytest.mark.django_db
+def test_UI01_wrong_credentials_state(client: Client) -> None:
+    sync_admin("admin", "pw-one")
+    typed = 'ad<m>in&"x'
+
+    response = _sign_in(client, typed, "wrong-pw-xyz")
+
+    page = assert_page(response, title=SIGN_IN, app=False)
+    # E1 error: one error-toned alert, announced, above the fields; no throttle message.
+    alert = by_testid(page, "form-error")
+    assert (alert.get("role"), alert.get("data-tone")) == ("alert", "error")
+    assert _alerts(page) == [ERROR_PREFIX + SIGN_IN_ERROR]
+    assert all_by_testid(page, "throttle-message") == []
+    assert all_by_testid(page, "throttle-countdown") == []
+    assert page.find_all(attrs={"x-data": "throttleCountdown"}) == []
+    # E1 partial: the username keeps the typed value, escaped in the markup; the password
+    # input has no value attribute at all.
+    assert field(page, "username").get("value") == typed
+    html = response.content.decode()
+    assert "ad<m>in" not in html
+    assert not field(page, "password").has_attr("value")
+    assert "wrong-pw-xyz" not in html
+    # The flash regions stay empty: the error is inline, never a toast.
+    assert messages(page) == []
+    # The submit button is rendered enabled.
+    (submit,) = by_testid(page, "sign-in-form").find_all("button")
+    assert not submit.has_attr("disabled") and not submit.has_attr("aria-disabled")
+
+
+@pytest.mark.django_db
+def test_UI01_sign_in_long_username(client: Client) -> None:
+    sync_admin("admin", "pw-one")
+    long_name = ("<script>alert(1)</script>" + "x" * 300)[:300]
+    assert len(long_name) == 300
+
+    response = _sign_in(client, long_name, "wrong-pw-xyz")
+
+    # E1 long-text: the injected payload is never markup (assert_page checks it), and the
+    # page shows only fixed copy: the typed name is the escaped value of #id_username and
+    # nothing else, never page text and never another attribute.
+    page = assert_page(response, title=SIGN_IN, app=False)
+    assert field(page, "username").get("value") == long_name
+    assert long_name not in text(page)
+    holders = [
+        (element.name, attribute)
+        for element in page.find_all(True)
+        for attribute, value in element.attrs.items()
+        if isinstance(value, str) and long_name in value
+    ]
+    assert holders == [("input", "value")]
+    assert _alerts(page) == [ERROR_PREFIX + SIGN_IN_ERROR]
+    assert field_error(page, "username") is None
+
+
 @pytest.mark.django_db
 def test_LOC01_sign_in_page_renders_fields(client: Client) -> None:
     response = client.get("/login/")
 
     assert response.status_code == 200
-    html = response.content.decode()
-    assert "<title>Sign in · Power Monitor</title>" in html
-    username = _input_tag(html, "username")
-    assert 'autocomplete="username"' in username
-    assert "autofocus" in username
-    password = _input_tag(html, "password")
-    assert 'type="password"' in password
-    assert 'autocomplete="current-password"' in password
+    page = parse(response)
+    assert title(page) == "Sign in · Power Monitor"
+    username = field(page, "username")
+    assert username.get("autocomplete") == "username"
+    assert username.has_attr("autofocus")
+    password = field(page, "password")
+    assert password.get("type") == "password"
+    assert password.get("autocomplete") == "current-password"
     # First load (UI-SPEC E1 empty state): both fields start empty.
-    assert "value=" not in username
-    assert "value=" not in password
-    assert 'name="csrfmiddlewaretoken"' in html
-    assert "placeholder" not in html
-    assert "<script" not in html
+    assert not username.has_attr("value")
+    assert not password.has_attr("value")
+    csrf = by_testid(page, "sign-in-form").find_all("input", attrs={"name": "csrfmiddlewaretoken"})
+    assert len(csrf) == 1
+    # No control shows a placeholder.
+    controls = page.find_all(["input", "select", "textarea"])
+    assert [control for control in controls if control.has_attr("placeholder")] == []
+    assert_no_injected_script(response.content.decode())
 
 
 @pytest.mark.django_db
@@ -210,11 +396,11 @@ def test_wrong_password_shows_generic_error_and_clears_password(client: Client) 
     response = _sign_in(client, "admin", "wrong-pw-xyz")
 
     assert response.status_code == 200
-    html = response.content.decode()
-    assert _role_text(html, "alert") == [SIGN_IN_ERROR]
-    assert 'value="admin"' in _input_tag(html, "username")
-    assert "wrong-pw-xyz" not in html
-    assert "value=" not in _input_tag(html, "password")
+    page = parse(response)
+    assert _alerts(page) == [ERROR_PREFIX + SIGN_IN_ERROR]
+    assert field(page, "username").get("value") == "admin"
+    assert "wrong-pw-xyz" not in response.content.decode()
+    assert not field(page, "password").has_attr("value")
     assert not _signed_in(client)
 
 
@@ -231,11 +417,11 @@ def test_blank_fields_show_the_same_error(client: Client, username: str, passwor
 
     assert response.status_code == 200
     html = response.content.decode()
-    assert _role_text(html, "alert") == [SIGN_IN_ERROR]
+    assert _alerts(html) == [ERROR_PREFIX + SIGN_IN_ERROR]
     assert "This field is required." not in html
     assert "pw-one" not in html
     if username == "admin":
-        assert 'value="admin"' in _input_tag(html, "username")
+        assert field(html, "username").get("value") == "admin"
     assert not _signed_in(client)
 
 
@@ -247,7 +433,7 @@ def test_INV21_old_password_rejected_after_env_change(client: Client) -> None:
     old = _sign_in(client, "admin", "pw-one")
 
     assert old.status_code == 200
-    assert _role_text(old.content.decode(), "alert") == [SIGN_IN_ERROR]
+    assert _alerts(old) == [ERROR_PREFIX + SIGN_IN_ERROR]
     assert not _signed_in(client)
 
     new = _sign_in(client, "admin", "pw-two")
@@ -260,9 +446,9 @@ def test_INV21_old_password_rejected_after_env_change(client: Client) -> None:
 @pytest.mark.django_db
 def test_next_same_host_is_honoured(client: Client) -> None:
     sync_admin("admin", "pw-one")
-    form = client.get("/login/", {"next": "/locations/new/"}).content.decode()
+    form = by_testid(client.get("/login/", {"next": "/locations/new/"}), "sign-in-form")
     # The form carries the validated target in its hidden next field.
-    assert 'value="/locations/new/"' in _input_tag(form, "next")
+    assert hidden_value(form, "next") == "/locations/new/"
 
     response = _sign_in(client, "admin", "pw-one", next="/locations/new/")
 
@@ -274,8 +460,9 @@ def test_next_same_host_is_honoured(client: Client) -> None:
 @pytest.mark.parametrize("target", ["https://evil.example/", "//evil.example/", "/\\evil.example"])
 def test_next_off_host_is_ignored(client: Client, target: str) -> None:
     sync_admin("admin", "pw-one")
-    form = client.get("/login/", {"next": target}).content.decode()
-    assert "evil.example" not in form
+    page = client.get("/login/", {"next": target})
+    assert "evil.example" not in page.content.decode()
+    assert hidden_value(by_testid(page, "sign-in-form"), "next") == ""
 
     response = _sign_in(client, "admin", "pw-one", next=target)
 
@@ -296,10 +483,10 @@ def test_sign_out_is_post_only_and_flashes(client: Client) -> None:
     assert response.status_code == 302
     assert response.url == "/login/"
     assert not _signed_in(client)
-    page = client.get("/login/").content.decode()
-    assert _role_text(page, "status") == ["You are signed out."]
+    page = client.get("/login/")
+    assert messages(page) == [Message("info", "status", SIGNED_OUT_MESSAGE)]
     # A flash is shown once.
-    assert _role_text(client.get("/login/").content.decode(), "status") == []
+    assert messages(client.get("/login/")) == []
 
 
 @pytest.mark.django_db

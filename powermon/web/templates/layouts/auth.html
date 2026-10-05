@@ -1,0 +1,50 @@
+{% load static icons %}<!DOCTYPE html>
+<html lang="en" data-theme="{{ theme }}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>{% block title %}{% endblock %} · Power Monitor</title>
+<link rel="preload" href="{% static 'web/fonts/inter-latin-wght-normal.woff2' %}" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="{% static 'web/fonts/inter-cyrillic-wght-normal.woff2' %}" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="{% static 'web/build/app.css' %}">
+<link rel="icon" href="{% static 'web/favicon.svg' %}" type="image/svg+xml">
+<link rel="icon" href="{% static 'web/favicon.ico' %}" sizes="32x32">
+<script src="{% static 'web/admin.js' %}"></script>
+<script src="{% static 'web/vendor/alpine-csp-3.17.4.min.js' %}" defer></script>
+</head>
+{% comment %}
+Auth layout for S1 Sign in (06-UI-SPEC Page Contracts > S1, Layout Shell > Toasts; UI-01,
+UI-02, UI-09, UI-12, R5, R15). Blocks: title, content.
+
+- data-theme is the theme context processor's allowlisted value (light, dark or system),
+  rendered on the server, so the page never shows the wrong theme first (D6-03). The layout
+  reads only theme and, through the toast partial, messages: never the sidebar, which is
+  for signed-in pages.
+- The head: robots noindex, nofollow; a viewport that never limits zoom; the latin and
+  cyrillic font preloads with crossorigin; the stylesheet; both favicons; then the two
+  scripts the CSP allows: admin.js render-blocking in the head and the Alpine CSP build
+  deferred. Every path goes through the static tag.
+- No sidebar, top bar or theme control: the theme POST needs a signed-in admin.
+- Below lg: the wordmark (24 px zap in the accent text colour) above the page's card, 64 px
+  from the top from md. From lg: a split screen, the form column left and the always-dark
+  brand panel right (a 32 px grid of 1 px sidebar-border lines, the zap in the brand colour,
+  the wordmark and the tagline).
+- Both toast regions, 16 px from the top on phones (this layout has no top bar). The
+  "You are signed out." info toast lands here after a sign-out.
+{% endcomment %}
+<body class="min-h-dvh bg-main-bg text-fg">
+<a href="#main" data-testid="skip-link" class="sr-only focus:not-sr-only focus:fixed focus:top-2 focus:left-2 focus:z-60 focus:rounded-control focus:bg-surface focus:px-3 focus:py-2 focus:font-semibold focus:text-fg focus:shadow-pop">Skip to content</a>
+<div class="min-h-dvh lg:grid lg:grid-cols-2">
+<main id="main" tabindex="-1" class="flex flex-col items-center gap-8 px-4 pt-8 pb-8 md:pt-16 lg:justify-center lg:pb-16 focus:outline-none focus:shadow-none">
+<p class="flex items-center gap-2 text-title font-semibold text-fg lg:hidden">{% icon "zap" class="size-6 shrink-0 text-accent-text" %}Power Monitor</p>
+{% block content %}{% endblock %}
+</main>
+<div class="hidden bg-sb-bg p-16 [background-image:linear-gradient(to_right,var(--sb-border)_1px,transparent_1px),linear-gradient(to_bottom,var(--sb-border)_1px,transparent_1px)] [background-size:32px_32px] lg:flex lg:flex-col lg:justify-center lg:gap-2">
+<p class="flex items-center gap-2 text-title font-semibold text-sb-fg">{% icon "zap" class="size-6 shrink-0 text-brand" %}Power Monitor</p>
+<p class="text-body text-sb-fg-muted">Power outage alerts for your locations</p>
+</div>
+</div>
+{% include "partials/_toasts.html" with auth=True %}
+</body>
+</html>

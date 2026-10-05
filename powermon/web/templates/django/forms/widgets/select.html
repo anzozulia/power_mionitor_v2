@@ -1,0 +1,18 @@
+{% comment %}
+Select widget (06-UI-SPEC Components > Form field; UI-01, UI-12). Django 5.2.17's stock
+template with one added class attribute right after name, so the attributes keep their stock
+order: name, class, then the widget attrs from Django's own attrs.html. The options render
+through the stock select_option.html.
+
+The class is the @tailwindcss/forms form-select (class strategy, with its chevron and the
+40 px right padding that keeps the text clear of it) plus the same field utilities as the
+input widget: 44 px below md and the control height from md, 12 px left padding, radius 4,
+a 1 px field border, the surface fill, 16/24 text below sm and 13/20 from sm, a muted border
+on hover, the focus border and 4 px halo, and on an invalid field the error border and an
+error-tinted halo while it is not focused (spelled aria-[invalid=true], as in input.html).
+Every class is spelled out, never built from a variable, so the Tailwind scan finds it.
+{% endcomment %}<select name="{{ widget.name }}" class="form-select block w-full min-h-11 md:min-h-(--control-h) rounded-control border border-field-border bg-surface py-0 pr-10 pl-3 text-lead text-fg sm:text-body hover:border-fg-muted focus:border-focus focus:[box-shadow:0_0_0_4px_var(--focus-halo)] aria-[invalid=true]:border-err-text aria-[invalid=true]:not-focus:[box-shadow:0_0_0_4px_var(--err-bg)]"{% include "django/forms/widgets/attrs.html" %}>{% for group_name, group_choices, group_index in widget.optgroups %}{% if group_name %}
+  <optgroup label="{{ group_name }}">{% endif %}{% for option in group_choices %}
+  {% include option.template_name with widget=option %}{% endfor %}{% if group_name %}
+  </optgroup>{% endif %}{% endfor %}
+</select>

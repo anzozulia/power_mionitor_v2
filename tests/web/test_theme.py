@@ -12,6 +12,9 @@ TEST-STRATEGY §8.4).
   GET is 405; a POST without a CSRF token is 403 and an anonymous POST goes to sign-in,
   neither with a cookie. ``next`` and the Referer never change the target (no open
   redirect, R8). The POST writes nothing, adds no flash and is never cached.
+- Rendered (S1, the first page on the auth layout): ``<html data-theme>`` is the
+  processor's value for every cookie above, the page keeps the page invariants in each
+  state, and a hostile value never reaches the HTML. No GET sets the cookie (D6-03).
 """
 
 from typing import Any
@@ -21,6 +24,7 @@ from django.contrib.auth import get_user_model
 from django.db import connection
 from django.test import Client, RequestFactory
 from django.test.utils import CaptureQueriesContext
+from pages import assert_no_injected_script, assert_page
 
 from powermon.web import context_processors
 from powermon.web.theme import THEME_MAX_AGE
@@ -29,8 +33,11 @@ User = get_user_model()
 
 URL = "/theme/"
 VALUES = ("light", "dark", "system")
+SCRIPT_PAYLOAD = '"><script>alert(1)</script>'
+LONG_VALUE = "x" * 4096
 # Every value the processor and the POST must refuse.
-HOSTILE = ("DARK", "dark;", "light ", "", "x" * 4096, '"><script>alert(1)</script>')
+HOSTILE = ("DARK", "dark;", "light ", "", LONG_VALUE, SCRIPT_PAYLOAD)
+HOSTILE_IDS = ("upper", "semicolon", "trailing-space", "empty", "4kb", "script")
 WRITES = ("INSERT", "UPDATE", "DELETE")
 
 
@@ -98,6 +105,43 @@ def test_UI02_theme_reaches_the_sign_in_page(client: Client) -> None:
     assert page.status_code == 200
     assert page.context["theme"] == "light"
     assert "theme" not in page.cookies
+
+
+# Rendered from the cookie on the auth layout (UI-02, D6-03, R1)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("cookie", "expected"),
+    [
+        # Edge: no cookie at all is the default.
+        (None, "system"),
+        # Expected: each allowlisted value renders as itself.
+        *((value, value) for value in VALUES),
+        # Failure: anything else, however close, renders the default.
+        *((value, "system") for value in HOSTILE),
+    ],
+    ids=["no-cookie", *VALUES, *HOSTILE_IDS],
+)
+def test_UI02_sign_in_renders_theme_from_cookie(
+    client: Client, cookie: str | None, expected: str
+) -> None:
+    if cookie is not None:
+        client.cookies["theme"] = cookie
+
+    response = client.get("/login/")
+
+    # The page keeps the invariants in every theme state, on the auth layout.
+    page = assert_page(response, title="Sign in", app=False)
+    root = page.find("html")
+    assert root is not None and root.get("data-theme") == expected
+    # Reading the theme never sets it: only the theme POST does.
+    assert "theme" not in response.cookies
+    html = response.content.decode()
+    if cookie in (SCRIPT_PAYLOAD, LONG_VALUE):
+        # The raw cookie never reaches the page, so the payload never runs (R1).
+        assert cookie not in html
+        assert_no_injected_script(html, "sign-in")
 
 
 # The no-JS POST fallback (D6-03, R8)
