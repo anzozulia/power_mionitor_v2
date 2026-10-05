@@ -416,3 +416,15 @@ def test_UI03_sidebar_links_open_in_one_click(
     # The deleted location is not listed; the probe is no location's page.
     assert DISTINCT_NAME not in admin.get(PROBE_PATH).content.decode()
     assert [link for link in links if link.has_attr("aria-current")] == []
+
+
+@pytest.mark.django_db
+def test_UI01_shell_with_zero_locations(admin: Client, clock: FakeClock) -> None:
+    # Empty fleet: the shell renders whole, with the sidebar's empty line and no summary.
+    soup = assert_page(admin.get(PROBE_PATH), title=PROBE_TITLE, app=True)
+
+    sidebar = by_testid(soup, "sidebar")
+    assert text(by_testid(sidebar, "sidebar-empty")) == "No locations yet"
+    assert all_by_testid(sidebar, "sidebar-location") == []
+    assert all_by_testid(sidebar, "sidebar-summary") == []
+    assert [count.get_text() for count in sidebar.select('[data-live="sidebar-count"]')] == ["0"]
