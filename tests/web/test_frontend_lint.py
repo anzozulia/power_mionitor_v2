@@ -12,24 +12,31 @@ the real tree must pass:
 
 - Templates (powermon/web/templates/**/*.html): no |safe, safeseq, {% filter safe %} or
   autoescape off; no <style, style= attribute or :style binding; no on*= attribute, x-html or
-  javascript: URL; no {{ or {% inside an x-*, @* or :* attribute, and no arrow function,
-  template literal or browser global in a directive value (the @alpinejs/csp grammar); no
-  http(s):// except the SVG namespace and no protocol-relative URL; no hard-coded /static/
+  javascript: URL; no {{ or {% inside an x-*, @* or :* attribute, and nothing outside the
+  @alpinejs/csp grammar in a directive value (arrow function, template literal, browser
+  global, the keywords new, typeof, function, void, delete, in and instanceof, a second
+  statement, an assignment to a dotted path); no http(s):// except the SVG namespace and no protocol-relative URL; no hard-coded /static/
   path; a <script> only in the two exact empty-body forms and only in layouts/app.html and
   layouts/auth.html; every {% icon %} literal name has a file and every {% icon %} a class;
   every {% static %} literal path has a manifest entry (comments are skipped for those two).
 - Icon SVGs (templates/icons/*.svg): no <script, on*=, style= or <style, href (xlink:href
   too) or foreignObject.
 - admin.js: no eval(, new Function, string timers, document.write, innerHTML, outerHTML,
-  insertAdjacentHTML, createContextualFragment, sessionStorage, indexedDB, caches.,
-  serviceWorker, pushState, replaceState, window.name, XMLHttpRequest, sendBeacon, confirm(,
-  alert(, prompt(, import/export, http(s)://, hard-coded /static/ path, FormData or the bot
-  token field; localStorage only inside a try block that has a catch, and only as
+  insertAdjacentHTML, createContextualFragment, setHTMLUnsafe, parseHTMLUnsafe, srcdoc,
+  sessionStorage, indexedDB, caches., serviceWorker, pushState, replaceState, window.name,
+  XMLHttpRequest, sendBeacon, confirm(, alert(, prompt(, import/export, http(s)://,
+  hard-coded /static/ path, FormData or the bot token field; localStorage only inside a try block that has a catch, and only as
   getItem/setItem/removeItem with the literal key powermon.sidebar.rail; document.cookie only
   as an assignment of a string starting with theme= (R4).
-- admin.js components (06-11): the Alpine.data names are the 15 of the binding contract,
-  each component names its contract hooks, the theme cookie carries exactly the attributes
-  ThemeView sets (Secure only on https), and the relative-time floors and units are timefmt's.
+- admin.js components (06-11): the Alpine.data names are exactly the 15 of the binding
+  contract and each component names its contract hooks; the theme cookie carries exactly
+  the attributes ThemeView sets (Secure only on https); the relative-time floors and units
+  are timefmt's; every fetch is a GET of a data-* value or a link's href with redirect:
+  "manual" and no body; the confirm dialog listens on document, finds the dialog by its
+  testid and injects only a 200 X-PM-Fragment response with one confirm root parsed by
+  DOMParser, else navigates; the clipboard is only written, in the copy click listener;
+  the reveal guard empties the key on pagehide and replaces a restored page; the only style
+  write is the fleet bar's flexGrow; the OFF-after bounds are the model's.
 - CSS entries (powermon/web/assets/css/*.css): @import only "tailwindcss" or a ./ or ../ path;
   every url() relative or data: (comments skipped).
 - Python (powermon/web/**/*.py), read with the stdlib ast module: SafeString, SafeText,
@@ -42,9 +49,8 @@ Not scanned: the vendored files under static/web/vendor/, which test_vendor_mani
 verifies by sha256 (the Alpine build legitimately holds https:// warning strings), and the
 licence texts under vendor/LICENSES/ (06-RESEARCH Pitfall 5).
 
-Later plans extend the rule tables through ``violations(text, rules)``: 06-11 (admin.js
-components) and 06-20 (the Alpine directive check: every x-data name registered in admin.js
-and every registered name used).
+Later plans extend the rule tables through ``violations(text, rules)``: 06-20 adds the Alpine
+directive check (every x-data name registered in admin.js and every registered name used).
 
 No string literal in this file (this docstring included) spells the class attribute with its
 equals sign, which 06-09's class guard rejects: patterns and samples that name the class
@@ -64,6 +70,7 @@ from django.conf import settings
 from django.contrib.staticfiles.storage import staticfiles_storage
 from django.test import RequestFactory
 
+from powermon.locations.models import MAX_SECONDS, MIN_SECONDS
 from powermon.web.context_processors import THEME_COOKIE, THEMES
 from powermon.web.templatetags import timefmt
 from powermon.web.templatetags.icons import ICONS
@@ -115,10 +122,16 @@ _DIRECTIVE = re.compile(
     r"(?<![\w-])(?:x-[\w:.-]+|@[\w:.-]+|:[\w:.-]+)\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>\"']+)"
 )
 # What the @alpinejs/csp parser rejects or the project bans in a directive value (06-RESEARCH
-# Pattern 4): arrow functions, template literals, browser globals and the keywords below.
+# Pattern 4): arrow functions, template literals, browser globals, the keywords new, typeof,
+# function, void, delete, in and instanceof (whole words: a Tailwind token such as ease-in
+# in an x-transition value is not one), a second statement (a ";" followed by more text; one
+# trailing ";" is allowed) and an assignment to a dotted path (user.name = x, a.b += 1).
 _OUTSIDE_CSP_GRAMMAR = re.compile(
     r"=>|`|(?<![\w$.])(?:window|document|globalThis|console|JSON|Math|eval|Function)\b"
     r"|\b(?:new|typeof|function)\b"
+    r"|(?<![\w$.-])(?:void|delete|in|instanceof)(?![\w$-])"
+    r"|;\s*\S"
+    r"|[\w$]+\.[\w$.]+\s*(?:[-+*/%&|^]|\*\*|<<|>>>?|&&|\|\||\?\?)?=(?!=)"
 )
 _URL_TOKEN = re.compile(r"https?://[^\s\"'<>()]*", _I)
 _PROTOCOL_RELATIVE = re.compile(r"(?:=|url\()\s*[\"']?\s*//", _I)
@@ -131,7 +144,10 @@ _STATIC_TAG = re.compile(r"{%\s*static\s+([\"'])(?P<path>[^\"']+)\1")
 
 
 def _directive_values(text: str) -> Iterator[str]:
-    return (match.group(1) for match in _DIRECTIVE.finditer(text))
+    """Every directive value, without its quotes."""
+    for match in _DIRECTIVE.finditer(text):
+        value = match.group(1)
+        yield value[1:-1] if value[:1] in "\"'" else value
 
 
 def _django_in_directive(text: str) -> bool:
@@ -326,6 +342,9 @@ ADMIN_JS_RULES: Rules = {
     "outerHTML": re.compile(r"\bouterHTML\b"),
     "insertAdjacentHTML": re.compile(r"\binsertAdjacentHTML\b"),
     "createContextualFragment": re.compile(r"\bcreateContextualFragment\b"),
+    "setHTMLUnsafe": re.compile(r"\bsetHTMLUnsafe\b"),
+    "parseHTMLUnsafe": re.compile(r"\bparseHTMLUnsafe\b"),
+    "srcdoc": re.compile(r"\bsrcdoc\b", _I),
     "sessionStorage": re.compile(r"\bsessionStorage\b"),
     "indexedDB": re.compile(r"\bindexedDB\b"),
     "Cache Storage": re.compile(r"\bcaches\s*\."),
@@ -553,6 +572,25 @@ GOOD_TEMPLATE = (
             ["directive outside the CSP grammar"],
             id="global",
         ),
+        *(
+            pytest.param(sample, ["directive outside the CSP grammar"], id=name)
+            for name, sample in (
+                ("two-statements", '<button x-on:click="a(); b()"></button>'),
+                ("in", """<p x-show="'k' in obj"></p>"""),
+                ("delete", '<button x-on:click="delete items.x"></button>'),
+                ("void", '<button x-on:click="void go()"></button>'),
+                ("instanceof", '<p x-show="el instanceof Element"></p>'),
+                ("dotted-assignment", """<button x-on:click="user.name = 'x'"></button>"""),
+                ("dotted-compound", '<button @click="item.count += 1"></button>'),
+            )
+        ),
+        pytest.param(
+            '<button x-on:click="go();" x-transition:enter="transition ease-in duration-150"'
+            ' :aria-pressed="a.b === c" x-show="item.count <= 3 && a.b !== d"'
+            ' x-text="label"></button>',
+            [],
+            id="grammar-ok",
+        ),
         pytest.param(
             '<a href="https://cdn.example.com/x.js">x</a>', ["URL to another origin"], id="https"
         ),
@@ -729,6 +767,9 @@ GOOD_JS = """(function () {
         pytest.param(
             "range.createContextualFragment(t);", ["createContextualFragment"], id="fragment"
         ),
+        pytest.param("el.setHTMLUnsafe(t);", ["setHTMLUnsafe"], id="set-html-unsafe"),
+        pytest.param("Document.parseHTMLUnsafe(t);", ["parseHTMLUnsafe"], id="parse-unsafe"),
+        pytest.param("frame.srcdoc = t;", ["srcdoc"], id="srcdoc"),
         pytest.param("sessionStorage.setItem('k', key);", ["sessionStorage"], id="session"),
         pytest.param("indexedDB.open('db');", ["indexedDB"], id="indexed-db"),
         pytest.param("caches.open('v1');", ["Cache Storage"], id="caches"),
@@ -930,6 +971,89 @@ def clipboard_violations(source: str) -> list[str]:
         found.add("no clipboard write")
     if any(not any(a < w < b for a, b in clicks) for w in writes):
         found.add("clipboard write outside the copy component's click listener")
+    return sorted(found)
+
+
+_FRAGMENT_HEADER = "X-PM-Fragment"
+
+
+def fragment_violations(source: str) -> list[str]:
+    """UI-07 / T-06-32: the confirm dialog injects the server's confirmation only from a 200
+    response carrying X-PM-Fragment: 1 with exactly one confirm root parsed by DOMParser,
+    and falls back to a full navigation for every other outcome."""
+    start, end = component_spans(source).get("confirmDialog", (0, -1))
+    body = source[start : end + 1]
+    found: set[str] = set()
+    outside = source[:start] + source[end + 1 :]
+    if _FRAGMENT_HEADER in outside:
+        found.add("X-PM-Fragment outside confirmDialog")
+    fragment_fetches = [
+        options
+        for _, options in fetch_calls(body)
+        if re.search(r"([\"'])X-PM-Fragment\1\s*:\s*([\"'])1\2", options)
+    ]
+    if len(fragment_fetches) != 1:
+        found.add("no single fetch sending X-PM-Fragment: 1")
+    checks = {
+        "no status 200 check": r"\.status\s*!==?\s*200|\.status\s*===?\s*200",
+        "no response header check": (
+            r"headers\s*\.\s*get\s*\(\s*([\"'])X-PM-Fragment\1\s*\)\s*[!=]==?\s*([\"'])1\2"
+        ),
+        "no DOMParser": r"new\s+DOMParser\s*\(\s*\)\s*\.\s*parseFromString\s*\([^)]*text/html",
+        "no single-root check": (
+            r"querySelectorAll\s*\(\s*'\[data-testid=\"confirm\"\]'\s*\)"
+            r"[\s\S]*?\.length\s*[!=]==?\s*1"
+        ),
+        "no opaque-redirect fallback": r"([\"'])opaqueredirect\1",
+        "no location.assign fallback": r"\blocation\s*\.\s*assign\s*\(",
+        "no showModal": r"\.showModal\s*\(",
+    }
+    found.update(name for name, pattern in checks.items() if re.search(pattern, body) is None)
+    return sorted(found)
+
+
+_DOCUMENT_CLICK = re.compile(r"\bdocument\s*\.\s*addEventListener\s*\(\s*([\"'])click\1")
+
+
+def confirm_scope_violations(source: str) -> list[str]:
+    """06-12 / 06-15: the dialog block renders after main and the kebab entries sit outside
+    the [data-confirm-scope] wrapper, so confirmDialog listens on document and finds the
+    dialog with document.querySelector, never inside its own element."""
+    body = component_bodies(source).get("confirmDialog", "")
+    code = _mask_js(body)
+    found: set[str] = set()
+    if not any(True for _ in _code_matches(_DOCUMENT_CLICK, body)):
+        found.add("a[data-confirm] click listener not on document")
+    if re.search(r"\$el\s*\.\s*addEventListener\s*\(\s*([\"'])click\1", body):
+        found.add("click listener on the component's element")
+    lookups = [
+        body[m.start() : _closing(code, m.start()) + 1]
+        for m in _code_matches(re.compile(r"\bdocument\s*\.\s*querySelector\s*\("), body)
+    ]
+    if not any('[data-testid="confirm-dialog"]' in lookup for lookup in lookups):
+        found.add("dialog not found with document.querySelector")
+    if re.search(r"\$el\s*\.\s*(?:querySelector|querySelectorAll|closest)\s*\(", body):
+        found.add("lookup inside the component's element")
+    return sorted(found)
+
+
+_STYLE_ACCESS = re.compile(r"\.\s*style\b")
+_FLEX_GROW_WRITE = re.compile(r"\.\s*style\s*\.\s*flexGrow\s*=(?!=)")
+
+
+def style_violations(source: str) -> list[str]:
+    """CSP style-src 'self': the one style write is the fleet bar's el.style.flexGrow."""
+    code = _mask_js(source)
+    found: set[str] = set()
+    for match in _STYLE_ACCESS.finditer(code):
+        if _FLEX_GROW_WRITE.match(code, match.start()) is None:
+            found.add("style access other than style.flexGrow =")
+    if re.search(r"setAttribute\s*\(\s*([\"'])style\1", source):
+        found.add("style attribute")
+    if re.search(r"\b(?:cssText|insertRule|adoptedStyleSheets|CSSStyleSheet)\b", code):
+        found.add("stylesheet or cssText write")
+    if re.search(r"createElement\s*\(\s*([\"'])style\1", source):
+        found.add("style element")
     return sorted(found)
 
 
@@ -1154,6 +1278,56 @@ CONTRACT_HOOKS: dict[str, tuple[str, ...]] = {
         '"tabindex"',
         "preventScroll",
     ),
+    "confirmDialog": (
+        "a[data-confirm]",
+        '[data-testid="confirm-dialog"]',
+        "[data-dialog-body]",
+        "[data-dialog-loading]",
+        "[data-dialog-close]",
+        '[data-testid="keep"]',
+        '[data-testid="confirm-submit"]',
+        '"aria-busy"',
+        '"cancel"',
+        '"Escape"',
+        '"close"',
+        "[popover]",
+        "popovertarget",
+        "preventDefault",
+    ),
+    "fleetFilter": (
+        'button[data-testid="filter-chip"][data-filter]',
+        '[data-testid="fleet-bar"]',
+        "style.flexGrow",
+        'tr[data-testid="location-row"]',
+        "li[data-status][data-delivery]",
+        '[data-testid="fleet-showing"]',
+        '"data-total"',
+        '[data-testid="no-match"]',
+        "[data-filter-reset]",
+        '"data-filtered"',
+        '"aria-pressed"',
+        '"pm:status"',
+        '"Showing all "',
+        '"Showing 1 location"',
+    ),
+    "offAfterHint": (
+        '"id_period_s"',
+        '"id_grace_s"',
+        "[data-off-after-value]",
+        "[data-off-after-fallback]",
+        "OFF_AFTER_MIN",
+        "OFF_AFTER_MAX",
+        '"input"',
+    ),
+    "errorSummary": (".focus(",),
+    "throttleCountdown": (
+        "[data-retry-after]",
+        '[data-testid="throttle-countdown"]',
+        'button[type="submit"]',
+        '"aria-disabled"',
+        '"(you can try again now)"',
+        '" left)"',
+    ),
 }
 
 
@@ -1233,13 +1407,12 @@ def test_theme_cookie_rule(write: str, expected: list[str]) -> None:
     assert theme_cookie_violations(sample + sample, server) == ["not exactly one cookie write"]
 
 
-def test_admin_js_registers_names() -> None:
+def test_admin_js_all_names_registered() -> None:
     names = registered_names(ADMIN_JS.read_text(encoding="utf-8"))
 
-    # Expected: no name twice, every name from the contract, the shell components present.
-    assert sorted(Counter(names).values())[-1] == 1
-    assert set(names) <= CONTRACT_NAMES
-    assert {"toasts", "theme", "sidebar", "relative"} <= set(names)
+    # Expected: exactly the 15 names of the binding contract, each registered once (06-20
+    # checks them against the templates' x-data values).
+    assert sorted(names) == sorted(CONTRACT_NAMES)
     # Edge: a repeat is seen; a registration inside a comment or a string is not one.
     assert Counter(registered_names('Alpine.data("theme", a);\nAlpine.data("theme", b);')) == {
         "theme": 2
@@ -1427,6 +1600,195 @@ def test_admin_js_reveal_guard() -> None:
     assert "pageshowHandlers.forEach" in source[listener.end() :]
     # Failure: a guard that never checks persisted, or replaces with another URL, is caught.
     assert missing_hooks(body.replace("persisted", "loaded"), ("persisted",)) == ["persisted"]
+
+
+GOOD_CONFIRM = """window.Alpine.data("confirmDialog", function () {
+  return { init: function () {
+    var dialog = document.querySelector('dialog[data-testid="confirm-dialog"]');
+    document.addEventListener("click", function (event) {
+      var link = event.target.closest("a[data-confirm]");
+      dialog.showModal();
+      fetch(link.href, { redirect: "manual", headers: { "X-PM-Fragment": "1" } })
+        .then(function (response) {
+          if (response.type === "opaqueredirect" || response.status !== 200 ||
+              response.headers.get("X-PM-Fragment") !== "1") { throw new Error("full"); }
+          return response.text();
+        })
+        .then(function (html) {
+          var doc = new DOMParser().parseFromString(html, "text/html");
+          var roots = doc.querySelectorAll('[data-testid="confirm"]');
+          if (roots.length !== 1) { throw new Error("full"); }
+          body.appendChild(roots[0]);
+        })
+        .catch(function () { window.location.assign(link.href); });
+    });
+  } };
+});
+"""
+
+
+def test_admin_js_fragment_protocol() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+
+    # Expected: one fragment fetch, every injection condition checked, every other outcome
+    # a full navigation; the header is named nowhere else (UI-07, T-06-32).
+    assert fragment_violations(source) == []
+    assert "link.href" in [url for url, _ in fetch_calls(source)]
+    assert fragment_violations(GOOD_CONFIRM) == []
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    [
+        pytest.param(
+            '|| response.status !== 200 ', "", ["no status 200 check"], id="no-status-check"
+        ),
+        pytest.param(
+            '||\n              response.headers.get("X-PM-Fragment") !== "1"',
+            "",
+            ["no response header check"],
+            id="no-header-check",
+        ),
+        pytest.param(
+            "if (roots.length !== 1) { throw new Error(\"full\"); }",
+            "",
+            ["no single-root check"],
+            id="no-root-count",
+        ),
+        pytest.param(
+            '.catch(function () { window.location.assign(link.href); });',
+            ";",
+            ["no location.assign fallback"],
+            id="no-fallback",
+        ),
+        pytest.param(
+            ', headers: { "X-PM-Fragment": "1" }',
+            "",
+            ["no single fetch sending X-PM-Fragment: 1"],
+            id="no-request-header",
+        ),
+        pytest.param(
+            'var doc = new DOMParser().parseFromString(html, "text/html");',
+            "var doc = document.implementation.createHTMLDocument(); doc.body.textContent = html;",
+            ["no DOMParser"],
+            id="no-domparser",
+        ),
+    ],
+)
+def test_fragment_rule(old: str, new: str, expected: list[str]) -> None:
+    assert old in GOOD_CONFIRM
+    assert fragment_violations(GOOD_CONFIRM.replace(old, new)) == expected
+
+
+def test_fragment_rule_flags_the_header_elsewhere_and_innerhtml() -> None:
+    poll = 'Alpine.data("poll", function () { var h = { "X-PM-Fragment": "1" }; });\n'
+    injected = GOOD_CONFIRM.replace("body.appendChild(roots[0]);", "body.innerHTML = html;")
+
+    # Failure: the fragment header in another component; markup injected as HTML.
+    assert fragment_violations(GOOD_CONFIRM + poll) == ["X-PM-Fragment outside confirmDialog"]
+    assert "innerHTML" in violations(injected, ADMIN_JS_RULES)
+
+
+def test_admin_js_no_confirm_call() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+    dialogs = {name: ADMIN_JS_RULES[name] for name in ("confirm(", "alert(", "prompt(")}
+
+    # Expected: the confirmation is the server's page in a native dialog, never confirm().
+    assert violations(source, dialogs) == []
+    assert ".showModal(" in component_bodies(source).get("confirmDialog", "")
+    # Failure: a browser dialog in any form is caught (06-07's rule).
+    assert violations("if (window.confirm('Delete?')) { go(); }", dialogs) == ["confirm("]
+    assert violations("self.alert(1);", dialogs) == ["alert("]
+
+
+def test_admin_js_confirm_dialog_is_document_wide() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+
+    # Expected: one click listener on document (the kebab entries are outside the scope
+    # wrapper) and the dialog found by its testid on document (it renders after main).
+    assert confirm_scope_violations(source) == []
+    assert confirm_scope_violations(GOOD_CONFIRM) == []
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    [
+        pytest.param(
+            'document.addEventListener("click"',
+            'this.$el.addEventListener("click"',
+            [
+                "a[data-confirm] click listener not on document",
+                "click listener on the component's element",
+            ],
+            id="listener-on-el",
+        ),
+        pytest.param(
+            "document.querySelector('dialog[data-testid=\"confirm-dialog\"]')",
+            "this.$el.querySelector('dialog[data-testid=\"confirm-dialog\"]')",
+            [
+                "dialog not found with document.querySelector",
+                "lookup inside the component's element",
+            ],
+            id="dialog-in-el",
+        ),
+    ],
+)
+def test_confirm_scope_rule(old: str, new: str, expected: list[str]) -> None:
+    assert old in GOOD_CONFIRM
+    assert confirm_scope_violations(GOOD_CONFIRM.replace(old, new)) == expected
+
+
+def test_admin_js_fleet_bar_style_only_flexgrow() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+    body = component_bodies(source).get("fleetFilter", "")
+
+    # Expected: the only style write is the fleet bar's flexGrow, inside fleetFilter.
+    assert style_violations(source) == []
+    assert len(_FLEX_GROW_WRITE.findall(_mask_js(source))) == 1
+    assert _FLEX_GROW_WRITE.search(_mask_js(body)) is not None
+
+
+@pytest.mark.parametrize(
+    ("sample", "expected"),
+    [
+        pytest.param("segment.style.flexGrow = String(count);", [], id="flex-grow"),
+        # Edge: style in a comment or a string is not code.
+        pytest.param('// el.style.color\nvar s = "x.style.color = 1";', [], id="comment"),
+        # Failure: any other style write.
+        pytest.param(
+            'el.style.color = "red";', ["style access other than style.flexGrow ="], id="color"
+        ),
+        pytest.param(
+            'el.setAttribute("style", "color: red");', ["style attribute"], id="attribute"
+        ),
+        pytest.param(
+            'el.style.cssText = "";',
+            ["style access other than style.flexGrow =", "stylesheet or cssText write"],
+            id="css-text",
+        ),
+        pytest.param(
+            'el.style.setProperty("--w", "1");',
+            ["style access other than style.flexGrow ="],
+            id="set-property",
+        ),
+        pytest.param(
+            'document.head.appendChild(document.createElement("style"));',
+            ["style element"],
+            id="style-element",
+        ),
+    ],
+)
+def test_style_rule(sample: str, expected: list[str]) -> None:
+    assert style_violations(sample) == expected
+
+
+def test_admin_js_off_after_bounds_match_the_model() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+    body = component_bodies(source).get("offAfterHint", "")
+
+    # Expected: the hint accepts exactly the whole numbers the form accepts (N8).
+    assert int(js_var(body, "OFF_AFTER_MIN")) == MIN_SECONDS
+    assert int(js_var(body, "OFF_AFTER_MAX")) == MAX_SECONDS
 
 
 def test_component_bodies_follow_the_brackets() -> None:
