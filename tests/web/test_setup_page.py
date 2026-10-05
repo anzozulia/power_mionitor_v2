@@ -23,6 +23,7 @@ from django.contrib.auth import get_user_model
 from django.test import Client
 from pages import hidden_value, post_form
 
+from powermon.engine import rules
 from powermon.engine.models import LocationState
 from powermon.locations.examples import (
     cron_lines,
@@ -45,6 +46,9 @@ REVEAL_NOTE = "Reveal the key above to fill it into these examples."
 HIDDEN_AGAIN = "The key is hidden again the next time you open this page."
 KEY_NOTE = "Anyone with this key can send heartbeats for this location. Keep it private."
 REGENERATE_NOTE = "If the key has leaked, regenerate it. The old key stops working at once."
+XSS_NAME = "<script>alert(1)</script>"
+ESCAPED_XSS_NAME = "&lt;script&gt;alert(1)&lt;/script&gt;"
+ROUTER_GRACE_S = int(rules.ROUTER_GRACE.total_seconds())
 
 
 @pytest.fixture
@@ -97,6 +101,20 @@ def _settings_rows(page: str) -> list[tuple[str, str]]:
     assert panel is not None
     pairs = re.findall(r"<dt>(.*?)</dt>\s*<dd>(.*?)</dd>", panel.group(1), re.S)
     return [(unescape(term), unescape(value)) for term, value in pairs]
+
+
+def _crumbs(page: str) -> list[tuple[str, str]]:
+    """The breadcrumb items as (li attributes, inner HTML).
+
+    Copied from tests/web/test_location_page.py with the setup-page halves of its tests
+    (06-09; test directories have no __init__.py).
+    """
+    trail = re.search(
+        r'<nav aria-label="Breadcrumb">\s*<ol class="crumbs">(.*?)</ol>\s*</nav>', page, re.S
+    )
+    assert trail is not None, "no breadcrumb trail"
+    items = re.findall(r"<li\b([^>]*)>(.*?)</li>", trail.group(1), re.S)
+    return [(attrs, inner.strip()) for attrs, inner in items]
 
 
 # Masked by default, revealed only by POST
@@ -469,3 +487,102 @@ def test_setup_meta_line_shows_maintenance(admin: Client, location: Any) -> None
         r'Last heartbeat: <span class="num">2026-10-25 03:30:00 EEST</span></p>',
         page,
     )
+
+
+# The setup page's halves of tests on the list and location pages (06-09): the other half
+# of each keeps its name in tests/web/test_templates.py (the first two) or
+# tests/web/test_location_page.py (the last three), so every assertion on this page is
+# in this file and is migrated with it (06-19).
+
+
+@pytest.mark.django_db
+def test_xss_name_is_escaped_everywhere_on_setup(
+    admin: Client, location_factory: Callable[..., Any]
+) -> None:
+    location = location_factory(name=XSS_NAME)
+
+    setup = admin.get(f"/locations/{location.pk}/setup/").content.decode()
+
+    assert f'<h1 class="name">{ESCAPED_XSS_NAME}</h1>' in setup
+    assert f"<title>{ESCAPED_XSS_NAME} · Device setup · Power Monitor</title>" in setup
+    assert "<script" not in setup
+
+
+@pytest.mark.django_db
+def test_long_name_has_the_wrapping_class_on_setup(
+    admin: Client, location_factory: Callable[..., Any]
+) -> None:
+    name = "x" * 100
+    location = location_factory(name=name)
+
+    setup = admin.get(f"/locations/{location.pk}/setup/").content.decode()
+
+    assert f'<h1 class="name">{name}</h1>' in setup
+
+
+@pytest.mark.django_db
+def test_location_page_settings_and_setup_sections_on_setup(
+    admin: Client, location_factory: Callable[..., Any]
+) -> None:
+    location = location_factory(
+        name="Office",
+        bot_token=TOKEN,
+        period_s=45,
+        grace_s=20,
+        chat_id=-1009876543210,
+        language="ru",
+        router_grace=True,
+    )
+
+    setup = admin.get(f"/locations/{location.pk}/setup/").content.decode()
+
+    # The location page's settings panel shows these same rows (test_location_page.py).
+    expected = [
+        ("Language", "Russian"),
+        ("Heartbeat period", "45 s"),
+        ("Grace period", "20 s"),
+        (
+            "Reported OFF after",
+            f"65 s without a heartbeat ({65 + ROUTER_GRACE_S} s right after power returns, "
+            "router grace on)",
+        ),
+        ("Channel chat ID", "-1009876543210"),
+        ("Bot token", MASKED_TOKEN),
+    ]
+    assert ROUTER_GRACE_S == 180
+    assert _settings_rows(setup) == expected
+
+
+@pytest.mark.django_db
+def test_location_page_escapes_the_name_on_setup(
+    admin: Client, location_factory: Callable[..., Any]
+) -> None:
+    location = location_factory(name=XSS_NAME)
+
+    setup = admin.get(f"/locations/{location.pk}/setup/").content.decode()
+
+    assert _crumbs(setup)[1] == (
+        "",
+        f'<a class="name" href="/locations/{location.pk}/">{ESCAPED_XSS_NAME}</a>',
+    )
+    # E3 loading / E10 loading: plain forms and static links, no script at all.
+    assert "<script" not in setup
+
+
+@pytest.mark.django_db
+def test_breadcrumbs_on_location_and_setup_pages_on_setup(
+    admin: Client, location_factory: Callable[..., Any]
+) -> None:
+    location = location_factory(name="Office")
+    detail = f"/locations/{location.pk}/"
+
+    setup = admin.get(f"{detail}setup/").content.decode()
+
+    assert _crumbs(setup) == [
+        ("", '<a href="/">Locations</a>'),
+        ("", f'<a class="name" href="{detail}">Office</a>'),
+        (' aria-current="page"', "Device setup"),
+    ]
+    # Order inside <main>: breadcrumbs, then the h1.
+    setup_main = setup[setup.index("<main") :]
+    assert setup_main.index('<nav aria-label="Breadcrumb">') < setup_main.index("<h1")

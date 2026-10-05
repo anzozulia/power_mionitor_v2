@@ -327,31 +327,21 @@ def test_signed_in_header_renders_nav_and_sign_out(admin: Client) -> None:
     assert ">Sign out</button>" in sign_out.group(1)
 
 
-def test_nav_marks_the_list_only_on_the_list_page(admin: Client) -> None:
-    html = admin.get("/locations/new/").content.decode()
-
-    assert '<a href="/">Locations</a>' in html
-    assert "aria-current" not in html
-
-
-# Escaping and wrapping of the user-typed name
+# Escaping and wrapping of the user-typed name. The list page's half of each test is here;
+# the setup page's half is *_on_setup in tests/web/test_setup_page.py (06-09).
 
 
 @pytest.mark.django_db
 def test_xss_name_is_escaped_everywhere(
     admin: Client, location_factory: Callable[..., Any]
 ) -> None:
-    location = location_factory(name=XSS_NAME)
+    location_factory(name=XSS_NAME)
 
     listing = admin.get("/").content.decode()
-    setup = admin.get(f"/locations/{location.pk}/setup/").content.decode()
 
     assert _table_rows(listing)[0][0] == ESCAPED_XSS_NAME
     assert f">{ESCAPED_XSS_NAME}</a>" in listing
-    assert f'<h1 class="name">{ESCAPED_XSS_NAME}</h1>' in setup
-    assert f"<title>{ESCAPED_XSS_NAME} · Device setup · Power Monitor</title>" in setup
-    for html in (listing, setup):
-        assert "<script" not in html
+    assert "<script" not in listing
 
 
 @pytest.mark.django_db
@@ -362,10 +352,8 @@ def test_long_name_has_the_wrapping_class(
     location = location_factory(name=name)
 
     listing = admin.get("/").content.decode()
-    setup = admin.get(f"/locations/{location.pk}/setup/").content.decode()
 
     assert f'<a class="name" href="/locations/{location.pk}/">{name}</a>' in listing
-    assert f'<h1 class="name">{name}</h1>' in setup
 
 
 # Static assets
