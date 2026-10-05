@@ -27,6 +27,9 @@ the real tree must pass:
   token field; localStorage only inside a try block that has a catch, and only as
   getItem/setItem/removeItem with the literal key powermon.sidebar.rail; document.cookie only
   as an assignment of a string starting with theme= (R4).
+- admin.js components (06-11): the Alpine.data names are the 15 of the binding contract,
+  each component names its contract hooks, the theme cookie carries exactly the attributes
+  ThemeView sets (Secure only on https), and the relative-time floors and units are timefmt's.
 - CSS entries (powermon/web/assets/css/*.css): @import only "tailwindcss" or a ./ or ../ path;
   every url() relative or data: (comments skipped).
 - Python (powermon/web/**/*.py), read with the stdlib ast module: SafeString, SafeText,
@@ -49,16 +52,22 @@ attribute are built from CLASS.
 """
 
 import ast
+import math
 import re
 from collections import Counter
 from collections.abc import Callable, Iterator, Mapping
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 from django.conf import settings
 from django.contrib.staticfiles.storage import staticfiles_storage
+from django.test import RequestFactory
 
+from powermon.web.context_processors import THEME_COOKIE, THEMES
+from powermon.web.templatetags import timefmt
 from powermon.web.templatetags.icons import ICONS
+from powermon.web.theme import THEME_MAX_AGE, ThemeView
 
 WEB = Path(settings.BASE_DIR) / "powermon" / "web"
 TEMPLATES = WEB / "templates"
@@ -778,6 +787,363 @@ def test_frontend_lint_admin_js_real_tree() -> None:
     # The real file uses the storage it is allowed: the rail flag, inside a try/catch.
     assert len(_LOCAL_STORAGE.findall(source)) >= 1
     assert _try_catch_blocks(source) != []
+
+
+# admin.js components (06-11 binding contract)
+
+# The 15 Alpine.data names of the 06-11 binding contract: toasts from 06-07, the rest 06-11.
+CONTRACT_NAMES = frozenset(
+    {
+        "toasts",
+        "sidebar",
+        "theme",
+        "poll",
+        "relative",
+        "copy",
+        "tabs",
+        "confirmDialog",
+        "chartImage",
+        "fleetFilter",
+        "offAfterHint",
+        "errorSummary",
+        "throttleCountdown",
+        "revealGuard",
+        "sectionNav",
+    }
+)
+_REGISTRATION = re.compile(r"\bAlpine\s*\.\s*data\s*\(\s*([\"'])(?P<name>[^\"']*)\1")
+_COOKIE_WRITE = re.compile(r"\bdocument\s*\.\s*cookie\s*=(?!=)")
+_JS_STRING = re.compile(r"\"([^\"\\]*)\"|'([^'\\]*)'")
+# The one allowed form of the Secure attribute: appended only on an https page.
+_SECURE_ON_HTTPS = re.compile(
+    r"\(\s*(?:window\s*\.\s*)?location\s*\.\s*protocol\s*===\s*([\"'])https:\1"
+    r"\s*\?\s*([\"']); Secure\2\s*:\s*([\"'])\3\s*\)"
+)
+
+
+def _closing(code: str, start: int, opening: str = "(", closing: str = ")") -> int:
+    """Offset of the bracket that closes the first ``opening`` at or after ``start``."""
+    depth = 0
+    for index in range(code.index(opening, start), len(code)):
+        if code[index] == opening:
+            depth += 1
+        elif code[index] == closing:
+            depth -= 1
+            if depth == 0:
+                return index
+    return len(code) - 1
+
+
+def registered_names(source: str) -> list[str]:
+    """Every Alpine.data("<name>" registration in code order (comments and strings skipped)."""
+    code = _mask_js(source)
+    return [m.group("name") for m in _REGISTRATION.finditer(source) if code[m.start()] != " "]
+
+
+def component_bodies(source: str) -> dict[str, str]:
+    """The text of each ``Alpine.data(...)`` call, by name (the first one for a repeat)."""
+    code = _mask_js(source)
+    bodies: dict[str, str] = {}
+    for match in _REGISTRATION.finditer(source):
+        if code[match.start()] != " ":
+            end = _closing(code, match.start())
+            bodies.setdefault(match.group("name"), source[match.start() : end + 1])
+    return bodies
+
+
+def missing_hooks(body: str, hooks: tuple[str, ...]) -> list[str]:
+    """The hooks of the binding contract that a component's text never names."""
+    return [hook for hook in hooks if hook not in body]
+
+
+def cookie_writes(source: str) -> list[str]:
+    """The right-hand side of every ``document.cookie = ...`` statement."""
+    code = _mask_js(source)
+    writes = []
+    for match in _COOKIE_WRITE.finditer(code):
+        end = code.find(";", match.end())
+        writes.append(source[match.end() : len(source) if end < 0 else end])
+    return writes
+
+
+def theme_cookie_violations(source: str, server: Mapping[str, str]) -> list[str]:
+    """How the theme cookie admin.js writes differs from the ``server``'s attributes.
+
+    ``server`` maps the lower-case attribute names path, max-age and samesite to the values
+    ThemeView sets. The JS write must set exactly those, name the cookie theme, and add
+    Secure only on an https page (the server sets it exactly in production, behind TLS).
+    """
+    writes = cookie_writes(source)
+    if len(writes) != 1:
+        return ["not exactly one cookie write"]
+    expression = writes[0]
+    secure = _SECURE_ON_HTTPS.search(expression)
+    if secure is not None:
+        expression = expression[: secure.start()] + expression[secure.end() :]
+    text = "".join(a or b for a, b in _JS_STRING.findall(expression))
+    found: set[str] = set()
+    if not text.startswith(THEME_COOKIE + "="):
+        found.add("cookie other than theme")
+    attributes: dict[str, str] = {}
+    for part in text.split(";")[1:]:
+        name, _, value = part.strip().partition("=")
+        attributes[name.lower()] = value
+    for name, value in server.items():
+        if attributes.get(name) != value:
+            found.add(f"{name} differs from the server")
+    if "secure" in attributes:
+        found.add("Secure without the https condition")
+    if set(attributes) - set(server) - {"secure"}:
+        found.add("attribute the server does not set")
+    if secure is None:
+        found.add("no Secure on https")
+    return sorted(found)
+
+
+def server_theme_cookie() -> dict[str, str]:
+    """Path, Max-Age and SameSite of the cookie ThemeView sets for a valid POST."""
+    response = ThemeView.as_view()(RequestFactory().post("/theme/", {"theme": "dark"}))
+    morsel = response.cookies[THEME_COOKIE]
+    return {
+        "path": morsel["path"],
+        "max-age": str(morsel["max-age"]),
+        "samesite": morsel["samesite"],
+    }
+
+
+def js_var(source: str, name: str) -> str:
+    """The initializer text of ``var <name> = ...;`` in admin.js."""
+    match = re.search(rf"\bvar\s+{name}\s*=\s*(?P<value>[^;]*);", source)
+    assert match is not None, name
+    return match.group("value").strip()
+
+
+def js_object(source: str, name: str) -> dict[str, int | str]:
+    """A flat ``var <name> = {key: 60, key: "text"}`` literal as a dict."""
+    body = js_var(source, name)
+    assert body.startswith("{") and body.endswith("}"), name
+    pairs = re.findall(r"([\w$]+)\s*:\s*(\"[^\"]*\"|\d+)", body)
+    return {key: int(value) if value.isdigit() else value[1:-1] for key, value in pairs}
+
+
+def relative_mismatches(source: str) -> list[str]:
+    """Ages at which admin.js's floors and units disagree with powermon's timefmt.
+
+    The JS constants (MS_PER_SECOND, AGE_FLOORS, JUST_NOW, UNIT_AGO, UNIT_WORDS,
+    UNIT_COMPACT) drive a port of admin.js's ageParts; its texts must equal timefmt's
+    relative_text, compact_age and age_words at every floor boundary.
+    """
+    ms_per_second = int(js_var(source, "MS_PER_SECOND"))
+    floors = js_object(source, "AGE_FLOORS")
+    just_now = js_var(source, "JUST_NOW").strip("\"'")
+    ago, words, compact = (js_object(source, n) for n in ("UNIT_AGO", "UNIT_WORDS", "UNIT_COMPACT"))
+    minute, hour, limit, day = (int(floors[k]) for k in ("minute", "hour", "hoursLimit", "day"))
+
+    def js_age(age: timedelta) -> tuple[int, str]:
+        seconds = math.floor(age / timedelta(milliseconds=1) / ms_per_second)
+        if seconds < 1:
+            return 0, "s"
+        if seconds < minute:
+            return seconds, "s"
+        if seconds < hour:
+            return seconds // minute, "min"
+        if seconds < limit:
+            return seconds // hour, "h"
+        return seconds // day, "d"
+
+    now = datetime(2026, 10, 25, 3, 30, tzinfo=UTC)
+    found = []
+    for seconds in (-90, 0, 0.5, 0.999, 1, 59, 59.999, 60, 3599, 3600, 172_799, 172_800, 10**7):
+        value = now - timedelta(seconds=seconds)
+        count, unit = js_age(now - value)
+        relative = just_now if (count, unit) == (0, "s") else f"{count}{ago[unit]}"
+        texts = (relative, f"{count}{compact[unit]}", f"{count}{words[unit]}")
+        expected = (
+            timefmt.relative_text(value, now),
+            timefmt.compact_age(value, now),
+            timefmt.age_words(value, now),
+        )
+        if texts != expected:
+            found.append(f"{seconds} s: {texts} != {expected}")
+    return found
+
+
+# Hooks of the binding contract each component must name (a pin against renames; 06-20
+# cross-checks the x-data names against the templates).
+CONTRACT_HOOKS: dict[str, tuple[str, ...]] = {
+    "theme": ('button[name="theme"]', "aria-pressed", '"data-theme"', "preventDefault"),
+    "sidebar": (
+        'getElementById("sidebar")',
+        '[data-testid="sidebar-toggle"]',
+        '[data-testid="drawer-close"]',
+        '[data-testid="rail-toggle"]',
+        "[data-drawer-overlay]",
+        "[data-shell-body]",
+        '[data-testid="skip-link"]',
+        '"data-drawer"',
+        '"data-rail"',
+        '"inert"',
+        'matchMedia("(min-width: 64rem)")',
+        '"powermon.sidebar.rail"',
+        "Open navigation",
+        "Close navigation",
+        "Collapse sidebar",
+        "Expand sidebar",
+        "toggleDrawer",
+        "closeDrawer",
+        "toggleRail",
+    ),
+    "relative": (
+        '"data-now"',
+        "[data-relative]",
+        'a[data-testid="sidebar-location"]',
+        "[data-live-age]",
+        '"pm:status"',
+        "RELATIVE_REFRESH_MS",
+    ),
+}
+
+
+def test_admin_js_theme_cookie_matches_server() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+    server = server_theme_cookie()
+
+    # Expected: the server sets Path=/, Max-Age=THEME_MAX_AGE and SameSite=Lax, and the one
+    # cookie admin.js writes carries exactly those, plus Secure only on https (UI-02).
+    assert server == {"path": "/", "max-age": str(THEME_MAX_AGE), "samesite": "Lax"}
+    assert theme_cookie_violations(source, server) == []
+    assert [w for w in cookie_writes(source) if "Max-Age=31536000" in w] != []
+    # The theme component only writes values of the server's allowlist.
+    assert set(re.findall(r"\"(\w+)\"", js_var(source, "THEMES"))) == THEMES
+
+
+@pytest.mark.parametrize(
+    ("write", "expected"),
+    [
+        # Edge: Secure under the https test, with or without window.
+        pytest.param(
+            '"theme=" + v + "; Path=/; Max-Age=31536000; SameSite=Lax" + '
+            '(location.protocol === "https:" ? "; Secure" : "")',
+            [],
+            id="no-window",
+        ),
+        # Failure: every attribute that drifts from the server.
+        pytest.param(
+            '"theme=" + v + "; Path=/; Max-Age=0; SameSite=Lax" + '
+            '(window.location.protocol === "https:" ? "; Secure" : "")',
+            ["max-age differs from the server"],
+            id="max-age-zero",
+        ),
+        pytest.param(
+            '"theme=" + v + "; Path=/; Max-Age=31536000" + '
+            '(window.location.protocol === "https:" ? "; Secure" : "")',
+            ["samesite differs from the server"],
+            id="no-samesite",
+        ),
+        pytest.param(
+            '"theme=" + v + "; Path=/locations/; Max-Age=31536000; SameSite=Strict" + '
+            '(window.location.protocol === "https:" ? "; Secure" : "")',
+            ["path differs from the server", "samesite differs from the server"],
+            id="path-and-samesite",
+        ),
+        pytest.param(
+            '"theme=" + v + "; Path=/; Max-Age=31536000; SameSite=Lax; Secure"',
+            ["Secure without the https condition", "no Secure on https"],
+            id="secure-always",
+        ),
+        pytest.param(
+            '"theme=" + v + "; Path=/; Max-Age=31536000; SameSite=Lax"',
+            ["no Secure on https"],
+            id="never-secure",
+        ),
+        pytest.param(
+            '"theme=" + v + "; Path=/; Max-Age=31536000; SameSite=Lax; Domain=example" + '
+            '(window.location.protocol === "https:" ? "; Secure" : "")',
+            ["attribute the server does not set"],
+            id="domain",
+        ),
+        pytest.param(
+            '"mode=" + v + "; Path=/; Max-Age=31536000; SameSite=Lax" + '
+            '(window.location.protocol === "https:" ? "; Secure" : "")',
+            ["cookie other than theme"],
+            id="other-name",
+        ),
+    ],
+)
+def test_theme_cookie_rule(write: str, expected: list[str]) -> None:
+    server = {"path": "/", "max-age": "31536000", "samesite": "Lax"}
+    sample = "function choose(v) {\n  document.cookie = " + write + ";\n}\n"
+
+    assert theme_cookie_violations(sample, server) == expected
+    # Failure: no write, or two writes.
+    assert theme_cookie_violations("var x = 1;", server) == ["not exactly one cookie write"]
+    assert theme_cookie_violations(sample + sample, server) == ["not exactly one cookie write"]
+
+
+def test_admin_js_registers_names() -> None:
+    names = registered_names(ADMIN_JS.read_text(encoding="utf-8"))
+
+    # Expected: no name twice, every name from the contract, the shell components present.
+    assert sorted(Counter(names).values())[-1] == 1
+    assert set(names) <= CONTRACT_NAMES
+    assert {"toasts", "theme", "sidebar", "relative"} <= set(names)
+    # Edge: a repeat is seen; a registration inside a comment or a string is not one.
+    assert Counter(registered_names('Alpine.data("theme", a);\nAlpine.data("theme", b);')) == {
+        "theme": 2
+    }
+    assert registered_names('// Alpine.data("x", f)\nvar s = \'Alpine.data("y"\';') == []
+
+
+def test_admin_js_relative_floors_match_timefmt() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+
+    # Expected: the JS floors are timefmt's, in seconds, with 1000 ms to the second.
+    assert int(js_var(source, "MS_PER_SECOND")) == timefmt.SECOND // timedelta(milliseconds=1)
+    assert js_object(source, "AGE_FLOORS") == {
+        "minute": timefmt.MINUTE // timefmt.SECOND,
+        "hour": timefmt.HOUR // timefmt.SECOND,
+        "hoursLimit": timefmt.HOURS_LIMIT // timefmt.SECOND,
+        "day": timefmt.DAY // timefmt.SECOND,
+    }
+    assert js_object(source, "UNIT_COMPACT") == timefmt.COMPACT_UNITS
+    for text in ('"just now"', '" s ago"', '" min ago"', '" h ago"', '" d ago"'):
+        assert text in source, text
+    # Edge: every floor boundary, a future instant and a sub-second age agree.
+    assert relative_mismatches(source) == []
+    # Failure: a drifted floor or unit is caught.
+    assert relative_mismatches(source.replace("hour: 3600", "hour: 3601")) != []
+    assert relative_mismatches(source.replace('min: " min ago"', 'min: " m ago"')) != []
+
+
+@pytest.mark.parametrize("name", sorted(CONTRACT_HOOKS))
+def test_admin_js_components_name_their_contract_hooks(name: str) -> None:
+    bodies = component_bodies(ADMIN_JS.read_text(encoding="utf-8"))
+
+    # Expected: the component exists and names every hook of its contract row.
+    assert missing_hooks(bodies[name], CONTRACT_HOOKS[name]) == []
+    # Failure: a body without the hooks reports every one of them.
+    stub = 'Alpine.data("' + name + '", function () { return {}; })'
+    assert missing_hooks(component_bodies(stub)[name], CONTRACT_HOOKS[name]) == list(
+        CONTRACT_HOOKS[name]
+    )
+
+
+def test_component_bodies_follow_the_brackets() -> None:
+    source = (
+        'window.Alpine.data("a", function () { var s = ")"; return { f: g(1) }; });\n'
+        '// Alpine.data("c", nothing)\n'
+        'window.Alpine.data("b", function () { return {}; });'
+    )
+    bodies = component_bodies(source)
+
+    # Expected: each call up to its own closing parenthesis; a bracket in a string is text.
+    assert bodies == {
+        "a": 'Alpine.data("a", function () { var s = ")"; return { f: g(1) }; })',
+        "b": 'Alpine.data("b", function () { return {}; })',
+    }
+    # Edge and failure: an unclosed call runs to the end; no registration gives nothing.
+    assert component_bodies('Alpine.data("x", f(') == {"x": 'Alpine.data("x", f('}
+    assert component_bodies("var x = 1;") == {}
 
 
 def test_js_masking_keeps_offsets() -> None:
