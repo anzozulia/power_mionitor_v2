@@ -70,7 +70,9 @@ from powermon.web.forms import (
     SECONDS_NOT_WHOLE,
     SECONDS_TOO_LONG,
     TOKEN_REPASTE_NOTE,
+    LocationForm,
 )
+from powermon.web.templatetags.forms_ui import off_after_initial, summary_links
 from powermon.web.templatetags.icons import ICONS
 from powermon.web.views import LOCATION_CREATED_MESSAGE, LocationCreateView
 
@@ -938,3 +940,185 @@ def test_nav_marks_the_list_only_on_the_list_page(admin: Client) -> None:
     assert by_testid(page, "nav-add-location").get("aria-current") == "page"
     # The trail's last item is this page; the Locations crumb is a plain link.
     assert breadcrumbs(page) == [("Locations", LIST_URL), (ADD_TITLE, None)]
+
+
+# S4's polish pinned (06-UI-SPEC Components > Form field; E5 error, partial, zero-one-many):
+# the N8 hint's server value and fallback, the N10 summary, the aria wiring of each invalid
+# field, and the write-only token (UI-12, R3).
+
+LABELS = {name: str(bound.label) for name, bound in LocationForm.base_fields.items()}
+
+
+def _links(page: Tag) -> list[tuple[str, str]]:
+    """(href, text) of each jump link in the page's one error summary, in document order."""
+    return [
+        (str(link.get("href")), text(link))
+        for link in by_testid(page, "error-summary").find_all("a")
+    ]
+
+
+def _only_in(element: Tag, selector: str) -> Tag:
+    """The one element inside ``element`` matching an attribute ``selector``."""
+    found = element.select(selector)
+    assert len(found) == 1, f"{selector}: expected exactly one element, found {len(found)}"
+    return found[0]
+
+
+@pytest.mark.parametrize(
+    ("period", "grace", "expected"),
+    [
+        ("45", "15", 60),
+        (" 10 ", "3600", 3610),
+        ("0060", "30", 90),
+        ("9", "30", None),
+        ("abc", "30", None),
+        ("3601", "1", None),
+        ("1.5", "30", None),
+        ("", "30", None),
+        ("60", "9" * 5000, None),
+        ("٦٠", "30", None),
+    ],
+    ids=[
+        "bound",
+        "bounds-with-spaces",
+        "leading-zeros",
+        "period-below-10",
+        "not-a-number",
+        "above-3600",
+        "decimal",
+        "empty",
+        "huge-paste",
+        "non-ascii-digits",
+    ],
+)
+def test_N8_off_after_initial(admin: Client, period: str, grace: str, expected: int | None) -> None:
+    # Expected: unbound, the initial values (the add form's 60 + 30, or the edit form's
+    # stored values); bound, the posted values when both are whole seconds in 10-3600.
+    assert off_after_initial(LocationForm()) == 90
+    assert off_after_initial(LocationForm(initial={"period_s": 120, "grace_s": 45})) == 165
+    form = LocationForm(data=_form(period_s=period, grace_s=grace))
+    assert off_after_initial(form) == expected
+
+    # The page renders the same: an invalid POST (no name) keeps the posted seconds, and
+    # the hint shows their sum or, for a value it cannot add, the fallback sentence.
+    page = _rejected(admin, name="", period_s=period, grace_s=grace)
+    hint = by_testid(page, "off-after-hint")
+    value = _only_in(hint, "[data-off-after-value]")
+    fallback = _only_in(hint, "[data-off-after-fallback]")
+    if expected is None:
+        assert _shown(hint) == OFF_AFTER_FALLBACK
+        assert not fallback.has_attr("hidden")
+        # The empty slot the offAfterHint component fills once both values are valid.
+        assert text(value) == ""
+    else:
+        assert _shown(hint) == OFF_AFTER.format(expected)
+        assert fallback.has_attr("hidden")
+        assert text(value) == str(expected)
+
+
+def test_N10_error_summary(admin: Client) -> None:
+    # Expected (many): three invalid fields give one jump link each, in field order, with
+    # the field's label and first error, each to a control that exists and is marked.
+    page = _rejected(admin, name="", period_s="9", chat_id="")
+    summary = by_testid(page, "error-summary")
+    attributes = ("role", "tabindex", "x-data", "data-tone")
+    assert [summary.get(name) for name in attributes] == ["alert", "-1", "errorSummary", "error"]
+    assert text(summary).startswith(f"Error: {LOCATION_FORM_ERROR} ")
+    assert _links(page) == [
+        ("#id_name", f"{LABELS['name']}: {NAME_EMPTY}"),
+        ("#id_period_s", f"{LABELS['period_s']}: {PERIOD_TOO_SHORT}"),
+        ("#id_chat_id", f"{LABELS['chat_id']}: {CHAT_ID_EMPTY_MSG}"),
+    ]
+    for href, _ in _links(page):
+        # The jump target is the control itself, by its element id.
+        assert section(page, href.removeprefix("#")).get("aria-invalid") == "true"
+    # It is the first thing in the form, before the sections.
+    form = by_testid(page, "location-form")
+    first = form.find(attrs={"data-testid": ["error-summary", "form-section"]})
+    assert first is summary
+
+    # Edge (one): a single invalid field gives a single link.
+    one = _rejected(admin, grace_s="3601")
+    assert _links(one) == [("#id_grace_s", f"{LABELS['grace_s']}: {SECONDS_TOO_LONG}")]
+    # Edge: a field with two errors links with its first one only.
+    form_with_two = LocationForm(data=_form(name=""))
+    assert not form_with_two.is_valid()
+    form_with_two.add_error("name", "A second error.")
+    assert summary_links(form_with_two) == [("id_name", LABELS["name"], NAME_EMPTY)]
+
+    # Zero: no summary on a first load, and no link from a valid bound form.
+    assert all_by_testid(parse(admin.get(NEW_URL)), "error-summary") == []
+    valid = LocationForm(data=_form())
+    assert valid.is_valid()
+    assert summary_links(valid) == []
+
+
+def test_UI12_field_errors_and_aria(admin: Client) -> None:
+    # Expected: each invalid field is aria-invalid and described by its help, its error and
+    # (the token) the re-paste note, ids that all exist once on the page.
+    page = _rejected(admin, name="", period_s="9", bot_token="not-a-token", chat_id="@chan")
+    errors = {
+        "name": NAME_EMPTY,
+        "period_s": PERIOD_TOO_SHORT,
+        "bot_token": TOKEN_FORMAT_MSG,
+        "chat_id": CHAT_ID_USERNAME_MSG,
+    }
+    for name, message in errors.items():
+        control = field(page, name)
+        assert control.get("aria-invalid") == "true", name
+        assert field_error(page, name) == message
+        described = str(control.get("aria-describedby")).split()
+        assert {f"id_{name}_helptext", f"id_{name}_error"} <= set(described), name
+        for element_id in described:
+            section(page, element_id)
+    assert str(field(page, "bot_token").get("aria-describedby")).split() == [
+        "id_bot_token_helptext",
+        "id_bot_token_error",
+        "id_bot_token_note",
+    ]
+    # The chat-ID help stays the described element inside its closed disclosure.
+    assert section(by_testid(page, "chat-id-help"), "id_chat_id_helptext") is not None
+
+    # Edge: a valid field keeps its value, has no invalid mark and no error id.
+    for name in ("grace_s", "language"):
+        control = field(page, name)
+        assert not control.has_attr("aria-invalid"), name
+        assert control.get("aria-describedby") == f"id_{name}_helptext"
+        assert field_error(page, name) is None
+
+    # Every control is named by its own <label for> with the form's label.
+    for name, label in LABELS.items():
+        labels = page.find_all("label", attrs={"for": f"id_{name}"})
+        assert [text(found) for found in labels] == [label], name
+
+
+def test_R3_token_never_returned(admin: Client) -> None:
+    # Failure path: a valid token typed while another field is invalid never comes back.
+    response = admin.post(NEW_URL, _form(name="", bot_token=GOOD_TOKEN))
+    page = _refused(response)
+    token = field(page, "bot_token")
+    assert token.get("type") == "password"
+    assert not token.has_attr("value")
+    assert_no_secrets(
+        response.content.decode(),
+        [GOOD_TOKEN, GOOD_TOKEN.partition(":")[2]],
+        label="invalid add POST with a typed token",
+    )
+    # S4 always shows the re-paste note after an invalid submit, linked to the input.
+    assert text(section(page, "id_bot_token_note")) == TOKEN_REPASTE_NOTE
+    assert "id_bot_token_note" in str(token.get("aria-describedby")).split()
+
+    # Edge: a token typed with the wrong shape is not echoed either.
+    typed = "123456789:not-a-token-but-still-secret"
+    wrong = admin.post(NEW_URL, _form(bot_token=typed))
+    assert field_error(_refused(wrong), "bot_token") == TOKEN_FORMAT_MSG
+    assert_no_secrets(wrong.content.decode(), [typed, typed.partition(":")[2]], label="bad")
+
+    # Edge: there is no "show" control: the Telegram section holds no button at all.
+    telegram = [
+        found
+        for found in all_by_testid(page, "form-section")
+        if found.get("data-section") == "telegram"
+    ]
+    assert len(telegram) == 1
+    assert telegram[0].find_all("button") == []
