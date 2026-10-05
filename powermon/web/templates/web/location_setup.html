@@ -1,86 +1,150 @@
-{% extends "base.html" %}
-{% load display_time %}
+{% extends "layouts/app.html" %}
+{% load icons %}
 {% comment %}
-UI-SPEC screen 4 / Phase 4 screen E (LOC-05, D-06, D-11). The full device key is in the
-page only when "revealed" is true, which only the Reveal and Regenerate POST responses set
-(views.render_setup). Every command in a code block is a string from
-powermon.locations.examples (the generator the INV-24 #3 test runs verbatim); none is
-written here. The bot token is shown only as its masked form. The meta line uses the Phase
-4 status vocabulary (status = web.status.LocationStatus).
+S8, device setup (06-UI-SPEC Page Contracts > S8; UI-01, UI-05, UI-08, UI-11, UI-12; R2, R4,
+R13). Context: views.render_setup (location, status, language_label, revealed, shown_key,
+key_tail, heartbeat_url, curl_example, cron_example, wget_gnu_example, wget_busybox_example,
+period_s, grace_s, off_after_s, masked_token, token_bot_id). Three states: masked (the GET),
+revealed by the Reveal POST and revealed by the Regenerate POST; both POSTs are top-level
+navigations answered 200 with this page, and every response is no-store (the view).
+
+- The full key exists only when revealed, and only as the text of code#device-key and of
+  the four example code elements (R4): never in an attribute, a title, the live element or
+  any other response. Every example is a string from powermon/locations/examples.py (the
+  generator the INV-24 #3 test runs verbatim); none is written here. The heartbeat URL comes
+  from PUBLIC_BASE_URL, never from the Host header (R13). The bot token shows only as its
+  mask in the settings list (R3).
+- Header: the h1 name with the status pill (live); the meta line "Last heartbeat {abs}
+  ({rel})" or "Last heartbeat Never" (live) and the live-chip slot; no header actions.
+- Live: main carries the poll (data-poll-page setup, reload to the masked setup URL). Step 5
+  [data-testid=first-heartbeat][data-live=first-heartbeat] holds two variants: waiting
+  (data-fh=waiting, JS only, revealed by the poll) and received (data-fh=received, shown for
+  every power state but waiting, with the last heartbeat time only when there is one, so a
+  first heartbeat on a page rendered while waiting flips the line and offers the reload chip
+  instead of filling a time in place). Step 5 never wraps the key region.
+- Content: one [data-confirm-scope] wrapper starts the confirmDialog component (the
+  regenerate entry is a plain link with data-confirm to the S9 confirmation GET; the click
+  handling is document-wide). Inside: from xl a 2fr / 1fr grid, the five step cards
+  ol[data-testid=setup-steps] > li[data-testid=setup-step][data-step] 24 px apart on the
+  left, the rail card "Location settings" on the right; below xl the rail follows the steps.
+  Each step card's header strip has a 24 px number badge and the micro-label title.
+  1. before: the three paragraphs.
+  2. url: the intro and the heartbeat URL copy field (partials/_copy_field.html).
+  3. key: the device key secret field (partials/_device_key.html, both states), the
+     private-key note, the regenerate intro and the outline-danger "Regenerate key..." link.
+  4. examples: masked only, the info note (partials/_alert.html with the hook
+     data-testid="examples-masked-note"); the tabs component's wrapper with the tablist
+     (data-js-only, hidden; four tabs whose aria-controls name the four panels) and the four
+     tabpanels, each its h3 caption and a code block (partials/_code_block.html, copyable
+     only when revealed), the cron and BusyBox help lines; without JS the tablist stays
+     hidden and the four panels stay stacked, and all four code blocks are always in the
+     HTML. Then the link-previewer warning (partials/_alert.html, tone warning, the hook
+     data-testid="previewer-warning"), outside the panels, always visible.
+  5. first-heartbeat: the responses paragraph, then the live first-heartbeat element.
+- The one polite [data-copy-status] region the copy component announces in; the confirm
+  dialog shell renders in the layout's dialog block, after main.
+Every class is spelled out: no class name is built from data.
 {% endcomment %}
 {% block title %}{{ location.name }} · Device setup{% endblock %}
-{% block crumbs %}
-<nav aria-label="Breadcrumb">
-  <ol class="crumbs">
-    <li><a href="{% url 'location-list' %}">Locations</a></li>
-    <li><a class="name" href="{% url 'location-detail' location.pk %}">{{ location.name }}</a></li>
-    <li aria-current="page">Device setup</li>
-  </ol>
-</nav>
-{% endblock %}
+{% block main_attrs %}x-data="poll" data-poll-url="{% url 'location-status-json' %}" data-poll-page="setup" data-reload-url="{% url 'location-setup' location.pk %}"{% endblock %}
+{% block live_indicator %}{% include "partials/_live.html" %}{% endblock %}
+{% block page_title %}{{ location.name }}{% endblock %}
+{% block page_badges %}{% include "partials/_status_pill.html" with status=status.key label=status.label live=True location_id=location.pk only %}{% endblock %}
+{% block page_meta %}<li>{% include "partials/_time.html" with value=status.last_heartbeat_at variant="full" label="Last heartbeat" live="last-heartbeat" location_id=location.pk now=now only %}</li>
+{% url 'location-setup' location.pk as reload_url %}{% include "partials/_live_chip.html" with reload_url=reload_url only %}{% endblock %}
 {% block content %}
-<h1 class="name">{{ location.name }}</h1>
-<p class="meta"><span class="status status--{{ status.key }}">{{ status.label }}</span> · Last heartbeat: <span class="num">{{ status.last_heartbeat_at|display_time }}</span></p>
+<div data-confirm-scope x-data="confirmDialog" class="grid min-w-0 grid-cols-1 items-start gap-4 xl:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
+<ol data-testid="setup-steps" class="flex min-w-0 flex-col gap-6">
 
-<h2>Before you start</h2>
+<li data-testid="setup-step" data-step="before" class="min-w-0 rounded-card border border-border bg-surface">
+<div class="flex items-center gap-2 rounded-t-[5px] border-b border-border bg-surface-muted px-4 py-2"><span aria-hidden="true" class="inline-flex size-6 shrink-0 items-center justify-center rounded-full border border-border bg-surface-sunken num text-label font-semibold text-fg-muted">1</span><h2 class="text-label font-semibold tracking-label text-fg-muted uppercase">Before you start</h2></div>
+<div class="flex max-w-190 flex-col gap-2 p-4 text-body text-fg">
 <p>Use a device that loses power in a blackout: plugged into mains, with no UPS, power bank or battery. A device on backup power keeps reporting and hides the outage.</p>
 <p>A heartbeat needs both power and internet at the device. If the router or the provider's network is down, this location is reported OFF too.</p>
-<p>The device must send a heartbeat at least every {{ period_s }} s. Power is reported OFF after {{ off_after_s }} s without one.</p>
+<p>The device must send a heartbeat at least every <span class="num whitespace-nowrap">{{ period_s }} s</span>. Power is reported OFF after <span class="num whitespace-nowrap">{{ off_after_s }} s</span> without one.</p>
+</div>
+</li>
 
-<h2>Heartbeat URL</h2>
-<p>Send a GET or POST request to this URL. Put the key in the Authorization header; use ?key= in the URL only for devices that cannot set headers.</p>
-<pre class="copy" id="heartbeat-url"><code>{{ heartbeat_url }}</code></pre>
+<li data-testid="setup-step" data-step="url" class="min-w-0 rounded-card border border-border bg-surface">
+<div class="flex items-center gap-2 rounded-t-[5px] border-b border-border bg-surface-muted px-4 py-2"><span aria-hidden="true" class="inline-flex size-6 shrink-0 items-center justify-center rounded-full border border-border bg-surface-sunken num text-label font-semibold text-fg-muted">2</span><h2 class="text-label font-semibold tracking-label text-fg-muted uppercase">Heartbeat URL</h2></div>
+<div class="flex min-w-0 flex-col gap-4 p-4 text-body text-fg">
+<p class="max-w-190">Send a GET or POST request to this URL. Put the key in the Authorization header; use <code class="num">?key=</code> in the URL only for devices that cannot set headers.</p>
+{% include "partials/_copy_field.html" with label="Heartbeat URL" value=heartbeat_url element_id="heartbeat-url" copy_sr="heartbeat URL" copied_msg="Heartbeat URL copied." only %}
+</div>
+</li>
 
-<h2>Device key</h2>
-{% if revealed %}
-<div class="inline">
-  <pre class="copy" id="device-key"><code>{{ shown_key }}</code></pre>
-  <a class="btn btn--secondary" href="{% url 'location-setup' location.pk %}">Hide key</a>
+<li data-testid="setup-step" data-step="key" class="min-w-0 rounded-card border border-border bg-surface">
+<div class="flex items-center gap-2 rounded-t-[5px] border-b border-border bg-surface-muted px-4 py-2"><span aria-hidden="true" class="inline-flex size-6 shrink-0 items-center justify-center rounded-full border border-border bg-surface-sunken num text-label font-semibold text-fg-muted">3</span><h2 class="text-label font-semibold tracking-label text-fg-muted uppercase">Device key</h2></div>
+<div class="flex min-w-0 flex-col gap-4 p-4 text-body text-fg">
+{% include "partials/_device_key.html" with revealed=revealed shown_key=shown_key key_tail=key_tail location=location csrf_token=csrf_token only %}
+<p class="max-w-190">Anyone with this key can send heartbeats for this location. Keep it private.</p>
+<div class="flex flex-col items-start gap-2">
+<p class="max-w-190">If the key has leaked, regenerate it. The old key stops working at once.</p>
+<a href="{% url 'location-regenerate' location.pk %}" data-testid="regenerate-key" data-confirm data-variant="outline-danger" class="inline-flex min-h-11 shrink-0 items-center justify-center gap-2 rounded-control border border-danger-border bg-surface px-3 text-body font-semibold whitespace-nowrap text-danger-text no-underline hover:bg-danger-soft md:min-h-(--control-h) motion-safe:transition-colors motion-safe:duration-150">{% icon "key-round" class="size-4 shrink-0" %}Regenerate key…</a>
 </div>
-<p>Anyone with this key can send heartbeats for this location. Keep it private.</p>
-<p>The key is hidden again the next time you open this page.</p>
-{% else %}
-<div class="inline">
-  <code id="device-key" aria-hidden="true">{{ shown_key }}</code>
-  <span class="visually-hidden">Hidden key ending in {{ key_tail }}</span>
-  <form method="post" action="{% url 'location-setup' location.pk %}">
-    {% csrf_token %}
-    <button class="btn btn--primary" type="submit">Reveal key</button>
-  </form>
 </div>
-<p>Anyone with this key can send heartbeats for this location. Keep it private.</p>
-{% endif %}
-{% comment %}Both key states (UI-SPEC screen E): the entry point only opens the confirmation page (UI-D5).{% endcomment %}
-<p>If the key has leaked, regenerate it. The old key stops working at once.</p>
-<p><a class="btn btn--secondary" href="{% url 'location-regenerate' location.pk %}">Regenerate key</a></p>
+</li>
 
-<h2>Examples</h2>
-{% if not revealed %}
-<p class="callout"><strong>Note:</strong> Reveal the key above to fill it into these examples.</p>
-{% endif %}
-<div class="example">
-  <h3>curl, key in a header (recommended)</h3>
-  <pre class="copy" id="example-curl"><code>{{ curl_example }}</code></pre>
+<li data-testid="setup-step" data-step="examples" class="min-w-0 rounded-card border border-border bg-surface">
+<div class="flex items-center gap-2 rounded-t-[5px] border-b border-border bg-surface-muted px-4 py-2"><span aria-hidden="true" class="inline-flex size-6 shrink-0 items-center justify-center rounded-full border border-border bg-surface-sunken num text-label font-semibold text-fg-muted">4</span><h2 class="text-label font-semibold tracking-label text-fg-muted uppercase">Examples</h2></div>
+<div class="flex min-w-0 flex-col gap-4 p-4 text-body text-fg">
+{% if not revealed %}{% include "partials/_alert.html" with tone="info" body="Reveal the key above to fill it into these examples." testid="examples-masked-note" only %}{% endif %}
+<div x-data="tabs" class="flex min-w-0 flex-col gap-4">
+<div role="tablist" aria-label="Device examples" data-testid="example-tabs" data-js-only hidden class="-mb-2 flex min-w-0 gap-1 overflow-x-auto border-b border-border [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+<button type="button" role="tab" id="example-tab-curl" aria-selected="true" aria-controls="example-panel-curl" tabindex="0" class="-mb-px inline-flex min-h-11 shrink-0 items-center border-b-2 border-transparent px-3 text-body font-semibold whitespace-nowrap text-fg-muted hover:text-fg aria-selected:border-accent-text aria-selected:text-fg md:min-h-(--control-h) motion-safe:transition-colors motion-safe:duration-150">curl (recommended)</button>
+<button type="button" role="tab" id="example-tab-cron" aria-selected="false" aria-controls="example-panel-cron" tabindex="-1" class="-mb-px inline-flex min-h-11 shrink-0 items-center border-b-2 border-transparent px-3 text-body font-semibold whitespace-nowrap text-fg-muted hover:text-fg aria-selected:border-accent-text aria-selected:text-fg md:min-h-(--control-h) motion-safe:transition-colors motion-safe:duration-150">Cron</button>
+<button type="button" role="tab" id="example-tab-wget-gnu" aria-selected="false" aria-controls="example-panel-wget-gnu" tabindex="-1" class="-mb-px inline-flex min-h-11 shrink-0 items-center border-b-2 border-transparent px-3 text-body font-semibold whitespace-nowrap text-fg-muted hover:text-fg aria-selected:border-accent-text aria-selected:text-fg md:min-h-(--control-h) motion-safe:transition-colors motion-safe:duration-150">GNU wget</button>
+<button type="button" role="tab" id="example-tab-wget-busybox" aria-selected="false" aria-controls="example-panel-wget-busybox" tabindex="-1" class="-mb-px inline-flex min-h-11 shrink-0 items-center border-b-2 border-transparent px-3 text-body font-semibold whitespace-nowrap text-fg-muted hover:text-fg aria-selected:border-accent-text aria-selected:text-fg md:min-h-(--control-h) motion-safe:transition-colors motion-safe:duration-150">BusyBox wget</button>
 </div>
-<div class="example">
-  <h3>Cron (router or Linux)</h3>
-  <pre class="copy" id="example-cron"><code>{{ cron_example }}</code></pre>
-  <p class="help">Each line is one crontab entry; add them with <code>crontab -e</code>. Together they send a heartbeat at least every {{ period_s }} s. No curl on the device? Put one of the wget commands below in place of the curl command.</p>
+<div role="tabpanel" id="example-panel-curl" aria-labelledby="example-curl-title" class="flex min-w-0 flex-col gap-2">
+<h3 id="example-curl-title" class="text-body font-semibold text-fg">curl, key in a header (recommended)</h3>
+{% include "partials/_code_block.html" with element_id="example-curl" caption="curl (recommended)" text=curl_example copyable=revealed copy_sr="curl example" copied_msg="Example copied." only %}
 </div>
-<div class="example">
-  <h3>wget, key in the URL (GNU wget)</h3>
-  <pre class="copy" id="example-wget-gnu"><code>{{ wget_gnu_example }}</code></pre>
+<div role="tabpanel" id="example-panel-cron" aria-labelledby="example-cron-title" class="flex min-w-0 flex-col gap-2">
+<h3 id="example-cron-title" class="text-body font-semibold text-fg">Cron (router or Linux)</h3>
+{% include "partials/_code_block.html" with element_id="example-cron" caption="Cron" text=cron_example copyable=revealed copy_sr="cron lines" copied_msg="Example copied." only %}
+<p class="max-w-190 text-fg-muted">Each line is one crontab entry; add them with <code class="num">crontab -e</code>. Together they send a heartbeat at least every <span class="num whitespace-nowrap">{{ period_s }} s</span>. No curl on the device? Use one of the wget commands from these examples in place of the curl command.</p>
 </div>
-<div class="example">
-  <h3>BusyBox wget or OpenWrt uclient-fetch, key in the URL</h3>
-  <pre class="copy" id="example-wget-busybox"><code>{{ wget_busybox_example }}</code></pre>
-  <p class="help">These do not accept <code>--max-redirect</code>. The heartbeat URL never redirects.</p>
+<div role="tabpanel" id="example-panel-wget-gnu" aria-labelledby="example-wget-gnu-title" class="flex min-w-0 flex-col gap-2">
+<h3 id="example-wget-gnu-title" class="text-body font-semibold text-fg">wget, key in the URL (GNU wget)</h3>
+{% include "partials/_code_block.html" with element_id="example-wget-gnu" caption="GNU wget" text=wget_gnu_example copyable=revealed copy_sr="GNU wget example" copied_msg="Example copied." only %}
 </div>
-<p class="callout"><strong>Warning:</strong> Do not paste a URL that contains the key into Telegram or any other chat. Chat apps open links to build previews, and every opening counts as a heartbeat: it can mark this location ON while the power is off.</p>
-<p>A working heartbeat gets HTTP 200 with the body ok. HTTP 401 means the key is missing or wrong, and nothing is recorded. After the first heartbeat this location shows On; the first heartbeat sends no alert.</p>
+<div role="tabpanel" id="example-panel-wget-busybox" aria-labelledby="example-wget-busybox-title" class="flex min-w-0 flex-col gap-2">
+<h3 id="example-wget-busybox-title" class="text-body font-semibold text-fg">BusyBox wget or OpenWrt uclient-fetch, key in the URL</h3>
+{% include "partials/_code_block.html" with element_id="example-wget-busybox" caption="BusyBox wget" text=wget_busybox_example copyable=revealed copy_sr="BusyBox wget example" copied_msg="Example copied." only %}
+<p class="max-w-190 text-fg-muted">These do not accept <code class="num">--max-redirect</code>. The heartbeat URL never redirects.</p>
+</div>
+</div>
+{% include "partials/_alert.html" with tone="warning" title="Do not paste a URL that contains the key into Telegram or any other chat." body="Chat apps open links to build previews, and every opening counts as a heartbeat: it can mark this location ON while the power is off." testid="previewer-warning" only %}
+</div>
+</li>
 
-<h2>Location settings</h2>
-{% include "web/_settings_panel.html" %}
-{% comment %}UI-D10: the entry point to the edit form, a secondary link-button under the panel.{% endcomment %}
-<p><a class="btn btn--secondary" href="{% url 'location-edit' location.pk %}">Edit location</a></p>
+<li data-testid="setup-step" data-step="first-heartbeat" class="min-w-0 rounded-card border border-border bg-surface">
+<div class="flex items-center gap-2 rounded-t-[5px] border-b border-border bg-surface-muted px-4 py-2"><span aria-hidden="true" class="inline-flex size-6 shrink-0 items-center justify-center rounded-full border border-border bg-surface-sunken num text-label font-semibold text-fg-muted">5</span><h2 class="text-label font-semibold tracking-label text-fg-muted uppercase">Check it works</h2></div>
+<div class="flex min-w-0 flex-col gap-4 p-4 text-body text-fg">
+<p class="max-w-190">A working heartbeat gets HTTP 200 with the body ok. HTTP 401 means the key is missing or wrong, and nothing is recorded. After the first heartbeat this location shows On; the first heartbeat sends no alert.</p>
+<div data-testid="first-heartbeat" data-live="first-heartbeat" data-location-id="{{ location.pk }}" aria-live="polite" class="flex min-w-0 flex-col gap-2">
+<div data-fh="waiting" data-js-only hidden class="flex min-w-0 items-start gap-2">{% icon "hourglass" class="mt-0.5 size-4 shrink-0 text-icon" %}<div class="flex min-w-0 flex-col">
+<p class="font-semibold text-fg">Waiting for the first heartbeat…</p>
+<p class="text-fg-muted">This updates on its own when the device sends it.</p>
+</div></div>
+<div data-fh="received"{% if status.power_key == "waiting" %} hidden{% endif %} class="flex min-w-0 items-start gap-2">{% icon "circle-check" class="mt-0.5 size-4 shrink-0 text-ok-text" %}<div class="flex min-w-0 flex-col">
+<p class="font-semibold text-fg">First heartbeat received.</p>
+{% if status.last_heartbeat_at %}<p class="text-fg-muted">{% include "partials/_time.html" with value=status.last_heartbeat_at variant="full" label="Last heartbeat" now=now only %}</p>
+{% endif %}</div></div>
+</div>
+</div>
+</li>
+
+</ol>
+<section aria-labelledby="rail-settings-title" class="min-w-0 rounded-card border border-border bg-surface">
+<div class="flex items-center justify-between gap-4 rounded-t-[5px] border-b border-border bg-surface-muted px-4 py-2"><h2 id="rail-settings-title" class="text-label font-semibold tracking-label text-fg-muted uppercase">Location settings</h2></div>
+<div class="flex flex-col items-start gap-4 px-4 py-2 pb-4">
+<div class="w-full min-w-0">{% include "partials/_settings_dl.html" with location=location language_label=language_label period_s=period_s grace_s=grace_s off_after_s=off_after_s masked_token=masked_token token_bot_id=token_bot_id only %}</div>
+{% url 'location-edit' location.pk as edit_url %}{% include "partials/_button.html" with variant="secondary" label="Edit location" href=edit_url icon="pencil" testid="edit-location" only %}
+</div>
+</section>
+<p data-copy-status aria-live="polite" class="sr-only"></p>
+</div>
 {% endblock %}
+{% block dialog %}{% include "partials/_confirm_dialog.html" only %}{% endblock %}

@@ -1,0 +1,25 @@
+{% load icons %}{% comment %}
+The device key secret field (06-UI-SPEC Components > Secret field, Page Contracts > S8 step 3;
+UI-08, R2, R4). Included with only: context revealed, shown_key (the full key when revealed,
+else its mask from keys.mask_key), key_tail (the key's last characters, shown masked only),
+location and csrf_token (an isolated include drops the context processors' values, so the
+caller passes the token on, or the Reveal form's CSRF input would be empty).
+
+[data-testid=device-key][data-state=masked|revealed]: secrets look different, so the value
+sits on the sunken fill in a 1 px dashed strong border, mono, with a left icon.
+
+- masked: the lock icon; code#device-key aria-hidden with the mask; the sr-only sentence
+  "Hidden key ending in {key_tail}"; form[method=post][data-testid=reveal-form] to the setup
+  URL with the CSRF input and the primary "Reveal key" (eye). The submit guard marks the
+  button aria-busy while the POST runs, which swaps the eye for the spinner. No copy button:
+  the key is never copied while masked.
+- revealed: the key-round icon; code#device-key holding the full key as its only text, never
+  in an attribute, a title or an aria-label (R4); a 3 px inset bar in the warning icon colour
+  marks the field. Then the small secondary Copy button for #device-key (bound to the copy
+  component, "Copy" then the sr-only " device key"), a[data-testid=hide-key] "Hide key"
+  (eye-off), a plain GET of the setup URL, and the note that the key is hidden again on the
+  next visit. The region carries the revealGuard component with data-masked-url = the setup
+  URL, which holds no key: on pagehide it empties the key and the four examples, and a page
+  restored from the back/forward cache is replaced by the masked page.
+Every class is spelled out: no class name is built from data.
+{% endcomment %}{% url 'location-setup' location.pk as setup_url %}{% if revealed %}<div data-testid="device-key" data-state="revealed" x-data="revealGuard" data-masked-url="{{ setup_url }}" class="flex min-w-0 flex-col gap-2"><div class="flex min-w-0 items-center gap-2 rounded-control border border-dashed border-border-strong bg-surface-sunken px-3 py-2.5 [box-shadow:inset_3px_0_0_var(--warn-icon)]">{% icon "key-round" class="size-4 shrink-0 text-icon" %}<code id="device-key" class="min-w-0 num text-body text-fg select-all [overflow-wrap:anywhere]">{{ shown_key }}</code></div><div class="flex flex-wrap items-center gap-2"><button type="button" data-testid="copy" data-copy-target="device-key" data-copied-msg="Device key copied." data-js-only hidden x-data="copy" class="group/copy inline-flex min-h-11 shrink-0 items-center justify-center gap-2 rounded-control border border-border-strong bg-surface px-3 text-body font-semibold whitespace-nowrap text-fg hover:bg-surface-sunken md:min-h-(--control-h-sm) motion-safe:transition-colors motion-safe:duration-150">{% icon "copy" class="size-3.5 shrink-0 group-data-copied/copy:hidden" %}{% icon "check" class="hidden size-3.5 shrink-0 text-ok-text group-data-copied/copy:block" %}Copy<span class="sr-only"> device key</span></button>{% include "partials/_button.html" with variant="secondary" size="sm" label="Hide key" href=setup_url icon="eye-off" testid="hide-key" only %}</div><p class="text-body text-fg-muted">The key is hidden again the next time you open this page.</p></div>{% else %}<div data-testid="device-key" data-state="masked" class="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center"><div class="flex min-w-0 flex-1 items-center gap-2 rounded-control border border-dashed border-border-strong bg-surface-sunken px-3 py-2.5">{% icon "lock" class="size-4 shrink-0 text-icon" %}<code id="device-key" aria-hidden="true" class="min-w-0 num text-body text-fg [overflow-wrap:anywhere]">{{ shown_key }}</code><span class="sr-only">Hidden key ending in {{ key_tail }}</span></div><form method="post" action="{{ setup_url }}" data-testid="reveal-form" class="shrink-0">{% csrf_token %}{% include "partials/_button.html" with variant="primary" label="Reveal key" icon="eye" only %}</form></div>{% endif %}

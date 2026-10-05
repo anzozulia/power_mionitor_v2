@@ -6,9 +6,10 @@
   is a salted HMAC of the key it replaces (UI-D7), so it carries no key characters.
 - The POST replaces the key with one conditional UPDATE, only while the marker still
   matches the current key and the UPDATE still finds that key. It answers 200 with the
-  setup page revealed (the new key in the key block and every example), ``Cache-Control:
-  no-store`` and the success flash (D-14). A resubmitted or raced POST never replaces the
-  key a second time: it shows the current key with the UI-D7 info flash.
+  setup page revealed (the new key as the text of ``#device-key`` and of every example,
+  nowhere else), ``Cache-Control: no-store`` and the sticky success toast (D-14). A
+  resubmitted or raced POST never replaces the key a second time: it shows the current key
+  with the UI-D7 info toast.
 - INV-24 #1: the old key gets 401 at once and changes nothing, the new key gets 200, and the
   history (timeline, outbox, chart records) is untouched.
 
@@ -18,16 +19,14 @@ No admin action here makes a Telegram call (KD2). The heartbeat endpoint is serv
 The confirmation page (S9) is read through ``pages.py`` and the 06-UI-SPEC hooks (06-16):
 the ``confirm`` root, ``confirm-title``, one ``state-block``, ``confirm-form`` with the
 marker, ``keep`` and ``confirm-submit``. Its modal fragment is tested in
-tests/web/test_fragments.py. The POST tests still read the revealed setup page's markup;
-they move to the hooks with the setup page (06-19), so this file keeps its marker.
+tests/web/test_fragments.py. The POST tests read the revealed setup page (S8) the same way
+(06-19): the key and the examples through ``code_block()``, the Hide-key link by its
+testid, the flashes as toasts.
 """
-
-# class-guard: pending migration
 
 import re
 from collections.abc import Callable
 from datetime import UTC, date, datetime
-from html import unescape
 from typing import Any
 
 import pytest
@@ -39,13 +38,17 @@ from django.test import Client, RequestFactory
 from django.utils.crypto import salted_hmac
 from pages import (
     all_by_testid,
+    assert_no_injected_script,
+    assert_no_secrets,
     assert_page,
     breadcrumbs,
     by_testid,
+    code_block,
     h1,
     hidden_value,
     main,
     messages,
+    parse,
     post_form,
     text,
 )
@@ -125,11 +128,13 @@ def _flashes(page: str) -> list[str]:
     return [flash.text for flash in messages(page) if flash.role == "status"]
 
 
-def _block(page: str, block_id: str) -> str:
-    """The unescaped text of the code block with this id."""
-    match = re.search(rf'<pre class="copy" id="{block_id}"><code>(.*?)</code></pre>', page, re.S)
-    assert match is not None, f"no code block {block_id!r}"
-    return unescape(match.group(1))
+def _toasts(page: str) -> list[tuple[str | None, str, bool]]:
+    """Each toast as (level, text, sticky): the sticky ones carry ``data-sticky`` (UI-09)."""
+    found = all_by_testid(page, "toast")
+    return [
+        (message.level, message.text, toast.has_attr("data-sticky"))
+        for message, toast in zip(messages(page), found, strict=True)
+    ]
 
 
 def _without_tokens(page: str) -> str:
@@ -198,7 +203,8 @@ def test_INV24_1_regeneration_kills_the_old_key_and_keeps_history(
     confirm = admin.get(_confirm(location))
     response = admin.post(_confirm(location), {"marker": _marker(confirm, location)})
 
-    # D-14: the setup page revealed with the new key, not cached, with the success flash.
+    # D-14: the setup page revealed with the new key, not cached, with the success flash,
+    # sticky because the device still needs the new key (UI-09).
     assert response.status_code == 200
     assert "no-store" in response["Cache-Control"]
     page = response.content.decode()
@@ -207,15 +213,29 @@ def test_INV24_1_regeneration_kills_the_old_key_and_keeps_history(
     assert len(new_key) == KEY_LENGTH
     assert set(new_key) <= set(KEY_ALPHABET)
     assert _flashes(page) == [REGENERATED_FLASH]
-    assert _block(page, "device-key") == new_key
+    assert _toasts(page) == [("success", REGENERATED_FLASH, True)]
+    soup = parse(page)
+    assert by_testid(soup, "device-key")["data-state"] == "revealed"
+    assert code_block(soup, "device-key") == new_key
     for block in EXAMPLE_BLOCKS:
-        assert new_key in _block(page, block)
-    assert old_key not in page
-    assert f'<a class="btn btn--secondary" href="/locations/{location.pk}/setup/">Hide key</a>' in (
-        page
+        assert new_key in code_block(soup, block)
+    # The new key is only the text of #device-key and the examples (R4); the old key is gone.
+    assert_no_secrets(
+        page,
+        [new_key],
+        label="regenerate POST",
+        allow=[(new_key, "#device-key"), *((new_key, f"#{block}") for block in EXAMPLE_BLOCKS)],
+        headers=[str(response.get("Location", ""))],
     )
-    # E7 loading: the regenerated page is server-rendered, with no script.
-    assert "<script" not in page
+    assert old_key not in page
+    hide = by_testid(soup, "hide-key")
+    assert (hide.name, hide["href"], text(hide)) == (
+        "a",
+        f"/locations/{location.pk}/setup/",
+        "Hide key",
+    )
+    # E7 loading: the regenerated page is server-rendered, with no injected or inline script.
+    assert_no_injected_script(page, "regenerate POST")
     # Only that location's key changed.
     assert _key(other) == other.device_key
 
@@ -258,7 +278,9 @@ def test_regenerate_resubmit_never_replaces_the_key_twice(
     assert second.status_code == 200
     assert "no-store" in second["Cache-Control"]
     assert _flashes(page) == [ALREADY_FLASH]
-    assert _block(page, "device-key") == regenerated
+    # UI-D7: an info toast, not sticky.
+    assert _toasts(page) == [("info", ALREADY_FLASH, False)]
+    assert code_block(page, "device-key") == regenerated
     assert len(fake_telegram.calls) == 0
 
 
@@ -270,7 +292,8 @@ def test_regenerate_without_a_marker_changes_nothing(
 
     for data in ({}, {"marker": ""}, {"marker": "0" * 64}, {"marker": location.device_key}):
         page = admin.post(_confirm(location), data).content.decode()
-        assert _flashes(page) == [ALREADY_FLASH]
+        assert _toasts(page) == [("info", ALREADY_FLASH, False)]
+        assert code_block(page, "device-key") == location.device_key
 
     assert _key(location) == location.device_key
 
@@ -300,8 +323,8 @@ def test_regenerate_race_one_winner(
     assert outcomes == [False]
     winner = _key(location)
     assert winner != location.device_key
-    assert _flashes(page) == [ALREADY_FLASH]
-    assert _block(page, "device-key") == winner
+    assert _toasts(page) == [("info", ALREADY_FLASH, False)]
+    assert code_block(page, "device-key") == winner
 
 
 @pytest.mark.django_db
