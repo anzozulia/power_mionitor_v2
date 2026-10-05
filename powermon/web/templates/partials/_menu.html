@@ -1,0 +1,21 @@
+{% load icons %}{% comment %}
+The location page's kebab menu (06-UI-SPEC Components > Popover menu, Page Contracts > S5
+header actions; UI-07, D6-05, R7). Context: location, has_history and outage_in_progress
+(LocationDetailView), and the page's status when present.
+
+- button[popovertarget=location-menu]: an icon-only secondary button (ellipsis-vertical),
+  named "More actions"; the Popover API opens and light-dismisses the menu without JS.
+- [popover][id=location-menu]: a plain list of links (no role=menu, Tab-navigable), placed
+  under the trigger by CSS anchor positioning (its implicit popovertarget anchor):
+  start-aligned below md, end-aligned from md.
+  1. "Device setup" to the setup page.
+  2. "Reset history…" follows the danger zone's three states. Reset possible (history, no
+     outage in progress): a[data-confirm] to the reset confirmation GET. Otherwise a plain
+     link to the danger-zone row #reset-history with data-reason (in-progress, which wins
+     while an outage is listed in progress or the stored power state is off, as the reset
+     view decides; else no-history) and aria-describedby="reset-unavailable": the page
+     gives its [data-testid=reset-unavailable] refusal line that id. Never a dead control.
+  3. "Delete location…" (danger tone): a[data-confirm] to the delete confirmation GET.
+- Nothing here acts: every entry is a link to a server-side confirmation or a page, so the
+  confirmDialog component can load it into the dialog and the no-JS path keeps working (R7).
+{% endcomment %}{% if outage_in_progress or status.power_key == "off" %}{% firstof "in-progress" as reset_reason %}{% elif has_history %}{% firstof "" as reset_reason %}{% else %}{% firstof "no-history" as reset_reason %}{% endif %}<button type="button" popovertarget="location-menu" class="inline-flex size-11 shrink-0 items-center justify-center rounded-control border border-border-strong bg-surface text-fg hover:bg-surface-sunken md:size-(--control-h) motion-safe:transition-colors motion-safe:duration-150">{% icon "ellipsis-vertical" class="size-4 shrink-0 text-icon" %}<span class="sr-only">More actions</span></button><div popover id="location-menu" class="m-0 my-1 min-w-60 rounded-control border border-border bg-surface p-2 text-body text-fg shadow-pop [position-area:bottom_span-right] md:[position-area:bottom_span-left]"><ul class="flex flex-col gap-1"><li><a href="{% url 'location-setup' location.pk %}" data-testid="menu-device-setup" class="flex min-h-11 items-center gap-2 rounded-control px-3 text-fg no-underline hover:bg-surface-sunken md:min-h-(--control-h)">{% icon "cpu" class="size-4 shrink-0 text-icon" %}Device setup</a></li><li><a href="{% if reset_reason %}#reset-history{% else %}{% url 'location-reset' location.pk %}{% endif %}" data-testid="menu-reset-history"{% if reset_reason %} data-reason="{{ reset_reason }}" aria-describedby="reset-unavailable"{% else %} data-confirm{% endif %} class="flex min-h-11 items-center gap-2 rounded-control px-3 text-fg no-underline hover:bg-surface-sunken md:min-h-(--control-h)">{% icon "rotate-ccw" class="size-4 shrink-0 text-icon" %}Reset history…</a></li><li><a href="{% url 'location-delete' location.pk %}" data-testid="menu-delete-location" data-confirm class="flex min-h-11 items-center gap-2 rounded-control px-3 text-danger-text no-underline hover:bg-danger-soft md:min-h-(--control-h)">{% icon "trash-2" class="size-4 shrink-0 text-danger-text" %}Delete location…</a></li></ul></div>

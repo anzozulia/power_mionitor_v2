@@ -1,0 +1,20 @@
+{% load icons %}{% comment %}
+Switch (06-UI-SPEC Components > Switch; UI-10, R2, R16). Context: row (a location_views
+SwitchRow: url_name, heading, help, button, target) and location. All copy is the row's
+Python text.
+
+- Its own form[method=post] to the row's switch route with the CSRF token and
+  input[name=value] = row.target, the state the switch moves to. It never posts a toggle, so
+  a stale page can only repeat the change it shows and the view answers "Nothing changed."
+- data-switch names the switch (maintenance, alerts, router-grace) from the route name, and
+  data-state is the current state, the opposite of the target.
+- The heading (h3, [data-testid=switch-state]) is the current state; the button to its right
+  is button[type=submit][role=switch][aria-checked] = the current state, named by the
+  sr-only action ("Turn maintenance on") and described by the help below
+  (id "{url_name}-help", unique on the page).
+- The 32x18 track and its 14x14 knob are aria-hidden. Off: switch-off with a 1 px
+  switch-off-border edge; on: switch-on, the knob 14 px to the right. The hit box is 44x44,
+  44x32 from md with a fine pointer. Hover adds a 4 px halo; the focus ring is drawn on the
+  track, not on the hit box. Pending (the submit guard's aria-busy) shows a 10 px spinner
+  in the knob, with no dimming. No optimistic toggle: POST, redirect, GET, then the toast.
+{% endcomment %}<form method="post" action="{% url row.url_name location.pk %}" data-testid="switch" data-switch="{% if row.url_name == "location-maintenance" %}maintenance{% elif row.url_name == "location-alerts" %}alerts{% elif row.url_name == "location-router-grace" %}router-grace{% endif %}" data-state="{% if row.target == "on" %}off{% else %}on{% endif %}" class="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-4 gap-y-1 py-3">{% csrf_token %}<input type="hidden" name="value" value="{{ row.target }}"><h3 data-testid="switch-state" class="text-body font-semibold break-words text-fg">{{ row.heading }}</h3><button type="submit" role="switch" aria-checked="{% if row.target == "on" %}false{% else %}true{% endif %}" aria-describedby="{{ row.url_name }}-help" class="group/switch inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-control focus-visible:shadow-none focus-visible:outline-none aria-busy:cursor-progress md:h-(--control-h)"><span class="sr-only">{{ row.button }}</span><span aria-hidden="true" class="relative block h-4.5 w-8 rounded-control border border-switch-off-border bg-switch-off group-hover/switch:[box-shadow:0_0_0_4px_var(--surface-sunken)] group-focus-visible/switch:outline-2 group-focus-visible/switch:outline-offset-2 group-focus-visible/switch:outline-focus group-focus-visible/switch:[box-shadow:0_0_0_4px_var(--focus-halo)] group-aria-checked/switch:border-switch-on group-aria-checked/switch:bg-switch-on group-hover/switch:group-aria-checked/switch:[box-shadow:0_0_0_4px_var(--accent-soft)] motion-safe:transition-colors motion-safe:duration-150"><span class="absolute top-px left-px flex size-3.5 items-center justify-center rounded-led bg-knob shadow-knob group-aria-checked/switch:translate-x-3.5 motion-safe:transition-transform motion-safe:duration-150">{% icon "loader-circle" class="hidden size-2.5 text-switch-on group-aria-busy/switch:block motion-safe:animate-spin" %}</span></span></button><p id="{{ row.url_name }}-help" class="col-span-2 text-body break-words text-fg-muted">{{ row.help }}</p></form>
