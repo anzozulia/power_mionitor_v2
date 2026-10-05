@@ -30,6 +30,7 @@ from pages import (
     assert_page,
     by_testid,
     field,
+    field_error,
     h1,
     hidden_value,
     messages,
@@ -295,6 +296,60 @@ def test_UI01_sign_in_head(client: Client) -> None:
     skip = by_testid(page, "skip-link")
     assert (skip.get("href"), text(skip)) == ("#main", "Skip to content")
     assert page.find(["a", "button", "input"]) is skip
+
+
+@pytest.mark.django_db
+def test_UI01_wrong_credentials_state(client: Client) -> None:
+    sync_admin("admin", "pw-one")
+    typed = 'ad<m>in&"x'
+
+    response = _sign_in(client, typed, "wrong-pw-xyz")
+
+    page = assert_page(response, title=SIGN_IN, app=False)
+    # E1 error: one error-toned alert, announced, above the fields; no throttle message.
+    alert = by_testid(page, "form-error")
+    assert (alert.get("role"), alert.get("data-tone")) == ("alert", "error")
+    assert _alerts(page) == [ERROR_PREFIX + SIGN_IN_ERROR]
+    assert all_by_testid(page, "throttle-message") == []
+    assert all_by_testid(page, "throttle-countdown") == []
+    assert page.find_all(attrs={"x-data": "throttleCountdown"}) == []
+    # E1 partial: the username keeps the typed value, escaped in the markup; the password
+    # input has no value attribute at all.
+    assert field(page, "username").get("value") == typed
+    html = response.content.decode()
+    assert "ad<m>in" not in html
+    assert not field(page, "password").has_attr("value")
+    assert "wrong-pw-xyz" not in html
+    # The flash regions stay empty: the error is inline, never a toast.
+    assert messages(page) == []
+    # The submit button is rendered enabled.
+    (submit,) = by_testid(page, "sign-in-form").find_all("button")
+    assert not submit.has_attr("disabled") and not submit.has_attr("aria-disabled")
+
+
+@pytest.mark.django_db
+def test_UI01_sign_in_long_username(client: Client) -> None:
+    sync_admin("admin", "pw-one")
+    long_name = ("<script>alert(1)</script>" + "x" * 300)[:300]
+    assert len(long_name) == 300
+
+    response = _sign_in(client, long_name, "wrong-pw-xyz")
+
+    # E1 long-text: the injected payload is never markup (assert_page checks it), and the
+    # page shows only fixed copy: the typed name is the escaped value of #id_username and
+    # nothing else, never page text and never another attribute.
+    page = assert_page(response, title=SIGN_IN, app=False)
+    assert field(page, "username").get("value") == long_name
+    assert long_name not in text(page)
+    holders = [
+        (element.name, attribute)
+        for element in page.find_all(True)
+        for attribute, value in element.attrs.items()
+        if isinstance(value, str) and long_name in value
+    ]
+    assert holders == [("input", "value")]
+    assert _alerts(page) == [ERROR_PREFIX + SIGN_IN_ERROR]
+    assert field_error(page, "username") is None
 
 
 @pytest.mark.django_db

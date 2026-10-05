@@ -28,13 +28,16 @@ from django.contrib.auth.models import AnonymousUser
 from django.contrib.messages.storage.fallback import FallbackStorage
 from django.contrib.sessions.backends.db import SessionStore
 from django.test import Client, RequestFactory
+from django.test.html import Element, parse_html
 from pages import (
     Page,
+    all_by_testid,
     assert_no_injected_script,
     assert_page,
     by_testid,
     field,
     hidden_value,
+    messages,
     parse,
     text,
 )
@@ -44,6 +47,7 @@ from powermon.throttle.models import LoginFailure
 from powermon.throttle.rules import RETRY_AFTER, THROTTLE_MESSAGE
 from powermon.web.admin_sync import sync_admin
 from powermon.web.forms import SIGN_IN_ERROR
+from powermon.web.templatetags.icons import ICONS
 from powermon.web.views import SignInView
 
 US = timedelta(microseconds=1)
@@ -60,6 +64,14 @@ def _alerts(page: Page) -> list[str]:
     """
     soup = page if isinstance(page, Tag) else parse(page)
     return [found for element in soup.find_all(attrs={"role": "alert"}) if (found := text(element))]
+
+
+def _is_icon(svg: Tag, name: str) -> bool:
+    """A parsed inline ``<svg>`` draws the shapes of the vendored icon ``name``."""
+    drawn = parse_html(f"<g>{svg.decode_contents()}</g>")
+    vendored = parse_html(f"<g>{ICONS[name]}</g>")
+    assert isinstance(drawn, Element) and isinstance(vendored, Element)
+    return drawn.children == vendored.children
 
 
 def _sign_in(client: Client, username: str, password: str, **extra: Any) -> Any:
@@ -302,6 +314,46 @@ def test_throttled_page_keeps_the_username_and_no_password(client: Client) -> No
         assert_no_injected_script(html)
     assert _alerts(throttled) == [WARNING_PREFIX + THROTTLE_MESSAGE]
     assert by_testid(throttled, "throttle-message").get("data-retry-after") == RETRY_AFTER
+
+
+@pytest.mark.django_db
+def test_UI01_throttled_state(client: Client) -> None:
+    sync_admin("admin", "pw-one")
+    _fail(client, 5)
+
+    # The sixth POST within the window, with the right password.
+    response = _sign_in(client, "admin", "pw-one")
+
+    page = assert_page(response, status=429, title="Sign in", app=False)
+    assert response["Retry-After"] == RETRY_AFTER == "300"
+    # R9: only the throttle message, inline, warning tone with the clock icon, announced.
+    message = by_testid(page, "throttle-message")
+    assert (message.get("role"), message.get("data-tone")) == ("alert", "warning")
+    assert message.get("data-retry-after") == RETRY_AFTER
+    assert _alerts(page) == [WARNING_PREFIX + THROTTLE_MESSAGE]
+    (icon,) = message.find_all("svg")
+    assert _is_icon(icon, "clock")
+    assert all_by_testid(page, "form-error") == []
+    # Never a flash: no toast carries the throttle text.
+    assert messages(page) == []
+    # N11: the countdown slot is JS-only, hidden, empty until the component writes it, and
+    # sits next to the message, outside it, in the throttleCountdown scope with the form.
+    countdown = by_testid(page, "throttle-countdown")
+    assert countdown.has_attr("data-js-only") and countdown.has_attr("hidden")
+    assert text(countdown) == ""
+    assert countdown.find_parent(attrs={"data-testid": "throttle-message"}) is None
+    (scope,) = page.find_all(attrs={"x-data": "throttleCountdown"})
+    form = by_testid(page, "sign-in-form")
+    for part in (message, countdown, form):
+        assert part is scope or scope in part.parents
+    # E1 partial: the unbound form never sends the password back (R9: nothing checked);
+    # the username keeps only the typed name, as on the fifth failure's page.
+    assert field(page, "username").get("value") == "admin"
+    assert not field(page, "password").has_attr("value")
+    # The button is rendered enabled; only the JS countdown marks it aria-disabled.
+    (submit,) = form.find_all("button")
+    assert submit.get("type") == "submit"
+    assert not submit.has_attr("disabled") and not submit.has_attr("aria-disabled")
 
 
 @pytest.mark.django_db
