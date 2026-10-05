@@ -171,12 +171,14 @@ def test_all_by_testid_keeps_document_order_and_may_be_empty() -> None:
 def test_main_h1_and_title() -> None:
     page = parse(
         "<html><head><title>\n  Office  ·  Power Monitor </title></head>"
-        '<body><main id="main"><h1>Office <span aria-hidden="true">*</span></h1></main></body>'
+        '<body><main id="main"><h1>Office <span aria-hidden="true">*</span></h1>'
+        '<svg role="img"><title>On</title></svg></main></body>'
         "</html>"
     )
 
     assert main(page)["id"] == "main"
     assert text(h1(page)) == "Office"
+    # An inline SVG's <title> names the icon; it is not a second document title.
     assert title(page) == "Office · Power Monitor"
 
 
@@ -470,9 +472,8 @@ def test_forms_and_values() -> None:
 
 def test_forms_and_values_fail_when_the_form_or_input_is_not_one() -> None:
     page = parse(LOCATION_FORM + REGENERATE_FORMS)
-    twice = REGENERATE_FORMS.replace(
-        'value="0123abcd" type="hidden">', 'value="0123abcd" type="hidden">' * 2
-    )
+    marker = '<input name="marker" value="0123abcd" type="hidden">'
+    twice = REGENERATE_FORMS.replace(marker, marker * 2)
 
     with pytest.raises(AssertionError, match="POST form to '/nowhere/'.*found 0"):
         post_form(page, "/nowhere/")
