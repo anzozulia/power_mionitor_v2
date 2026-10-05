@@ -36,11 +36,14 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.staticfiles.storage import staticfiles_storage
 from django.http import HttpResponse
+from django.template import TemplateSyntaxError
 from django.template.loader import render_to_string
 from django.test import Client
 from django.test.html import Element, parse_html
-from pages import STATIC_ASSET, parse
+from pages import STATIC_ASSET, assert_page, by_testid, parse, text
 from urls_raise import RAISE_PATH
+
+from powermon.web.templatetags.icons import ICONS, icon
 
 BASE_DIR = Path(settings.BASE_DIR)
 ENTRY = BASE_DIR / "powermon" / "web" / "assets" / "css" / "app.css"
@@ -81,6 +84,10 @@ ERROR_CODES = [
     pytest.param("403", id="E2-403-csrf"),
     pytest.param("500", id="E3-500", marks=pytest.mark.urls("urls_raise")),
 ]
+ERROR_TITLES = {"404": "Page not found", "403": "Form expired", "500": "Server error"}
+# The icon in each card's 48 px circle (06-UI-SPEC Iconography and E1-E3).
+ERROR_ICONS = {"404": "file-question-mark", "403": "clock", "500": "circle-alert"}
+WORDMARK = "Power Monitor"
 
 
 # CSS helpers
@@ -423,6 +430,68 @@ def test_error_layout_still_context_free(code: str) -> None:
     assert response.content.decode() == render_to_string(ERROR_TEMPLATES[code])
 
 
+# The error pages' art and favicons (UI-01, UI-12, UI-13)
+
+
+def _shapes(markup: str) -> list[Element | str]:
+    """The elements of an icon's inner markup as Django's HTML tree (attribute order and
+    self-closing syntax ignored)."""
+    wrapper = parse_html(f"<g>{markup}</g>")
+    assert isinstance(wrapper, Element)
+    return wrapper.children
+
+
+def _is_icon(svg: Any, name: str) -> bool:
+    """A parsed inline <svg> draws the shapes of the vendored icon ``name``."""
+    return _shapes(svg.decode_contents()) == _shapes(ICONS[name])
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("code", ERROR_CODES)
+def test_error_pages_use_icons_and_favicons(code: str) -> None:
+    page = parse(_error_response(code))
+
+    favicons = [link for link in page.find_all("link") if "icon" in _rel(link)]
+    assert [(link.get("href"), link.get("type"), link.get("sizes")) for link in favicons] == [
+        (staticfiles_storage.url("web/favicon.svg"), "image/svg+xml", None),
+        (staticfiles_storage.url("web/favicon.ico"), None, "32x32"),
+    ]
+    for link in favicons:
+        assert STATIC_ASSET.fullmatch(link["href"]), link["href"]
+    # Two inline icons, both hidden from assistive technology; the text carries the meaning.
+    svgs = page.find_all("svg")
+    assert len(svgs) == 2
+    for svg in svgs:
+        assert (svg.get("aria-hidden"), svg.get("focusable")) == ("true", "false")
+    # The code's icon is in the card; the zap mark is in the wordmark, outside the card.
+    (code_icon,) = by_testid(page, "error-page").find_all("svg")
+    assert _is_icon(code_icon, ERROR_ICONS[code])
+    (mark,) = [svg for svg in svgs if svg is not code_icon]
+    assert _is_icon(mark, "zap")
+    assert text(mark.parent) == WORDMARK
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("code", ERROR_CODES)
+def test_error_pages_pass_the_page_invariants(code: str) -> None:
+    page = assert_page(
+        _error_response(code), status=int(code), title=ERROR_TITLES[code], app=False
+    )
+
+    # Still no JavaScript at all, with the icons inlined (E1-E3).
+    assert page.find_all("script") == []
+
+
+def test_is_icon_tells_icons_apart() -> None:
+    # The helper the icon tests rely on: the tag's own rendering matches (expected), an icon
+    # with no shapes matches nothing (edge), another icon's shapes never match (failure).
+    (svg,) = parse(icon("plus", **{"class": "size-4"})).find_all("svg")
+
+    assert _is_icon(svg, "plus")
+    assert not _is_icon(parse("<svg></svg>").find_all("svg")[0], "plus")
+    assert not _is_icon(svg, "x")
+
+
 # The entry's tokens (UI-02)
 
 
@@ -613,3 +682,50 @@ def test_button_partial_escapes_its_values() -> None:
     assert "<b>" not in html
     assert "&lt;b&gt;x&lt;/b&gt;" in html
     assert '"><i>' not in html
+
+
+def _svg_before_label(element: Element, name: str, label: str) -> None:
+    """``element`` starts with the hidden svg of icon ``name``, followed by ``label``."""
+    svg = element.children[0]
+    assert isinstance(svg, Element) and svg.name == "svg"
+    assert ("aria-hidden", "true") in svg.attributes
+    assert ("focusable", "false") in svg.attributes
+    assert svg.children == _shapes(ICONS[name])
+    assert element.children[1] == label
+
+
+def test_button_icon_is_optional() -> None:
+    button = _render_button(variant="primary", label="Add location", icon="plus")
+    plain = render_to_string(BUTTON, {"variant": "primary", "label": "Add location"})
+
+    assert button.name == "button"
+    assert len(button.children) == 2
+    _svg_before_label(button, "plus", "Add location")
+    # Without the parameter, or with an empty one, the partial renders no icon at all.
+    assert "<svg" not in plain
+    empty = {"variant": "primary", "label": "Add location", "icon": ""}
+    assert render_to_string(BUTTON, empty) == plain
+
+
+def test_button_icon_on_a_small_link_keeps_the_suffix_last() -> None:
+    # Edge: a small button-styled link with a screen-reader suffix.
+    link = _render_button(
+        variant="ghost",
+        label="Edit",
+        href="/locations/1/edit/",
+        size="sm",
+        sr_suffix="Office",
+        icon="pencil",
+    )
+
+    assert link.name == "a"
+    _svg_before_label(link, "pencil", "Edit")
+    suffix = link.children[2]
+    assert isinstance(suffix, Element)
+    assert (suffix.name, suffix.children) == ("span", ["Office"])
+
+
+def test_button_icon_rejects_an_unknown_name() -> None:
+    # Failure: the name goes through the icon tag's allowlist.
+    with pytest.raises(TemplateSyntaxError, match="unknown icon name"):
+        render_to_string(BUTTON, {"variant": "primary", "label": "Add", "icon": "no-such-icon"})
