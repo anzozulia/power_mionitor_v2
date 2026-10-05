@@ -152,6 +152,26 @@ def test_icon_names_are_allowlisted() -> None:
         assert not ICON_NAME.fullmatch(bad), bad
 
 
+def test_icon_files_are_read_without_root_and_licence(tmp_path: Path) -> None:
+    from powermon.web.templatetags.icons import _inner_markup
+
+    drawn = tmp_path / "drawn.svg"
+    drawn.write_text(
+        '<!-- @license x -->\n<svg\n  stroke-width="2"\n>\n  <path d="M1 1" />\n</svg>\n',
+        encoding="utf-8",
+    )
+    assert _inner_markup(drawn) == '<path d="M1 1" />'
+    # Edge: an empty root yields empty markup.
+    empty = tmp_path / "empty.svg"
+    empty.write_text("<svg></svg>", encoding="utf-8")
+    assert _inner_markup(empty) == ""
+    # Failure: a file with no svg root is refused, so the tag can never inline it.
+    broken = tmp_path / "broken.svg"
+    broken.write_text("<!-- only a comment -->", encoding="utf-8")
+    with pytest.raises(ValueError, match="no <svg> root"):
+        _inner_markup(broken)
+
+
 def test_icons_module_has_one_mark_safe() -> None:
     assert ICONS_MODULE.is_file()
     calls = _mark_safe_calls(ICONS_MODULE.read_text(encoding="utf-8"))
