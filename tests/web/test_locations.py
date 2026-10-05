@@ -23,6 +23,7 @@ from django.contrib.messages.storage.fallback import FallbackStorage
 from django.contrib.sessions.backends.db import SessionStore
 from django.db import IntegrityError, transaction
 from django.test import Client, RequestFactory
+from pages import messages
 
 from powermon.engine.models import LocationState
 from powermon.locations.keys import KEY_ALPHABET, KEY_LENGTH, generate_device_key, mask_key
@@ -686,7 +687,7 @@ def test_LOC02_valid_create_redirects_to_setup(admin: Client) -> None:
     assert (state.status, state.last_heartbeat_at) == ("waiting", None)
 
     setup = admin.get(response.url).content.decode()
-    assert re.findall(r'role="status">([^<]*)<', setup) == [CREATED_FLASH]
+    assert [(flash.role, flash.text) for flash in messages(setup)] == [("status", CREATED_FLASH)]
     # The flash shows once.
     assert CREATED_FLASH not in admin.get(response.url).content.decode()
 

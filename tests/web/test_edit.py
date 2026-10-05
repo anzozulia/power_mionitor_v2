@@ -47,6 +47,7 @@ from django.db.models import F, Value
 from django.db.models.functions import Greatest
 from django.http import HttpResponse
 from django.test import Client, RequestFactory
+from pages import message_texts
 
 from powermon.alerts import outbox
 from powermon.alerts.models import OutboxMessage
@@ -150,9 +151,8 @@ def _loaded_form(page: str) -> dict[str, str]:
 
 
 def _flashes(admin: Client, url: str) -> list[str]:
-    """The flash messages the page at ``url`` shows (success and info have role=status)."""
-    page = admin.get(url).content.decode()
-    return [unescape(t) for t in re.findall(r'role="(?:status|alert)">([^<]*)<', page)]
+    """The flash messages the page at ``url`` shows, toast or legacy callout alike (UI-09)."""
+    return message_texts(admin.get(url))
 
 
 def _power_off_rows(location: Any) -> int:

@@ -24,7 +24,6 @@ import dataclasses
 import re
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from html import unescape
 from typing import Any
 
 import pytest
@@ -46,6 +45,7 @@ from django.contrib.sessions.backends.db import SessionStore
 from django.db import transaction
 from django.http import HttpResponse
 from django.test import Client, RequestFactory
+from pages import messages as page_messages
 from urllib3.exceptions import MaxRetryError, NewConnectionError
 
 from powermon.alerts import delivery, outbox
@@ -188,11 +188,8 @@ def _post_test_message(
 
 
 def _flashes(html: str) -> list[tuple[str, str]]:
-    """Each flash on a page as (role, text)."""
-    return [
-        (role, unescape(text).strip())
-        for role, text in re.findall(r'role="(status|alert)">([^<]*)<', html)
-    ]
+    """Each flash on a page as (role, text), toast or legacy callout alike (UI-09)."""
+    return [(flash.role, flash.text) for flash in page_messages(html)]
 
 
 def _get(rf: RequestFactory, view: Callable[..., HttpResponse], path: str, **kwargs: Any) -> str:
