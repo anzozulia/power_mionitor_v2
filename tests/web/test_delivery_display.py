@@ -1,40 +1,42 @@
-"""Delivery health on the location list (LOC-03, OPS-03; D-10, D-13, UI-D6; UI-SPEC screen A).
+"""Delivery health on the location list (LOC-03, OPS-03; D-10, D-13, UI-D6; 06-UI-SPEC S3).
 
-- The list's fourth column, Delivery, shows "OK" as plain text while the location has no
-  open ``delivery_failing`` incident, and "Failing since {time} ({code})" with the failing
-  dot while it has one. The open incident is the badge's single source (D-10).
+- The list's fourth column, Delivery, shows "OK" while the location has no open
+  ``delivery_failing`` incident, and the failing pill "Failing since {time} ({code})" while
+  it has one; the pill's text is ``live.delivery_text``. The open incident is the badge's
+  single source (D-10). The row and the cell carry ``data-delivery`` ok or failing.
 - UI-D6: ``{time}`` is HH:MM in the display TZ when the incident started on today's local
   date, else YYYY-MM-DD HH:MM; minutes are truncated, never rounded. ``{code}`` is
   ``http_{status}`` of the refusal the incident describes.
-- One query reads the incidents of every listed location; nothing is read per row.
-- E1: zero locations give the P1 empty panel, one and twenty the same table with no
-  pagination and no count; no script; the table scrolls inside its wrapper.
+- The incidents of every listed location are read at once: the number of incident reads is
+  the same for one row as for three, never one per row.
+- E1: zero locations give the empty state, one and twenty the same table with no
+  pagination; no injected script; a 100-character name shows whole.
 
 The list view takes an injected clock (``LocationListView.as_view(clock=...)``) for the
-"today" decision, through RequestFactory as in tests/web/test_locations.py (LOC-02).
+"today" decision, through RequestFactory as in tests/web/test_locations.py (LOC-02). Rows
+and cells are read only inside the locations table (06-18 adds the phone cards with the
+same hooks), after dropping every element that carries the ``hidden`` attribute.
 """
 
-# class-guard: pending migration
-
-import re
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
+from bs4 import BeautifulSoup, Tag
 from conftest import FakeClock
-from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.messages.storage.fallback import FallbackStorage
 from django.contrib.sessions.backends.db import SessionStore
 from django.db import connection, transaction
 from django.test import Client, RequestFactory
 from django.test.utils import CaptureQueriesContext
+from pages import all_by_testid, assert_no_injected_script, by_testid, main, parse, table, text
 
 from powermon.alerts import delivery
 from powermon.web import status
+from powermon.web.live import delivery_text
 from powermon.web.views import LocationListView
 
 User = get_user_model()
@@ -42,7 +44,7 @@ User = get_user_model()
 KYIV = ZoneInfo("Europe/Kyiv")
 # Now on the list: 2026-10-02 12:00 in Kyiv (09:00 UTC).
 NOW = datetime(2026, 10, 2, 12, 0, tzinfo=KYIV)
-CSS_PATH = Path(settings.BASE_DIR) / "powermon" / "web" / "static" / "web" / "app.css"
+HEADERS = ["Name", "Status", "Last heartbeat", "Delivery"]
 
 
 @pytest.fixture
@@ -74,20 +76,44 @@ def _list(rf: RequestFactory, now: datetime) -> str:
     return response.content.decode()
 
 
-def _text(fragment: str) -> str:
-    return " ".join(re.sub(r"<[^>]+>", " ", fragment).split())
-
-
-def _headers(html: str) -> list[str]:
-    return re.findall(r'<th scope="col">([^<]*)</th>', html)
+def _shown(html: str) -> BeautifulSoup:
+    """The page parsed, without the elements that carry the ``hidden`` attribute."""
+    soup = parse(html)
+    for element in [found for found in soup.find_all(True) if found.has_attr("hidden")]:
+        element.extract()
+    return soup
 
 
 def _rows(html: str) -> list[list[str]]:
-    """Each body row's cells as raw HTML."""
-    body = re.search(r"<tbody>(.*?)</tbody>", html, re.S)
-    assert body is not None, "no table body in the page"
-    rows = re.findall(r"<tr>(.*?)</tr>", body.group(1), re.S)
-    return [re.findall(r"<td\b[^>]*>(.*?)</td>", row, re.S) for row in rows]
+    """The cell texts of each shown row of the locations table."""
+    headers, rows = table(_shown(html), "locations-table")
+    assert headers == HEADERS
+    return rows
+
+
+def _row_elements(html: str) -> list[Tag]:
+    """The ``location-row`` elements of the locations table, in order."""
+    return all_by_testid(by_testid(_shown(html), "locations-table"), "location-row")
+
+
+def _delivery_cell(row: Tag) -> Tag:
+    """The row's one delivery element."""
+    [cell] = all_by_testid(row, "delivery")
+    return cell
+
+
+def _count(html: str) -> str | None:
+    """The text of the meta count item ("3 locations"), or None when the page has none."""
+    values = main(parse(html)).find_all(attrs={"data-count-value": True})
+    if not values:
+        return None
+    item = values[0].find_parent("li")
+    assert isinstance(item, Tag), "the meta count is not inside a meta line item"
+    return text(item)
+
+
+def _incident_reads(queries: CaptureQueriesContext) -> list[str]:
+    return [q["sql"] for q in queries.captured_queries if '"ops_incident"' in q["sql"]]
 
 
 def _fail(location: Any, started_at: datetime, status: int = 403) -> None:
@@ -140,31 +166,37 @@ def test_list_delivery_column(
     rf: RequestFactory, kyiv: Any, location_factory: Callable[..., Any]
 ) -> None:
     location_factory(name="A healthy")
+    now = _local(2, 15, 0)
+    with CaptureQueriesContext(connection) as one:
+        _list(rf, now)
     today = location_factory(name="B today")
     older = location_factory(name="C older")
     _fail(today, _local(2, 14, 5, 59), 403)
     _fail(older, _local(1, 23, 59, 59), 401)
-    now = _local(2, 15, 0)
 
-    with CaptureQueriesContext(connection) as queries:
+    with CaptureQueriesContext(connection) as three:
         html = _list(rf, now)
 
-    assert _headers(html) == ["Name", "Status", "Last heartbeat", "Delivery"]
-    cells = _rows(html)
-    assert [len(row) for row in cells] == [4, 4, 4]
-    # "OK" is plain text with no status dot (UI-SPEC screen A).
-    assert cells[0][3] == "OK"
-    assert (
-        cells[1][3] == '<span class="status status--failing">Failing since 14:05 (http_403)</span>'
-    )
-    assert cells[2][3] == (
-        '<span class="status status--failing">Failing since 2026-10-01 23:59 (http_401)</span>'
-    )
-    # A failure shows only in its own row's Delivery cell (E1 error).
-    assert html.count("status--failing") == 2
-    # One query for the incidents of all rows, none per row.
-    incident_reads = [q["sql"] for q in queries.captured_queries if '"ops_incident"' in q["sql"]]
-    assert len(incident_reads) == 1
+    rows = _rows(html)
+    assert [len(row) for row in rows] == [4, 4, 4]
+    assert [row[3] for row in rows] == [
+        "OK",
+        "Failing since 14:05 (http_403)",
+        "Failing since 2026-10-01 23:59 (http_401)",
+    ]
+    elements = _row_elements(html)
+    assert [row["data-delivery"] for row in elements] == ["ok", "failing", "failing"]
+    cells = [_delivery_cell(row) for row in elements]
+    assert [cell["data-delivery"] for cell in cells] == ["ok", "failing", "failing"]
+    # The failing pill's text is the list's delivery_text of the open incident; OK has none.
+    failing = delivery.failing_incidents([today.pk, older.pk])
+    for cell, location in zip(cells[1:], (today, older), strict=True):
+        [label] = cell.find_all(attrs={"data-label": True})
+        assert text(label) == delivery_text(failing[location.pk], now)
+    assert cells[0].find_all(attrs={"data-label": True}) == []
+    assert text(cells[0]) == "OK"
+    # The incidents of all rows are read at once: as many reads for three rows as for one.
+    assert len(_incident_reads(three)) == len(_incident_reads(one)) >= 1
 
 
 @pytest.mark.django_db
@@ -179,12 +211,18 @@ def test_list_delivery_follows_the_open_incident_only(
 
     failing = _list(rf, _local(2, 10, 0))
 
-    assert _text(_rows(failing)[0][3]) == "Failing since 09:00 (http_400)"
+    assert _rows(failing)[0][3] == "Failing since 09:00 (http_400)"
+    [row] = _row_elements(failing)
+    assert row["data-delivery"] == "failing"
 
     with transaction.atomic():
         delivery.close_failing(location.pk, _local(2, 10, 0))
 
-    assert _rows(_list(rf, _local(2, 10, 1)))[0][3] == "OK"
+    closed = _list(rf, _local(2, 10, 1))
+    assert _rows(closed)[0][3] == "OK"
+    [row] = _row_elements(closed)
+    assert row["data-delivery"] == "ok"
+    assert _delivery_cell(row)["data-delivery"] == "ok"
 
 
 @pytest.mark.django_db
@@ -203,7 +241,7 @@ def test_list_query_count_does_not_grow_with_the_rows(
     assert len(five.captured_queries) == len(one.captured_queries)
 
 
-# E1: zero, one and many rows; no script; overflow
+# E1: zero, one and many rows; no injected script; long names
 
 
 @pytest.mark.django_db
@@ -212,10 +250,10 @@ def test_list_empty_and_single_and_many(
 ) -> None:
     empty = admin.get("/").content.decode()
 
-    assert "<h2>No locations yet</h2>" in empty
-    assert empty.count("btn--primary") == 1
-    assert "<table" not in empty
-    assert "<script" not in empty
+    by_testid(parse(empty), "empty-state")
+    assert all_by_testid(parse(empty), "locations-table") == []
+    assert parse(empty).find("table") is None
+    assert_no_injected_script(empty, "empty")
 
     location_factory(name="Only")
     single = admin.get("/").content.decode()
@@ -223,16 +261,16 @@ def test_list_empty_and_single_and_many(
         location_factory(name=f"Place {n:02d}")
     many = admin.get("/").content.decode()
 
-    for html, count in ((single, 1), (many, 20)):
-        assert html.count("<table") == 1
-        assert len(_rows(html)) == count
-        assert all(row[3] == "OK" for row in _rows(html))
-        assert re.search(r'<div class="table-wrap">\s*<table>', html)
-        # No pagination and no count text, whatever the number of rows.
+    for html, count, noun in ((single, 1, "location"), (many, 20, "locations")):
+        assert len(parse(html).find_all("table")) == 1
+        rows = _rows(html)
+        assert len(rows) == count
+        assert all(row[3] == "OK" for row in rows)
+        # No pagination; the meta line counts every row.
         assert "page=" not in html
-        assert str(count) not in _text(html.split("<tbody>")[0])
-        assert "<script" not in html
-        assert "No locations yet" not in html
+        assert _count(html) == f"{count} {noun}"
+        assert_no_injected_script(html, noun)
+        assert all_by_testid(parse(html), "empty-state") == []
 
 
 @pytest.mark.django_db
@@ -244,11 +282,13 @@ def test_list_long_name_and_cells_keep_their_classes(
 
     html = admin.get("/").content.decode()
 
-    [row] = _rows(html)
-    # The 100-character name is shown whole in its .name link; Last heartbeat keeps .num.
-    assert row[0] == f'<a class="name" href="/locations/{location.pk}/">{name}</a>'
-    assert '<td class="num">Never</td>' in html
-    css = CSS_PATH.read_text(encoding="utf-8")
-    assert ".table-wrap { overflow-x: auto; }" in css
-    assert re.search(r"\.num \{[^}]*white-space: nowrap", css)
-    assert re.search(r"\.status-cell \{[^}]*flex-wrap: wrap", css, re.S)
+    [row] = _row_elements(html)
+    # The 100-character name is shown whole in its link and title; its row has no
+    # heartbeat yet, so the cell reads Never with no time element.
+    [link] = all_by_testid(row, "location-link")
+    assert text(link) == name
+    assert link["title"] == name
+    assert link["href"] == f"/locations/{location.pk}/"
+    [heartbeat] = all_by_testid(row, "last-heartbeat")
+    assert text(heartbeat) == "Never"
+    assert heartbeat.find_all("time") == []
