@@ -1,0 +1,15 @@
+{% load icons %}{% comment %}
+Delivery health (06-UI-SPEC Components > Status pill, delivery pill, tag; UI-01, UI-05).
+Parameters: failing (bool), text (the Python delivery text while failing, e.g. views.
+delivery_text's "Failing since 10:42 (http_403)", passed in by the caller), live (optional:
+True adds the poll hooks data-live="delivery" and data-location-id) and location_id.
+
+- data-delivery is ok or failing. OK is the check icon and "OK" (copy row list.ok) in the
+  ok text colour, no pill. Failing is the orange pill: triangle-alert and the whole text in
+  [data-label], Inter with tabular-nums (the maintainer-approved pill exception to the mono
+  rule). A long pill wraps with the icon on its first line.
+- Without live only the variant that applies is rendered. With live both are in the DOM,
+  each marked by data-delivery-variant (ok, failing), and the one that does not apply carries
+  the hidden attribute, so the poll switches them by hidden and sets data-delivery and the
+  pill's [data-label] text (06-11 Live update targets).
+{% endcomment %}<span data-testid="delivery" data-delivery="{% if failing %}failing{% else %}ok{% endif %}"{% if live %} data-live="delivery" data-location-id="{{ location_id }}"{% endif %} class="inline-flex max-w-full">{% if live or not failing %}<span data-delivery-variant="ok"{% if failing %} hidden{% endif %} class="inline-flex items-center gap-1 text-ok-text">{% icon "check" class="size-3.5 shrink-0" %}OK</span>{% endif %}{% if live or failing %}<span data-delivery-variant="failing"{% if not failing %} hidden{% endif %} class="inline-flex max-w-full items-start gap-1 rounded-control border border-transparent bg-st-fail-bg px-2.5 py-0.5 text-label font-semibold tabular-nums text-st-fail-text">{% icon "triangle-alert" class="mt-px size-3.5 shrink-0" %}<span data-label class="min-w-0 break-words">{{ text|default:"" }}</span></span>{% endif %}</span>

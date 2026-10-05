@@ -1,0 +1,22 @@
+{% load display_time timefmt %}{% comment %}
+An absolute time with its relative time (06-UI-SPEC Components > Relative time; UI-11,
+UI-05). Parameters: value (an aware datetime, or None), variant ("full", "table" or "card"),
+label (optional text before the time, e.g. "On since" or "Last heartbeat"), testid
+(optional), live (optional: the data-live value, e.g. "last-heartbeat" or "since") and
+location_id. The relative text is "now" from the context (the view's clock), else timefmt's
+CLOCK: pass now when including with only.
+
+- An aware value renders <time datetime="{ISO with the display-TZ offset}"> holding the
+  unchanged display_time text, and exactly one mono [data-relative] sibling with the same
+  ISO value holding the server-rendered relative text; the relative component keeps it fresh.
+- full (meta lines, the Status card, S8): "{abs} ({rel})", the text in [data-part=full].
+- table (the S3 Last heartbeat cell): the relative text over the compact time, one line from
+  xl. [data-part=compact] holds display_time_compact and [data-part=tail] the rest of the
+  display_time text (":SS TZ"), shown from xl, so together they are the unchanged full text.
+- card (the S3 stacked card): "{rel} · {abs}", the text in [data-part=full].
+- None renders "Never" (display_time) with no time element; a naive or non-datetime value
+  renders no time and no text.
+- With live the wrapper carries data-live and data-location-id; with live="since" the label
+  is the [data-since-label] child, so the poll can switch "On since" / "Outage since".
+- Times are mono and never wrap inside; the label and the brackets stay Inter.
+{% endcomment %}{% with iso_value=value|iso %}<span{% if testid %} data-testid="{{ testid }}"{% endif %}{% if live %} data-live="{{ live }}" data-location-id="{{ location_id }}"{% endif %}{% if variant == "table" %} class="flex flex-col xl:flex-row xl:flex-wrap xl:items-baseline xl:gap-x-2"{% endif %}>{% if label %}<span{% if live == "since" %} data-since-label{% endif %}>{{ label }}</span> {% endif %}{% if not iso_value %}<span class="text-fg-muted">{{ value|display_time }}</span>{% elif variant == "table" %}<span data-relative="{{ iso_value }}" class="num text-body whitespace-nowrap">{% relative_time value %}</span> <time datetime="{{ iso_value }}" class="num text-label whitespace-nowrap text-fg-muted"><span data-part="compact">{{ value|display_time_compact }}</span><span data-part="tail" class="hidden xl:inline">{{ value|display_time|slice:"16:" }}</span></time>{% elif variant == "card" %}<span data-relative="{{ iso_value }}" class="num whitespace-nowrap">{% relative_time value %}</span> · <time datetime="{{ iso_value }}" class="num whitespace-nowrap"><span data-part="full">{{ value|display_time }}</span></time>{% else %}<time datetime="{{ iso_value }}" class="num whitespace-nowrap"><span data-part="full">{{ value|display_time }}</span></time> (<span data-relative="{{ iso_value }}" class="num whitespace-nowrap">{% relative_time value %}</span>){% endif %}</span>{% endwith %}

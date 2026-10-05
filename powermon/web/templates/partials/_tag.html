@@ -1,0 +1,7 @@
+{% load icons %}{% comment %}
+Tag (06-UI-SPEC Components > Status pill, delivery pill, tag; UI-01). Parameter: tag,
+alerts-off or router-grace. Fixed copy (copy row list.tags) with its icon: "Alerts off"
+with bell-off, "Router grace" with router. Never split across lines. Pages place the tags
+after the status pill in this order: Alerts off, then Router grace. Any other value renders
+nothing.
+{% endcomment %}{% if tag == "alerts-off" or tag == "router-grace" %}<span data-testid="tag" data-tag="{{ tag }}" class="inline-flex items-center gap-1 rounded-control border border-border bg-surface-sunken px-2 py-0.5 text-label whitespace-nowrap text-fg-muted">{% if tag == "alerts-off" %}{% icon "bell-off" class="size-3.5 shrink-0" %}Alerts off{% else %}{% icon "router" class="size-3.5 shrink-0" %}Router grace{% endif %}</span>{% endif %}

@@ -1,0 +1,16 @@
+{% load icons %}{% comment %}
+Status pill (06-UI-SPEC Components > Status pill, delivery pill, tag; UI-01, UI-05, UI-12).
+Parameters: status (the status key: on, off, maintenance or waiting), label (the Python
+STATUS_LABELS text, passed in by the caller and never repeated here), live (optional: True
+adds the poll hooks data-live="status" and data-location-id) and location_id.
+
+- Status is never shown by colour alone: every pill has its text label and an icon.
+- The pill renders all four status icons. The named group's data-status shows the one that
+  matches (on zap, off zap-off, maintenance wrench, waiting hourglass), so a live update only
+  sets data-status and the text of [data-label] (06-11 Live update targets).
+- Colours come from data-status variants of one spelled-out class string, never from a
+  class built from data. Waiting has its 1 px border and may wrap below sm and inside a
+  table cell below xl; the other pills stay on one line.
+- The whole label is Inter with tabular-nums: the maintainer-approved pill exception to the
+  mono rule.
+{% endcomment %}<span data-testid="status-pill" data-status="{{ status }}"{% if live %} data-live="status" data-location-id="{{ location_id }}"{% endif %} class="group/pill inline-flex max-w-full items-start gap-1 rounded-control border border-transparent px-2.5 py-0.5 text-label font-semibold whitespace-nowrap tabular-nums data-[status=on]:bg-st-on-bg data-[status=on]:text-st-on-text data-[status=off]:bg-st-off-bg data-[status=off]:text-st-off-text data-[status=maintenance]:bg-st-maint-bg data-[status=maintenance]:text-st-maint-text data-[status=waiting]:border-st-wait data-[status=waiting]:bg-st-wait-bg data-[status=waiting]:text-st-wait-text max-sm:data-[status=waiting]:whitespace-normal max-xl:in-[td]:data-[status=waiting]:whitespace-normal">{% icon "zap" class="mt-px hidden size-3.5 shrink-0 group-data-[status=on]/pill:block" %}{% icon "zap-off" class="mt-px hidden size-3.5 shrink-0 group-data-[status=off]/pill:block" %}{% icon "wrench" class="mt-px hidden size-3.5 shrink-0 group-data-[status=maintenance]/pill:block" %}{% icon "hourglass" class="mt-px hidden size-3.5 shrink-0 group-data-[status=waiting]/pill:block" %}<span data-label>{{ label }}</span></span>

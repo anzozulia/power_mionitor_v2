@@ -1,0 +1,11 @@
+{% load icons %}{% comment %}
+Empty state (06-UI-SPEC Components > Empty state; UI-01, UI-12). Parameters: icon (a Lucide
+name, drawn at 24 px in a 48 px circle), title, body, testid, accent (optional: the accent
+circle, which only the Locations empty state uses; else the neutral one) and an optional
+primary call to action: cta_label, cta_href, cta_testid and cta_icon, rendered by
+_button.html as a link.
+
+A centred column with 16 px gaps and 32/16 padding: the circle (decorative, aria-hidden),
+the title (16/24 600), the body (13/20 muted, at most 400 px wide), then the CTA. It is the
+whole content of its region: the page renders no table, list or count beside it.
+{% endcomment %}<div data-testid="{{ testid }}" class="flex flex-col items-center gap-4 px-4 py-8 text-center"><span aria-hidden="true" class="flex size-12 shrink-0 items-center justify-center rounded-full {% if accent %}bg-accent-soft text-accent-text{% else %}bg-surface-sunken text-icon{% endif %}">{% icon icon class="size-6" %}</span><p class="text-lead font-semibold break-words text-fg">{{ title }}</p>{% if body %}<p class="max-w-100 text-body break-words text-fg-muted">{{ body }}</p>{% endif %}{% if cta_label %}{% include "partials/_button.html" with variant="primary" label=cta_label href=cta_href testid=cta_testid icon=cta_icon only %}{% endif %}</div>
