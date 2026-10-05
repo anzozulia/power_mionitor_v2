@@ -30,6 +30,8 @@ from powermon.worker.supervision import HEALTH_FILE
 BASE_DIR = Path(settings.BASE_DIR)
 COMPOSE_FILES = {"local": "docker-compose.local.yml", "prod": "docker-compose.prod.yml"}
 ENVS = sorted(COMPOSE_FILES)
+# The local-only Tailwind watcher override (UI-13): -f docker-compose.local.yml -f this file.
+DEV_UI_FILE = "docker-compose.dev-ui.yml"
 CADDYFILE = BASE_DIR / "docker" / "Caddyfile"
 # Caddy reads only these two from its environment; every other app setting is blanked.
 CADDY_KEYS = frozenset({"DOMAIN", "ACME_EMAIL"})
@@ -40,12 +42,16 @@ ENV_FILES = {"local": ".env.docker_local", "prod": ".env.docker_production"}
 _PLACEHOLDER_RE = re.compile(r"\{\$[A-Za-z_][A-Za-z0-9_]*(?::[^}]*)?\}")
 
 
-def _compose(env: str) -> dict[str, Any]:
-    path = BASE_DIR / COMPOSE_FILES[env]
-    assert path.is_file(), f"{COMPOSE_FILES[env]} is missing"
+def _load(filename: str) -> dict[str, Any]:
+    path = BASE_DIR / filename
+    assert path.is_file(), f"{filename} is missing"
     data = yaml.safe_load(path.read_text())
-    assert isinstance(data, dict), f"{COMPOSE_FILES[env]} is not a mapping"
+    assert isinstance(data, dict), f"{filename} is not a mapping"
     return data
+
+
+def _compose(env: str) -> dict[str, Any]:
+    return _load(COMPOSE_FILES[env])
 
 
 def _services(env: str) -> dict[str, dict[str, Any]]:
@@ -195,6 +201,48 @@ def test_commands_are_exec_form_and_gunicorn_flags(env: str) -> None:
 
 def test_prod_and_local_web_run_the_same_gunicorn_command() -> None:
     assert _services("prod")["web"]["command"] == _services("local")["web"]["command"]
+
+
+# The local Tailwind dev watcher (UI-13, T-06-23)
+
+
+def test_dev_ui_override_is_local_only() -> None:
+    services = _load(DEV_UI_FILE).get("services")
+    assert isinstance(services, dict)
+    local = _services("local")
+
+    assert set(services) == {"css", "web"}
+    css, web = services["css"], services["web"]
+    # The watcher builds only the css stage and writes the gitignored build file through
+    # the bind mount; it publishes nothing.
+    assert css["build"] == {"context": ".", "target": "css"}
+    assert css["command"] == [
+        "tailwindcss",
+        "-i",
+        "powermon/web/assets/css/app.css",
+        "-o",
+        "powermon/web/static/web/build/app.css",
+        "--watch=always",
+    ]
+    assert css["volumes"] == ["./powermon:/app/powermon"]
+    assert "ports" not in css
+    assert "expose" not in css
+    # web only swaps gunicorn for runserver with DEBUG on; its one published port stays the
+    # local file's loopback binding.
+    assert web["command"] == ["python", "manage.py", "runserver", "0.0.0.0:8000"]
+    assert web["environment"] == {"DEBUG": "1"}
+    assert web["volumes"] == ["./powermon:/app/powermon"]
+    assert "ports" not in web
+    assert local["web"]["ports"] == ["127.0.0.1:8000:8000"]
+    for name, svc in services.items():
+        logging = svc.get("logging") or {}
+        assert logging.get("driver") == "json-file", name
+        assert {"max-size", "max-file"} <= set(logging.get("options") or {}), name
+        assert isinstance(svc["command"], list), f"{name} uses a shell-form command"
+        assert "image" not in svc, name
+    # The production deployment never references the override.
+    for path in (COMPOSE_FILES["prod"], "docker/Caddyfile"):
+        assert "dev-ui" not in (BASE_DIR / path).read_text(), path
 
 
 # Migrations gate the app (D-02, OPS-07, INV-26)

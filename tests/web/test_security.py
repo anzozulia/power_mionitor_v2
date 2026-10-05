@@ -38,6 +38,7 @@ from django.template.loader import render_to_string
 from django.test import Client, RequestFactory
 from django.test.utils import CaptureQueriesContext
 from django.views.defaults import server_error
+from urls_raise import EXCEPTION_MESSAGE, RAISE_PATH
 
 from powermon.web.admin_sync import sync_admin
 from powermon.web.location_views import ALERTS_COPY
@@ -500,19 +501,27 @@ def test_E1_404_page_is_context_free(
 
 
 @pytest.mark.django_db
-def test_E1_404_page_keeps_a_pending_flash(
-    client: Client, location_factory: Callable[..., Any]
+@pytest.mark.parametrize("page", ["404", "csrf-403"])
+def test_R11_error_pages_keep_a_pending_flash(
+    client: Client, location_factory: Callable[..., Any], page: str
 ) -> None:
     location = location_factory(name="Office")
     admin = _sign_in(client)
     # Queue a flash: the alerts switch redirects with it, and nothing reads it yet.
     assert admin.post(f"/locations/{location.pk}/alerts/", {"value": "off"}).status_code == 302
 
-    assert admin.get("/no-such-page-xyz").status_code == 404
+    if page == "404":
+        assert admin.get("/no-such-page-xyz").status_code == 404
+    else:
+        # The same browser (session and pending flash), sending a form without its token.
+        browser = Client(enforce_csrf_checks=True)
+        browser.cookies = admin.cookies
+        response = browser.post(f"/locations/{location.pk}/alerts/", {"value": "on"})
+        assert response.status_code == 403
 
     # The error page showed no toast, so the next page still has the flash.
-    page = admin.get(f"/locations/{location.pk}/")
-    assert [str(message) for message in page.context["messages"]] == [ALERTS_COPY["off"]]
+    after = admin.get(f"/locations/{location.pk}/")
+    assert [str(message) for message in after.context["messages"]] == [ALERTS_COPY["off"]]
 
 
 @pytest.mark.django_db
@@ -524,12 +533,11 @@ def test_csrf_failure_renders_form_expired(path: str) -> None:
     assert response.status_code == 403
     html = response.content.decode()
     assert "<title>Form expired · Power Monitor</title>" in html
-    assert "<h1>Form expired</h1>" in html
-    assert (
-        "This form was open too long, or the browser blocked cookies. "
-        "Go back, reload the page and try again."
-    ) in html
-    assert '<a href="/">Back to locations</a>' in html
+    page = _Page(html)
+    assert [h1.text for h1 in page.find("h1")] == ["Form expired"]
+    assert E403_BODY in page.text
+    back = page.one("a", {"data-testid": "back-to-locations"})
+    assert (back.attr("href"), back.text) == ("/", BACK)
     # Django's own CSRF page explains the failure reason; ours shows fixed copy only.
     assert "CSRF" not in html
 
@@ -542,7 +550,72 @@ def test_csrf_failure_with_a_stale_token_renders_form_expired() -> None:
     response = client.post("/logout/", {"csrfmiddlewaretoken": "b" * 32})
 
     assert response.status_code == 403
-    assert "<h1>Form expired</h1>" in response.content.decode()
+    assert [h1.text for h1 in _Page(response.content.decode()).find("h1")] == ["Form expired"]
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("signed_in", [False, True], ids=["anonymous", "signed-in"])
+def test_E2_csrf_page(
+    client: Client, location_factory: Callable[..., Any], signed_in: bool
+) -> None:
+    # CsrfViewMiddleware runs before LoginRequiredMiddleware, so even an anonymous POST to an
+    # admin URL renders 403_csrf.html with the request and every context processor (R11).
+    location_factory(name=DISTINCT_NAME)
+    browser = Client(enforce_csrf_checks=True)
+    if signed_in:
+        _sign_in(browser)
+    browser.cookies["theme"] = "dark"
+
+    with CaptureQueriesContext(connection) as queries:
+        response = browser.post("/locations/new/", {"name": DISTINCT_NAME})
+
+    assert response.status_code == 403
+    html = response.content.decode()
+    # Byte-equal to the template rendered with no context and no request: it reads nothing.
+    assert html == render_to_string("403_csrf.html")
+    _assert_error_page(
+        html, code="403", title="Form expired", heading="Form expired", body=E403_BODY
+    )
+    # Neither Django's failure page nor its reason (no cookie, no token, bad Referer or
+    # Origin) is shown, and nothing the request carried comes back.
+    for echo in ("Forbidden", "verification failed", "cookie not set", "Referer", "Origin"):
+        assert echo not in html, echo
+    assert _location_queries(queries) == []
+    assert DISTINCT_NAME not in html
+
+
+@pytest.mark.django_db
+@pytest.mark.urls("urls_raise")
+def test_E3_500_through_the_middleware() -> None:
+    # A view that raises, behind the whole middleware stack: Django's handler renders
+    # 500.html with no context, and the CSP still reaches the response (R5, R11).
+    browser = _sign_in(Client(raise_request_exception=False))
+    browser.cookies["theme"] = "dark"
+
+    response = browser.get(RAISE_PATH)
+
+    assert response.status_code == 500
+    _assert_csp(response)
+    html = response.content.decode()
+    _assert_error_page(
+        html, code="500", title="Server error", heading="Something went wrong", body=E500_BODY
+    )
+    for part in (EXCEPTION_MESSAGE, "echo-me", "/secret/path", "RuntimeError", "Traceback"):
+        assert part not in html, part
+
+
+@pytest.mark.django_db
+@pytest.mark.urls("urls_raise")
+def test_E3_500_renders_without_context() -> None:
+    # Signed in, so default-deny lets the request reach the raising view.
+    browser = _sign_in(Client(raise_request_exception=False))
+
+    served = browser.get(RAISE_PATH).content.decode()
+
+    # The served page equals the template rendered with no context and no request, and so
+    # does the page the handler builds for a bare request outside the middleware.
+    assert served == render_to_string("500.html")
+    assert _server_error().content.decode() == served
 
 
 def test_500_page_renders_without_request_context() -> None:
@@ -551,14 +624,12 @@ def test_500_page_renders_without_request_context() -> None:
     assert response.status_code == 500
     html = response.content.decode()
     assert "<title>Server error · Power Monitor</title>" in html
-    assert "<h1>Something went wrong</h1>" in html
-    assert (
-        "The server could not finish this request. Details are in the web container logs. "
-        "Try again in a moment."
-    ) in html
-    assert '<a href="/">Back to locations</a>' in html
-    # Renders with no context at all, as Django's handler does.
-    assert "Something went wrong" in render_to_string("500.html")
+    page = _Page(html)
+    assert [h1.text for h1 in page.find("h1")] == ["Something went wrong"]
+    assert E500_BODY in page.text
+    _assert_error_page(
+        html, code="500", title="Server error", heading="Something went wrong", body=E500_BODY
+    )
 
 
 @pytest.mark.django_db
