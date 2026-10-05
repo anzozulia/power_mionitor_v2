@@ -1,0 +1,22 @@
+{% load icons %}{% comment %}
+Code block with copy (06-UI-SPEC Components > Copy field and code block; UI-08, R4). The
+setup page's four device examples. Context: element_id (the code element's id, e.g.
+example-curl), caption (the header row's short label, copy row setup.tabs), text (the exact
+example string from powermon/locations/examples.py), copyable (True only on a revealed
+page: no key copy while masked), copy_sr (the sr-only suffix after "Copy", copy row
+shell.copy_sr, e.g. "curl example") and copied_msg (the copy component's polite message,
+copy row shell.copied_msg). The page renders the one [data-copy-status] polite region.
+
+- Header row on the code background: the caption (12/16, the code muted colour) and, when
+  copyable, the small secondary Copy button, button[data-testid=copy][data-copy-target]
+  [data-copied-msg][data-js-only][hidden] bound to the copy component. Its visible "Copy"
+  is its first text, then the sr-only suffix, so every copy button on the page has a unique
+  accessible name. The button never holds the value.
+- Body: a pre that scrolls sideways inside the block (focusable, so a keyboard can scroll
+  it), holding code#{element_id} with the text exactly: no whitespace or newline is added
+  inside the code element, and the lines keep their breaks (whitespace-pre). select-all is
+  the no-JS fallback for copying.
+- The text is element text only, never an attribute (R4): on a revealed page the key is in
+  it, and the reveal guard empties it on pagehide.
+Every class is spelled out: no class name is built from data.
+{% endcomment %}<div class="flex min-w-0 flex-col rounded-control bg-code-bg"><div class="flex min-h-11 items-center justify-between gap-2 border-b border-code-muted/30 px-3 py-1 md:min-h-(--control-h)"><span class="text-label text-code-muted">{{ caption }}</span>{% if copyable %}<button type="button" data-testid="copy" data-copy-target="{{ element_id }}" data-copied-msg="{{ copied_msg }}" data-js-only hidden x-data="copy" class="group/copy inline-flex min-h-11 shrink-0 items-center justify-center gap-2 rounded-control border border-border-strong bg-surface px-3 text-body font-semibold whitespace-nowrap text-fg hover:bg-surface-sunken md:min-h-(--control-h-sm) motion-safe:transition-colors motion-safe:duration-150">{% icon "copy" class="size-3.5 shrink-0 group-data-copied/copy:hidden" %}{% icon "check" class="hidden size-3.5 shrink-0 text-ok-text group-data-copied/copy:block" %}Copy<span class="sr-only"> {{ copy_sr }}</span></button>{% endif %}</div><pre tabindex="0" class="overflow-x-auto rounded-b-control px-3 py-2.5"><code id="{{ element_id }}" class="num text-body whitespace-pre text-code-fg select-all">{{ text }}</code></pre></div>
