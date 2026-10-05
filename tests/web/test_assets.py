@@ -13,6 +13,10 @@ TEST-STRATEGY §7.2 and 06-RESEARCH Pitfalls 7 and 13:
   and the num and bg-hatch utilities, whether or not a page uses them yet.
 - In the entry, the [data-theme=dark] block and the system-in-dark block are identical, and
   every themed light token has a dark value (UI-02).
+- The vendored Inter Variable subsets are the admin's font (D6-07): fonts.css declares them,
+  the built CSS carries the four @font-face rules with url()s that collectstatic rewrote to
+  the hashed same-origin files, and E1-E3 preload the latin and cyrillic files with
+  crossorigin. The error layout still reads no context as its head grows (R11).
 - admin.js applies the stored rail flag first; the button partial renders a link or a button
   with data-variant and never the disabled attribute.
 
@@ -21,6 +25,7 @@ production, after the css stage and collectstatic.
 """
 
 import json
+import posixpath
 import re
 import shutil
 from pathlib import Path
@@ -28,12 +33,18 @@ from typing import Any
 
 import pytest
 from django.conf import settings
+from django.contrib.auth import get_user_model
 from django.contrib.staticfiles.storage import staticfiles_storage
+from django.http import HttpResponse
 from django.template.loader import render_to_string
+from django.test import Client
 from django.test.html import Element, parse_html
+from pages import STATIC_ASSET, parse
+from urls_raise import RAISE_PATH
 
 BASE_DIR = Path(settings.BASE_DIR)
 ENTRY = BASE_DIR / "powermon" / "web" / "assets" / "css" / "app.css"
+FONTS_CSS = BASE_DIR / "powermon" / "web" / "assets" / "css" / "fonts.css"
 ADMIN_JS = BASE_DIR / "powermon" / "web" / "static" / "web" / "admin.js"
 DOCKERFILE = BASE_DIR / "Dockerfile"
 VENDOR_MANIFEST = BASE_DIR / "powermon" / "web" / "assets" / "vendor-manifest.json"
@@ -54,6 +65,22 @@ _CSS_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
 _URL = re.compile(r"url\(\s*([^)]*)\)", re.IGNORECASE)
 _SCHEME = re.compile(r"^[a-z][a-z0-9+.-]*:", re.IGNORECASE)
 BUTTON = "partials/_button.html"
+# The four Inter Variable subsets of the vendor manifest; E1-E3 preload two of them.
+FONT_SUBSETS = frozenset({"latin", "cyrillic", "latin-ext", "cyrillic-ext"})
+PRELOADED_SUBSETS = ("latin", "cyrillic")
+_FONT_FACE = re.compile(r"@font-face\s*\{([^{}]*)\}", re.IGNORECASE)
+_FONT_FILE = re.compile(r"inter-(?P<subset>[a-z-]+)-wght-normal\.")
+_HASHED_FONT_URL = re.compile(r"\.\./fonts/inter-[a-z-]+-wght-normal\.[0-9a-f]{12}\.woff2")
+_UNICODE_RANGE = re.compile(
+    r"U\+(?P<digits>[0-9A-F]{0,6})(?P<wild>\?{0,6})(?:-(?P<end>[0-9A-F]{1,6}))?"
+)
+# E1-E3 and their templates; E3 goes through the middleware with the urls_raise URLconf.
+ERROR_TEMPLATES = {"404": "404.html", "403": "403_csrf.html", "500": "500.html"}
+ERROR_CODES = [
+    pytest.param("404", id="E1-404"),
+    pytest.param("403", id="E2-403-csrf"),
+    pytest.param("500", id="E3-500", marks=pytest.mark.urls("urls_raise")),
+]
 
 
 # CSS helpers
@@ -135,6 +162,48 @@ def _relative_or_data(url: str) -> bool:
     if url.lower().startswith("data:"):
         return True
     return not (_SCHEME.match(url) or url.startswith("/"))
+
+
+def _font_faces(css: str) -> dict[str, dict[str, str]]:
+    """The @font-face rules of ``css`` as declarations, keyed by the subset in their url()."""
+    faces: dict[str, dict[str, str]] = {}
+    for body in _FONT_FACE.findall(_CSS_COMMENT.sub("", css)):
+        face = {name.lower(): value for name, value in _declarations(body).items()}
+        urls = _url_values(face.get("src", ""))
+        assert len(urls) == 1, urls
+        match = _FONT_FILE.search(urls[0])
+        assert match, urls[0]
+        subset = match.group("subset")
+        assert subset not in faces, f"two @font-face rules for {subset}"
+        faces[subset] = face
+    return faces
+
+
+def _code_points(value: str) -> frozenset[tuple[int, int]]:
+    """(first, last) code point of every unicode-range item, ``?`` wildcards expanded.
+
+    The minifier rewrites the items (U+0000-00FF becomes U+??, U+0400-045F becomes
+    U+400-45F), so the source and the built file are compared as code points.
+    """
+    ranges: set[tuple[int, int]] = set()
+    for item in "".join(value.split()).upper().split(","):
+        match = _UNICODE_RANGE.fullmatch(item)
+        if match is None:
+            raise ValueError(f"not a unicode-range item: {item!r}")
+        digits, wild, end = match.group("digits"), match.group("wild"), match.group("end")
+        if not 1 <= len(digits) + len(wild) <= 6 or (wild and end):
+            raise ValueError(f"not a unicode-range item: {item!r}")
+        if end is None:
+            first, last = digits + "0" * len(wild), digits + "F" * len(wild)
+        else:
+            first, last = digits, end
+        ranges.add((int(first, 16), int(last, 16)))
+    return frozenset(ranges)
+
+
+def _css_font_path(url: str) -> str:
+    """A font url() of the built stylesheet, resolved to its /static/ path."""
+    return settings.STATIC_URL + posixpath.normpath(posixpath.join("web/build", url))
 
 
 # Dockerfile helpers
@@ -236,6 +305,122 @@ def test_UI13_built_css_carries_the_design_before_any_page_uses_it() -> None:
     assert ".bg-hatch{" in compact
     # num reads the mono stack through the theme variable, which must be emitted with it.
     assert "--font-mono:" in compact
+
+
+# Fonts (UI-13, D6-07)
+
+
+def test_built_css_has_the_inter_font_faces() -> None:
+    source = _font_faces(FONTS_CSS.read_text(encoding="utf-8"))
+    built = _font_faces(_built_css())
+
+    assert set(source) == set(built) == FONT_SUBSETS
+    for subset, face in built.items():
+        assert face["font-family"].strip("'\"") == "Inter Variable", subset
+        assert (face["font-weight"], face["font-display"]) == ("100 900", "swap"), subset
+        assert "format(woff2-variations)" in _compact(face["src"]), subset
+        # collectstatic rewrote the relative url() to that subset's hashed same-origin file.
+        (url,) = _url_values(face["src"])
+        assert _HASHED_FONT_URL.fullmatch(url), url
+        assert _css_font_path(url) == staticfiles_storage.url(
+            f"web/fonts/inter-{subset}-wght-normal.woff2"
+        )
+        assert _code_points(face["unicode-range"]) == _code_points(
+            source[subset]["unicode-range"]
+        ), subset
+    assert (0x0400, 0x045F) in _code_points(built["cyrillic"]["unicode-range"])
+    # The source names the unhashed files, relative to the built stylesheet.
+    for subset, face in source.items():
+        assert _url_values(face["src"]) == [f"../fonts/inter-{subset}-wght-normal.woff2"]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("U+0400-045F", {(0x400, 0x45F)}),
+        ("u+400-45f, U+2116", {(0x400, 0x45F), (0x2116, 0x2116)}),
+        ("U+??,U+04??", {(0x0, 0xFF), (0x400, 0x4FF)}),
+    ],
+)
+def test_code_points_reads_unicode_ranges(value: str, expected: set[tuple[int, int]]) -> None:
+    # Expected, minified and wildcard forms all give the same code points.
+    assert _code_points(value) == expected
+
+
+@pytest.mark.parametrize("value", ["U+", "U+12-", "U+1?-2", "U+1234567", "0400-045F", ""])
+def test_code_points_rejects_broken_ranges(value: str) -> None:
+    with pytest.raises(ValueError, match="not a unicode-range item"):
+        _code_points(value)
+
+
+def test_font_faces_rejects_a_duplicate_subset() -> None:
+    face = "@font-face{src:url(../fonts/inter-latin-wght-normal.woff2)}"
+
+    with pytest.raises(AssertionError, match="two @font-face rules for latin"):
+        _font_faces(face + face)
+    # Edge: CSS without @font-face rules has no faces.
+    assert _font_faces("a{b:c}") == {}
+
+
+# The error pages' head (UI-13, R11)
+
+
+def _error_response(code: str) -> HttpResponse:
+    """E1-E3 as a signed-in browser with a theme=dark cookie gets them.
+
+    Every context processor runs for 404 and 403, and the pages must read none of them (R11).
+    """
+    browser = Client(enforce_csrf_checks=True, raise_request_exception=False)
+    browser.force_login(get_user_model().objects.create_user("admin", password="not-used-here"))
+    browser.cookies["theme"] = "dark"
+    if code == "404":
+        response = browser.get("/no-such-page-xyz")
+    elif code == "403":
+        # A form posted without its token (E2).
+        response = browser.post("/login/", {"username": "admin", "password": "x"})
+    else:
+        assert code == "500", code
+        # A raising view behind the whole middleware stack (the test runs with urls_raise).
+        response = browser.get(RAISE_PATH)
+    assert response.status_code == int(code), response.status_code
+    assert isinstance(response, HttpResponse)
+    return response
+
+
+def _rel(link: Any) -> list[str]:
+    """The lowercased tokens of a parsed link's rel attribute."""
+    value = link.get("rel")
+    tokens = value if isinstance(value, list) else str(value or "").split()
+    return [str(token).lower() for token in tokens]
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("code", ERROR_CODES)
+def test_error_pages_preload_fonts(code: str) -> None:
+    page = parse(_error_response(code))
+    built = _font_faces(_built_css())
+
+    preloads = [link for link in page.find_all("link") if "preload" in _rel(link)]
+
+    # Exactly the latin and the cyrillic file, each the hashed same-origin name the built
+    # stylesheet's url() resolves to, so the browser reuses the preloaded file.
+    assert [link.get("href") for link in preloads] == [
+        _css_font_path(_url_values(built[subset]["src"])[0]) for subset in PRELOADED_SUBSETS
+    ]
+    for link in preloads:
+        assert STATIC_ASSET.fullmatch(link["href"]), link["href"]
+        assert (link.get("as"), link.get("type")) == ("font", "font/woff2")
+        # A font preload without crossorigin is fetched twice.
+        assert link.has_attr("crossorigin")
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("code", ERROR_CODES)
+def test_error_layout_still_context_free(code: str) -> None:
+    response = _error_response(code)
+
+    # Byte-equal to the template rendered with no context and no request (R11).
+    assert response.content.decode() == render_to_string(ERROR_TEMPLATES[code])
 
 
 # The entry's tokens (UI-02)
