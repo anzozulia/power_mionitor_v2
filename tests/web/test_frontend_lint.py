@@ -3541,6 +3541,13 @@ _RELEASE_ALL = re.compile(r"\bpending\s*\.\s*slice\s*\(\s*\)\s*\.\s*forEach\s*\(
 _RUN_HANDLERS = re.compile(r"\bpageshowHandlers\s*\.\s*forEach\s*\(")
 _PENDING_SOME = re.compile(r"\bpending\s*\.\s*some\s*\(")
 _ACTION_READ = re.compile(r"\.\s*getAttribute\s*\(\s*([\"'])action\1\s*\)")
+# A pending form's action read and compared for equality with this form's, either way round.
+_SAME_ACTION = re.compile(
+    r"\.\s*getAttribute\s*\(\s*([\"'])action\1\s*\)\s*===\s*action\b"
+    r"|\baction\s*===\s*[\w.]+\s*\.\s*getAttribute\s*\(\s*([\"'])action\2\s*\)"
+)
+_BUSY = re.compile(r"\bvar\s+busy\s*=")
+_ENTRY_PENDING = re.compile(r"\bpending\s*\.\s*push\s*\(\s*entry\s*\)")
 # The submitter's two attributes the guard sets, each restored to its value from before.
 GUARD_RESTORES = (
     ["entry.button", '"aria-busy"', "entry.ariaBusy"],
@@ -3554,6 +3561,7 @@ GUARD_TIMER_KEPT = "release keeps the entry's timer"
 GUARD_MARK_KEPT = "release leaves a mark"
 GUARD_PAGESHOW = "pageshow does not release a copy of pending before its handlers"
 GUARD_NO_SAME_ACTION = "no same-action check across pending submits"
+GUARD_NOT_PENDING = "a submit never records its entry as pending before its timer"
 
 
 def listener_call(source: str, pattern: re.Pattern[str]) -> str:
@@ -3589,25 +3597,32 @@ def guard_violations(source: str) -> list[str]:
     (data-submitted, the submitter's aria-busy and aria-disabled, the label's text).
     pageshow releases a copy of pending (release edits the list) before it runs the
     registered handlers. A submit is refused while a pending entry's form has the same
-    non-null action.
+    non-null action, the check being part of the busy test.
     """
     found: set[str] = set()
     delay = re.search(r"\bvar\s+GUARD_RELEASE_MS\s*=\s*(\d+)\s*;", _mask_js(source))
     if delay is None or int(delay.group(1)) < guard_release_floor_ms():
         found.add(GUARD_SHORT_DELAY)
     submit = listener_call(source, _SUBMIT_LISTENER)
-    if first_in_code(_TIMER_SET, submit) < 0 or not any(
+    timer_set = first_in_code(_TIMER_SET, submit)
+    pushed = first_in_code(_ENTRY_PENDING, submit)
+    if pushed < 0 or 0 <= timer_set < pushed:
+        found.add(GUARD_NOT_PENDING)
+    if timer_set < 0 or not any(
         "release(entry)" in arguments[0] and arguments[1:] == ["GUARD_RELEASE_MS"]
         for _, arguments in call_arguments(submit, "window.setTimeout")
     ):
         found.add(GUARD_NO_TIMER)
     code = _mask_js(submit)
+    busy = first_in_code(_BUSY, submit)
+    # Only a pending.some(...) inside the "var busy = ..." statement decides the refusal.
     checks = [
         submit[match.start() : _closing(code, match.start()) + 1]
         for match in _code_matches(_PENDING_SOME, submit)
+        if 0 <= busy < match.start() and ";" not in code[busy : match.start()]
     ]
     if not any(
-        _ACTION_READ.search(check) and re.search(r"!==?\s*null\b", check) for check in checks
+        _SAME_ACTION.search(check) and re.search(r"!==?\s*null\b", check) for check in checks
     ):
         found.add(GUARD_NO_SAME_ACTION)
     release = function_body(source, "release")
@@ -3671,6 +3686,7 @@ def test_WR02_submit_guard_releases_a_stopped_navigation() -> None:
             GUARD_MARK_KEPT,
             GUARD_PAGESHOW,
             GUARD_NO_SAME_ACTION,
+            GUARD_NOT_PENDING,
         ]
     )
 
@@ -3761,6 +3777,25 @@ GUARD_SAME_ACTION_JS = (
             "return other",
             [GUARD_NO_SAME_ACTION],
             id="null-actions-match",
+        ),
+        # Failure (fix audit L1/L2): an entry never recorded as pending (release then always
+        # returns early, so nothing is ever released); the action comparison inverted; the
+        # same-action check computed but no longer part of the busy test.
+        pytest.param("    pending.push(entry);\n", "", [GUARD_NOT_PENDING], id="never-pushed"),
+        pytest.param(
+            'other.form.getAttribute("action") === action',
+            'other.form.getAttribute("action") !== action',
+            [GUARD_NO_SAME_ACTION],
+            id="inverted-equality",
+        ),
+        pytest.param(
+            GUARD_SAME_ACTION_JS,
+            '      form.hasAttribute("data-submitted");\n'
+            "    pending.some(function (other) {\n"
+            '      return action !== null && other.form.getAttribute("action") === action;\n'
+            "    });\n",
+            [GUARD_NO_SAME_ACTION],
+            id="some-unused",
         ),
     ],
 )
