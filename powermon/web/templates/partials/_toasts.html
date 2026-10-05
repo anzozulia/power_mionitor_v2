@@ -1,0 +1,58 @@
+{% load icons %}{% comment %}
+Toast live regions (06-UI-SPEC Layout Shell > Toasts, Components > Toast; UI-09, UI-12).
+
+Included by the app layout as {% include "partials/_toasts.html" %} and by the auth layout
+with auth=True, which places the phone stack 16 px from the top (that layout has no top
+bar). Never included by the error layout, which reads no context variable (R11). The partial
+reads only messages (Django's messages context processor).
+
+- Both regions are always rendered, also when empty: error messages go to the alert region
+  (role=alert, assertive), success, info and warning messages to the status region
+  (role=status, polite). Each region loops over messages and keeps its own levels; a level
+  without a tone of its own (a custom level) renders as info.
+- Every message renders server-side as a toast, so toasts work without JavaScript. The toasts
+  component in admin.js (bound on each region) reveals the Dismiss buttons, re-announces each
+  toast's text after load, removes a success toast when its timer bar ends and moves the focus
+  to main when a focused toast closes.
+- Each toast: data-level (the Django level tag), the 20 px tone icon, the visually hidden
+  "Warning: " / "Error: " prefix before toast-text, data-sticky when the message's extra tags
+  hold "sticky", the 10 s timer bar only on a success that is not sticky (paused on hover and
+  focus), and the Dismiss button (JS only, rendered hidden).
+- DOM order is arrival order. Phones: full width under the top bar, the alert region first and
+  the newest toast on top. From sm: a 384 px column 16 px from the right and bottom edges, the
+  alert region below the status region and the newest toast nearest the corner.
+- Tone classes are spelled out per level, never built from a variable, so the Tailwind scan
+  finds them. Only the timer bar has a clipping wrapper, so focus rings are never clipped.
+{% endcomment %}<div class="pointer-events-none fixed inset-x-4 z-15 flex flex-col gap-2 {% if auth %}top-4{% else %}top-[calc(var(--tb-h)_+_8px)]{% endif %} sm:inset-x-auto sm:top-auto sm:right-4 sm:bottom-4 sm:w-96 sm:flex-col-reverse">
+  <div data-testid="toasts-alert" role="alert" aria-live="assertive" aria-atomic="false" x-data="toasts" class="flex flex-col-reverse gap-2 sm:flex-col">
+    {% for message in messages %}{% if message.level_tag == "error" %}
+    <div data-testid="toast" data-level="error"{% if "sticky" in message.extra_tags.split %} data-sticky{% endif %} class="group pointer-events-auto relative flex items-start gap-2 rounded-control border border-border bg-surface py-3.5 pr-12 pl-4 text-body text-fg [box-shadow:var(--sh-pop),inset_3px_0_0_var(--err-text)] motion-safe:animate-toast-in">
+      {% icon "circle-alert" class="size-5 shrink-0 text-err-text" %}
+      <p aria-atomic="true" class="min-w-0 flex-1 break-words"><span class="sr-only">Error: </span><span data-testid="toast-text">{{ message }}</span></p>
+      <button type="button" aria-label="Dismiss" data-js-only hidden class="absolute top-0.5 right-0.5 inline-flex size-11 items-center justify-center rounded-control text-icon hover:bg-surface-sunken hover:text-fg motion-safe:transition-colors motion-safe:duration-150 md:top-2 md:right-2 md:size-(--control-h-sm)">{% icon "x" class="size-5" %}</button>
+    </div>
+    {% endif %}{% endfor %}
+  </div>
+  <div data-testid="toasts-status" role="status" aria-live="polite" aria-atomic="false" x-data="toasts" class="flex flex-col-reverse gap-2 sm:flex-col">
+    {% for message in messages %}{% if message.level_tag != "error" %}{% if message.level_tag == "success" %}
+    <div data-testid="toast" data-level="success"{% if "sticky" in message.extra_tags.split %} data-sticky{% endif %} class="group pointer-events-auto relative flex items-start gap-2 rounded-control border border-border bg-surface py-3.5 pr-12 pl-4 text-body text-fg [box-shadow:var(--sh-pop),inset_3px_0_0_var(--ok-text)] motion-safe:animate-toast-in">
+      {% icon "circle-check" class="size-5 shrink-0 text-ok-text" %}
+      <p aria-atomic="true" class="min-w-0 flex-1 break-words"><span data-testid="toast-text">{{ message }}</span></p>
+      <button type="button" aria-label="Dismiss" data-js-only hidden class="absolute top-0.5 right-0.5 inline-flex size-11 items-center justify-center rounded-control text-icon hover:bg-surface-sunken hover:text-fg motion-safe:transition-colors motion-safe:duration-150 md:top-2 md:right-2 md:size-(--control-h-sm)">{% icon "x" class="size-5" %}</button>
+      {% if "sticky" not in message.extra_tags.split %}<span aria-hidden="true" class="pointer-events-none absolute inset-0 overflow-hidden rounded-[3px]"><span data-toast-timer class="absolute bottom-0 left-0 h-[3px] w-full bg-st-on animate-toast-timer group-hover:[animation-play-state:paused] group-focus-within:[animation-play-state:paused]"></span></span>{% endif %}
+    </div>
+    {% elif message.level_tag == "warning" %}
+    <div data-testid="toast" data-level="warning"{% if "sticky" in message.extra_tags.split %} data-sticky{% endif %} class="group pointer-events-auto relative flex items-start gap-2 rounded-control border border-border bg-surface py-3.5 pr-12 pl-4 text-body text-fg [box-shadow:var(--sh-pop),inset_3px_0_0_var(--warn-icon)] motion-safe:animate-toast-in">
+      {% icon "triangle-alert" class="size-5 shrink-0 text-warn-icon" %}
+      <p aria-atomic="true" class="min-w-0 flex-1 break-words"><span class="sr-only">Warning: </span><span data-testid="toast-text">{{ message }}</span></p>
+      <button type="button" aria-label="Dismiss" data-js-only hidden class="absolute top-0.5 right-0.5 inline-flex size-11 items-center justify-center rounded-control text-icon hover:bg-surface-sunken hover:text-fg motion-safe:transition-colors motion-safe:duration-150 md:top-2 md:right-2 md:size-(--control-h-sm)">{% icon "x" class="size-5" %}</button>
+    </div>
+    {% else %}
+    <div data-testid="toast" data-level="info"{% if "sticky" in message.extra_tags.split %} data-sticky{% endif %} class="group pointer-events-auto relative flex items-start gap-2 rounded-control border border-border bg-surface py-3.5 pr-12 pl-4 text-body text-fg [box-shadow:var(--sh-pop),inset_3px_0_0_var(--info-text)] motion-safe:animate-toast-in">
+      {% icon "info" class="size-5 shrink-0 text-info-text" %}
+      <p aria-atomic="true" class="min-w-0 flex-1 break-words"><span data-testid="toast-text">{{ message }}</span></p>
+      <button type="button" aria-label="Dismiss" data-js-only hidden class="absolute top-0.5 right-0.5 inline-flex size-11 items-center justify-center rounded-control text-icon hover:bg-surface-sunken hover:text-fg motion-safe:transition-colors motion-safe:duration-150 md:top-2 md:right-2 md:size-(--control-h-sm)">{% icon "x" class="size-5" %}</button>
+    </div>
+    {% endif %}{% endif %}{% endfor %}
+  </div>
+</div>

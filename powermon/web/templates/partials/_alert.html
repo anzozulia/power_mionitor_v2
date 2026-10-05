@@ -1,0 +1,27 @@
+{% load icons %}{% comment %}
+Alert / banner (06-UI-SPEC Components > Alert / banner; UI-09, UI-12). Parameters:
+tone (success, info, warning, error, muted), title (optional, in the tone's text colour),
+body (optional), testid (optional data-testid), role (only when passed: "alert" for inline
+form errors and throttle messages; alerts that are not live messages have no role) and
+action_template (optional: the name of a template included in the action slot, e.g. a fix
+button; it sees the including context). The action sits right of the text from md and
+under it below md.
+
+- Warning and error alerts start with a visually hidden "Warning: " / "Error: " prefix.
+- success, info, warning and error draw a 3 px inset tone bar on the left edge; muted
+  (maintenance) draws a 6 px hatch stripe there instead, with 20 px left padding and the
+  wrench icon.
+- Tone classes are spelled out per tone, never built from a variable, so the Tailwind scan
+  finds them. No block: the partial is included, never extended.
+{% endcomment %}<div data-tone="{{ tone }}"{% if testid %} data-testid="{{ testid }}"{% endif %}{% if role %} role="{{ role }}"{% endif %} class="relative flex flex-col gap-4 rounded-control border p-4 text-body md:flex-row md:items-start {% if tone == "success" %}border-ok-border bg-ok-bg [box-shadow:inset_3px_0_0_var(--ok-text)]{% elif tone == "info" %}border-info-border bg-info-bg [box-shadow:inset_3px_0_0_var(--info-text)]{% elif tone == "warning" %}border-warn-border bg-warn-bg [box-shadow:inset_3px_0_0_var(--warn-icon)]{% elif tone == "error" %}border-err-border bg-err-bg [box-shadow:inset_3px_0_0_var(--err-text)]{% elif tone == "muted" %}border-border bg-surface-muted pl-5{% endif %}">
+  {% if tone == "muted" %}<span aria-hidden="true" class="absolute inset-y-0 left-0 w-1.5 rounded-l-[3px] bg-hatch"></span>{% endif %}
+  <div class="flex min-w-0 flex-1 items-start gap-2">
+    {% if tone == "success" %}{% icon "circle-check" class="size-5 shrink-0 text-ok-text" %}{% elif tone == "info" %}{% icon "info" class="size-5 shrink-0 text-info-text" %}{% elif tone == "warning" %}{% icon "triangle-alert" class="size-5 shrink-0 text-warn-icon" %}{% elif tone == "error" %}{% icon "circle-alert" class="size-5 shrink-0 text-err-text" %}{% elif tone == "muted" %}{% icon "wrench" class="size-5 shrink-0 text-st-maint-text" %}{% endif %}
+    <div class="flex min-w-0 flex-1 flex-col gap-1">
+      {% if tone == "warning" %}<span class="sr-only">Warning: </span>{% elif tone == "error" %}<span class="sr-only">Error: </span>{% endif %}
+      {% if title %}<p class="font-semibold break-words {% if tone == "success" %}text-ok-text{% elif tone == "info" %}text-info-text{% elif tone == "warning" %}text-warn-text{% elif tone == "error" %}text-err-text{% else %}text-fg{% endif %}">{{ title }}</p>{% endif %}
+      {% if body %}<p class="break-words text-fg">{{ body }}</p>{% endif %}
+    </div>
+  </div>
+  {% if action_template %}<div class="shrink-0 pl-7 md:pl-0">{% include action_template %}</div>{% endif %}
+</div>
