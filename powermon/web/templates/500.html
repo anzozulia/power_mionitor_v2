@@ -1,7 +1,8 @@
-{% extends "layouts/error.html" %}
+{% extends "layouts/error.html" %}{% load icons %}
 {% comment %}E3, copy row e500. Django's 500 handler renders this with no context and no request; fixed copy only, never the exception (R11).{% endcomment %}
 {% block title %}Server error{% endblock %}
 {% block code %}500{% endblock %}
 {% block code_label %}500{% endblock %}
+{% block icon %}{% icon "circle-alert" class="size-6 text-icon" %}{% endblock %}
 {% block heading %}Something went wrong{% endblock %}
 {% block body %}The server could not finish this request. Details are in the web container logs. Try again in a moment.{% endblock %}

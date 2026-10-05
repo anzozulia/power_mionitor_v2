@@ -1,7 +1,8 @@
-{% extends "layouts/error.html" %}
+{% extends "layouts/error.html" %}{% load icons %}
 {% comment %}E1, copy row e404. Fixed copy only: never print the requested path or any request data (R11).{% endcomment %}
 {% block title %}Page not found{% endblock %}
 {% block code %}404{% endblock %}
 {% block code_label %}404{% endblock %}
+{% block icon %}{% icon "file-question-mark" class="size-6 text-icon" %}{% endblock %}
 {% block heading %}Page not found{% endblock %}
 {% block body %}This page does not exist. Check the address, or go back to the location list.{% endblock %}

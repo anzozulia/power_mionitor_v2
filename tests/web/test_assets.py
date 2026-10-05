@@ -474,9 +474,7 @@ def test_error_pages_use_icons_and_favicons(code: str) -> None:
 @pytest.mark.django_db
 @pytest.mark.parametrize("code", ERROR_CODES)
 def test_error_pages_pass_the_page_invariants(code: str) -> None:
-    page = assert_page(
-        _error_response(code), status=int(code), title=ERROR_TITLES[code], app=False
-    )
+    page = assert_page(_error_response(code), status=int(code), title=ERROR_TITLES[code], app=False)
 
     # Still no JavaScript at all, with the icons inlined (E1-E3).
     assert page.find_all("script") == []
