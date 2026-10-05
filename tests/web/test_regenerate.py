@@ -86,8 +86,7 @@ OFF_BLOCK = (
     "maintenance on first to have that time shown as not monitored instead."
 )
 WAITING_BLOCK = (
-    "This location has had no heartbeat yet, so nothing is reported while you update the "
-    "device."
+    "This location has had no heartbeat yet, so nothing is reported while you update the device."
 )
 MAINTENANCE_BLOCK = (
     "Maintenance is on, so OFF is not detected while you update the device. Turn maintenance "

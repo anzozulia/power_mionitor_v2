@@ -694,6 +694,7 @@ class RegenerateKeyView(View):
     template_name = "web/location_regenerate.html"
 
     def get(self, request: HttpRequest, pk: int) -> HttpResponse:
+        """The confirmation page, or its partial alone for the modal (UI-07): no key (R4)."""
         location = location_or_404(pk)
         context = {
             "location": location,
@@ -702,7 +703,9 @@ class RegenerateKeyView(View):
             "off_after_s": location.period_s + location.grace_s,
             "marker": regenerate_marker(location.device_key),
         }
-        return render(request, self.template_name, context)
+        return confirm_response(
+            request, self.template_name, "web/_confirm_regenerate.html", context
+        )
 
     def post(self, request: HttpRequest, pk: int) -> HttpResponse:
         current = location_or_404(pk).device_key

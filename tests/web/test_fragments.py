@@ -103,8 +103,7 @@ REGEN_POWER_OFF = (
     "maintenance on first to have that time shown as not monitored instead."
 )
 REGEN_WAITING = (
-    "This location has had no heartbeat yet, so nothing is reported while you update the "
-    "device."
+    "This location has had no heartbeat yet, so nothing is reported while you update the device."
 )
 REGEN_MAINTENANCE = (
     "Maintenance is on, so OFF is not detected while you update the device. Turn maintenance "

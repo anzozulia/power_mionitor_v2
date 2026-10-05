@@ -1,0 +1,60 @@
+{% load icons %}{% comment %}
+S9, the regenerate key confirmation (06-UI-SPEC Page Contracts > Confirmations, Components
+> Modal; UI-07, D6-05, R4, R7). One partial for both variants: web/location_regenerate.html
+includes it in its focus card, and fragments.confirm_response renders it alone, with
+fragment set, as the modal body. Copy rows regen.*.
+
+Context: location; state_block (location_views.regenerate_block: warning, off, waiting or
+maintenance); off_after_s; marker (the salted HMAC of the key it replaces, never key
+characters); fragment (set only for the modal, as in web/_confirm_delete.html).
+
+- Root [data-testid=confirm]; header strip with the 16 px key-round icon and h1#confirm-title.
+- Body: the lead, then exactly one [data-testid=state-block][data-tone][data-state-block],
+  mapped from state_block in an if chain: warning gives warning-on (a warning alert with its
+  visually hidden "Warning: " prefix and the link "Open the location page"), off gives
+  power-off, waiting gives waiting and maintenance gives maintenance (info alerts). The
+  value with its unit is mono. The "maintenance first" path is that plain link, never a
+  second form (UI-D9).
+- Footer strip: Keep (back to the device setup page) first, then form[data-testid=confirm-form]
+  (POST, CSRF, the hidden marker) holding only the danger submit [data-testid=confirm-submit].
+- Never the key, its mask or its tail, not even in the fragment (R4). No autofocus.
+{% endcomment %}{% url 'location-detail' location.pk as detail_url %}{% url 'location-setup' location.pk as setup_url %}<div data-testid="confirm" class="flex min-h-0 flex-1 flex-col">
+<div class="flex shrink-0 items-center gap-2 border-b border-border bg-surface-muted py-2 pl-6 {% if fragment %}min-h-15 pr-15 md:min-h-[calc(var(--control-h-sm)_+_1rem)] md:pr-[calc(var(--control-h-sm)_+_1rem)]{% else %}pr-2{% endif %}">
+{% icon "key-round" class="size-4 shrink-0 text-danger-text" %}
+<h1 id="confirm-title" data-testid="confirm-title" class="min-w-0 flex-1 font-semibold break-words text-fg {% if fragment %}text-lead{% else %}text-title tracking-title{% endif %}">Regenerate the device key?</h1>
+</div>
+<div class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-6 py-4 text-body text-fg">
+<p class="text-fg-muted">The old key stops working at once. Until the device has the new key, it gets HTTP 401 and its heartbeats are not recorded. The history is kept.</p>
+{% if state_block == "warning" %}
+<div data-testid="state-block" data-tone="warning" data-state-block="warning-on" class="flex items-start gap-2 rounded-control border border-warn-border bg-warn-bg p-4 [box-shadow:inset_3px_0_0_var(--warn-icon)]">
+{% icon "triangle-alert" class="size-5 shrink-0 text-warn-icon" %}
+<div class="flex min-w-0 flex-1 flex-col gap-2">
+<p class="break-words"><span class="sr-only">Warning: </span>While maintenance is off, this location can be reported OFF as soon as <span class="num">{{ off_after_s }} seconds</span> after its last heartbeat, and subscribers then get an OFF alert if alerts are on. Turn maintenance on first on the location page, update the device, then turn maintenance off there.</p>
+<p><a href="{{ detail_url }}" class="font-semibold text-accent-text underline underline-offset-3 hover:text-fg">Open the location page</a></p>
+</div>
+</div>
+{% elif state_block == "off" %}
+<div data-testid="state-block" data-tone="info" data-state-block="power-off" class="flex items-start gap-2 rounded-control border border-info-border bg-info-bg p-4 [box-shadow:inset_3px_0_0_var(--info-text)]">
+{% icon "info" class="size-5 shrink-0 text-info-text" %}
+<p class="min-w-0 flex-1 break-words">This location is off now. Until the device has the new key, the return of power is not seen: the outage is recorded until the first heartbeat with the new key, so the chart, the day totals and the ON alert (if alerts are on) count that time as off. Turn maintenance on first to have that time shown as not monitored instead.</p>
+</div>
+{% elif state_block == "waiting" %}
+<div data-testid="state-block" data-tone="info" data-state-block="waiting" class="flex items-start gap-2 rounded-control border border-info-border bg-info-bg p-4 [box-shadow:inset_3px_0_0_var(--info-text)]">
+{% icon "info" class="size-5 shrink-0 text-info-text" %}
+<p class="min-w-0 flex-1 break-words">This location has had no heartbeat yet, so nothing is reported while you update the device.</p>
+</div>
+{% elif state_block == "maintenance" %}
+<div data-testid="state-block" data-tone="info" data-state-block="maintenance" class="flex items-start gap-2 rounded-control border border-info-border bg-info-bg p-4 [box-shadow:inset_3px_0_0_var(--info-text)]">
+{% icon "info" class="size-5 shrink-0 text-info-text" %}
+<p class="min-w-0 flex-1 break-words">Maintenance is on, so OFF is not detected while you update the device. Turn maintenance off on the location page once the device sends heartbeats with the new key.</p>
+</div>
+{% endif %}
+</div>
+<div class="flex shrink-0 flex-col-reverse gap-2 border-t border-border bg-surface-muted px-6 py-3 sm:flex-row sm:justify-end">
+{% include "partials/_button.html" with variant="secondary" label="Keep current key" href=setup_url testid="keep" only %}
+<form method="post" action="{% url 'location-regenerate' location.pk %}" data-testid="confirm-form" class="flex flex-col">{% csrf_token %}
+<input type="hidden" name="marker" value="{{ marker }}">
+{% include "partials/_button.html" with variant="danger" label="Regenerate key" icon="key-round" testid="confirm-submit" only %}
+</form>
+</div>
+</div>
