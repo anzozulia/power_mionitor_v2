@@ -1,0 +1,46 @@
+{% load icons %}{% comment %}
+S7, the delete confirmation (06-UI-SPEC Page Contracts > Confirmations, Components > Modal;
+UI-07, D6-05, R7). One partial for both variants: web/location_delete.html includes it in
+its focus card, and fragments.confirm_response renders it alone, with fragment set, as the
+modal body. Both therefore show the same copy (copy rows delete.*) and the same form.
+
+Context: location; fragment (set only for the modal: the 16 px title, and the header strip
+keeps room for the dialog's own close button at its top-right).
+
+- Root [data-testid=confirm]: a column whose body scrolls between the fixed header and footer
+  strips, so in the 480 px dialog Keep and the destructive button always stay visible.
+- Header strip: the 16 px trash icon in the danger text tone, then h1#confirm-title (the
+  dialog's name, aria-labelledby); the name is escaped (R1) and wraps anywhere.
+- Body: the lead, ul[data-testid=consequences] with the five consequences (4 px dots), the
+  pause info alert, the re-create paragraph.
+- Footer strip: Keep (a[data-testid=keep], secondary, back to the location page) first,
+  then form[data-testid=confirm-form] (POST, CSRF) holding only the danger submit
+  [data-testid=confirm-submit], whose pending spinner comes from the button partial (the
+  submit guard sets aria-busy). Phones: both full width, the destructive one on top; from
+  sm a right-aligned row.
+- No autofocus attribute: the dialog loader focuses Keep, and the full page, a destructive
+  page, focuses nothing. No secret, not even masked: no settings, no key, no token.
+{% endcomment %}{% url 'location-detail' location.pk as detail_url %}<div data-testid="confirm" class="flex min-h-0 flex-1 flex-col">
+<div class="flex shrink-0 items-center gap-2 border-b border-border bg-surface-muted py-2 pl-6 {% if fragment %}min-h-15 pr-15 md:min-h-[calc(var(--control-h-sm)_+_1rem)] md:pr-[calc(var(--control-h-sm)_+_1rem)]{% else %}pr-2{% endif %}">
+{% icon "trash-2" class="size-4 shrink-0 text-danger-text" %}
+<h1 id="confirm-title" data-testid="confirm-title" class="min-w-0 flex-1 font-semibold break-words text-fg {% if fragment %}text-lead{% else %}text-title tracking-title{% endif %}">Delete {{ location.name }}?</h1>
+</div>
+<div class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-6 py-4 text-body text-fg">
+<p class="text-fg-muted">This cannot be undone. Deleting this location:</p>
+<ul data-testid="consequences" class="flex flex-col gap-2">
+<li class="relative pl-4 before:absolute before:top-2 before:left-0.5 before:size-1 before:rounded-full before:bg-fg-subtle">stops its alerts at once and drops the alerts still queued, so they are never sent;</li>
+<li class="relative pl-4 before:absolute before:top-2 before:left-0.5 before:size-1 before:rounded-full before:bg-fg-subtle">makes its device key stop working: the device gets HTTP 401;</li>
+<li class="relative pl-4 before:absolute before:top-2 before:left-0.5 before:size-1 before:rounded-full before:bg-fg-subtle">unpins its weekly chart in the channel if the bot can still pin there; otherwise unpin it by hand in Telegram (the posted messages stay in the channel);</li>
+<li class="relative pl-4 before:absolute before:top-2 before:left-0.5 before:size-1 before:rounded-full before:bg-fg-subtle">closes its open problems, such as failing delivery, without a recovery notice;</li>
+<li class="relative pl-4 before:absolute before:top-2 before:left-0.5 before:size-1 before:rounded-full before:bg-fg-subtle">hides it from the admin panel. Its history stays in the database but is never shown again.</li>
+</ul>
+{% include "partials/_alert.html" with tone="info" body="To pause this location instead, turn maintenance on or alerts off on the location page." only %}
+<p>To monitor this place again later, add a new location. It gets a new device key and starts with an empty history.</p>
+</div>
+<div class="flex shrink-0 flex-col-reverse gap-2 border-t border-border bg-surface-muted px-6 py-3 sm:flex-row sm:justify-end">
+{% include "partials/_button.html" with variant="secondary" label="Keep location" href=detail_url testid="keep" only %}
+<form method="post" action="{% url 'location-delete' location.pk %}" data-testid="confirm-form" class="flex flex-col">{% csrf_token %}
+{% include "partials/_button.html" with variant="danger" label="Delete location" icon="trash-2" testid="confirm-submit" only %}
+</form>
+</div>
+</div>

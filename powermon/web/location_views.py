@@ -54,6 +54,7 @@ from powermon.locations.models import LANGUAGE_CHOICES, Location
 from powermon.telegram.client import DEFAULT_RETRY_AFTER_S, SendResult, TelegramClient
 from powermon.web import views
 from powermon.web.forms import LocationEditForm
+from powermon.web.fragments import confirm_response
 from powermon.web.status import location_status
 
 log = logging.getLogger(__name__)
@@ -632,8 +633,11 @@ class LocationDeleteView(View):
     clock: Clock = SystemClock()
 
     def get(self, request: HttpRequest, pk: int) -> HttpResponse:
+        """The confirmation page, or its partial alone for the modal (UI-07, never_cache)."""
         location = location_or_404(pk)
-        return render(request, self.template_name, {"location": location})
+        return confirm_response(
+            request, self.template_name, "web/_confirm_delete.html", {"location": location}
+        )
 
     def post(self, request: HttpRequest, pk: int) -> HttpResponse:
         # Deleted or not: only an id that never existed is 404 (UI-D8).
