@@ -32,6 +32,17 @@ COMPOSE_FILES = {"local": "docker-compose.local.yml", "prod": "docker-compose.pr
 ENVS = sorted(COMPOSE_FILES)
 # The local-only Tailwind watcher override (UI-13): -f docker-compose.local.yml -f this file.
 DEV_UI_FILE = "docker-compose.dev-ui.yml"
+# The shared-VPS override (README section 17): -f docker-compose.prod.yml -f this file.
+VPS_FILE = "docker-compose.vps.yml"
+# Its memory caps; caddy is capped too but never starts there (bundled-proxy profile).
+VPS_MEM_LIMITS = {
+    "caddy": "128m",
+    "web": "512m",
+    "worker": "384m",
+    "db": "512m",
+    "migrate": "384m",
+    "backup": "256m",
+}
 CADDYFILE = BASE_DIR / "docker" / "Caddyfile"
 # Caddy reads only these two from its environment; every other app setting is blanked.
 CADDY_KEYS = frozenset({"DOMAIN", "ACME_EMAIL"})
@@ -147,6 +158,27 @@ def test_local_only_web_publishes_on_loopback() -> None:
 
     assert published == {"web": ["127.0.0.1:8000:8000"]}
     assert not [name for name, svc in services.items() if svc.get("network_mode") == "host"]
+
+
+def test_INV22_vps_override_publishes_only_a_loopback_port_and_gates_caddy() -> None:
+    # On the shared VPS the host nginx is the TLS proxy (SEC-02 deviation, README section
+    # 17): caddy never starts, and the one published port is bound to 127.0.0.1, because
+    # a Docker-published port bypasses host firewall rules.
+    data = _load(VPS_FILE)
+    services = data.get("services")
+    prod = _services("prod")
+
+    assert isinstance(services, dict)
+    # An override only: no project name of its own, no new service, no other keys.
+    assert set(data) == {"services"}
+    assert set(services) == set(prod)
+    for name, svc in services.items():
+        assert set(svc) <= {"ports", "mem_limit", "profiles"}, name
+    published = {name: svc["ports"] for name, svc in services.items() if "ports" in svc}
+    assert published == {"web": ["127.0.0.1:8091:8000"]}
+    assert [name for name, svc in services.items() if "profiles" in svc] == ["caddy"]
+    assert services["caddy"]["profiles"] == ["bundled-proxy"]
+    assert {name: svc.get("mem_limit") for name, svc in services.items()} == VPS_MEM_LIMITS
 
 
 @pytest.mark.parametrize("env", ENVS)
