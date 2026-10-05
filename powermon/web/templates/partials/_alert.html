@@ -2,10 +2,14 @@
 Alert / banner (06-UI-SPEC Components > Alert / banner; UI-09, UI-12). Parameters:
 tone (success, info, warning, error, muted), title (optional, in the tone's text colour),
 body (optional), testid (optional data-testid), role (only when passed: "alert" for inline
-form errors and throttle messages; alerts that are not live messages have no role) and
+form errors and throttle messages; alerts that are not live messages have no role),
 action_template (optional: the name of a template included in the action slot, e.g. a fix
-button; it sees the including context). The action sits right of the text from md and
-under it below md.
+button; it sees the including context) and action_testid (optional: the action's testid).
+The action sits right of the text from md and under it below md.
+
+- The action template gets action_testid as its testid, never the alert's own testid, so
+  the alert's data-testid stays on exactly one element; without action_testid the action
+  has none.
 
 - Warning and error alerts start with a visually hidden "Warning: " / "Error: " prefix.
 - success, info, warning and error draw a 3 px inset tone bar on the left edge; muted
@@ -23,5 +27,5 @@ under it below md.
       {% if body %}<p class="break-words text-fg">{{ body }}</p>{% endif %}
     </div>
   </div>
-  {% if action_template %}<div class="shrink-0 pl-7 md:pl-0">{% include action_template %}</div>{% endif %}
+  {% if action_template %}<div class="shrink-0 pl-7 md:pl-0">{% include action_template with testid=action_testid %}</div>{% endif %}
 </div>
