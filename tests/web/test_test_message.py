@@ -197,7 +197,7 @@ def _post_test_message(
 
 
 def _flashes(html: str) -> list[tuple[str, str]]:
-    """Each flash on a page as (role, text), toast or legacy callout alike (UI-09)."""
+    """Each flash on a page as (role, text), read from its toasts (UI-09)."""
     return [(flash.role, flash.text) for flash in page_messages(html)]
 
 

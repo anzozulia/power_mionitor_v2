@@ -109,13 +109,13 @@ def _on_since_8(location_factory: Callable[..., Any]) -> Any:
 
 
 def _flashes(page: Any) -> list[tuple[str, str]]:
-    """Each flash on the page as (role, text), toast or legacy callout alike (UI-09)."""
+    """Each flash on the page as (role, text), read from its toasts (UI-09)."""
     return [(message.role, message.text) for message in messages(page)]
 
 
 def _is_info(page: Any) -> bool:
-    """Every flash on the page is an info flash (a legacy callout carries no level)."""
-    return all(message.level in (None, "info") for message in messages(page))
+    """Every flash on the page is an info flash."""
+    return all(message.level == "info" for message in messages(page))
 
 
 def _maintenance_form(page: Any, location: Any) -> Tag:

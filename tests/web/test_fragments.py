@@ -357,12 +357,12 @@ def _written(location: Any) -> tuple[Any, ...]:
 
 
 def assert_one_flash(page: HttpResponse, level: str, flash: str) -> None:
-    """Exactly one flash, of ``level``: a toast, or a legacy callout until S5 is rebuilt."""
+    """Exactly one flash, a toast of ``level``."""
     found = messages(page)
     role = "alert" if level == "error" else "status"
     assert len(found) == 1, found
     assert (found[0].role, found[0].text) == (role, flash)
-    assert found[0].level in (None, level), found
+    assert found[0].level == level, found
 
 
 # S7 delete (UI-07): the page in the app shell and the fragment, from one partial

@@ -211,7 +211,7 @@ def location_or_404(pk: int) -> Location:
 
 
 def settings_context(location: Location) -> dict[str, Any]:
-    """The values of the shared settings panel (``web/_settings_panel.html``).
+    """The values of the shared settings list (``partials/_settings_dl.html``) on S5 and S8.
 
     The bot token only ever goes out masked (SEC-04, D-11).
     """
