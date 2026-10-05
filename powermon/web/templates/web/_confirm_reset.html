@@ -1,0 +1,41 @@
+{% load icons %}{% comment %}
+S11, the reset history confirmation (06-UI-SPEC Page Contracts > Confirmations, Components
+> Modal; UI-07, D6-05, R7). One partial for both variants: web/history_reset.html includes
+it in its focus card, and fragments.confirm_response renders it alone, with fragment set,
+as the modal body. Copy rows reset.*.
+
+Context: location; fragment (set only for the modal: the 16 px title, and the header strip
+keeps room for the dialog's own close button at its top-right).
+
+- Root [data-testid=confirm]; header strip with the 16 px rotate-ccw icon and
+  h1#confirm-title; the name is escaped (R1) and wraps anywhere.
+- Body: the lead, ul[data-testid=consequences] with the five consequences, then the
+  alternative, whose "Recent outages" links to the location page's card.
+- Footer strip: Keep first, a secondary link back to the location page's Reset history row
+  (the button partial renders it as a[data-testid="keep"]), then
+  form[data-testid="confirm-form"] (POST, CSRF) holding only the danger submit, rendered by
+  the button partial as button[data-testid="confirm-submit"] with its pending spinner.
+- No settings panel and no secret, not even masked. No autofocus.
+{% endcomment %}{% url 'location-detail' location.pk as detail_url %}{% with outages_url=detail_url|add:"#recent-outages" keep_url=detail_url|add:"#reset-history" %}<div data-testid="confirm" class="flex min-h-0 flex-1 flex-col">
+<div class="flex shrink-0 items-center gap-2 border-b border-border bg-surface-muted py-2 pl-6 {% if fragment %}min-h-15 pr-15 md:min-h-[calc(var(--control-h-sm)_+_1rem)] md:pr-[calc(var(--control-h-sm)_+_1rem)]{% else %}pr-2{% endif %}">
+{% icon "rotate-ccw" class="size-4 shrink-0 text-danger-text" %}
+<h1 id="confirm-title" data-testid="confirm-title" class="min-w-0 flex-1 font-semibold break-words text-fg {% if fragment %}text-lead{% else %}text-title tracking-title{% endif %}">Reset the history of {{ location.name }}?</h1>
+</div>
+<div class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-6 py-4 text-body text-fg">
+<p class="text-fg-muted">This cannot be undone. Resetting the history:</p>
+<ul data-testid="consequences" class="flex flex-col gap-2">
+<li class="relative pl-4 before:absolute before:top-2 before:left-0.5 before:size-1 before:rounded-full before:bg-fg-subtle">deletes all recorded power history of this location: the chart and the daily totals show no data for the time before the reset, and Recent outages is empty;</li>
+<li class="relative pl-4 before:absolute before:top-2 before:left-0.5 before:size-1 before:rounded-full before:bg-fg-subtle">unpins its weekly chart in the channel if the bot can still pin there; otherwise unpin it by hand in Telegram (the posted messages stay in the channel);</li>
+<li class="relative pl-4 before:absolute before:top-2 before:left-0.5 before:size-1 before:rounded-full before:bg-fg-subtle">sets it to Waiting for first heartbeat: nothing is detected until the next heartbeat, which restarts monitoring as On without an alert and posts and pins a new chart;</li>
+<li class="relative pl-4 before:absolute before:top-2 before:left-0.5 before:size-1 before:rounded-full before:bg-fg-subtle">still sends the alerts already queued, because they report real events;</li>
+<li class="relative pl-4 before:absolute before:top-2 before:left-0.5 before:size-1 before:rounded-full before:bg-fg-subtle">keeps the settings, the device key, the switches and the Delivery status.</li>
+</ul>
+<p>To remove a single false outage instead, use <a href="{{ outages_url }}" class="text-accent-text underline underline-offset-3 hover:text-fg">Recent outages</a> on the location page.</p>
+</div>
+<div class="flex shrink-0 flex-col-reverse gap-2 border-t border-border bg-surface-muted px-6 py-3 sm:flex-row sm:justify-end">
+{% include "partials/_button.html" with variant="secondary" label="Keep history" href=keep_url testid="keep" only %}
+<form method="post" action="{% url 'location-reset' location.pk %}" data-testid="confirm-form" class="flex flex-col">{% csrf_token %}
+{% include "partials/_button.html" with variant="danger" label="Reset history" icon="rotate-ccw" testid="confirm-submit" only %}
+</form>
+</div>
+</div>{% endwith %}

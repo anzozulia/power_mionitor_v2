@@ -14,6 +14,12 @@
 
 No admin action here makes a Telegram call (KD2). The heartbeat endpoint is served through
 ``RequestFactory`` with an injected ``FakeClock``, as in tests/web/test_heartbeat.py.
+
+The confirmation page (S9) is read through ``pages.py`` and the 06-UI-SPEC hooks (06-16):
+the ``confirm`` root, ``confirm-title``, one ``state-block``, ``confirm-form`` with the
+marker, ``keep`` and ``confirm-submit``. Its modal fragment is tested in
+tests/web/test_fragments.py. The POST tests still read the revealed setup page's markup;
+they move to the hooks with the setup page (06-19), so this file keeps its marker.
 """
 
 # class-guard: pending migration
@@ -31,7 +37,18 @@ from django.db import transaction
 from django.http import HttpResponse
 from django.test import Client, RequestFactory
 from django.utils.crypto import salted_hmac
-from pages import hidden_value, messages, post_form
+from pages import (
+    all_by_testid,
+    assert_page,
+    breadcrumbs,
+    by_testid,
+    h1,
+    hidden_value,
+    main,
+    messages,
+    post_form,
+    text,
+)
 
 from powermon.alerts import outbox
 from powermon.alerts.models import OutboxMessage
@@ -55,26 +72,25 @@ LEAD = (
     "The old key stops working at once. Until the device has the new key, it gets HTTP 401 "
     "and its heartbeats are not recorded. The history is kept."
 )
+# 06-UI-SPEC copy rows regen.warning_on, regen.power_off, regen.waiting, regen.maintenance.
 WARNING_BLOCK = (
-    "<strong>Warning:</strong> While maintenance is off, this location can be reported OFF "
-    "as soon as {off_after} seconds after its last heartbeat, and subscribers then get an OFF "
-    "alert if alerts are on. Turn maintenance on first on the location page, update the "
-    "device, then turn maintenance off there."
+    "While maintenance is off, this location can be reported OFF as soon as {off_after} "
+    "seconds after its last heartbeat, and subscribers then get an OFF alert if alerts are on. "
+    "Turn maintenance on first on the location page, update the device, then turn maintenance "
+    "off there."
 )
 OFF_BLOCK = (
-    "<strong>Note:</strong> This location is off now. Until the device has the new key, the "
-    "return of power is not seen: the outage is recorded until the first heartbeat with the "
-    "new key, so the chart, the day totals and the ON alert (if alerts are on) count that "
-    "time as off. Turn maintenance on first to have that time shown as not monitored instead."
+    "This location is off now. Until the device has the new key, the return of power is not "
+    "seen: the outage is recorded until the first heartbeat with the new key, so the chart, "
+    "the day totals and the ON alert (if alerts are on) count that time as off. Turn "
+    "maintenance on first to have that time shown as not monitored instead."
 )
 WAITING_BLOCK = (
-    "<strong>Note:</strong> This location has had no heartbeat yet, so nothing is reported "
-    "while you update the device."
+    "This location has had no heartbeat yet, so nothing is reported while you update the device."
 )
 MAINTENANCE_BLOCK = (
-    "<strong>Note:</strong> Maintenance is on, so OFF is not detected while you update the "
-    "device. Turn maintenance off on the location page once the device sends heartbeats with "
-    "the new key."
+    "Maintenance is on, so OFF is not detected while you update the device. Turn maintenance "
+    "off on the location page once the device sends heartbeats with the new key."
 )
 EXAMPLE_BLOCKS = ("example-curl", "example-cron", "example-wget-gnu", "example-wget-busybox")
 
@@ -114,11 +130,6 @@ def _block(page: str, block_id: str) -> str:
     match = re.search(rf'<pre class="copy" id="{block_id}"><code>(.*?)</code></pre>', page, re.S)
     assert match is not None, f"no code block {block_id!r}"
     return unescape(match.group(1))
-
-
-def _main(page: str) -> str:
-    """The page's <main>: the header (with its sign-out form) left out."""
-    return page[page.index("<main") :]
 
 
 def _without_tokens(page: str) -> str:
@@ -327,14 +338,14 @@ def _set(location: Any, *, maintenance: bool, status: str) -> None:
 
 @pytest.mark.django_db
 @pytest.mark.parametrize(
-    ("maintenance", "status", "block"),
+    ("maintenance", "status", "block", "tone"),
     [
-        (False, "on", "warning"),
-        (False, "off", "off"),
-        (False, "waiting", "waiting"),
-        (True, "on", "maintenance"),
-        (True, "off", "maintenance"),
-        (True, "waiting", "maintenance"),
+        (False, "on", "warning-on", "warning"),
+        (False, "off", "power-off", "info"),
+        (False, "waiting", "waiting", "info"),
+        (True, "on", "maintenance", "info"),
+        (True, "off", "maintenance", "info"),
+        (True, "waiting", "maintenance", "info"),
     ],
 )
 def test_regenerate_confirmation_blocks(
@@ -344,45 +355,58 @@ def test_regenerate_confirmation_blocks(
     maintenance: bool,
     status: str,
     block: str,
+    tone: str,
 ) -> None:
     location = location_factory(name="Office", period_s=45, grace_s=20)
     _set(location, maintenance=maintenance, status=status)
 
     response = admin.get(_confirm(location))
 
-    assert response.status_code == 200
     assert "no-store" in response["Cache-Control"]
-    page = response.content.decode()
-    main = _main(page)
-    assert "<title>Office · Regenerate key · Power Monitor</title>" in page
-    assert "<h1>Regenerate the device key?</h1>" in main
-    assert f"<p>{LEAD}</p>" in main
+    # assert_page also proves there is no injected or inline script (R5).
+    soup = assert_page(response, app=True, title="Office · Regenerate key")
+    root = by_testid(main(soup), "confirm")
+    assert text(h1(soup)) == "Regenerate the device key?"
+    assert LEAD in text(root)
     expected = {
-        "warning": WARNING_BLOCK.format(off_after=65),
-        "off": OFF_BLOCK,
+        "warning-on": WARNING_BLOCK.format(off_after=65),
+        "power-off": OFF_BLOCK,
         "waiting": WAITING_BLOCK,
         "maintenance": MAINTENANCE_BLOCK,
     }
-    # Exactly one state block (D-15).
-    assert re.findall(r'<p class="callout">(.*?)</p>', main, re.S) == [expected[block]]
-    link = f'<p><a href="/locations/{location.pk}/">Open the location page</a></p>'
-    assert (link in main) is (block == "warning")
-    # Exactly one form: the destructive POST with its marker (UI-D9), no autofocus.
-    forms = re.findall(r'<form method="post" action="([^"]+)">(.*?)</form>', main, re.S)
-    assert [action for action, _ in forms] == [_confirm(location)]
-    body = forms[0][1]
-    assert 'name="csrfmiddlewaretoken"' in body
-    assert '<input type="hidden" name="marker" value="' in body
-    assert '<button class="btn btn--danger" type="submit">Regenerate key</button>' in body
-    assert "autofocus" not in page
-    assert "btn--primary" not in page
-    assert page.count("btn--danger") == 1
-    keep = (
-        f'<a class="btn btn--secondary" href="/locations/{location.pk}/setup/">Keep current key</a>'
+    # Exactly one state block (D-15), its tone and its copy.
+    [state] = all_by_testid(soup, "state-block")
+    assert (state.get("data-state-block"), state.get("data-tone")) == (block, tone)
+    assert expected[block] in text(state)
+    # The "maintenance first" path is a plain link, never a second form (UI-D9).
+    links = [(link.get("href"), text(link)) for link in state.find_all("a")]
+    expected_links = [(f"/locations/{location.pk}/", "Open the location page")]
+    assert links == (expected_links if block == "warning-on" else [])
+    # Exactly one form in main: the destructive POST with its marker (UI-D9), no autofocus.
+    [form] = main(soup).find_all("form")
+    assert form is post_form(soup, _confirm(location))
+    assert form is by_testid(root, "confirm-form")
+    assert form.find("input", attrs={"name": "csrfmiddlewaretoken"}) is not None
+    assert hidden_value(form, "marker") == _marker(soup, location)
+    submit = by_testid(form, "confirm-submit")
+    assert (submit.get("type"), submit.get("data-variant"), text(submit)) == (
+        "submit",
+        "danger",
+        "Regenerate key",
     )
-    assert keep in main
-    assert main.index("btn--danger") < main.index(keep)
-    assert "<script" not in page
+    assert soup.find_all(autofocus=True) == []
+    page = main(soup)
+    dangers = page.find_all(attrs={"data-variant": "danger"})
+    assert [found.get("data-testid") for found in dangers] == ["confirm-submit"]
+    assert page.find_all(attrs={"data-variant": "primary"}) == []
+    keep = by_testid(root, "keep")
+    assert (keep.get("href"), text(keep)) == (
+        f"/locations/{location.pk}/setup/",
+        "Keep current key",
+    )
+    # Keep comes first, the destructive button last.
+    controls = root.find_all(["a", "button"])
+    assert controls[-2:] == [keep, submit]
     # Nothing was changed by the GET.
     assert _key(location) == location.device_key
     assert len(fake_telegram.calls) == 0
@@ -415,22 +439,24 @@ def test_regenerate_breadcrumbs_and_long_name(
     location = location_factory(name=name)
     xss = location_factory(name="<script>alert(1)</script>")
 
-    page = admin.get(_confirm(location)).content.decode()
-    escaped = admin.get(_confirm(xss)).content.decode()
-
-    crumbs = re.search(r'<ol class="crumbs">(.*?)</ol>', page, re.S)
-    assert crumbs is not None
-    assert re.findall(r"<li([^>]*)>(.*?)</li>", crumbs.group(1), re.S) == [
-        ("", '<a href="/">Locations</a>'),
-        ("", f'<a class="name" href="/locations/{location.pk}/">{name}</a>'),
-        ("", f'<a href="/locations/{location.pk}/setup/">Device setup</a>'),
-        (' aria-current="page"', "Regenerate key"),
-    ]
-    assert "<h1>Regenerate the device key?</h1>" in page
-    assert "<title>&lt;script&gt;alert(1)&lt;/script&gt; · Regenerate key · Power Monitor" in (
-        escaped
+    page = assert_page(admin.get(_confirm(location)), app=True, title=f"{name} · Regenerate key")
+    escaped = assert_page(
+        admin.get(_confirm(xss)), app=True, title="<script>alert(1)</script> · Regenerate key"
     )
-    assert "<script>alert(1)" not in escaped
+
+    # E10 long-text: the whole name in both trails, never truncated.
+    trail = [
+        ("Locations", "/"),
+        (name, f"/locations/{location.pk}/"),
+        ("Device setup", f"/locations/{location.pk}/setup/"),
+        ("Regenerate key", None),
+    ]
+    assert breadcrumbs(page) == trail
+    assert breadcrumbs(page, "breadcrumbs-compact") == trail
+    # The h1 carries no name; the name is escaped everywhere it shows (R1).
+    assert text(h1(page)) == "Regenerate the device key?"
+    assert breadcrumbs(escaped)[1] == ("<script>alert(1)</script>", f"/locations/{xss.pk}/")
+    assert escaped.find_all("script", string="alert(1)") == []
 
 
 # Failure cases: unknown, deleted, anonymous, GET has no effect

@@ -1,51 +1,21 @@
-{% extends "base.html" %}
-{% load display_time %}
-{% comment %}
-05-UI-SPEC screen B (D-02, D-03, D-04; UI5-D7, UI5-D11, UI5-D13): the removal confirmation.
-A GET page that changes nothing: the details panel (Start and End as full display_time
-values, Off time in the chart's totals format, each inside .num), the lead, the
-consequences (ul.list; the not-monitored item only when off time < end - start), the
-closing paragraph about the chart, then the button row. Consequence 3 is the 2026-10-03
-amendment for the refined D-04: a queued ON alert is still sent when the OFF alert already
-went out (history._drop_queued_alerts). The page holds exactly one form, the destructive
-Remove POST (CSRF); "Keep outage" is a plain link back to the location page. No autofocus
-on a page whose action is destructive. The h1 has no name (UI5-D13); the name is only in
-the breadcrumb and the title, auto-escaped. Secrets (SEC-04): no settings panel, no device
-key and no bot token, not even masked. No script, no inline style.
+{% extends "layouts/app.html" %}{% comment %}
+S10, the remove outage confirmation page (06-UI-SPEC Page Contracts > Confirmations,
+Components > Modal and confirmation focus card; UI-07, UI-01, UI-12, D6-05, R7, R12). The
+no-JS and deep-link fallback of the modal: a GET that changes nothing, answered never_cache
+with Vary: X-PM-Fragment (fragments.confirm_response). With the fragment header the view
+renders web/_confirm_remove_outage.html alone instead of this page. An outage that is gone
+or in progress never reaches this page: the view redirects to the location page.
+
+- Title "{name} · Remove outage"; the breadcrumbs Locations > {name} > Remove outage come
+  from the layout (top bar from md, the compact copy below md).
+- The page header is only the compact breadcrumbs: the h1 lives in the shared partial.
+- Content: the shared partial, with fragment unset (the 20 px title), inside a centred
+  576 px focus card.
 {% endcomment %}
 {% block title %}{{ location.name }} · Remove outage{% endblock %}
-{% block crumbs %}
-<nav aria-label="Breadcrumb">
-  <ol class="crumbs">
-    <li><a href="{% url 'location-list' %}">Locations</a></li>
-    <li><a class="name" href="{% url 'location-detail' location.pk %}">{{ location.name }}</a></li>
-    <li aria-current="page">Remove outage</li>
-  </ol>
-</nav>
-{% endblock %}
+{% block page_header %}{% include "partials/_crumbs.html" with variant="compact" trail=trail only %}{% endblock %}
 {% block content %}
-<h1>Remove this outage?</h1>
-<dl class="panel settings">
-  <dt>Start</dt>
-  <dd><span class="num">{{ outage.start|display_time }}</span></dd>
-  <dt>End</dt>
-  <dd><span class="num">{{ outage.end|display_time }}</span></dd>
-  <dt>Off time</dt>
-  <dd><span class="num">{{ off_text }}</span></dd>
-</dl>
-<p>This cannot be undone. Removing this outage:</p>
-<ul class="list">
-  <li>records its off time as power on, so the chart and the daily totals no longer count it as off time or as an outage;</li>
-  {% if shows_unmonitored %}<li>keeps the time inside it that was not monitored (maintenance, server downtime) as not monitored;</li>
-  {% endif %}<li>sends no new message to the channel. If its OFF alert was never sent, its queued OFF and ON alerts are dropped; if the OFF alert already went out, a queued ON alert is still sent, so the channel is not left at power off;</li>
-  <li>leaves the live status unchanged, including the On since time from which the next OFF alert counts "was ON for".</li>
-</ul>
-<p>The chart updates within 15 minutes. It shows the last 7 days; charts already posted for earlier days do not change.</p>
-<div class="actions">
-  <form method="post" action="{% url 'outage-remove' location.pk start_us %}">
-    {% csrf_token %}
-    <button class="btn btn--danger" type="submit">Remove outage</button>
-  </form>
-  <a class="btn btn--secondary" href="{% url 'location-detail' location.pk %}">Keep outage</a>
+<div class="mx-auto flex w-full max-w-144 flex-col overflow-clip rounded-card border border-border bg-surface">
+{% include "web/_confirm_remove_outage.html" %}
 </div>
 {% endblock %}

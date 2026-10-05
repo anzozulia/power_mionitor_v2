@@ -28,13 +28,14 @@ from datetime import datetime, timedelta
 from django.conf import settings
 from django.contrib import messages
 from django.http import Http404, HttpRequest, HttpResponse
-from django.shortcuts import redirect, render
+from django.shortcuts import redirect
 from django.views import View
 
 from powermon.alerts import ops
 from powermon.clock import Clock, SystemClock
 from powermon.engine import history
 from powermon.i18n.duration import format_total_duration
+from powermon.web.fragments import confirm_response, refusal_redirect
 from powermon.web.location_views import local_minute, location_or_404
 from powermon.web.status import location_status
 
@@ -98,15 +99,21 @@ class OutageRemoveView(View):
     clock: Clock = SystemClock()
 
     def get(self, request: HttpRequest, pk: int, start_us: int) -> HttpResponse:
+        """The confirmation page, or its partial alone for the modal (UI-07).
+
+        A refusal is the same redirect in both variants; only the full page queues its flash.
+        """
         location = location_or_404(pk)
         start = instant_or_404(start_us)
         outage = history.find_outage(pk, start, self.clock.now())
         if outage is None:
-            messages.info(request, OUTAGE_GONE_MESSAGE)
-            return redirect("location-detail", pk=pk)
+            return refusal_redirect(
+                request, messages.INFO, OUTAGE_GONE_MESSAGE, "location-detail", pk=pk
+            )
         if outage.in_progress or outage.end is None:
-            messages.error(request, REMOVAL_REFUSED_MESSAGE)
-            return redirect("location-detail", pk=pk)
+            return refusal_redirect(
+                request, messages.ERROR, REMOVAL_REFUSED_MESSAGE, "location-detail", pk=pk
+            )
         span_us = (outage.end - outage.start) // ONE_US
         context = {
             "location": location,
@@ -117,7 +124,9 @@ class OutageRemoveView(View):
             # Not-monitored time lies inside the outage (05-UI-SPEC B, Consequence 2).
             "shows_unmonitored": outage.off_us < span_us,
         }
-        return render(request, self.template_name, context)
+        return confirm_response(
+            request, self.template_name, "web/_confirm_remove_outage.html", context
+        )
 
     def post(self, request: HttpRequest, pk: int, start_us: int) -> HttpResponse:
         location_or_404(pk)
@@ -154,14 +163,22 @@ class HistoryResetView(View):
     clock: Clock = SystemClock()
 
     def get(self, request: HttpRequest, pk: int) -> HttpResponse:
+        """The confirmation page, or its partial alone for the modal (UI-07).
+
+        A refusal is the same redirect in both variants; only the full page queues its flash.
+        """
         location = location_or_404(pk)
         if location_status(location).power_key == "off":
-            messages.error(request, RESET_REFUSED_MESSAGE)
-            return redirect("location-detail", pk=pk)
+            return refusal_redirect(
+                request, messages.ERROR, RESET_REFUSED_MESSAGE, "location-detail", pk=pk
+            )
         if not history.has_history(pk):
-            messages.info(request, NOTHING_TO_RESET_MESSAGE)
-            return redirect("location-detail", pk=pk)
-        return render(request, self.template_name, {"location": location})
+            return refusal_redirect(
+                request, messages.INFO, NOTHING_TO_RESET_MESSAGE, "location-detail", pk=pk
+            )
+        return confirm_response(
+            request, self.template_name, "web/_confirm_reset.html", {"location": location}
+        )
 
     def post(self, request: HttpRequest, pk: int) -> HttpResponse:
         location_or_404(pk)

@@ -1,0 +1,48 @@
+{% load icons display_time %}{% comment %}
+S10, the remove outage confirmation (06-UI-SPEC Page Contracts > Confirmations, Components
+> Modal; UI-07, D6-05, R7, R12). One partial for both variants: web/outage_remove.html
+includes it in its focus card, and fragments.confirm_response renders it alone, with
+fragment set, as the modal body. Copy rows remove.* (remove.c3 is amendment A3).
+
+Context: location; start_us (from the stored outage, never the request's value, R12);
+outage (start, end); off_text (the chart's totals format); shows_unmonitored (off time is
+shorter than the outage's span); fragment (set only for the modal).
+
+- Root [data-testid=confirm]; header strip with the 16 px trash icon and h1#confirm-title.
+  The h1 carries no name (UI5-D13); the name is only in the title and the breadcrumbs.
+- Body: dl[data-testid=outage-details] (Start and End as full display_time values, Off time;
+  each value mono; the label above the value on phones, a 96 px label column from sm), the
+  lead, ul[data-testid=consequences] (consequence 2 only when shows_unmonitored), then the
+  chart sentence.
+- Footer strip: Keep first, a secondary link back to the location page's Recent outages
+  (the button partial renders it as a[data-testid="keep"]), then
+  form[data-testid="confirm-form"] (POST to the stored start, CSRF) holding only the danger
+  submit, rendered by the button partial as button[data-testid="confirm-submit"].
+- No secret, not even masked. No autofocus.
+{% endcomment %}{% url 'location-detail' location.pk as detail_url %}{% with keep_url=detail_url|add:"#recent-outages" %}<div data-testid="confirm" class="flex min-h-0 flex-1 flex-col">
+<div class="flex shrink-0 items-center gap-2 border-b border-border bg-surface-muted py-2 pl-6 {% if fragment %}min-h-15 pr-15 md:min-h-[calc(var(--control-h-sm)_+_1rem)] md:pr-[calc(var(--control-h-sm)_+_1rem)]{% else %}pr-2{% endif %}">
+{% icon "trash-2" class="size-4 shrink-0 text-danger-text" %}
+<h1 id="confirm-title" data-testid="confirm-title" class="min-w-0 flex-1 font-semibold break-words text-fg {% if fragment %}text-lead{% else %}text-title tracking-title{% endif %}">Remove this outage?</h1>
+</div>
+<div class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-6 py-4 text-body text-fg">
+<dl data-testid="outage-details" class="flex flex-col gap-2 rounded-control border border-border bg-surface-muted px-4 py-3 sm:gap-1">
+<div class="flex min-w-0 flex-col sm:grid sm:grid-cols-[96px_minmax(0,1fr)] sm:gap-4"><dt class="text-label/5 font-semibold tracking-label text-fg-muted uppercase">Start</dt><dd class="min-w-0"><span class="num">{{ outage.start|display_time }}</span></dd></div>
+<div class="flex min-w-0 flex-col sm:grid sm:grid-cols-[96px_minmax(0,1fr)] sm:gap-4"><dt class="text-label/5 font-semibold tracking-label text-fg-muted uppercase">End</dt><dd class="min-w-0"><span class="num">{{ outage.end|display_time }}</span></dd></div>
+<div class="flex min-w-0 flex-col sm:grid sm:grid-cols-[96px_minmax(0,1fr)] sm:gap-4"><dt class="text-label/5 font-semibold tracking-label text-fg-muted uppercase">Off time</dt><dd class="min-w-0"><span class="num">{{ off_text }}</span></dd></div>
+</dl>
+<p class="text-fg-muted">This cannot be undone. Removing this outage:</p>
+<ul data-testid="consequences" class="flex flex-col gap-2">
+<li class="relative pl-4 before:absolute before:top-2 before:left-0.5 before:size-1 before:rounded-full before:bg-fg-subtle">records its off time as power on, so the chart and the daily totals no longer count it as off time or as an outage;</li>
+{% if shows_unmonitored %}<li class="relative pl-4 before:absolute before:top-2 before:left-0.5 before:size-1 before:rounded-full before:bg-fg-subtle">keeps the time inside it that was not monitored (maintenance, server downtime) as not monitored;</li>
+{% endif %}<li class="relative pl-4 before:absolute before:top-2 before:left-0.5 before:size-1 before:rounded-full before:bg-fg-subtle">sends nothing itself, and drops its queued OFF and ON alerts if the OFF alert was never sent (if it already went out, its queued ON alert is still sent, so the channel is not left at power off);</li>
+<li class="relative pl-4 before:absolute before:top-2 before:left-0.5 before:size-1 before:rounded-full before:bg-fg-subtle">leaves the live status unchanged, including the On since time from which the next OFF alert counts "was ON for".</li>
+</ul>
+<p>The chart updates within 15 minutes. It shows the last 7 days; charts already posted for earlier days do not change.</p>
+</div>
+<div class="flex shrink-0 flex-col-reverse gap-2 border-t border-border bg-surface-muted px-6 py-3 sm:flex-row sm:justify-end">
+{% include "partials/_button.html" with variant="secondary" label="Keep outage" href=keep_url testid="keep" only %}
+<form method="post" action="{% url 'outage-remove' location.pk start_us %}" data-testid="confirm-form" class="flex flex-col">{% csrf_token %}
+{% include "partials/_button.html" with variant="danger" label="Remove outage" icon="trash-2" testid="confirm-submit" only %}
+</form>
+</div>
+</div>{% endwith %}

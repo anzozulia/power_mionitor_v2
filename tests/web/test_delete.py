@@ -2,8 +2,10 @@
 
 - Delete is a GET confirmation page, then a POST (CSRF). The page says what the delete
   does (the five consequences), points to the reversible options and to re-creating, and
-  holds one form: the destructive "Delete location" POST, next to "Keep location". No
-  autofocus, no script.
+  holds one form: the destructive "Delete location" POST, after "Keep location". No
+  autofocus, no inline script. With the request header ``X-PM-Fragment: 1`` the same GET
+  answers the shared confirmation partial alone for the modal (UI-07); that variant is
+  tested in tests/web/test_fragments.py.
 - The POST is one transaction under the location's ``location_state`` row lock
   (``actions.delete_location``): the ``deleted_at`` tombstone, a ``state_version`` bump
   (a detector snapshot read before it loses its OFF CAS), the pending subscriber alerts
@@ -21,17 +23,15 @@
 Worker-, detection- and race-driven tests are ``django_db(transaction=True)``. The delete
 POST gets a ``FakeClock`` by constructor injection through ``RequestFactory`` where its time
 is asserted (``_post_delete``). The chart helpers are copied from tests/chart (tests have no
-``__init__.py``).
+``__init__.py``). Pages are read through ``pages.py`` and the 06-UI-SPEC hooks (S7: the
+``confirm`` root, ``confirm-title``, ``consequences``, ``confirm-form``, ``keep`` and
+``confirm-submit``), never through markup or classes.
 """
 
-# class-guard: pending migration
-
 import dataclasses
-import re
 import threading
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from html import unescape
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -55,7 +55,19 @@ from django.db.models import F, Value
 from django.db.models.functions import Greatest
 from django.http import HttpResponse
 from django.test import Client, RequestFactory
-from pages import Message, message_texts, messages
+from pages import (
+    Message,
+    assert_page,
+    breadcrumbs,
+    by_testid,
+    h1,
+    main,
+    message_texts,
+    messages,
+    parse,
+    text,
+    title,
+)
 
 from powermon.alerts import delivery, outbox
 from powermon.alerts.models import OpsIncident, OutboxMessage
@@ -94,7 +106,6 @@ RECREATE = (
 SECRET = "Sx_9-Qw7Lm" * 4
 TOKEN = f"987654321:{SECRET}"
 XSS_NAME = "<script>alert(1)</script>"
-ESCAPED_XSS_NAME = "&lt;script&gt;alert(1)&lt;/script&gt;"
 MIN_US = 60_000_000
 
 
@@ -130,16 +141,9 @@ def _post_delete(
     return response, [str(m) for m in request._messages]  # type: ignore[attr-defined]
 
 
-def _main(page: str) -> str:
-    """The page's <main>: the header (with its sign-out form) left out."""
-    return page[page.index("<main") :]
-
-
-def _crumbs(page: str) -> list[tuple[str, str]]:
-    trail = re.search(r'<ol class="crumbs">(.*?)</ol>', page, re.S)
-    assert trail is not None, "no breadcrumb trail"
-    items = re.findall(r"<li\b([^>]*)>(.*?)</li>", trail.group(1), re.S)
-    return [(attrs, inner.strip()) for attrs, inner in items]
+def _trail(location: Any, name: str) -> list[tuple[str, str | None]]:
+    """The S7 breadcrumbs: Locations > {name} > Delete (the current page)."""
+    return [("Locations", "/"), (name, f"/locations/{location.pk}/"), ("Delete", None)]
 
 
 def _queue(location: Any, recorded_at: datetime) -> OutboxMessage:
@@ -250,26 +254,29 @@ def test_INV19_2_delete_stops_everything(
     assert _pass(clock, relay) is True
     assert fake_telegram.count(OPS_BOT_TOKEN, "sendMessage") == 1
 
-    # The confirmation page (UI-SPEC screen D).
+    # The confirmation page (06-UI-SPEC Confirmations, S7).
     confirm = admin.get(_delete(location))
-    assert confirm.status_code == 200
-    page = _main(confirm.content.decode())
-    assert '<h1 class="name">Delete Office?</h1>' in page
-    assert f"<p>{LEAD}</p>" in page
-    consequences = re.search(r'<ul class="list">(.*?)</ul>', page, re.S)
-    assert consequences is not None
-    assert [unescape(c) for c in re.findall(r"<li>(.*?)</li>", consequences.group(1))] == (
-        CONSEQUENCES
+    soup = assert_page(confirm, app=True, title="Office · Delete")
+    root = by_testid(main(soup), "confirm")
+    assert text(h1(soup)) == "Delete Office?"
+    assert h1(soup) is by_testid(root, "confirm-title")
+    consequences = by_testid(root, "consequences")
+    assert [text(item) for item in consequences.find_all("li")] == CONSEQUENCES
+    words = text(root)
+    assert words.index(LEAD) < words.index(ALTERNATIVES) < words.index(RECREATE)
+    # One form in main: the destructive POST, after Keep.
+    [form] = main(soup).find_all("form")
+    assert (form.get("method"), form.get("action")) == ("post", _delete(location))
+    assert form is by_testid(root, "confirm-form")
+    submit = by_testid(form, "confirm-submit")
+    assert (submit.get("type"), submit.get("data-variant"), text(submit)) == (
+        "submit",
+        "danger",
+        "Delete location",
     )
-    assert f"<p>{ALTERNATIVES}</p>" in page
-    assert f"<p>{RECREATE}</p>" in page
-    forms = re.findall(r"<form\b[^>]*>", page)
-    assert forms == [f'<form method="post" action="/locations/{location.pk}/delete/">']
-    assert '<button class="btn btn--danger" type="submit">Delete location</button>' in page
-    assert (
-        f'<a class="btn btn--secondary" href="/locations/{location.pk}/">Keep location</a>'
-    ) in page
-    assert "autofocus" not in page
+    keep = by_testid(root, "keep")
+    assert (keep.get("href"), text(keep)) == (f"/locations/{location.pk}/", "Keep location")
+    assert soup.find_all(autofocus=True) == []
     # Nothing changed on GET.
     assert Location.objects.get(pk=location.pk).deleted_at is None
 
@@ -309,8 +316,8 @@ def test_INV19_2_delete_stops_everything(
     assert fake_telegram.count(OPS_BOT_TOKEN, "sendMessage") == 1
 
     # The location is gone from the list, and every other URL of it answers 404.
-    listing = admin.get("/").content.decode()
-    assert f'href="/locations/{location.pk}/"' not in listing
+    listing = parse(admin.get("/"))
+    assert listing.find_all("a", href=f"/locations/{location.pk}/") == []
     for url in _location_urls(location):
         assert admin.get(url).status_code == 404, url
     for switch in ("maintenance", "alerts", "router-grace"):
@@ -536,19 +543,18 @@ def test_delete_without_a_csrf_token_is_refused(location_factory: Callable[..., 
 def test_delete_escapes_the_name(admin: Client, location_factory: Callable[..., Any]) -> None:
     location = location_factory(name=XSS_NAME, bot_token=TOKEN)
 
-    page = admin.get(_delete(location)).content.decode()
+    response = admin.get(_delete(location))
 
-    assert f"<title>{ESCAPED_XSS_NAME} · Delete · Power Monitor</title>" in page
-    assert f'<h1 class="name">Delete {ESCAPED_XSS_NAME}?</h1>' in page
-    assert _crumbs(page)[1] == (
-        "",
-        f'<a class="name" href="/locations/{location.pk}/">{ESCAPED_XSS_NAME}</a>',
-    )
-    assert "<script" not in page
+    # assert_page also proves no injected or inline script reached the page (R1).
+    soup = assert_page(response, app=True, title=f"{XSS_NAME} · Delete")
+    assert text(h1(soup)) == f"Delete {XSS_NAME}?"
+    assert breadcrumbs(soup)[1] == (XSS_NAME, f"/locations/{location.pk}/")
+    page = response.content.decode()
+    assert XSS_NAME not in page
     # No secret, not even masked: the page shows neither the token nor the key (SEC-04).
     assert SECRET not in page
     assert location.device_key not in page
-    assert "•" not in _main(page)
+    assert "•" not in str(main(soup))
 
 
 @pytest.mark.django_db
@@ -558,15 +564,15 @@ def test_delete_page_long_name_and_crumbs(
     name = "x" * 100
     location = location_factory(name=name)
 
-    page = admin.get(_delete(location)).content.decode()
+    soup = assert_page(admin.get(_delete(location)), app=True, title=f"{name} · Delete")
 
-    assert f"<title>{name} · Delete · Power Monitor</title>" in page
-    assert f'<h1 class="name">Delete {name}?</h1>' in page
-    assert _crumbs(page) == [
-        ("", '<a href="/">Locations</a>'),
-        ("", f'<a class="name" href="/locations/{location.pk}/">{name}</a>'),
-        (' aria-current="page"', "Delete"),
-    ]
+    # E10 long-text: the whole name, never truncated, in the title, h1 and both trails.
+    assert title(soup) == f"{name} · Delete · Power Monitor"
+    assert text(h1(soup)) == f"Delete {name}?"
+    assert breadcrumbs(soup) == _trail(location, name)
+    assert breadcrumbs(soup, "breadcrumbs-compact") == _trail(location, name)
     # One destructive button, no accent button (UI-D5).
-    assert page.count("btn--danger") == 1
-    assert "btn--primary" not in page
+    page = main(soup)
+    dangers = page.find_all(attrs={"data-variant": "danger"})
+    assert [found.get("data-testid") for found in dangers] == ["confirm-submit"]
+    assert page.find_all(attrs={"data-variant": "primary"}) == []
