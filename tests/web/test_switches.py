@@ -10,23 +10,27 @@ switch makes a Telegram call (KD2).
 Edges (UI-SPEC screen H, E3 error): the same state again writes nothing and gets the
 "already" info flash; GET and other methods answer 405; a missing or unknown value answers
 400 with an empty body; a POST without a CSRF token is refused; an unknown location is 404.
+
+The location page is read through tests/web/pages.py and the 06-UI-SPEC switch hooks
+(UI-10): each switch is ``form[data-testid=switch][data-switch][data-state]`` posting the
+hidden ``value`` (the target) with ``button[role=switch][aria-checked]`` (the current
+state), named by its sr-only action and described by its help; the state heading is
+``[data-testid=switch-state]``.
 """
 
-# class-guard: pending migration
-
-import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from bs4 import Tag
 from conftest import FakeClock, FakeTelegram
 from django.contrib.auth import get_user_model
 from django.contrib.messages.storage.fallback import FallbackStorage
 from django.contrib.sessions.backends.db import SessionStore
 from django.db import connection
 from django.test import Client, RequestFactory
-from pages import messages
+from pages import all_by_testid, by_testid, hidden_value, messages, parse, post_form, text
 
 from powermon.engine import transitions
 from powermon.engine.models import LocationState, PowerInterval
@@ -99,23 +103,60 @@ def _on_since_8(location_factory: Callable[..., Any]) -> Any:
     return location
 
 
-def _flashes(page: str) -> list[tuple[str, str]]:
+def _flashes(page: Any) -> list[tuple[str, str]]:
     """Each flash on the page as (role, text), toast or legacy callout alike (UI-09)."""
     return [(message.role, message.text) for message in messages(page)]
 
 
-def _is_info(page: str) -> bool:
+def _is_info(page: Any) -> bool:
     """Every flash on the page is an info flash (a legacy callout carries no level)."""
     return all(message.level in (None, "info") for message in messages(page))
 
 
-def _maintenance_form(page: str, location: Any) -> str:
-    """The body of the one form that posts to the location's maintenance switch."""
-    forms = re.findall(
-        rf'<form method="post" action="{_switch(location)}">(.*?)</form>', page, re.S
-    )
-    assert len(forms) == 1
-    return str(forms[0])
+def _maintenance_form(page: Any, location: Any) -> Tag:
+    """The one form that posts to the location's maintenance switch."""
+    return post_form(page, _switch(location))
+
+
+def _has_csrf(form: Tag) -> bool:
+    return form.find("input", attrs={"name": "csrfmiddlewaretoken"}) is not None
+
+
+def _button(form: Tag) -> Tag:
+    """The switch's one submit button, ``button[type=submit][role=switch]``."""
+    buttons = form.select('button[type="submit"][role="switch"]')
+    assert len(buttons) == 1, f"expected one switch button, found {len(buttons)}"
+    return buttons[0]
+
+
+def _action(form: Tag) -> str:
+    """The switch button's accessible name: its sr-only action, e.g. "Turn maintenance on"."""
+    return text(_button(form))
+
+
+def _state(form: Tag) -> str:
+    """The switch's state heading, e.g. "Maintenance is off"."""
+    return text(by_testid(form, "switch-state"))
+
+
+def _help(form: Tag) -> str:
+    """The text of the help the switch button is described by, inside its own form."""
+    help_id = str(_button(form)["aria-describedby"])
+    found = form.find(id=help_id)
+    assert isinstance(found, Tag), f"no help element {help_id!r} in the switch form"
+    return text(found)
+
+
+def _get(admin: Client, location: Any) -> Tag:
+    """The location page, parsed."""
+    response = admin.get(_page(location))
+    assert response.status_code == 200
+    return parse(response)
+
+
+def _status_pill(page: Any) -> Tag:
+    """The header's status pill."""
+    return by_testid(by_testid(page, "location-header"), "status-pill")
 
 
 @pytest.mark.django_db
@@ -124,27 +165,26 @@ def test_LOC08_maintenance_on_from_the_location_page(
 ) -> None:
     location = _on_since_8(location_factory)
 
-    page = admin.get(_page(location))
+    page = _get(admin, location)
 
-    assert page.status_code == 200
-    html = page.content.decode()
-    assert "<h3>Maintenance is off</h3>" in html
-    form = _maintenance_form(html, location)
-    assert 'name="csrfmiddlewaretoken"' in form
-    assert '<input type="hidden" name="value" value="on">' in form
-    assert '<button class="btn btn--secondary" type="submit">Turn maintenance on</button>' in form
+    form = _maintenance_form(page, location)
+    assert _state(form) == "Maintenance is off"
+    assert _has_csrf(form)
+    assert hidden_value(form, "value") == "on"
+    assert (form["data-switch"], form["data-state"]) == ("maintenance", "off")
+    assert (_button(form)["aria-checked"], _action(form)) == ("false", "Turn maintenance on")
 
     response = admin.post(_switch(location), {"value": "on"})
 
     assert response.status_code == 302
     assert response.url == _page(location)
-    followed = admin.get(response.url).content.decode()
+    followed = parse(admin.get(response.url))
     assert _flashes(followed) == [("status", MAINTENANCE_ON_FLASH)]
-    assert '<span class="status status--maintenance">Maintenance</span>' in followed
-    assert "<h3>Maintenance is on</h3>" in followed
-    assert '<button class="btn btn--secondary" type="submit">Turn maintenance off</button>' in (
-        _maintenance_form(followed, location)
-    )
+    pill = _status_pill(followed)
+    assert (pill["data-status"], text(pill)) == ("maintenance", "Maintenance")
+    after = _maintenance_form(followed, location)
+    assert _state(after) == "Maintenance is on"
+    assert (_button(after)["aria-checked"], _action(after)) == ("true", "Turn maintenance off")
     assert Location.objects.get(pk=location.pk).maintenance is True
     assert _open_state(location) == "not_monitored"
     assert len(fake_telegram.calls) == 0
@@ -190,15 +230,15 @@ def test_maintenance_off_from_the_location_page(
 ) -> None:
     location = _on_since_8(location_factory)
     assert admin.post(_switch(location), {"value": "on"}).status_code == 302
-    page = admin.get(_page(location)).content.decode()
-    assert '<input type="hidden" name="value" value="off">' in _maintenance_form(page, location)
+    page = _get(admin, location)
+    assert hidden_value(_maintenance_form(page, location), "value") == "off"
 
     response = admin.post(_switch(location), {"value": "off"})
 
     assert (response.status_code, response.url) == (302, _page(location))
-    followed = admin.get(response.url).content.decode()
+    followed = parse(admin.get(response.url))
     assert _flashes(followed) == [("status", MAINTENANCE_OFF_FLASH)]
-    assert "<h3>Maintenance is off</h3>" in followed
+    assert _state(_maintenance_form(followed, location)) == "Maintenance is off"
     assert Location.objects.get(pk=location.pk).maintenance is False
     assert _open_state(location) == "on"
     assert len(fake_telegram.calls) == 0
@@ -276,11 +316,14 @@ def test_switch_without_a_csrf_token_is_refused(location_factory: Callable[..., 
 # The alerts switch (LOC-10, D-05, D-06): one configuration column, nothing else
 
 
-def _form(page: str, url: str) -> str:
-    """The body of the one form that posts to ``url``."""
-    forms = re.findall(rf'<form method="post" action="{url}">(.*?)</form>', page, re.S)
-    assert len(forms) == 1
-    return str(forms[0])
+def _form(page: Any, url: str) -> Tag:
+    """The one form that posts to ``url``."""
+    return post_form(page, url)
+
+
+def _switch_states(page: Any) -> list[tuple[str, str]]:
+    """Every switch on the page as (data-switch, state heading), in DOM order."""
+    return [(str(form["data-switch"]), _state(form)) for form in all_by_testid(page, "switch")]
 
 
 def _alerts(location: Any) -> str:
@@ -307,26 +350,30 @@ def test_LOC10_alerts_off_from_the_location_page(
     before = _columns(location)
     version = LocationState.objects.get(location=location).state_version
 
-    page = admin.get(_page(location)).content.decode()
+    page = _get(admin, location)
 
-    assert "<h3>Alerts are on</h3>" in page
-    assert f'<p class="help">{ALERTS_HELP}</p>' in page
     form = _form(page, _alerts(location))
-    assert 'name="csrfmiddlewaretoken"' in form
-    assert '<input type="hidden" name="value" value="off">' in form
-    assert '<button class="btn btn--secondary" type="submit">Turn alerts off</button>' in form
+    assert _state(form) == "Alerts are on"
+    assert _help(form) == ALERTS_HELP
+    assert _has_csrf(form)
+    assert hidden_value(form, "value") == "off"
+    assert (form["data-switch"], form["data-state"]) == ("alerts", "on")
+    assert (_button(form)["aria-checked"], _action(form)) == ("true", "Turn alerts off")
     # D-05 order: Maintenance first, then Alerts.
-    assert page.index("<h3>Maintenance is off</h3>") < page.index("<h3>Alerts are on</h3>")
+    assert _switch_states(page)[:2] == [
+        ("maintenance", "Maintenance is off"),
+        ("alerts", "Alerts are on"),
+    ]
 
     response = admin.post(_alerts(location), {"value": "off"})
 
     assert (response.status_code, response.url) == (302, _page(location))
-    followed = admin.get(response.url).content.decode()
+    followed = parse(admin.get(response.url))
     assert _flashes(followed) == [("status", ALERTS_OFF_FLASH)]
-    assert "<h3>Alerts are off</h3>" in followed
     after = _form(followed, _alerts(location))
-    assert '<input type="hidden" name="value" value="on">' in after
-    assert '<button class="btn btn--secondary" type="submit">Turn alerts on</button>' in after
+    assert _state(after) == "Alerts are off"
+    assert hidden_value(after, "value") == "on"
+    assert (_button(after)["aria-checked"], _action(after)) == ("false", "Turn alerts on")
     # Exactly one column changed (D-05): no other setting, no state row, no timeline.
     assert _columns(location) == {**before, "alerts_enabled": False}
     assert LocationState.objects.get(location=location).state_version == version
@@ -435,29 +482,30 @@ def test_router_grace_switch_flashes(
     before = _columns(location)
     version = LocationState.objects.get(location=location).state_version
 
-    page = admin.get(_page(location)).content.decode()
+    page = _get(admin, location)
 
-    assert "<h3>Router grace is off</h3>" in page
-    assert f'<p class="help">{ROUTER_GRACE_HELP}</p>' in page
     form = _form(page, _router_grace(location))
-    assert 'name="csrfmiddlewaretoken"' in form
-    assert '<input type="hidden" name="value" value="on">' in form
-    assert '<button class="btn btn--secondary" type="submit">Turn router grace on</button>' in form
+    assert _state(form) == "Router grace is off"
+    assert _help(form) == ROUTER_GRACE_HELP
+    assert _has_csrf(form)
+    assert hidden_value(form, "value") == "on"
+    assert (form["data-switch"], form["data-state"]) == ("router-grace", "off")
+    assert (_button(form)["aria-checked"], _action(form)) == ("false", "Turn router grace on")
     # D-05 order: Maintenance, Alerts, Router grace.
-    switches = re.search(r'<ul class="switches">(.*?)</ul>', page, re.S)
-    assert switches is not None
-    headings = re.findall(r"<h3>([^<]*)</h3>", switches.group(1))
-    assert headings == ["Maintenance is off", "Alerts are on", "Router grace is off"]
+    assert _switch_states(page) == [
+        ("maintenance", "Maintenance is off"),
+        ("alerts", "Alerts are on"),
+        ("router-grace", "Router grace is off"),
+    ]
 
     on = admin.post(_router_grace(location), {"value": "on"})
 
     assert (on.status_code, on.url) == (302, _page(location))
-    followed = admin.get(on.url).content.decode()
+    followed = parse(admin.get(on.url))
     assert _flashes(followed) == [("status", ROUTER_GRACE_ON_FLASH)]
-    assert "<h3>Router grace is on</h3>" in followed
-    assert '<button class="btn btn--secondary" type="submit">Turn router grace off</button>' in (
-        _form(followed, _router_grace(location))
-    )
+    after = _form(followed, _router_grace(location))
+    assert _state(after) == "Router grace is on"
+    assert (_button(after)["aria-checked"], _action(after)) == ("true", "Turn router grace off")
     assert _columns(location) == {**before, "router_grace": True}
     assert LocationState.objects.get(location=location).state_version == version
 

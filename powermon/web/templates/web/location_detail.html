@@ -1,140 +1,185 @@
-{% extends "base.html" %}
-{% load display_time %}
+{% extends "layouts/app.html" %}
+{% load display_time icons timefmt %}
 {% comment %}
-UI-SPEC screen B (D-13): the location page. Sections in order (05-UI-SPEC UI5-D1): Status,
-Switches, Test message, Recent outages, Settings (with the "Edit location" link-button,
-UI-D10), Device setup, Reset history, Delete location (a secondary link-button that only
-opens the confirmation page, UI-D5). The switch
-rows come from location_views.switch_rows, in D-05 order: Maintenance, Alerts, Router grace.
-Read-only except the switches, each a one-click POST form (CSRF) that posts its target value
-(UI-D3) and redirects back here (UI-D4), and the test message, a one-click POST form whose
-button is the page's only accent button (UI-D15, D-11). No script, no inline style.
-The status panel's last row is Delivery (D-13): "OK" with its help, or the failing indicator
-with the full display_time of the incident's start, the cause line (or the supergroup line)
-and the retry line, from location_views.delivery_row.
-Recent outages (05-UI-SPEC A1, D-01): the outages of the last 14 local days, newest first,
-from location_views.outage_rows. Exactly one of: the table (Outage, Off time and a visually
-hidden Action column; each date and time its own .num span; the current outage reads "in
-progress" and has an empty Remove cell), "No outages in the last 14 days." (history but no
-outage in the window) or "No power history yet. …" (no interval at all). The off-time note
-always follows the table, the in-progress note only when the current outage is listed. Each
-Remove link only opens the GET confirmation page; it has a unique accessible name (UI5-D6).
-Reset history (05-UI-SPEC A2, D-05, D-06, UI5-D9): the description sentence, then exactly
-one of, in this order: the D-06 line while the stored status is off (whatever the
-maintenance flag), "There is no power history to reset." while the location has no stored
-interval, else the secondary "Reset history" link-button that only opens the confirmation
-page.
-Secrets (SEC-04): no device key appears on this page, not even masked; the bot token only
-in its masked form, in the settings panel.
+S5, the location page (06-UI-SPEC Page Contracts > S5; UI-01, UI-05, UI-06, UI-07, UI-10,
+UI-11, UI-12). Context: LocationDetailView (location, status, delivery, switch_rows,
+outage_rows, outages_total_text, has_history, outage_in_progress, now, heartbeat_url and
+the settings_context keys). Read-only apart from its POST forms: the three switches and the
+two test-message forms, each a plain form with the CSRF token that answers POST, redirect,
+GET with a toast. JavaScript only enhances it.
+
+- Header [data-testid=location-header]: the h1 name, the status pill (live) and the tags
+  in the order Alerts off, Router grace; the compact breadcrumbs; the meta line
+  [data-testid=location-meta]: "On since" or "Outage since" by the power state (none while
+  waiting), "Last heartbeat" (or "Never"), the live-chip slot; page-actions: Edit and the
+  kebab (partials/_menu.html).
+- Live hooks: main carries the poll (data-poll-page detail); the header pill, the since and
+  last-heartbeat times of the meta line and the Status card carry data-live and
+  data-location-id. While maintenance is on, the since rows carry no live hook: the poll
+  does not read the power state, so a power change under maintenance shows the reload chip
+  instead of flipping one row. The delivery row and banner carry no data-live: the
+  poll's list-format delivery text must never replace their full-format text.
+- Banners after the header: delivery failing (warning, with the cause or migrate line, the
+  retry line and its own test-message form) and maintenance (muted, the power-state help
+  line). Both can show at once.
+- Content: one [data-confirm-scope] wrapper starts the confirmDialog component (its click
+  handling is document-wide, so the kebab entries outside the wrapper are covered too);
+  the section nav, then the cards in the test-pinned DOM order status, controls,
+  weekly-chart, recent-outages, settings, device-setup, danger-zone, each a section named
+  by its title. Below xl one column; from xl the 2fr / 1fr grid, without reordering.
+- Danger zone: rows reset-history and delete-location; the reset row shows exactly one of
+  the confirmation link or the refusal line [data-testid=reset-unavailable] (id
+  reset-unavailable, which the kebab's unavailable entry points at), in the same three
+  states as the kebab. Every destructive entry point is a plain link with data-confirm to
+  its server-side confirmation page, never a form that acts (R7).
+- Never on this page: the device key, not even masked (R4); the bot token only as its mask
+  in the settings list (R3).
+- The dialog shell renders in the layout's dialog block, after main.
+Every class is spelled out: no class name is built from data.
 {% endcomment %}
 {% block title %}{{ location.name }}{% endblock %}
-{% block crumbs %}
-<nav aria-label="Breadcrumb">
-  <ol class="crumbs">
-    <li><a href="{% url 'location-list' %}">Locations</a></li>
-    <li class="name" aria-current="page">{{ location.name }}</li>
-  </ol>
-</nav>
+{% block main_attrs %}x-data="poll" data-poll-url="{% url 'location-status-json' %}" data-poll-page="detail" data-reload-url="{% url 'location-detail' location.pk %}"{% endblock %}
+{% block live_indicator %}{% include "partials/_live.html" %}{% endblock %}
+{% block page_header %}
+<header data-testid="location-header" class="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+<div class="flex min-w-0 flex-col gap-4 md:gap-1">
+<div class="flex min-w-0 flex-wrap items-center gap-2">
+<h1 class="min-w-0 text-title font-semibold tracking-title text-fg break-words">{{ location.name }}</h1>
+{% include "partials/_status_pill.html" with status=status.key label=status.label live=True location_id=location.pk only %}
+{% if not location.alerts_enabled %}{% include "partials/_tag.html" with tag="alerts-off" only %}{% endif %}
+{% if location.router_grace %}{% include "partials/_tag.html" with tag="router-grace" only %}{% endif %}
+</div>
+{% include "partials/_crumbs.html" with variant="compact" trail=trail only %}
+<div class="sm:overflow-clip sm:[overflow-clip-margin:4px]"><ul data-testid="location-meta" class="flex flex-col gap-1 text-body text-fg-muted sm:-ml-4 sm:flex-row sm:flex-wrap sm:gap-x-0 sm:*:before:inline-block sm:*:before:w-4 sm:*:before:text-center sm:*:before:content-['·'_/_'']">
+{% if status.power_key == "on" %}<li>{% if status.key == "maintenance" %}{% include "partials/_time.html" with value=status.on_since variant="full" label="On since" now=now only %}{% else %}{% include "partials/_time.html" with value=status.on_since variant="full" label="On since" live="since" location_id=location.pk now=now only %}{% endif %}</li>
+{% elif status.power_key == "off" %}<li>{% if status.key == "maintenance" %}{% include "partials/_time.html" with value=status.outage_started_at variant="full" label="Outage since" now=now only %}{% else %}{% include "partials/_time.html" with value=status.outage_started_at variant="full" label="Outage since" live="since" location_id=location.pk now=now only %}{% endif %}</li>
+{% endif %}<li>{% include "partials/_time.html" with value=status.last_heartbeat_at variant="full" label="Last heartbeat" live="last-heartbeat" location_id=location.pk now=now only %}</li>
+{% url 'location-detail' location.pk as reload_url %}{% include "partials/_live_chip.html" with reload_url=reload_url only %}
+</ul></div>
+</div>
+<div data-testid="page-actions" class="flex flex-wrap items-center gap-2 md:shrink-0 md:flex-nowrap">
+{% url 'location-edit' location.pk as edit_url %}{% include "partials/_button.html" with variant="secondary" label="Edit" href=edit_url icon="pencil" sr_suffix="location" testid="header-edit-location" only %}
+{% include "partials/_menu.html" with location=location has_history=has_history outage_in_progress=outage_in_progress status=status only %}
+</div>
+</header>
+{% endblock %}
+{% block banners_below %}
+{% if delivery.failing_since %}
+<div data-testid="delivery-banner" data-tone="warning" data-delivery="failing" class="relative flex flex-col gap-4 rounded-control border border-warn-border bg-warn-bg p-4 text-body [box-shadow:inset_3px_0_0_var(--warn-icon)] md:flex-row md:items-center">
+<div class="flex min-w-0 flex-1 items-start gap-2">
+{% icon "triangle-alert" class="size-5 shrink-0 text-warn-icon" %}
+<div class="flex min-w-0 flex-1 flex-col gap-1">
+<p class="font-semibold break-words text-warn-text"><span class="sr-only">Warning: </span>Delivery failing</p>
+<p class="break-words text-warn-text">Failing since <time datetime="{{ delivery.failing_since|iso }}" class="num whitespace-nowrap">{{ delivery.failing_since|display_time }}</time> (<span class="num">{{ delivery.code }}</span>) · <span data-relative="{{ delivery.failing_since|iso }}" class="num whitespace-nowrap">{% relative_time delivery.failing_since %}</span></p>
+<p data-testid="delivery-cause" class="break-words text-fg">{{ delivery.lines.0 }}</p>
+<p data-testid="delivery-retry" class="break-words text-fg-muted">{{ delivery.lines.1 }}</p>
+</div>
+</div>
+<form method="post" action="{% url 'location-test-message' location.pk %}" data-testid="banner-test-message-form" class="shrink-0 pl-7 md:pl-0">{% csrf_token %}{% include "partials/_button.html" with variant="primary" label="Send test message" icon="send" pending_label="Sending… up to 15 s" only %}</form>
+</div>
+{% endif %}
+{% if status.key == "maintenance" %}
+{% if status.power_key == "off" %}{% include "partials/_alert.html" with tone="muted" title="Maintenance is on" body="The outage goes on. When power returns, the ON alert is sent as usual." testid="maintenance-banner" only %}{% else %}{% include "partials/_alert.html" with tone="muted" title="Maintenance is on" body="OFF is not detected during maintenance." testid="maintenance-banner" only %}{% endif %}
+{% endif %}
 {% endblock %}
 {% block content %}
-<h1 class="name">{{ location.name }}</h1>
-
-<h2>Status</h2>
-{% comment %}Rows that do not apply are left out (UI-SPEC E2).{% endcomment %}
-<dl class="panel settings">
-  <dt>Status</dt>
-  <dd><span class="status status--{{ status.key }}">{{ status.label }}</span></dd>
-  {% if status.key == "maintenance" %}
-  <dt>Power state</dt>
-  <dd><span class="status status--{{ status.power_key }}">{{ status.power_label }}</span>{% if status.power_key == "on" %}<p class="help">OFF is not detected during maintenance.</p>{% elif status.power_key == "off" %}<p class="help">The outage goes on. When power returns, the ON alert is sent as usual.</p>{% endif %}</dd>
-  {% endif %}
-  {% if status.power_key == "on" %}
-  <dt>On since</dt>
-  <dd><span class="num">{{ status.on_since|display_time }}</span></dd>
-  {% elif status.power_key == "off" %}
-  <dt>Outage since</dt>
-  <dd><span class="num">{{ status.outage_started_at|display_time }}</span></dd>
-  {% endif %}
-  <dt>Last heartbeat</dt>
-  <dd><span class="num">{{ status.last_heartbeat_at|display_time }}</span></dd>
-  <dt>Delivery</dt>
-  <dd>{% if delivery.failing_since %}<span class="status status--failing">Failing since {{ delivery.failing_since|display_time }} ({{ delivery.code }})</span>{% else %}OK{% endif %}{% for line in delivery.lines %}<p class="help">{{ line }}</p>{% endfor %}</dd>
-</dl>
-
-<h2>Switches</h2>
-<ul class="switches">
-  {% for row in switch_rows %}
-  <li class="switch">
-    <div class="switch__text">
-      <h3>{{ row.heading }}</h3>
-      <p class="help">{{ row.help }}</p>
-    </div>
-    <form method="post" action="{% url row.url_name location.pk %}">
-      {% csrf_token %}
-      <input type="hidden" name="value" value="{{ row.target }}">
-      <button class="btn btn--secondary" type="submit">{{ row.button }}</button>
-    </form>
-  </li>
-  {% endfor %}
+<div data-confirm-scope x-data="confirmDialog" class="flex min-w-0 flex-col gap-4">
+<nav aria-label="Sections" data-testid="section-nav" x-data="sectionNav" class="min-w-0">
+<ul class="-m-1 flex gap-1 overflow-x-auto p-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+<li class="shrink-0"><a href="#status" class="inline-flex min-h-11 items-center rounded-control border border-border bg-surface px-3 text-label font-semibold tracking-label whitespace-nowrap text-fg-muted uppercase no-underline hover:border-accent-border hover:bg-accent-soft hover:text-accent-text md:min-h-(--control-h-sm) motion-safe:transition-colors motion-safe:duration-150">Overview</a></li>
+<li class="shrink-0"><a href="#weekly-chart" class="inline-flex min-h-11 items-center rounded-control border border-border bg-surface px-3 text-label font-semibold tracking-label whitespace-nowrap text-fg-muted uppercase no-underline hover:border-accent-border hover:bg-accent-soft hover:text-accent-text md:min-h-(--control-h-sm) motion-safe:transition-colors motion-safe:duration-150">Chart</a></li>
+<li class="shrink-0"><a href="#recent-outages" class="inline-flex min-h-11 items-center rounded-control border border-border bg-surface px-3 text-label font-semibold tracking-label whitespace-nowrap text-fg-muted uppercase no-underline hover:border-accent-border hover:bg-accent-soft hover:text-accent-text md:min-h-(--control-h-sm) motion-safe:transition-colors motion-safe:duration-150">Outages</a></li>
+<li class="shrink-0"><a href="#settings" class="inline-flex min-h-11 items-center rounded-control border border-border bg-surface px-3 text-label font-semibold tracking-label whitespace-nowrap text-fg-muted uppercase no-underline hover:border-accent-border hover:bg-accent-soft hover:text-accent-text md:min-h-(--control-h-sm) motion-safe:transition-colors motion-safe:duration-150">Settings</a></li>
+<li class="shrink-0"><a href="#danger-zone" class="inline-flex min-h-11 items-center rounded-control border border-border bg-surface px-3 text-label font-semibold tracking-label whitespace-nowrap text-fg-muted uppercase no-underline hover:border-accent-border hover:bg-accent-soft hover:text-accent-text md:min-h-(--control-h-sm) motion-safe:transition-colors motion-safe:duration-150">Danger zone</a></li>
 </ul>
+</nav>
+<div class="grid min-w-0 grid-cols-1 items-start gap-4 xl:grid-cols-[minmax(0,2fr)_minmax(0,1fr)] xl:grid-rows-[auto_auto_1fr_auto]">
 
-<h2>Test message</h2>
-<p>Sends one silent message to the channel with this location's bot, to check the bot token and the chat ID. It is not an alert: it is sent even while alerts are off or maintenance is on. Telegram can take up to 15 seconds to answer.</p>
-<form method="post" action="{% url 'location-test-message' location.pk %}">
-  {% csrf_token %}
-  <button class="btn btn--primary" type="submit">Send test message</button>
-</form>
+<section id="status" aria-labelledby="status-title" tabindex="-1" class="min-w-0 scroll-mt-16 rounded-card border border-border bg-surface xl:col-start-1 xl:row-start-1">
+<div class="flex items-center justify-between gap-4 rounded-t-[5px] border-b border-border bg-surface-muted px-4 py-2"><h2 id="status-title" class="text-label font-semibold tracking-label text-fg-muted uppercase">Status</h2></div>
+<dl data-testid="status-panel" class="divide-y divide-border px-4 py-2 text-body text-fg">
+<div class="flex flex-col gap-1 py-2 sm:flex-row sm:items-baseline sm:gap-4"><dt class="text-label/5 font-semibold tracking-label text-fg-muted uppercase sm:w-40 sm:shrink-0">Status</dt>
+<dd class="flex min-w-0 flex-col items-start gap-1">{% include "partials/_status_pill.html" with status=status.key label=status.label live=True location_id=location.pk only %}</dd></div>
+{% if status.key == "maintenance" %}<div class="flex flex-col gap-1 py-2 sm:flex-row sm:items-baseline sm:gap-4"><dt class="text-label/5 font-semibold tracking-label text-fg-muted uppercase sm:w-40 sm:shrink-0">Power state</dt>
+<dd class="flex min-w-0 flex-col items-start gap-1"><span data-power="{{ status.power_key }}" class="inline-flex max-w-full">{% include "partials/_status_pill.html" with status=status.power_key label=status.power_label only %}</span></dd></div>
+{% endif %}{% if status.power_key == "on" %}<div{% if status.key != "maintenance" %} data-live="since" data-location-id="{{ location.pk }}"{% endif %} class="flex flex-col gap-1 py-2 sm:flex-row sm:items-baseline sm:gap-4"><dt class="text-label/5 font-semibold tracking-label text-fg-muted uppercase sm:w-40 sm:shrink-0"><span{% if status.key != "maintenance" %} data-since-label{% endif %}>On since</span></dt>
+<dd class="flex min-w-0 flex-col items-start gap-1">{% include "partials/_time.html" with value=status.on_since variant="full" now=now only %}</dd></div>
+{% elif status.power_key == "off" %}<div{% if status.key != "maintenance" %} data-live="since" data-location-id="{{ location.pk }}"{% endif %} class="flex flex-col gap-1 py-2 sm:flex-row sm:items-baseline sm:gap-4"><dt class="text-label/5 font-semibold tracking-label text-fg-muted uppercase sm:w-40 sm:shrink-0"><span{% if status.key != "maintenance" %} data-since-label{% endif %}>Outage since</span></dt>
+<dd class="flex min-w-0 flex-col items-start gap-1">{% include "partials/_time.html" with value=status.outage_started_at variant="full" now=now only %}</dd></div>
+{% endif %}<div class="flex flex-col gap-1 py-2 sm:flex-row sm:items-baseline sm:gap-4"><dt class="text-label/5 font-semibold tracking-label text-fg-muted uppercase sm:w-40 sm:shrink-0">Last heartbeat</dt>
+<dd class="flex min-w-0 flex-col items-start gap-1">{% include "partials/_time.html" with value=status.last_heartbeat_at variant="full" live="last-heartbeat" location_id=location.pk now=now only %}</dd></div>
+<div class="flex flex-col gap-1 py-2 sm:flex-row sm:items-baseline sm:gap-4"><dt class="text-label/5 font-semibold tracking-label text-fg-muted uppercase sm:w-40 sm:shrink-0">Delivery</dt>
+{% if delivery.failing_since %}<dd data-delivery="failing" class="flex min-w-0 flex-col items-start gap-1">
+<span class="inline-flex max-w-full items-start gap-1 rounded-control border border-transparent bg-st-fail-bg px-2.5 py-0.5 text-label font-semibold tabular-nums text-st-fail-text sm:whitespace-nowrap">{% icon "triangle-alert" class="mt-px size-3.5 shrink-0" %}<span data-label class="min-w-0 break-words">Failing since <time datetime="{{ delivery.failing_since|iso }}">{{ delivery.failing_since|display_time }}</time> ({{ delivery.code }})</span></span>
+<span data-relative="{{ delivery.failing_since|iso }}" class="num whitespace-nowrap text-fg-muted">{% relative_time delivery.failing_since %}</span>
+</dd>{% else %}<dd data-delivery="ok" class="flex min-w-0 flex-col items-start gap-1">
+<span class="inline-flex items-center gap-1 text-ok-text">{% icon "check" class="size-3.5 shrink-0" %}<span data-label>OK</span></span>
+<p class="text-fg-muted">{{ delivery.lines.0 }}</p>
+</dd>{% endif %}</div>
+</dl>
+</section>
 
-<h2>Recent outages</h2>
-<p>Outages in the last 14 days, newest first. Remove an outage that was not a real power cut, for example when the device or its internet connection was down while the power was on.</p>
-{% if outage_rows %}
-<div class="table-wrap">
-<table>
-  <thead>
-    <tr>
-      <th scope="col">Outage</th>
-      <th scope="col">Off time</th>
-      <th scope="col"><span class="visually-hidden">Action</span></th>
-    </tr>
-  </thead>
-  <tbody>
-    {% for row in outage_rows %}
-    <tr>
-      <td><span class="num">{{ row.start_date }}</span> <span class="num">{{ row.start_time }}</span> – {% if row.in_progress %}in progress{% else %}{% if row.end_date %}<span class="num">{{ row.end_date }}</span> {% endif %}<span class="num">{{ row.end_time }}</span>{% endif %}</td>
-      <td><span class="num">{{ row.off_text }}</span></td>
-      <td>{% if not row.in_progress %}<a href="{% url 'outage-remove' location.pk row.start_us %}">Remove<span class="visually-hidden"> the outage from {{ row.start_date }} {{ row.start_time }}</span></a>{% endif %}</td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
+<section id="controls" aria-labelledby="controls-title" tabindex="-1" class="min-w-0 scroll-mt-16 rounded-card border border-border bg-surface xl:col-start-2 xl:row-span-2 xl:row-start-1">
+<div class="flex items-center justify-between gap-4 rounded-t-[5px] border-b border-border bg-surface-muted px-4 py-2"><h2 id="controls-title" class="text-label font-semibold tracking-label text-fg-muted uppercase">Controls</h2></div>
+<div class="divide-y divide-border px-4">
+{% for row in switch_rows %}{% include "partials/_switch.html" with row=row location=location csrf_token=csrf_token only %}
+{% endfor %}<div class="flex flex-col items-start gap-2 py-3">
+<h3 class="text-label font-semibold tracking-label text-fg-muted uppercase">Test message</h3>
+<p class="text-body text-fg-muted">Sends one silent message to the channel with this location's bot, to check the bot token and the chat ID. It is not an alert: it is sent even while alerts are off or maintenance is on. Telegram can take up to 15 seconds to answer.</p>
+<form method="post" action="{% url 'location-test-message' location.pk %}" data-testid="test-message-form">{% csrf_token %}{% include "partials/_button.html" with variant="secondary" label="Send test message" icon="send" pending_label="Sending… up to 15 s" only %}</form>
 </div>
-<p class="help">Off time counts only time recorded as power off, as the chart's daily totals do. Time that was not monitored (maintenance, server downtime) is left out, so off time can be shorter than the span from start to end and than the ON alert's "was OFF for". The end shown is the last time recorded as power off, so it can be earlier than the ON alert when power came back while the location was not monitored.</p>
-{% if outage_in_progress %}<p class="help">The outage in progress can be removed after power returns.</p>{% endif %}
-{% elif has_history %}
-<p>No outages in the last 14 days.</p>
-{% else %}
-<p>No power history yet. Outages are listed here once the device has sent its first heartbeat.</p>
-{% endif %}
+</div>
+</section>
 
-<h2>Settings</h2>
-{% include "web/_settings_panel.html" %}
-<p><a class="btn btn--secondary" href="{% url 'location-edit' location.pk %}">Edit location</a></p>
+<div class="flex min-w-0 flex-col gap-4 xl:col-start-1 xl:row-span-2 xl:row-start-2">
+<section id="weekly-chart" aria-labelledby="weekly-chart-title" tabindex="-1" class="min-w-0 scroll-mt-16 rounded-card border border-border bg-surface">
+{% include "web/_weekly_chart.html" %}
+</section>
+<section id="recent-outages" aria-labelledby="recent-outages-title" tabindex="-1" class="min-w-0 scroll-mt-16 rounded-card border border-border bg-surface">
+{% include "web/_recent_outages.html" %}
+</section>
+</div>
 
-<h2>Device setup</h2>
-<p>Heartbeat URL, device key and copy-paste examples for the device.</p>
-<p><a class="btn btn--secondary" href="{% url 'location-setup' location.pk %}">Open device setup</a></p>
+<div class="flex min-w-0 flex-col gap-4 xl:col-start-2 xl:row-start-3">
+<section id="settings" aria-labelledby="settings-title" tabindex="-1" class="min-w-0 scroll-mt-16 rounded-card border border-border bg-surface">
+<div class="flex items-center justify-between gap-4 rounded-t-[5px] border-b border-border bg-surface-muted px-4 py-2"><h2 id="settings-title" class="text-label font-semibold tracking-label text-fg-muted uppercase">Settings</h2>
+<div class="-my-1 flex shrink-0 items-center gap-2">{% url 'location-edit' location.pk as settings_edit_url %}{% include "partials/_button.html" with variant="secondary" size="sm" label="Edit" href=settings_edit_url icon="pencil" sr_suffix="location" testid="edit-location" only %}</div></div>
+<div class="px-4 py-2">{% include "partials/_settings_dl.html" with location=location language_label=language_label period_s=period_s grace_s=grace_s off_after_s=off_after_s masked_token=masked_token token_bot_id=token_bot_id only %}</div>
+</section>
+<section id="device-setup" aria-labelledby="device-setup-title" tabindex="-1" class="min-w-0 scroll-mt-16 rounded-card border border-border bg-surface">
+<div class="flex items-center justify-between gap-4 rounded-t-[5px] border-b border-border bg-surface-muted px-4 py-2"><h2 id="device-setup-title" class="text-label font-semibold tracking-label text-fg-muted uppercase">Device setup</h2></div>
+<div class="flex flex-col items-start gap-4 p-4">
+<p class="text-body text-fg-muted">Heartbeat URL, device key and copy-paste examples for the device.</p>
+<div class="w-full min-w-0">{% include "partials/_copy_field.html" with label="Heartbeat URL" value=heartbeat_url element_id="heartbeat-url" copy_sr="heartbeat URL" copied_msg="Heartbeat URL copied." only %}</div>
+<a href="{% url 'location-setup' location.pk %}" data-testid="open-setup" data-variant="secondary" class="inline-flex min-h-11 items-center justify-center gap-2 rounded-control border border-border-strong bg-surface px-3 text-body font-semibold whitespace-nowrap text-fg no-underline hover:bg-surface-sunken md:min-h-(--control-h) motion-safe:transition-colors motion-safe:duration-150">Open device setup{% icon "chevron-right" class="size-4 shrink-0 text-icon" %}</a>
+</div>
+</section>
+</div>
 
-<h2>Reset history</h2>
-<p>Deletes all recorded power history of this location and unpins its weekly chart where the bot still can. The location then waits for its next heartbeat, which restarts monitoring without an alert. Settings, the device key and the switches are kept. There is no undo.</p>
-{% if status.power_key == "off" %}
-<p>An outage is in progress. Reset the history after power returns, or delete the location.</p>
-{% elif not has_history %}
-<p>There is no power history to reset.</p>
-{% else %}
-<p><a class="btn btn--secondary" href="{% url 'location-reset' location.pk %}">Reset history</a></p>
-{% endif %}
+<section id="danger-zone" aria-labelledby="danger-zone-title" tabindex="-1" class="min-w-0 scroll-mt-16 rounded-card border border-danger-border bg-surface xl:col-span-2 xl:row-start-4">
+<div class="flex items-center justify-between gap-4 rounded-t-[5px] border-b border-danger-border bg-danger-soft px-4 py-2"><h2 id="danger-zone-title" class="text-label font-semibold tracking-label text-danger-text uppercase">Danger zone</h2></div>
+<div class="divide-y divide-border px-4">
+<div id="reset-history" tabindex="-1" class="flex scroll-mt-16 flex-col items-start gap-4 py-3 md:flex-row md:items-center md:justify-between md:gap-6">
+<div class="flex min-w-0 max-w-190 flex-col gap-1">
+<h3 class="text-body font-semibold text-fg">Reset history</h3>
+<p class="text-body text-fg-muted">Deletes all recorded power history of this location and unpins its weekly chart where the bot still can. The location then waits for its next heartbeat, which restarts monitoring without an alert. Settings, the device key and the switches are kept. There is no undo.</p>
+{% if outage_in_progress or status.power_key == "off" %}<p id="reset-unavailable" data-testid="reset-unavailable" data-reason="in-progress" class="flex items-start gap-1 text-body text-fg-muted">{% icon "info" class="mt-0.5 size-3.5 shrink-0 text-icon" %}<span>An outage is in progress. Reset the history after power returns, or delete the location.</span></p>
+{% elif not has_history %}<p id="reset-unavailable" data-testid="reset-unavailable" data-reason="no-history" class="flex items-start gap-1 text-body text-fg-muted">{% icon "info" class="mt-0.5 size-3.5 shrink-0 text-icon" %}<span>There is no power history to reset.</span></p>
+{% endif %}</div>
+{% if not outage_in_progress and status.power_key != "off" and has_history %}<a href="{% url 'location-reset' location.pk %}" data-testid="reset-history" data-confirm data-variant="outline-danger" class="inline-flex min-h-11 shrink-0 items-center justify-center gap-2 rounded-control border border-danger-border bg-surface px-3 text-body font-semibold whitespace-nowrap text-danger-text no-underline hover:bg-danger-soft md:min-h-(--control-h) motion-safe:transition-colors motion-safe:duration-150">{% icon "rotate-ccw" class="size-4 shrink-0" %}Reset history…</a>{% endif %}
+</div>
+<div id="delete-location" tabindex="-1" class="flex scroll-mt-16 flex-col items-start gap-4 py-3 md:flex-row md:items-center md:justify-between md:gap-6">
+<div class="flex min-w-0 max-w-190 flex-col gap-1">
+<h3 class="text-body font-semibold text-fg">Delete location</h3>
+<p class="text-body text-fg-muted">Stops this location's alerts, drops the alerts still queued, unpins its weekly chart where the bot still can, and hides it from the admin panel. There is no undo.</p>
+</div>
+<a href="{% url 'location-delete' location.pk %}" data-testid="delete-location" data-confirm data-variant="outline-danger" class="inline-flex min-h-11 shrink-0 items-center justify-center gap-2 rounded-control border border-danger-border bg-surface px-3 text-body font-semibold whitespace-nowrap text-danger-text no-underline hover:bg-danger-soft md:min-h-(--control-h) motion-safe:transition-colors motion-safe:duration-150">{% icon "trash-2" class="size-4 shrink-0" %}Delete location…</a>
+</div>
+</div>
+</section>
 
-<h2>Delete location</h2>
-<p>Stops this location's alerts, drops the alerts still queued, unpins its weekly chart where the bot still can, and hides it from the admin panel. There is no undo.</p>
-<p><a class="btn btn--secondary" href="{% url 'location-delete' location.pk %}">Delete location</a></p>
+</div>
+<p data-copy-status aria-live="polite" class="sr-only"></p>
+</div>
 {% endblock %}
+{% block dialog %}{% include "partials/_confirm_dialog.html" only %}{% endblock %}

@@ -1,0 +1,56 @@
+{% load icons %}{% comment %}
+The location page's Recent outages card (06-UI-SPEC Page Contracts > S5 Recent outages,
+Components > Table; UI-07, UI-11, UI-12; Phase 5 D-01): the header strip and the body of
+section#recent-outages, which the page renders around this include. Context: the detail
+view's (location, outage_rows, outages_total_text, has_history, outage_in_progress).
+
+- Header: the title and, while at least one outage is listed, [data-testid=outages-stats]
+  "{n} outages" ("1 outage") and the summed off time outages_total_text, the numbers mono.
+- Body, flush to the card edges: the intro, then exactly one of the table
+  [data-testid=outages-table], the empty state for no outage in the last 14 days, or the
+  empty state for no history at all ([data-testid=outages-empty] with data-reason).
+- Table: an sr-only caption, column headers Outage, Off time (right-aligned, 1 % wide, never
+  wrapping) and an sr-only Action, sticky under the top bar. Rows are the last 14 local days,
+  newest first: start date and start time as two mono spans that never wrap inside (they may
+  wrap apart on phones); the end time alone on the same local date, else with its date; the
+  range never breaks after the dash. The dates and times are local minutes from OutageRow,
+  not instants, so they are plain mono spans. The outage in progress carries
+  data-in-progress, a pulsing LED and "in progress" after its start, a 2 px Off tone bar and
+  no action; every other row has its remove-outage entry: a plain link with data-confirm to
+  the removal confirmation page (R7), named "Remove the outage from {date} {time}".
+- Notes after the table: the off-time note always (amendment A2), the in-progress note
+  only while the outage in progress is listed.
+- The poll never patches this card: a change shows the reload chip instead.
+{% endcomment %}<div class="flex items-center justify-between gap-4 rounded-t-[5px] border-b border-border bg-surface-muted px-4 py-2">
+<div class="flex min-w-0 flex-wrap items-baseline gap-x-2"><h2 id="recent-outages-title" class="text-label font-semibold tracking-label text-fg-muted uppercase">Recent outages</h2>
+{% if outage_rows %}<p data-testid="outages-stats" class="text-label text-fg-subtle"><span class="num">{{ outage_rows|length }}</span> {% if outage_rows|length == 1 %}outage{% else %}outages{% endif %} · <span class="num">{{ outages_total_text }}</span></p>{% endif %}</div>
+</div>
+<p class="px-4 pt-4 pb-2 text-body text-fg-muted">Outages in the last 14 days, newest first. Remove an outage that was not a real power cut, for example when the device or its internet connection was down while the power was on.</p>
+{% if outage_rows %}<table data-testid="outages-table" class="w-full border-collapse text-body text-fg">
+<caption class="sr-only">Recent outages</caption>
+<thead>
+<tr>
+<th scope="col" class="sticky top-12 z-1 bg-surface-muted py-2 pr-3 pl-4 text-left text-label font-semibold tracking-label whitespace-nowrap text-fg-muted uppercase [box-shadow:inset_0_-1px_0_var(--border)]">Outage</th>
+<th scope="col" class="sticky top-12 z-1 w-[1%] bg-surface-muted px-3 py-2 text-right text-label font-semibold tracking-label whitespace-nowrap text-fg-muted uppercase [box-shadow:inset_0_-1px_0_var(--border)]">Off time</th>
+<th scope="col" class="sticky top-12 z-1 w-[1%] bg-surface-muted py-2 pr-4 pl-3 [box-shadow:inset_0_-1px_0_var(--border)]"><span class="sr-only">Action</span></th>
+</tr>
+</thead>
+<tbody>
+{% for row in outage_rows %}<tr data-testid="outage-row"{% if row.in_progress %} data-in-progress{% endif %} class="hover:bg-surface-muted">
+<td class="border-t border-border py-2 pr-3 pl-4{% if row.in_progress %} [box-shadow:inset_2px_0_0_var(--st-off)]{% endif %}">{% if row.in_progress %}<span aria-hidden="true" class="mr-2 inline-block size-2 rounded-led bg-st-off align-[1px] motion-safe:animate-live-pulse"></span>{% endif %}<span class="num whitespace-nowrap">{{ row.start_date }}</span> <span class="num whitespace-nowrap">{{ row.start_time }}</span>{% if row.in_progress %}&nbsp;<span class="whitespace-nowrap">–&nbsp;in progress</span>{% elif row.end_date %}&nbsp;–&#8288;&nbsp;<span class="num whitespace-nowrap">{{ row.end_date }}</span> <span class="num whitespace-nowrap">{{ row.end_time }}</span>{% else %}&nbsp;–&#8288;&nbsp;<span class="num whitespace-nowrap">{{ row.end_time }}</span>{% endif %}</td>
+<td class="border-t border-border px-3 py-2 text-right whitespace-nowrap"><span class="num">{{ row.off_text }}</span></td>
+<td class="border-t border-border py-1 pr-4 pl-3 text-right">{% if not row.in_progress %}<a href="{% url 'outage-remove' location.pk row.start_us %}" data-testid="remove-outage" data-confirm data-variant="ghost" class="inline-flex size-11 items-center justify-center rounded-control text-icon hover:bg-danger-soft hover:text-danger-text md:size-(--control-h-sm) motion-safe:transition-colors motion-safe:duration-150">{% icon "trash-2" class="size-4 shrink-0" %}<span class="sr-only">Remove the outage from {{ row.start_date }} {{ row.start_time }}</span></a>{% endif %}</td>
+</tr>
+{% endfor %}</tbody>
+</table>
+<div class="flex flex-col gap-1 px-4 pt-2 pb-4 text-label text-fg-muted">
+<p data-testid="off-time-note">Off time counts only time recorded as power off, as the chart's daily totals do. Time that was not monitored is left out, so off time and the end shown can differ from the alerts.</p>
+{% if outage_in_progress %}<p data-testid="in-progress-note">The outage in progress can be removed after power returns.</p>{% endif %}
+</div>{% elif has_history %}<div data-testid="outages-empty" data-reason="none-in-14-days" class="flex flex-col items-center gap-4 px-4 pt-4 pb-8 text-center">
+<span aria-hidden="true" class="flex size-12 shrink-0 items-center justify-center rounded-full bg-surface-sunken text-icon">{% icon "circle-check" class="size-6" %}</span>
+<p class="text-lead font-semibold break-words text-fg">No outages in the last 14 days.</p>
+</div>{% else %}<div data-testid="outages-empty" data-reason="no-history" class="flex flex-col items-center gap-4 px-4 pt-4 pb-8 text-center">
+<span aria-hidden="true" class="flex size-12 shrink-0 items-center justify-center rounded-full bg-surface-sunken text-icon">{% icon "hourglass" class="size-6" %}</span>
+<p class="text-lead font-semibold break-words text-fg">No power history yet.</p>
+<p class="max-w-100 text-body break-words text-fg-muted">Outages are listed here once the device has sent its first heartbeat.</p>
+</div>{% endif %}

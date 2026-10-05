@@ -1,78 +1,90 @@
-"""The location page (LOC-03; D-13, SEC-04; UI-SPEC screen B, UI-D2, UI-D11, UI-D15).
+"""The location page S5 (LOC-03; D-13, SEC-04; 06-UI-SPEC Page Contracts › S5; UI-01, UI-12).
 
-- The status panel uses the one Phase 4 vocabulary: "Maintenance" whenever the flag is on,
-  else the stored status. Under maintenance the stored status shows as the power state,
-  with its help line. Rows that do not apply are omitted (E2).
-- Its last row, Delivery, shows "OK" with its help, or "Failing since {display_time}
-  ({code})" with the cause line for that code (or the supergroup line with the new chat
-  ID) and the retry line, read from the open delivery_failing incident (D-10, D-13).
-- The page's one accent button is "Send test message", after the switches (UI-D15).
-- The settings panel is the setup page's, shared through one include, so both pages show
+- The page extends the app layout: breadcrumbs Locations › {name}; a header
+  (``location-header``) with the h1 name, the status pill and the tags; the meta line
+  (``location-meta``) with "On since" / "Outage since" (none while waiting) and "Last
+  heartbeat"; the page actions (Edit and the kebab); the section nav; the seven cards in the
+  test-pinned DOM order status, controls, weekly-chart, recent-outages, settings,
+  device-setup, danger-zone.
+- The Status card (``status-panel``) uses the one Phase 4 vocabulary: "Maintenance" whenever
+  the flag is on, else the stored status. Under maintenance the stored status shows as the
+  power state; its help line is in the maintenance banner. Rows that do not apply are left
+  out.
+- Its last row, Delivery, shows "OK" with its help, or the failing pill "Failing since
+  {display_time} ({code})"; the cause line for that code (or the supergroup line with the
+  new chat ID) and the retry line are in the delivery-failing banner (D-10, D-13).
+- The settings list is the setup page's, shared through one partial, so both pages show
   identical values; with router grace on, "Reported OFF after" names the longer timeout
   right after power returns.
 - The page shows no device key, not even masked, and the bot token only masked (SEC-04).
-- Breadcrumbs sit before the flash messages and the h1 on the location and setup pages
-  (UI-D2, E10). The admin-typed name is escaped everywhere and never truncated (E2).
+- The admin-typed name is escaped everywhere and never truncated (E2).
 - Every location URL answers 404 for an unknown or deleted location, and every page needs
   the signed-in admin.
+
+Pages are read through tests/web/pages.py and the 06-UI-SPEC test hooks only. Python-owned
+copy is imported; template-owned copy is pinned against the 06-UI-SPEC copy table. The view
+clock is pinned (``clock``), so the relative times are known.
 """
 
-# class-guard: pending migration
-
-import re
 from collections.abc import Callable
 from datetime import UTC, datetime
-from html import unescape
-from pathlib import Path
 from typing import Any
 
 import pytest
-from django.conf import settings
+from bs4 import Tag
+from conftest import FakeClock
 from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.test import Client
+from pages import (
+    all_by_testid,
+    assert_no_injected_script,
+    assert_page,
+    breadcrumbs,
+    by_testid,
+    definitions,
+    h1,
+    messages,
+    parse,
+    post_form,
+    section,
+    text,
+    title,
+)
+from secret_fixtures import MASKED as MASKED_TOKEN
+from secret_fixtures import SECRET, TOKEN
 
 from powermon.alerts import delivery
 from powermon.engine import rules
 from powermon.engine.models import LocationState
 from powermon.locations import keys
 from powermon.locations.models import Location
+from powermon.web.location_views import (
+    ALERTS_COPY,
+    DELIVERY_BOT_REJECTED_CAUSE,
+    DELIVERY_CANNOT_POST_CAUSE,
+    DELIVERY_MIGRATE_LINE,
+    DELIVERY_NOT_IN_CHAT_CAUSE,
+    DELIVERY_OK_HELP,
+    DELIVERY_OTHER_CAUSE,
+    DELIVERY_RETRY_LINE,
+    MAINTENANCE_COPY,
+    LocationDetailView,
+)
+from powermon.web.status import STATUS_LABELS
 
 User = get_user_model()
 
-SECRET = "Sx_9-Qw7Lm" * 4
-TOKEN = f"987654321:{SECRET}"
-MASKED_TOKEN = "987654321:••••••••"
 XSS_NAME = "<script>alert(1)</script>"
 ESCAPED_XSS_NAME = "&lt;script&gt;alert(1)&lt;/script&gt;"
 ROUTER_GRACE_S = int(rules.ROUTER_GRACE.total_seconds())
+# 06-UI-SPEC copy table, loc.banner_mnt_body.
 HELP_POWER_ON = "OFF is not detected during maintenance."
 HELP_POWER_OFF = "The outage goes on. When power returns, the ON alert is sent as usual."
-# UI-SPEC Copywriting › List and status, verbatim (D-13, D-10).
-HELP_DELIVERY_OK = "No alert has been refused by Telegram since the last successful send."
-CAUSE_400 = (
-    "Telegram did not accept the chat: the chat ID is wrong, or the bot is not in that chat. "
-    "Check the chat ID in Edit location, then send a test message."
-)
-CAUSE_401_404 = (
-    "Telegram rejected the bot token. Paste the current token from @BotFather in Edit "
-    "location, then send a test message."
-)
-CAUSE_403 = (
-    "The bot cannot post in the channel: it was removed or is not an admin. Make the bot an "
-    "admin with the right to post messages, then send a test message."
-)
-CAUSE_OTHER = (
-    "Telegram refused the alerts. Check the bot token and the chat ID in Edit location, then "
-    "send a test message."
-)
 MIGRATED_CHAT_ID = -1001234567999
-MIGRATE_LINE = (
-    f"The group became a supergroup. Its new chat ID is {MIGRATED_CHAT_ID}: put it in Edit "
-    "location, then send a test message."
-)
-RETRY_LINE = "Queued alerts are retried every 15 minutes until they expire."
-DELIVERY_OK_ROW = ("Delivery", "OK", HELP_DELIVERY_OK)
+MIGRATE_LINE = DELIVERY_MIGRATE_LINE.format(new_chat_id=MIGRATED_CHAT_ID)
+DELIVERY_OK_ROW = ("Delivery", f"OK {DELIVERY_OK_HELP}")
+# 06-UI-SPEC copy table, loc.setup_intro, loc.test_body, loc.delete_desc.
 DEVICE_SETUP_SENTENCE = "Heartbeat URL, device key and copy-paste examples for the device."
 TEST_MESSAGE_PARAGRAPH = (
     "Sends one silent message to the channel with this location's bot, to check the bot "
@@ -83,7 +95,26 @@ DELETE_SENTENCE = (
     "Stops this location's alerts, drops the alerts still queued, unpins its weekly chart "
     "where the bot still can, and hides it from the admin panel. There is no undo."
 )
-CSS_PATH = Path(settings.BASE_DIR) / "powermon" / "web" / "static" / "web" / "app.css"
+# The cards in their test-pinned DOM order, with their titles (loc.cards).
+CARDS = [
+    ("status", "Status"),
+    ("controls", "Controls"),
+    ("weekly-chart", "Weekly chart"),
+    ("recent-outages", "Recent outages"),
+    ("settings", "Settings"),
+    ("device-setup", "Device setup"),
+    ("danger-zone", "Danger zone"),
+]
+# The section nav (loc.sections).
+SECTION_LINKS = [
+    ("Overview", "#status"),
+    ("Chart", "#weekly-chart"),
+    ("Outages", "#recent-outages"),
+    ("Settings", "#settings"),
+    ("Danger zone", "#danger-zone"),
+]
+# The page's "now": 2026-10-01 08:00:12 UTC, 11:00:12 in Kyiv.
+NOW = datetime(2026, 10, 1, 8, 0, 12, tzinfo=UTC)
 
 
 @pytest.fixture
@@ -98,6 +129,14 @@ def kyiv(settings: Any) -> Any:
     """Pin the display TZ, so the expected times do not depend on the env file."""
     settings.TIME_ZONE = "Europe/Kyiv"
     return settings
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
+    """The location page's clock at ``NOW``: its relative times are then known."""
+    fake = FakeClock(NOW)
+    monkeypatch.setattr(LocationDetailView, "clock", fake)
+    return fake
 
 
 def _at(hour: int, minute: int, second: int = 0) -> datetime:
@@ -117,47 +156,138 @@ def _set_maintenance(location: Any) -> None:
     Location.objects.filter(pk=location.pk).update(maintenance=True)
 
 
-def _text(fragment: str) -> str:
-    """The visible text of an HTML fragment: tags dropped, whitespace collapsed."""
-    return unescape(" ".join(re.sub(r"<[^>]+>", " ", fragment).split()))
+def _get(admin: Client, location: Any) -> Any:
+    """The location page, parsed."""
+    response = admin.get(_page(location))
+    assert response.status_code == 200
+    return parse(response)
 
 
-def _status_rows(page: str) -> list[tuple[str, str, str]]:
-    """The status panel as (term, value, help line) triples; "" when a value has no help."""
-    panel = re.search(r'<dl class="panel settings">(.*?)</dl>', page, re.S)
-    assert panel is not None, "no status panel"
-    rows = []
-    for term, value in re.findall(r"<dt>(.*?)</dt>\s*<dd>(.*?)</dd>", panel.group(1), re.S):
-        help_line = re.search(r'<p class="help">(.*?)</p>', value, re.S)
-        shown = re.sub(r'<p class="help">.*?</p>', "", value, flags=re.S)
-        rows.append((_text(term), _text(shown), _text(help_line.group(1)) if help_line else ""))
-    return rows
+def _status_rows(page: Any) -> list[tuple[str, str]]:
+    """The Status card as (term, value) pairs, in order."""
+    return definitions(page, "status-panel")
 
 
-def _settings_rows(page: str) -> list[tuple[str, str]]:
-    """The shared settings panel (the same parse as tests/web/test_setup_page.py)."""
-    panel = re.search(r'<dl class="panel settings name">(.*?)</dl>', page, re.S)
-    assert panel is not None, "no settings panel"
-    pairs = re.findall(r"<dt>(.*?)</dt>\s*<dd>(.*?)</dd>", panel.group(1), re.S)
-    return [(unescape(term), unescape(value)) for term, value in pairs]
+def _status_row(page: Any, term: str) -> Tag:
+    """The ``dd`` of the Status card row named ``term``."""
+    panel = by_testid(page, "status-panel")
+    for dt in panel.find_all("dt"):
+        if text(dt) == term:
+            dd = dt.find_next_sibling("dd")
+            assert isinstance(dd, Tag)
+            return dd
+    raise AssertionError(f"no Status row {term!r}")
 
 
-def _crumbs(page: str) -> list[tuple[str, str]]:
-    """The breadcrumb items as (li attributes, inner HTML)."""
-    trail = re.search(
-        r'<nav aria-label="Breadcrumb">\s*<ol class="crumbs">(.*?)</ol>\s*</nav>', page, re.S
-    )
-    assert trail is not None, "no breadcrumb trail"
-    items = re.findall(r"<li\b([^>]*)>(.*?)</li>", trail.group(1), re.S)
-    return [(attrs, inner.strip()) for attrs, inner in items]
+def _delivery_value(page: Any) -> Tag:
+    """The Status card's Delivery value, ``[data-delivery]``."""
+    found = by_testid(page, "status-panel").select("[data-delivery]")
+    assert len(found) == 1, f"expected one [data-delivery] in the Status card, found {len(found)}"
+    return found[0]
 
 
-# The status panel (LOC-03, E2)
+def _meta_items(page: Any) -> list[str]:
+    """The meta line's items as text, the JS-only live-chip slot left out."""
+    meta = by_testid(by_testid(page, "location-header"), "location-meta")
+    items = [li for li in meta.find_all("li", recursive=False) if isinstance(li, Tag)]
+    return [text(li) for li in items if li.get("data-testid") != "live-chip"]
+
+
+def _tags(page: Any) -> list[str]:
+    header = by_testid(page, "location-header")
+    return [str(tag["data-tag"]) for tag in all_by_testid(header, "tag")]
+
+
+def _header_pill(page: Any) -> Tag:
+    return by_testid(by_testid(page, "location-header"), "status-pill")
+
+
+# The shell, the header and the card order (UI-01, UI-12)
+
+
+@pytest.mark.django_db
+def test_UI01_location_page_shell(
+    admin: Client, kyiv: Any, clock: FakeClock, location_factory: Callable[..., Any]
+) -> None:
+    location = location_factory(name="Kyiv office", alerts_enabled=False, router_grace=True)
+    _set_state(location, status="on", on_since=_at(7, 30), last_heartbeat_at=_at(8, 0))
+    other = location_factory(name="Lviv home")
+
+    response = admin.get(_page(location))
+
+    soup = assert_page(response, title="Kyiv office", app=True)
+    assert breadcrumbs(soup) == [("Locations", "/"), ("Kyiv office", None)]
+    # The sidebar marks this location as the current one, and only it.
+    current = {
+        str(link["data-location-id"]): link.get("aria-current")
+        for link in all_by_testid(soup, "sidebar-location")
+    }
+    assert current == {str(location.pk): "page", str(other.pk): None}
+    # The header: the h1 name, the status pill, the tags in the order Alerts off, Router grace.
+    header = by_testid(soup, "location-header")
+    assert header.find("h1") is h1(soup)
+    assert text(h1(soup)) == "Kyiv office"
+    pill = _header_pill(soup)
+    assert (pill["data-status"], text(pill)) == ("on", STATUS_LABELS["on"])
+    assert _tags(soup) == ["alerts-off", "router-grace"]
+    actions = by_testid(soup, "page-actions")
+    edit = by_testid(actions, "header-edit-location")
+    assert (edit["href"], text(edit)) == (f"/locations/{location.pk}/edit/", "Edit location")
+    # The seven cards in the pinned DOM order, each a section named by its title.
+    cards = [found for found in soup.find_all("section") if isinstance(found, Tag)]
+    assert [card.get("id") for card in cards] == [card_id for card_id, _ in CARDS]
+    for card, (_, card_title) in zip(cards, CARDS, strict=True):
+        labelled = soup.find(id=str(card["aria-labelledby"]))
+        assert isinstance(labelled, Tag)
+        assert text(labelled) == card_title
+        assert card.get("tabindex") == "-1"
+    # The section nav jumps to five of the cards.
+    nav = by_testid(soup, "section-nav")
+    assert (nav.name, nav.get("aria-label")) == ("nav", "Sections")
+    links = [(text(link), link["href"]) for link in nav.find_all("a")]
+    assert links == SECTION_LINKS
+    for _, href in links:
+        assert section(soup, str(href)[1:]).name == "section"
+
+
+@pytest.mark.django_db
+def test_UI01_location_meta(
+    admin: Client, kyiv: Any, clock: FakeClock, location_factory: Callable[..., Any]
+) -> None:
+    on = location_factory(name="On")
+    _set_state(on, status="on", on_since=_at(7, 30), last_heartbeat_at=_at(8, 0))
+    off = location_factory(name="Off")
+    _set_state(off, status="off", outage_started_at=_at(7, 58), last_heartbeat_at=_at(7, 58))
+    waiting = location_factory(name="Waiting")
+
+    on_page = _get(admin, on)
+    assert _meta_items(on_page) == [
+        "On since 2026-10-01 10:30:00 EEST (30 min ago)",
+        "Last heartbeat 2026-10-01 11:00:00 EEST (12 s ago)",
+    ]
+    # Each time is a <time datetime> of the stored instant beside one [data-relative].
+    meta = by_testid(on_page, "location-meta")
+    stamps = [datetime.fromisoformat(str(found["datetime"])) for found in meta.find_all("time")]
+    assert stamps == [_at(7, 30), _at(8, 0)]
+    relatives = [found["data-relative"] for found in meta.select("[data-relative]")]
+    assert relatives == [found["datetime"] for found in meta.find_all("time")]
+
+    assert _meta_items(_get(admin, off)) == [
+        "Outage since 2026-10-01 10:58:00 EEST (2 min ago)",
+        "Last heartbeat 2026-10-01 10:58:00 EEST (2 min ago)",
+    ]
+    # Edge: waiting has no since item, and "Never" has no <time>.
+    waiting_page = _get(admin, waiting)
+    assert _meta_items(waiting_page) == ["Last heartbeat Never"]
+    assert by_testid(waiting_page, "location-meta").find("time") is None
+
+
+# The Status card (LOC-03, E2)
 
 
 @pytest.mark.django_db
 def test_LOC03_location_page_status_panel(
-    admin: Client, kyiv: Any, location_factory: Callable[..., Any]
+    admin: Client, kyiv: Any, clock: FakeClock, location_factory: Callable[..., Any]
 ) -> None:
     on = location_factory(name="On")
     _set_state(on, status="on", on_since=_at(7, 30), last_heartbeat_at=_at(8, 0))
@@ -167,76 +297,79 @@ def test_LOC03_location_page_status_panel(
     stateless = location_factory(name="No state row")
     LocationState.objects.filter(location=stateless).delete()
 
-    on_since = ("On since", "2026-10-01 10:30:00 EEST", "")
-    outage_since = ("Outage since", "2026-10-01 10:58:00 EEST", "")
-    on_beat = ("Last heartbeat", "2026-10-01 11:00:00 EEST", "")
-    off_beat = ("Last heartbeat", "2026-10-01 10:58:00 EEST", "")
-    never = ("Last heartbeat", "Never", "")
+    on_since = ("On since", "2026-10-01 10:30:00 EEST (30 min ago)")
+    outage_since = ("Outage since", "2026-10-01 10:58:00 EEST (2 min ago)")
+    on_beat = ("Last heartbeat", "2026-10-01 11:00:00 EEST (12 s ago)")
+    off_beat = ("Last heartbeat", "2026-10-01 10:58:00 EEST (2 min ago)")
+    never = ("Last heartbeat", "Never")
 
     # Delivery is the last row, "OK" while no delivery-failing incident is open (D-13).
-    assert _status_rows(admin.get(_page(on)).content.decode()) == [
-        ("Status", "On", ""),
-        on_since,
-        on_beat,
-        DELIVERY_OK_ROW,
-    ]
-    assert _status_rows(admin.get(_page(off)).content.decode()) == [
-        ("Status", "Off", ""),
+    assert _status_rows(_get(admin, on)) == [("Status", "On"), on_since, on_beat, DELIVERY_OK_ROW]
+    assert _status_rows(_get(admin, off)) == [
+        ("Status", "Off"),
         outage_since,
         off_beat,
         DELIVERY_OK_ROW,
     ]
     # Waiting: no On since / Outage since row (E2), and no state row counts as waiting.
     for place in (waiting, stateless):
-        assert _status_rows(admin.get(_page(place)).content.decode()) == [
-            ("Status", "Waiting for first heartbeat", ""),
+        page = _get(admin, place)
+        assert _status_rows(page) == [
+            ("Status", "Waiting for first heartbeat"),
             never,
             DELIVERY_OK_ROW,
         ]
+        assert not all_by_testid(page, "maintenance-banner")
 
     for place in (on, off, waiting):
         _set_maintenance(place)
-    maintenance_on = admin.get(_page(on)).content.decode()
+    maintenance_on = _get(admin, on)
 
     assert _status_rows(maintenance_on) == [
-        ("Status", "Maintenance", ""),
-        ("Power state", "On", HELP_POWER_ON),
+        ("Status", "Maintenance"),
+        ("Power state", "On"),
         on_since,
         on_beat,
         DELIVERY_OK_ROW,
     ]
-    # UI-D11: the maintenance label gets its own (grey) dot; the power state keeps its own.
-    assert '<span class="status status--maintenance">Maintenance</span>' in maintenance_on
-    assert '<span class="status status--on">On</span>' in maintenance_on
-    assert _status_rows(admin.get(_page(off)).content.decode()) == [
-        ("Status", "Maintenance", ""),
-        ("Power state", "Off", HELP_POWER_OFF),
+    # The maintenance label has its own pill; the power state keeps its own; its help line
+    # is in the maintenance banner.
+    assert _header_pill(maintenance_on)["data-status"] == "maintenance"
+    power = by_testid(maintenance_on, "status-panel").select("[data-power]")
+    assert [found["data-power"] for found in power] == ["on"]
+    assert by_testid(power[0], "status-pill")["data-status"] == "on"
+    banner = by_testid(maintenance_on, "maintenance-banner")
+    assert text(banner) == f"Maintenance is on {HELP_POWER_ON}"
+    maintenance_off = _get(admin, off)
+    assert _status_rows(maintenance_off) == [
+        ("Status", "Maintenance"),
+        ("Power state", "Off"),
         outage_since,
         off_beat,
         DELIVERY_OK_ROW,
     ]
-    assert _status_rows(admin.get(_page(waiting)).content.decode()) == [
-        ("Status", "Maintenance", ""),
-        ("Power state", "Waiting for first heartbeat", ""),
+    assert text(by_testid(maintenance_off, "maintenance-banner")) == (
+        f"Maintenance is on {HELP_POWER_OFF}"
+    )
+    maintenance_waiting = _get(admin, waiting)
+    assert _status_rows(maintenance_waiting) == [
+        ("Status", "Maintenance"),
+        ("Power state", "Waiting for first heartbeat"),
         never,
         DELIVERY_OK_ROW,
     ]
+    assert text(by_testid(maintenance_waiting, "maintenance-banner")) == (
+        f"Maintenance is on {HELP_POWER_ON}"
+    )
 
 
 # The Delivery row (LOC-03, D-10, D-13)
 
 
-def _delivery(page: str) -> tuple[str, list[str]]:
-    """The status panel's Delivery row: its value (HTML) and its help lines (text)."""
-    row = re.search(r"<dt>Delivery</dt>\s*<dd>(.*?)</dd>", page, re.S)
-    assert row is not None, "no Delivery row"
-    lines = [_text(line) for line in re.findall(r'<p class="help">(.*?)</p>', row.group(1), re.S)]
-    value = re.sub(r'<p class="help">.*?</p>', "", row.group(1), flags=re.S).strip()
-    return value, lines
-
-
 @pytest.mark.django_db
-def test_location_page_delivery_row_ok(admin: Client, location_factory: Callable[..., Any]) -> None:
+def test_location_page_delivery_row_ok(
+    admin: Client, clock: FakeClock, location_factory: Callable[..., Any]
+) -> None:
     location = location_factory(name="Office")
     # Another location's failure and this location's closed one never show here.
     other = location_factory(name="Other")
@@ -245,23 +378,24 @@ def test_location_page_delivery_row_ok(admin: Client, location_factory: Callable
         delivery.open_failing(location.pk, _at(7, 0), 403)
         delivery.close_failing(location.pk, _at(7, 30))
 
-    page = admin.get(_page(location)).content.decode()
+    page = _get(admin, location)
 
-    # Plain "OK", no dot, and its help line.
-    assert _delivery(page) == ("OK", [HELP_DELIVERY_OK])
-    assert "status--failing" not in page
-    assert _status_rows(page)[-1][0] == "Delivery"
+    # Plain "OK" with its help line, no failing pill and no banner.
+    value = _delivery_value(page)
+    assert (value["data-delivery"], text(value)) == ("ok", f"OK {DELIVERY_OK_HELP}")
+    assert not all_by_testid(page, "delivery-banner")
+    assert _status_rows(page)[-1] == DELIVERY_OK_ROW
 
 
 @pytest.mark.django_db
 @pytest.mark.parametrize(
     ("status", "migrate_to", "cause"),
     [
-        (403, None, CAUSE_403),
-        (400, None, CAUSE_400),
-        (401, None, CAUSE_401_404),
-        (404, None, CAUSE_401_404),
-        (409, None, CAUSE_OTHER),
+        (403, None, DELIVERY_CANNOT_POST_CAUSE),
+        (400, None, DELIVERY_NOT_IN_CHAT_CAUSE),
+        (401, None, DELIVERY_BOT_REJECTED_CAUSE),
+        (404, None, DELIVERY_BOT_REJECTED_CAUSE),
+        (409, None, DELIVERY_OTHER_CAUSE),
         # Telegram reported a supergroup: the migrate line replaces the cause line (D-10).
         (400, MIGRATED_CHAT_ID, MIGRATE_LINE),
         (403, MIGRATED_CHAT_ID, MIGRATE_LINE),
@@ -271,6 +405,7 @@ def test_location_page_delivery_row_ok(admin: Client, location_factory: Callable
 def test_location_page_delivery_row(
     admin: Client,
     kyiv: Any,
+    clock: FakeClock,
     location_factory: Callable[..., Any],
     status: int,
     migrate_to: int | None,
@@ -278,24 +413,32 @@ def test_location_page_delivery_row(
 ) -> None:
     location = location_factory(name="Office", bot_token=TOKEN)
     with transaction.atomic():
-        delivery.open_failing(location.pk, _at(8, 0, 59), status, migrate_to)
+        delivery.open_failing(location.pk, _at(8, 0, 2), status, migrate_to)
 
-    page = admin.get(_page(location)).content.decode()
+    response = admin.get(_page(location))
+    page = parse(response)
 
-    # The full display_time of the start (seconds and zone), whatever the day (UI-D6).
-    assert _delivery(page) == (
-        '<span class="status status--failing">'
-        f"Failing since 2026-10-01 11:00:59 EEST (http_{status})</span>",
-        [cause, RETRY_LINE],
-    )
+    # The full display_time of the start (seconds and zone), whatever the day (UI-D6), in
+    # the failing pill; its relative time beside it.
+    value = _delivery_value(page)
+    assert value["data-delivery"] == "failing"
+    pill = value.select_one("[data-label]")
+    assert pill is not None
+    assert text(pill) == f"Failing since 2026-10-01 11:00:02 EEST (http_{status})"
+    assert text(value) == f"Failing since 2026-10-01 11:00:02 EEST (http_{status}) 10 s ago"
     assert _status_rows(page)[-1][0] == "Delivery"
+    # The cause (or supergroup) line and the retry line are in the banner.
+    banner = by_testid(page, "delivery-banner")
+    assert text(by_testid(banner, "delivery-cause")) == cause
+    assert text(by_testid(banner, "delivery-retry")) == DELIVERY_RETRY_LINE
     # The chat stays as stored: the new ID is only shown (PITFALLS 6e); no secret shows.
     assert Location.objects.get(pk=location.pk).chat_id != MIGRATED_CHAT_ID
-    assert TOKEN not in page
-    assert SECRET not in page
+    html = response.content.decode()
+    assert TOKEN not in html
+    assert SECRET not in html
 
 
-# Sections: settings (shared with the setup page) and device setup
+# Cards: settings (shared with the setup page) and device setup
 
 
 @pytest.mark.django_db
@@ -312,7 +455,7 @@ def test_location_page_settings_and_setup_sections(
         router_grace=True,
     )
 
-    page = admin.get(_page(location)).content.decode()
+    page = _get(admin, location)
 
     # The setup page shows these same rows: *_on_setup in tests/web/test_setup_page.py.
     expected = [
@@ -325,57 +468,60 @@ def test_location_page_settings_and_setup_sections(
             "router grace on)",
         ),
         ("Channel chat ID", "-1009876543210"),
-        ("Bot token", MASKED_TOKEN),
+        ("Bot token", "987654321, the rest is hidden"),
     ]
     assert ROUTER_GRACE_S == 180
-    assert _settings_rows(page) == expected
-    assert re.findall(r"<h2>(.*?)</h2>", page) == [
-        "Status",
-        "Switches",
-        "Test message",
-        "Recent outages",
-        "Settings",
-        "Device setup",
-        "Reset history",
-        "Delete location",
-    ]
-    # UI-D10: "Edit location" is a secondary link-button under the settings panel.
-    settings_section = page[page.index("<h2>Settings</h2>") : page.index("<h2>Device setup</h2>")]
-    assert settings_section.index("</dl>") < settings_section.index("Edit location")
-    assert (
-        f'<p><a class="btn btn--secondary" href="/locations/{location.pk}/edit/">'
-        "Edit location</a></p>"
-    ) in settings_section
-    device = page[page.index("<h2>Device setup</h2>") : page.index("<h2>Reset history</h2>")]
-    assert f"<p>{DEVICE_SETUP_SENTENCE}</p>" in device
-    assert (
-        f'<a class="btn btn--secondary" href="/locations/{location.pk}/setup/">'
-        "Open device setup</a>"
-    ) in device
+    settings_card = section(page, "settings")
+    assert definitions(settings_card, "settings-panel") == expected
+    # The token shows only as its aria-hidden mask (R3).
+    mask = by_testid(settings_card, "masked-token").find("code")
+    assert isinstance(mask, Tag)
+    assert (mask.get_text(), mask.get("aria-hidden")) == (MASKED_TOKEN, "true")
+    # "Edit" is the Settings card's header action, a link to the edit form.
+    edit = by_testid(settings_card, "edit-location")
+    assert (edit.name, edit["href"], text(edit)) == (
+        "a",
+        f"/locations/{location.pk}/edit/",
+        "Edit location",
+    )
+    device = section(page, "device-setup")
+    assert DEVICE_SETUP_SENTENCE in text(device)
+    setup = by_testid(device, "open-setup")
+    assert (setup.name, setup["href"], text(setup)) == (
+        "a",
+        f"/locations/{location.pk}/setup/",
+        "Open device setup",
+    )
 
     Location.objects.filter(pk=location.pk).update(router_grace=False)
 
-    plain = admin.get(_page(location)).content.decode()
-    assert ("Reported OFF after", "65 s without a heartbeat") in _settings_rows(plain)
+    plain = _get(admin, location)
+    assert ("Reported OFF after", "65 s without a heartbeat") in definitions(
+        plain, "settings-panel"
+    )
 
 
 @pytest.mark.django_db
 def test_location_page_delete_section(admin: Client, location_factory: Callable[..., Any]) -> None:
     location = location_factory(name="Office")
 
-    page = admin.get(_page(location)).content.decode()
+    page = _get(admin, location)
 
-    # UI-D5: the last section, a sentence and a secondary link-button that only opens the
-    # confirmation page; the destructive button is on that page, not here.
-    section = page[page.index("<h2>Delete location</h2>") :]
-    section = section[: section.index("</main>")]
-    assert f"<p>{DELETE_SENTENCE}</p>" in section
-    assert (
-        f'<p><a class="btn btn--secondary" href="/locations/{location.pk}/delete/">'
-        "Delete location</a></p>"
-    ) in section
-    assert "<form" not in section
-    assert "btn--danger" not in page
+    # The last card's Delete row: a sentence and a link that only opens the confirmation
+    # page; the destructive button is on that page, not here (R7).
+    danger = section(page, "danger-zone")
+    row = section(page, "delete-location")
+    assert danger.find(id="delete-location") is row
+    assert DELETE_SENTENCE in text(row)
+    link = by_testid(row, "delete-location")
+    assert (link.name, link["href"], text(link)) == (
+        "a",
+        f"/locations/{location.pk}/delete/",
+        "Delete location…",
+    )
+    assert link.has_attr("data-confirm")
+    assert danger.find("form") is None
+    assert not page.select('[data-variant="danger"]')
 
 
 # Secrets (SEC-04) and the admin-typed name (UI rule 1, E2)
@@ -406,14 +552,24 @@ def test_location_page_escapes_the_name(
 ) -> None:
     location = location_factory(name=XSS_NAME)
 
-    page = admin.get(_page(location)).content.decode()
+    response = admin.get(_page(location))
+    html = response.content.decode()
+    page = parse(response)
 
-    assert f'<h1 class="name">{ESCAPED_XSS_NAME}</h1>' in page
-    assert f"<title>{ESCAPED_XSS_NAME} · Power Monitor</title>" in page
-    assert _crumbs(page)[-1] == (' class="name" aria-current="page"', ESCAPED_XSS_NAME)
-    # E3 loading / E10 loading: plain forms and static links, no script at all. The setup
-    # page's half is *_on_setup in tests/web/test_setup_page.py (06-09).
-    assert "<script" not in page
+    # The name is text everywhere: the h1, the title, the breadcrumbs, the sidebar.
+    assert text(h1(page)) == XSS_NAME
+    assert title(page) == f"{XSS_NAME} · Power Monitor"
+    assert breadcrumbs(page)[-1] == (XSS_NAME, None)
+    sidebar = [
+        link
+        for link in all_by_testid(page, "sidebar-location")
+        if link["data-location-id"] == str(location.pk)
+    ]
+    assert [link["title"] for link in sidebar] == [XSS_NAME]
+    assert ESCAPED_XSS_NAME in html
+    # Plain forms and static links: no injected or inline script. The setup page's half is
+    # *_on_setup in tests/web/test_setup_page.py (06-09).
+    assert_no_injected_script(html, "location page")
 
 
 @pytest.mark.django_db
@@ -421,14 +577,15 @@ def test_long_name_is_shown_whole(admin: Client, location_factory: Callable[...,
     name = "x" * 100
     location = location_factory(name=name)
 
-    page = admin.get(_page(location)).content.decode()
+    page = _get(admin, location)
 
-    assert f'<h1 class="name">{name}</h1>' in page
-    assert f"<title>{name} · Power Monitor</title>" in page
-    assert _crumbs(page)[-1] == (' class="name" aria-current="page"', name)
+    assert text(h1(page)) == name
+    assert title(page) == f"{name} · Power Monitor"
+    assert breadcrumbs(page)[-1] == (name, None)
+    assert breadcrumbs(page, "breadcrumbs-compact")[-1] == (name, None)
 
 
-# Breadcrumbs (UI-D2, E10)
+# Breadcrumbs (UI-D2, E10) and the flash after a switch (UI-09)
 
 
 @pytest.mark.django_db
@@ -438,20 +595,21 @@ def test_breadcrumbs_on_location_and_setup_pages(
     location = location_factory(name="Office")
     detail = f"/locations/{location.pk}/"
 
-    page = admin.post(f"{detail}maintenance/", {"value": "on"}, follow=True).content.decode()
+    response = admin.post(f"{detail}maintenance/", {"value": "on"}, follow=True)
+    page = parse(response)
 
-    assert _crumbs(page) == [
-        ("", '<a href="/">Locations</a>'),
-        (' class="name" aria-current="page"', "Office"),
+    assert breadcrumbs(page) == [("Locations", "/"), ("Office", None)]
+    assert breadcrumbs(page, "breadcrumbs-compact") == [("Locations", "/"), ("Office", None)]
+    # The top-bar breadcrumbs come before the h1; the flash is a toast, not page content.
+    # The setup page's half is *_on_setup in tests/web/test_setup_page.py (06-09).
+    elements = list(page.find_all(True))
+    assert elements.index(by_testid(page, "breadcrumbs")) < elements.index(h1(page))
+    assert [(message.level, message.text) for message in messages(page)] == [
+        ("success", MAINTENANCE_COPY["on"])
     ]
-    # Order inside <main>: breadcrumbs, then the flash, then the h1. The setup page's
-    # half is *_on_setup in tests/web/test_setup_page.py (06-09).
-    main = page[page.index("<main") :]
-    assert main.index('<nav aria-label="Breadcrumb">') < main.index('<div class="messages')
-    assert main.index('<div class="messages') < main.index("<h1")
 
 
-# Accent and destructive buttons (UI-D15, UI-D5)
+# Primary and destructive buttons (06-UI-SPEC Components › Button)
 
 
 @pytest.mark.django_db
@@ -460,21 +618,21 @@ def test_location_page_has_one_accent_button_at_most(
 ) -> None:
     location = location_factory()
 
-    page = admin.get(_page(location)).content.decode()
+    page = _get(admin, location)
 
-    # The page's one accent button is "Send test message", in its own POST form (CSRF) to
-    # the test-message URL (UI-D15). The switches, "Edit location", "Open device setup" and
-    # the "Delete location" entry are secondary, and the destructive style is used only on
-    # the delete confirmation page (UI-D5).
-    assert page.count("btn--primary") == 1
-    forms = re.findall(r'<form method="post" action="([^"]+)">(.*?)</form>', page, re.S)
-    primary = [(action, body) for action, body in forms if "btn--primary" in body]
-    assert len(primary) == 1
-    action, body = primary[0]
-    assert action == f"/locations/{location.pk}/test-message/"
-    assert '<button class="btn btn--primary" type="submit">Send test message</button>' in body
-    assert 'name="csrfmiddlewaretoken"' in body
-    assert "btn--danger" not in page
+    # With delivery OK the page has no primary button: the only primary on S5 is the
+    # delivery banner's fix. The Controls card's "Send test message" is secondary, in its
+    # own POST form (CSRF) to the test-message URL, and the destructive style is used only
+    # on the confirmation pages.
+    assert not page.select('[data-variant="primary"]')
+    form = post_form(page, f"/locations/{location.pk}/test-message/")
+    assert form is by_testid(page, "test-message-form")
+    assert form.find("input", attrs={"name": "csrfmiddlewaretoken"}) is not None
+    buttons = [found for found in form.find_all("button") if isinstance(found, Tag)]
+    assert [(b.get("type"), b.get("data-variant"), text(b)) for b in buttons] == [
+        ("submit", "secondary", "Send test message")
+    ]
+    assert not page.select('[data-variant="danger"]')
 
 
 @pytest.mark.django_db
@@ -483,15 +641,23 @@ def test_location_page_test_message_section(
 ) -> None:
     location = location_factory(name="Office")
 
-    page = admin.get(_page(location)).content.decode()
+    response = admin.get(_page(location))
+    page = parse(response)
 
-    # UI-SPEC screen B, section 3: after Switches, before Recent outages (05-UI-SPEC UI5-D1);
-    # the paragraph, then a plain POST form (no script: the browser's own indicator shows
-    # while it waits, E4).
-    section = page[page.index("<h2>Test message</h2>") : page.index("<h2>Recent outages</h2>")]
-    assert f"<p>{TEST_MESSAGE_PARAGRAPH}</p>" in section
-    assert section.count("<form") == 1
-    assert "<script" not in page
+    # 06-UI-SPEC S5 Controls: the three switches, then the Test message block: its micro
+    # heading, the paragraph, then a plain POST form (the submit guard only adds a pending
+    # label, E4).
+    controls = section(page, "controls")
+    forms = [found for found in controls.find_all("form") if isinstance(found, Tag)]
+    assert [form.get("data-testid") for form in forms] == [
+        "switch",
+        "switch",
+        "switch",
+        "test-message-form",
+    ]
+    assert "Test message" in [text(found) for found in controls.find_all("h3")]
+    assert TEST_MESSAGE_PARAGRAPH in text(controls)
+    assert_no_injected_script(response.content.decode(), "location page")
 
 
 # Edge responses: unknown or deleted locations, anonymous visitors
@@ -527,17 +693,18 @@ def test_anonymous_location_page_redirects_to_sign_in(
     assert Location.objects.get(pk=location.pk).maintenance is False
 
 
-# Styles for narrow screens (E3 and E10 overflow)
+# The flash of a switch after the redirect is a toast on this page (UI-09)
 
 
-def test_switch_rows_stack_and_crumbs_wrap_on_narrow_screens() -> None:
-    css = re.sub(r"/\*.*?\*/", "", CSS_PATH.read_text(encoding="utf-8"), flags=re.S)
-    narrow = re.search(r"@media \(width < 640px\) \{(.*)\}\s*$", css, re.S)
-    assert narrow is not None
-    switch = re.search(r"\.switch \{([^}]*)\}", narrow.group(1))
-    assert switch is not None, "switch rows do not stack below 640px"
-    assert "flex-direction: column" in switch.group(1)
-    crumbs = re.search(r"\.crumbs \{([^}]*)\}", css)
-    assert crumbs is not None
-    assert "flex-wrap: wrap" in crumbs.group(1)
-    assert "list-style: none" in crumbs.group(1)
+@pytest.mark.django_db
+def test_location_page_shows_the_switch_flash_as_a_toast(
+    admin: Client, location_factory: Callable[..., Any]
+) -> None:
+    location = location_factory(name="Office")
+
+    page = parse(admin.post(f"/locations/{location.pk}/alerts/", {"value": "off"}, follow=True))
+
+    assert [(m.level, m.role, m.text) for m in messages(page)] == [
+        ("success", "status", ALERTS_COPY["off"])
+    ]
+    assert _tags(page) == ["alerts-off"]

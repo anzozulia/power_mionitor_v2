@@ -18,9 +18,12 @@ Tests that run the relay are ``django_db(transaction=True)``. One FakeClock driv
 relay and the view (``SendTestMessageView.as_view(clock=...)`` through RequestFactory, the
 LOC-02 injection pattern); Telegram is faked at the HTTP boundary (``fake_telegram``), and
 ``ops_settings`` configures the admin chat.
-"""
 
-# class-guard: pending migration
+The location page (S5) is read through tests/web/pages.py and its 06-UI-SPEC hooks: the
+Status card's Delivery value ``[data-delivery]`` and its ``[data-label]``, the
+delivery-failing banner and the two test-message forms. The list page (S3) is read as
+visible text only (``_list_text``).
+"""
 
 import dataclasses
 import re
@@ -47,6 +50,7 @@ from django.contrib.sessions.backends.db import SessionStore
 from django.db import transaction
 from django.http import HttpResponse
 from django.test import Client, RequestFactory
+from pages import all_by_testid, by_testid
 from pages import main as page_main
 from pages import messages as page_messages
 from pages import parse as page_parse
@@ -227,12 +231,17 @@ def _list_text(rf: RequestFactory, clock: FakeClock) -> str:
     return page_text(shown)
 
 
-def _page_delivery(rf: RequestFactory, location: Any) -> str:
-    """The location page's Delivery value, its help lines dropped."""
+def _page_delivery(rf: RequestFactory, location: Any) -> tuple[str, str, bool]:
+    """The location page's Delivery value: its state, its label (the help line and the
+    relative time left out) and whether the delivery-failing banner shows."""
     html = _get(rf, LocationDetailView.as_view(), f"/locations/{location.pk}/", pk=location.pk)
-    row = re.search(r"<dt>Delivery</dt>\s*<dd>(.*?)</dd>", html, re.S)
-    assert row is not None, "no Delivery row on the location page"
-    return re.sub(r'<p class="help">.*?</p>', "", row.group(1), flags=re.S).strip()
+    page = page_parse(html)
+    found = by_testid(page, "status-panel").select("[data-delivery]")
+    assert len(found) == 1, "no Delivery value on the location page"
+    label = found[0].select_one("[data-label]")
+    assert label is not None, "the Delivery value has no label"
+    banner = bool(all_by_testid(page, "delivery-banner"))
+    return str(found[0]["data-delivery"]), page_text(label), banner
 
 
 def _error(status: int, description: str, **parameters: Any) -> dict[str, Any]:
@@ -279,8 +288,9 @@ def test_INV16_1_test_message_clears_failing_and_releases_the_queue(
     # The badge: the list's Delivery text and the location page's Delivery row (D-13).
     assert "Failing since 13:06 (http_403)" in _list_text(rf, clock)
     assert _page_delivery(rf, location) == (
-        '<span class="status status--failing">'
-        "Failing since 2026-10-01 13:06:31 EEST (http_403)</span>"
+        "failing",
+        "Failing since 2026-10-01 13:06:31 EEST (http_403)",
+        True,
     )
 
     # Five minutes later the 403's 15-minute hold is still in force: nothing is sent.
@@ -306,7 +316,7 @@ def test_INV16_1_test_message_clears_failing_and_releases_the_queue(
     listed = _list_text(rf, clock)
     assert "Failing since" not in listed
     assert re.search(r"\bOK\b", listed), listed
-    assert _page_delivery(rf, location) == "OK"
+    assert _page_delivery(rf, location) == ("ok", "OK", False)
 
     # The worker's next pass, still at the test time (10 minutes before the hold would
     # end), sends the OFF with its event time, then the recovery notice to the admin.
