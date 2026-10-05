@@ -840,15 +840,107 @@ def registered_names(source: str) -> list[str]:
     return [m.group("name") for m in _REGISTRATION.finditer(source) if code[m.start()] != " "]
 
 
-def component_bodies(source: str) -> dict[str, str]:
-    """The text of each ``Alpine.data(...)`` call, by name (the first one for a repeat)."""
+def component_spans(source: str) -> dict[str, tuple[int, int]]:
+    """(start, end) offsets of each ``Alpine.data(...)`` call, by name (the first one)."""
     code = _mask_js(source)
-    bodies: dict[str, str] = {}
+    spans: dict[str, tuple[int, int]] = {}
     for match in _REGISTRATION.finditer(source):
         if code[match.start()] != " ":
-            end = _closing(code, match.start())
-            bodies.setdefault(match.group("name"), source[match.start() : end + 1])
-    return bodies
+            spans.setdefault(match.group("name"), (match.start(), _closing(code, match.start())))
+    return spans
+
+
+def component_bodies(source: str) -> dict[str, str]:
+    """The text of each ``Alpine.data(...)`` call, by name (the first one for a repeat)."""
+    return {name: source[start : end + 1] for name, (start, end) in component_spans(source).items()}
+
+
+def _code_matches(pattern: re.Pattern[str], source: str) -> Iterator[re.Match[str]]:
+    """Matches of ``pattern`` in the raw source that start in code (not a comment/string)."""
+    code = _mask_js(source)
+    return (m for m in pattern.finditer(source) if code[m.start()] != " ")
+
+
+_FETCH_CALL = re.compile(r"(?<![\w$])fetch\s*\(")
+_FETCH_NAME = re.compile(r"(?<![\w$])fetch\b")
+# A fetch URL is a value the server rendered into the page: a data-* value or a link's href.
+_FETCH_URL = re.compile(r"[\w$]+(?:\.[\w$]+)*\.(?:dataset\.[\w$]+|href)")
+
+
+def fetch_calls(source: str) -> list[tuple[str, str]]:
+    """(first argument, rest of the arguments) of every fetch(...) call in code."""
+    code = _mask_js(source)
+    calls = []
+    for match in _code_matches(_FETCH_CALL, source):
+        opening = code.index("(", match.start())
+        closing = _closing(code, match.start())
+        depth, comma = 0, closing
+        for index in range(opening + 1, closing):
+            if code[index] in "([{":
+                depth += 1
+            elif code[index] in ")]}":
+                depth -= 1
+            elif code[index] == "," and depth == 0:
+                comma = index
+                break
+        calls.append((source[opening + 1 : comma].strip(), source[comma + 1 : closing].strip()))
+    return calls
+
+
+def fetch_violations(source: str) -> list[str]:
+    """TEST-STRATEGY §5.5: every fetch is a GET of a server-rendered same-origin URL that
+    never follows a redirect (T-06-35, T-06-37)."""
+    found: set[str] = set()
+    calls = fetch_calls(source)
+    if sum(1 for _ in _code_matches(_FETCH_NAME, source)) != len(calls):
+        found.add("fetch used other than as a call")
+    for url, options in calls:
+        if _FETCH_URL.fullmatch(url) is None:
+            found.add("fetch URL not from a data-* value or a link's href")
+        if re.search(r"\bredirect\s*:\s*([\"'])manual\1", options) is None:
+            found.add('fetch without redirect: "manual"')
+        if re.search(r"\bmethod\s*:", options) and not re.search(
+            r"\bmethod\s*:\s*([\"'])GET\1", options
+        ):
+            found.add("fetch method other than GET")
+        if re.search(r"\bbody\s*:", options):
+            found.add("fetch with a body")
+    return sorted(found)
+
+
+_CLIPBOARD_WRITE = re.compile(r"\bnavigator\s*\.\s*clipboard\s*\.\s*writeText\s*\(")
+_CLICK_LISTENER = re.compile(r"\.\s*addEventListener\s*\(\s*([\"'])click\1")
+
+
+def clipboard_violations(source: str) -> list[str]:
+    """UI-08 / R4: the clipboard is only written, only by the copy component, only inside a
+    click listener; it is never read."""
+    code = _mask_js(source)
+    found: set[str] = set()
+    if re.search(r"\bclipboard\s*\.\s*read|\bexecCommand\b", code):
+        found.add("clipboard read or execCommand")
+    start, end = component_spans(source).get("copy", (-1, -1))
+    clicks = [
+        (m.start(), _closing(code, m.start()))
+        for m in _code_matches(_CLICK_LISTENER, source)
+        if start < m.start() < end
+    ]
+    writes = [m.start() for m in _code_matches(_CLIPBOARD_WRITE, source)]
+    if not writes:
+        found.add("no clipboard write")
+    if any(not any(a < w < b for a, b in clicks) for w in writes):
+        found.add("clipboard write outside the copy component's click listener")
+    return sorted(found)
+
+
+def poll_schedule(source: str) -> dict[str, object]:
+    """The poll component's interval, backoff steps and failure threshold, from its text."""
+    body = component_bodies(source).get("poll", "")
+    return {
+        "interval": int(js_var(body, "POLL_INTERVAL_MS")),
+        "backoff": [int(n) for n in re.findall(r"\d+", js_var(body, "POLL_BACKOFF_MS"))],
+        "pause_after": int(js_var(body, "POLL_PAUSE_AFTER")),
+    }
 
 
 def missing_hooks(body: str, hooks: tuple[str, ...]) -> list[str]:
@@ -1001,6 +1093,67 @@ CONTRACT_HOOKS: dict[str, tuple[str, ...]] = {
         '"pm:status"',
         "RELATIVE_REFRESH_MS",
     ),
+    "poll": (
+        "dataset.pollUrl",
+        "dataset.pollPage",
+        "dataset.reloadUrl",
+        '[data-testid="live-status"]',
+        '"data-live-state"',
+        '[data-testid="live-chip"]',
+        "[data-chip]",
+        '"Live"',
+        '"Paused"',
+        "[data-live][data-location-id]",
+        'a[data-testid="sidebar-location"]',
+        '[data-live="summary"]',
+        '[data-live="count"]',
+        '[data-testid="fleet-tile"]',
+        '[data-testid="fleet-count"]',
+        '[data-testid="fleet-bar"]',
+        '"opaqueredirect"',
+        '"visibilitychange"',
+        '"pm:status"',
+    ),
+    "copy": (
+        '"data-copy-target"',
+        '"data-copied-msg"',
+        "[data-copy-status]",
+        '"data-copied"',
+        '"Copied"',
+        '"Copy failed. Select the text and copy it by hand."',
+        "navigator.clipboard.writeText",
+    ),
+    "tabs": (
+        '[role="tablist"][data-testid="example-tabs"]',
+        '[role="tab"]',
+        '"aria-controls"',
+        '"aria-selected"',
+        '"tabindex"',
+        '"ArrowLeft"',
+        '"ArrowRight"',
+        '"Home"',
+        '"End"',
+    ),
+    "revealGuard": (
+        '"pagehide"',
+        "onPageshow(",
+        "persisted",
+        "location.replace(",
+        "dataset.maskedUrl",
+        '"device-key"',
+        '"example-curl"',
+        '"example-cron"',
+        '"example-wget-gnu"',
+        '"example-wget-busybox"',
+    ),
+    "chartImage": ('"error"', '[data-testid="weekly-chart-error"]', "naturalWidth"),
+    "sectionNav": (
+        'a[href^="#"]',
+        "(prefers-reduced-motion: reduce)",
+        "scrollIntoView",
+        '"tabindex"',
+        "preventScroll",
+    ),
 }
 
 
@@ -1120,12 +1273,160 @@ def test_admin_js_components_name_their_contract_hooks(name: str) -> None:
     bodies = component_bodies(ADMIN_JS.read_text(encoding="utf-8"))
 
     # Expected: the component exists and names every hook of its contract row.
-    assert missing_hooks(bodies[name], CONTRACT_HOOKS[name]) == []
+    assert missing_hooks(bodies.get(name, ""), CONTRACT_HOOKS[name]) == []
     # Failure: a body without the hooks reports every one of them.
     stub = 'Alpine.data("' + name + '", function () { return {}; })'
     assert missing_hooks(component_bodies(stub)[name], CONTRACT_HOOKS[name]) == list(
         CONTRACT_HOOKS[name]
     )
+
+
+FETCH_URL_RULE = "fetch URL not from a data-* value or a link's href"
+NO_MANUAL = 'fetch without redirect: "manual"'
+
+
+def test_admin_js_fetch_rules() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+
+    # Expected: every fetch passes the rules, and the poll fetches its data-poll-url.
+    assert fetch_violations(source) == []
+    assert "main.dataset.pollUrl" in [url for url, _ in fetch_calls(source)]
+
+
+@pytest.mark.parametrize(
+    ("sample", "expected"),
+    [
+        pytest.param('fetch(main.dataset.pollUrl, { redirect: "manual" });', [], id="dataset"),
+        pytest.param(
+            "window.fetch(link.href, {redirect: 'manual', method: \"GET\", "
+            'headers: {"X-PM-Fragment": "1"}});',
+            [],
+            id="href-get",
+        ),
+        # Edge: a fetch in a comment or a string is not code.
+        pytest.param(
+            '// fetch("/x")\nvar s = "fetch(1)";\nfetch(main.dataset.pollUrl, {redirect: "manual"});',
+            [],
+            id="comment",
+        ),
+        # Failure: a literal or built URL, a followed redirect, a write, an alias.
+        pytest.param(
+            'fetch("/locations/status.json", { redirect: "manual" });', [FETCH_URL_RULE], id="literal"
+        ),
+        pytest.param(
+            'fetch(main.dataset.pollUrl + "?all=1", { redirect: "manual" });',
+            [FETCH_URL_RULE],
+            id="built",
+        ),
+        pytest.param("fetch(main.dataset.pollUrl);", [NO_MANUAL], id="no-options"),
+        pytest.param(
+            'fetch(main.dataset.pollUrl, { redirect: "follow" });', [NO_MANUAL], id="follow"
+        ),
+        pytest.param(
+            'fetch(link.href, { redirect: "manual", method: "POST" });',
+            ["fetch method other than GET"],
+            id="post",
+        ),
+        pytest.param(
+            'fetch(link.href, { redirect: "manual", body: data });', ["fetch with a body"], id="body"
+        ),
+        pytest.param(
+            "var get = fetch; get(link.href);", ["fetch used other than as a call"], id="alias"
+        ),
+    ],
+)
+def test_fetch_rule(sample: str, expected: list[str]) -> None:
+    assert fetch_violations(sample) == expected
+
+
+def test_admin_js_poll_schedule() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+    body = component_bodies(source).get("poll", "")
+    expected = {"interval": 30_000, "backoff": [60_000, 120_000, 240_000, 300_000], "pause_after": 3}
+
+    # Expected: 30 s while visible; 60 -> 120 -> 240 -> 300 s after failures; paused after
+    # 3 failures in a row; polls at once on becoming visible; stops on an opaque redirect.
+    assert poll_schedule(source) == expected
+    for hook in ('"visibilitychange"', "document.visibilityState", '"opaqueredirect"'):
+        assert hook in body, hook
+    # Failure: a drifted constant is seen.
+    drifted = source.replace("POLL_INTERVAL_MS = 30000", "POLL_INTERVAL_MS = 5000")
+    assert poll_schedule(drifted) != expected
+
+
+def test_admin_js_copy_uses_click_only() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+
+    # Expected: one clipboard write, inside the copy component's click listener; no read.
+    assert clipboard_violations(source) == []
+    assert len(list(_code_matches(_CLIPBOARD_WRITE, source))) == 1
+
+
+COPY_OK = (
+    'Alpine.data("copy", function () { return { init: function () {'
+    ' b.addEventListener("click", function () { navigator.clipboard.writeText(t.textContent); });'
+    " } }; });"
+)
+OUTSIDE_CLICK = "clipboard write outside the copy component's click listener"
+
+
+@pytest.mark.parametrize(
+    ("sample", "expected"),
+    [
+        pytest.param(COPY_OK, [], id="click"),
+        # Failure: a write on init (an automatic copy of a revealed key), a write in another
+        # component, any read, execCommand, no write at all.
+        pytest.param(
+            'Alpine.data("copy", function () { return { init: function () {'
+            " navigator.clipboard.writeText(t.textContent); } }; });",
+            [OUTSIDE_CLICK],
+            id="on-init",
+        ),
+        pytest.param(
+            COPY_OK.replace('"copy"', '"revealGuard"'), [OUTSIDE_CLICK], id="no-copy-component"
+        ),
+        pytest.param(
+            COPY_OK
+            + 'Alpine.data("revealGuard", function () { return { init: function () {'
+            ' b.addEventListener("click", function () { navigator.clipboard.writeText(k); });'
+            " } }; });",
+            [OUTSIDE_CLICK],
+            id="other-component",
+        ),
+        pytest.param(
+            COPY_OK + " navigator.clipboard.readText();",
+            ["clipboard read or execCommand"],
+            id="read",
+        ),
+        pytest.param(
+            COPY_OK + ' document.execCommand("copy");',
+            ["clipboard read or execCommand"],
+            id="exec-command",
+        ),
+        pytest.param("var x = 1;", ["no clipboard write"], id="none"),
+    ],
+)
+def test_clipboard_rule(sample: str, expected: list[str]) -> None:
+    assert clipboard_violations(sample) == expected
+
+
+def test_admin_js_reveal_guard() -> None:
+    source = ADMIN_JS.read_text(encoding="utf-8")
+    body = component_bodies(source).get("revealGuard", "")
+    replaced = re.findall(r"\blocation\s*\.\s*replace\s*\(\s*([^)]*)\)", body)
+
+    # Expected: pagehide empties the key and the four examples; pageshow with persisted
+    # replaces the page with the masked setup URL from data-masked-url (R4).
+    assert missing_hooks(body, CONTRACT_HOOKS["revealGuard"]) == []
+    assert re.search(r"\.textContent\s*=\s*\"\"", body) is not None
+    assert replaced != [] and all("maskedUrl" in argument for argument in replaced)
+    # Edge: admin.js keeps one window pageshow listener (06-07's reset), which also runs
+    # the handlers components register through onPageshow.
+    listener = re.search(r"window\.addEventListener\(\"pageshow\", function \(event\) \{", source)
+    assert listener is not None
+    assert "pageshowHandlers.forEach" in source[listener.end() :]
+    # Failure: a guard that never checks persisted, or replaces with another URL, is caught.
+    assert missing_hooks(body.replace("persisted", "loaded"), ("persisted",)) == ["persisted"]
 
 
 def test_component_bodies_follow_the_brackets() -> None:
