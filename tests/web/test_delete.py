@@ -53,6 +53,7 @@ from django.db.models import F, Value
 from django.db.models.functions import Greatest
 from django.http import HttpResponse
 from django.test import Client, RequestFactory
+from pages import Message, message_texts, messages
 
 from powermon.alerts import delivery, outbox
 from powermon.alerts.models import OpsIncident, OutboxMessage
@@ -125,10 +126,6 @@ def _post_delete(
     request._messages = FallbackStorage(request)  # type: ignore[attr-defined]
     response = location_views.LocationDeleteView.as_view(clock=clock)(request, pk=location.pk)
     return response, [str(m) for m in request._messages]  # type: ignore[attr-defined]
-
-
-def _flashes(page: str) -> list[str]:
-    return [unescape(t) for t in re.findall(r'role="(?:status|alert)">([^<]*)<', page)]
 
 
 def _main(page: str) -> str:
@@ -334,7 +331,7 @@ def test_delete_twice_shows_already_deleted(
     first = admin.post(_delete(location))
     assert first.status_code == 302
     assert first.url == "/"
-    assert _flashes(admin.get(first.url).content.decode()) == [DELETED_FLASH]
+    assert message_texts(admin.get(first.url)) == [DELETED_FLASH]
     deleted_at = Location.objects.get(pk=location.pk).deleted_at
     assert deleted_at is not None
     version = LocationState.objects.get(location=location).state_version
@@ -346,8 +343,12 @@ def test_delete_twice_shows_already_deleted(
     assert second.status_code == 302
     assert second.url == "/"
     page = admin.get(second.url).content.decode()
-    assert _flashes(page) == [ALREADY_DELETED_FLASH]
-    assert f'<p class="callout" role="status">{ALREADY_DELETED_FLASH}</p>' in page
+    assert message_texts(page) == [ALREADY_DELETED_FLASH]
+    # An info flash announced as status: a legacy callout (no level) or an info toast.
+    assert messages(page) in (
+        [Message(None, "status", ALREADY_DELETED_FLASH)],
+        [Message("info", "status", ALREADY_DELETED_FLASH)],
+    )
     assert Location.objects.get(pk=location.pk).deleted_at == deleted_at
     assert LocationState.objects.get(location=location).state_version == version
     assert _row(late).status == "pending"

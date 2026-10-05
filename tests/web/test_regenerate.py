@@ -29,6 +29,7 @@ from django.db import transaction
 from django.http import HttpResponse
 from django.test import Client, RequestFactory
 from django.utils.crypto import salted_hmac
+from pages import hidden_value, messages, post_form
 
 from powermon.alerts import outbox
 from powermon.alerts.models import OutboxMessage
@@ -96,15 +97,14 @@ def _key(location: Any) -> str:
     return str(Location.objects.get(pk=location.pk).device_key)
 
 
-def _marker(page: str) -> str:
-    """The hidden marker of the confirmation page's one form."""
-    found = re.findall(r'<input type="hidden" name="marker" value="([^"]*)">', page)
-    assert len(found) == 1
-    return str(found[0])
+def _marker(page: HttpResponse | str, location: Any) -> str:
+    """The hidden marker of the confirmation's one regenerate form, whatever its markup."""
+    return hidden_value(post_form(page, _confirm(location)), "marker")
 
 
 def _flashes(page: str) -> list[str]:
-    return re.findall(r'role="status">([^<]*)<', page)
+    """The text of each flash announced as status, toast or legacy callout alike (UI-09)."""
+    return [flash.text for flash in messages(page) if flash.role == "status"]
 
 
 def _block(page: str, block_id: str) -> str:
@@ -183,7 +183,7 @@ def test_INV24_1_regeneration_kills_the_old_key_and_keeps_history(
     locations = list(Location.objects.order_by("pk").values_list("pk", "name", "deleted_at"))
 
     confirm = admin.get(_confirm(location))
-    response = admin.post(_confirm(location), {"marker": _marker(confirm.content.decode())})
+    response = admin.post(_confirm(location), {"marker": _marker(confirm, location)})
 
     # D-14: the setup page revealed with the new key, not cached, with the success flash.
     assert response.status_code == 200
@@ -231,7 +231,7 @@ def test_regenerate_resubmit_never_replaces_the_key_twice(
     admin: Client, location_factory: Callable[..., Any], fake_telegram: FakeTelegram
 ) -> None:
     location = location_factory(name="Office")
-    marker = _marker(admin.get(_confirm(location)).content.decode())
+    marker = _marker(admin.get(_confirm(location)), location)
 
     first = admin.post(_confirm(location), {"marker": marker})
     regenerated = _key(location)
@@ -271,7 +271,7 @@ def test_regenerate_race_one_winner(
     # The marker is valid, but another tab's regenerate commits between this POST's read
     # of the key and its UPDATE: the conditional UPDATE finds the old key gone.
     location = location_factory(name="Office")
-    marker = _marker(admin.get(_confirm(location)).content.decode())
+    marker = _marker(admin.get(_confirm(location)), location)
     real = actions.regenerate_key
     outcomes: list[bool] = []
 
@@ -401,7 +401,7 @@ def test_regenerate_confirmation_shows_no_key(
     assert key[-4:] not in page
     # UI-D7: the marker is a salted HMAC of the key, with no key characters (T-04-18).
     expected = salted_hmac("powermon.regenerate-key", key, algorithm="sha256").hexdigest()
-    assert _marker(page) == expected
+    assert _marker(page, location) == expected
     assert re.fullmatch(r"[0-9a-f]{64}", expected)
 
 
@@ -471,7 +471,7 @@ def test_regenerate_without_a_csrf_token_is_refused(location_factory: Callable[.
     browser.force_login(User.objects.create_user("admin", password="not-used-here"))
     page = browser.get(_confirm(location)).content.decode()
 
-    response = browser.post(_confirm(location), {"marker": _marker(page)})
+    response = browser.post(_confirm(location), {"marker": _marker(page, location)})
 
     assert response.status_code == 403
     assert _key(location) == location.device_key
@@ -484,7 +484,7 @@ def test_regenerate_page_records_nothing_for_a_heartbeat_in_between(
     # A heartbeat between the confirmation and the POST changes nothing about the guard:
     # the marker is of the key, not of the state, so the POST still regenerates once.
     location = location_factory(name="Office")
-    marker = _marker(admin.get(_confirm(location)).content.decode())
+    marker = _marker(admin.get(_confirm(location)), location)
     assert transitions.record_heartbeat(location.pk, _at(8, 0)) == "started"
 
     page = admin.post(_confirm(location), {"marker": marker}).content.decode()

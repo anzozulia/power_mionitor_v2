@@ -11,22 +11,26 @@ security rules 3, 4 and 8).
 - The full device key appears in exactly two responses: the setup page's Reveal POST and
   the Regenerate POST (D-14), both ``Cache-Control: no-store``. After the regenerate the
   new key follows the same rule, and the old key appears nowhere.
-- No scanned page has a script element (UI-SPEC rule 8).
+- No scanned page carries an injected script, a script with a body or an inline event
+  handler; a script may only load from a manifest-hashed same-origin static path
+  (``pages.assert_no_injected_script``; R5, UI-13).
 - Phase 5 (05-UI-SPEC security rule 3): the location page with outages listed, with the
   in-progress row and in both empty states, the removal and reset confirmation pages, and
   the location page after each of the seven Phase 5 flashes (removed, removal refused,
   already gone, removal deferred, history reset, reset refused, nothing to reset) carry
-  neither the bot token nor the device key, put neither in a ``Location`` header and have
-  no script. The confirmation pages have no settings panel, so not even the mask shows.
+  neither the bot token nor the device key, put neither in a ``Location`` header and carry
+  no injected or inline script. The confirmation pages have no settings panel, so not even
+  the mask shows.
+
+Pages are read through ``pages.py``: the flashes with ``messages()`` (toast or legacy
+callout), the regenerate marker with ``hidden_value(post_form(...), "marker")``.
 
 The scans run through the signed-in test client, Telegram faked at the HTTP boundary
 (``fake_telegram``); the 429 page comes from five failed sign-ins in a separate client.
 """
 
-import re
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
-from html import unescape
 from typing import Any
 
 import pytest
@@ -36,6 +40,7 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.http import HttpResponse
 from django.test import Client
+from pages import assert_no_injected_script, hidden_value, message_texts, messages, post_form
 from secret_fixtures import MASKED, MASKED_2, MASKED_3, SECRET, SECRETS, TOKEN, TOKEN_2, TOKEN_3
 
 from powermon.alerts import ops, outbox
@@ -98,11 +103,9 @@ def _form(location: Any, **overrides: str) -> dict[str, str]:
     }
 
 
-def _marker(page: str) -> str:
-    """The regenerate confirmation's hidden marker (UI-D7)."""
-    found = re.search(r'<input type="hidden" name="marker" value="([^"]*)">', page)
-    assert found is not None, "no marker in the regenerate confirmation"
-    return found.group(1)
+def _marker(page: HttpResponse | str, location: Any) -> str:
+    """The regenerate confirmation's hidden marker (UI-D7), whatever its attribute order."""
+    return hidden_value(post_form(page, _urls(location)["regenerate"]), "marker")
 
 
 def _error(status: int, description: str, **parameters: Any) -> dict[str, Any]:
@@ -112,21 +115,11 @@ def _error(status: int, description: str, **parameters: Any) -> dict[str, Any]:
     return body
 
 
-def _flash_count(html: str) -> int:
-    return len(re.findall(r'role="(?:status|alert)">', html))
-
-
 def _headers_and_urls(response: HttpResponse) -> Iterator[str]:
     """The ``Location`` header and every URL the client followed for this response."""
     yield response.get("Location", "")
     for url, _status in getattr(response, "redirect_chain", []):
         yield url
-
-
-def _assert_no_script(label: str, html: str) -> None:
-    # UI-SPEC rule 8: no script, no inline handler, no external URL on any admin page.
-    assert "<script" not in html, label
-    assert not re.search(r"\son[a-z]+=", html), label
 
 
 def _throttled_sign_in() -> HttpResponse:
@@ -162,7 +155,7 @@ def _test_message_results(admin: Client, fake_telegram: FakeTelegram, url: str) 
     for page in pages:
         # Each result has its own flash on the location page it redirects to.
         assert page.status_code == 200
-        assert _flash_count(page.content.decode()) == 1
+        assert len(messages(page)) == 1
     return pages
 
 
@@ -192,7 +185,7 @@ def test_INV23_2_token_never_in_any_page(
     seen.append(("regenerate confirmation", confirm, None))
     seen.append(("setup masked", admin.get(urls["setup"]), MASKED))
     seen.append(("setup revealed", admin.post(urls["setup"]), MASKED))
-    regenerated = admin.post(urls["regenerate"], {"marker": _marker(confirm.content.decode())})
+    regenerated = admin.post(urls["regenerate"], {"marker": _marker(confirm, location)})
     seen.append(("regenerate POST", regenerated, MASKED))
     saved = admin.post(urls["edit"], _form(location, name="Renamed"), follow=True)
     seen.append(("page after a valid save", saved, MASKED))
@@ -213,7 +206,7 @@ def test_INV23_2_token_never_in_any_page(
         assert MASKED_2 not in html, label
         if mask is not None:
             assert mask in html, label
-        _assert_no_script(label, html)
+        assert_no_injected_script(html, label)
 
 
 # The device key (D-14, UI-SPEC rule 4)
@@ -257,11 +250,11 @@ def test_INV23_2_key_only_in_reveal_and_regenerate(
         assert key not in html, label
         for url in _headers_and_urls(response):
             assert key not in url, label
-        _assert_no_script(label, html)
+        assert_no_injected_script(html, label)
 
     revealed = admin.post(urls["setup"])
     confirm = admin.get(urls["regenerate"]).content.decode()
-    regenerated = admin.post(urls["regenerate"], {"marker": _marker(confirm)})
+    regenerated = admin.post(urls["regenerate"], {"marker": _marker(confirm, location)})
     new_key = Location.objects.get(pk=location.pk).device_key
 
     # Exactly the Reveal POST and the Regenerate POST carry a full key, never cached.
@@ -272,7 +265,7 @@ def test_INV23_2_key_only_in_reveal_and_regenerate(
     for response in (revealed, regenerated):
         assert response.status_code == 200
         assert "no-store" in response["Cache-Control"]
-        _assert_no_script("reveal/regenerate", response.content.decode())
+        assert_no_injected_script(response.content.decode(), "reveal/regenerate")
 
     # After the rotation neither key shows anywhere else; a new Reveal shows the new one.
     Location.objects.filter(pk=location.pk).update(maintenance=False)
@@ -317,10 +310,6 @@ def _timeline(location: Any, *pieces: tuple[str, datetime, datetime | None]) -> 
 def _live(location: Any, status: str, **fields: Any) -> None:
     """The live state the engine would have left with that timeline."""
     LocationState.objects.filter(pk=location.pk).update(status=status, **fields)
-
-
-def _flash_texts(html: str) -> list[str]:
-    return [unescape(t) for t in re.findall(r'role="(?:status|alert)">([^<]*)<', html)]
 
 
 @pytest.mark.django_db
@@ -407,7 +396,7 @@ def test_INV23_2_history_pages_and_flashes_never_show_a_token_or_the_key(
     for label, url, flash in actions:
         response = admin.post(url, follow=True)
         # Each action reached its own flash on the location page it redirects to.
-        assert _flash_texts(response.content.decode()) == [flash], label
+        assert message_texts(response) == [flash], label
         assert response.redirect_chain, label
         seen.append((f"location page after the {label} flash", response, True))
 
@@ -426,6 +415,6 @@ def test_INV23_2_history_pages_and_flashes_never_show_a_token_or_the_key(
             # No settings panel on a confirmation page: not even the masked token.
             assert MASKED not in html, label
             assert "•" not in html[html.index("<main") :], label
-        _assert_no_script(label, html)
+        assert_no_injected_script(html, label)
     # No action called Telegram (KD2).
     assert len(fake_telegram.calls) == 0

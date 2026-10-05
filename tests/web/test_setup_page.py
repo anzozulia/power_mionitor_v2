@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 from django.contrib.auth import get_user_model
 from django.test import Client
+from pages import hidden_value, post_form
 
 from powermon.engine.models import LocationState
 from powermon.locations.examples import (
@@ -197,9 +198,9 @@ def test_full_key_appears_in_no_other_response(admin: Client) -> None:
 
     # The only other response with the full key is the Regenerate POST, with the new one
     # (SEC-04, D-14); the old key is gone from it, and the new key from every page after.
-    marker = re.search(r'name="marker" value="([^"]+)"', confirm.content.decode())
-    assert marker is not None
-    regenerated = admin.post(regenerate, {"marker": marker.group(1)})
+    marker = hidden_value(post_form(confirm, regenerate), "marker")
+    assert marker
+    regenerated = admin.post(regenerate, {"marker": marker})
     new_key = Location.objects.get(pk=location.pk).device_key
     assert new_key != key
     assert new_key in regenerated.content.decode()
