@@ -1,4 +1,5 @@
 @import "tailwindcss" source(none);
+@import "./fonts.css";
 @source "../../templates";
 @source "../../static/web/admin.js";
 /* Always built, even before a template uses them (the design is never missing from the file). */

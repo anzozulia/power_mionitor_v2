@@ -1,7 +1,8 @@
-{% extends "layouts/error.html" %}
+{% extends "layouts/error.html" %}{% load icons %}
 {% comment %}E2, copy row e403. Django renders this for a failed form check, with the request and every context processor; fixed copy only, so the failure reason never reaches the page (R11).{% endcomment %}
 {% block title %}Form expired{% endblock %}
 {% block code %}403{% endblock %}
 {% block code_label %}403{% endblock %}
+{% block icon %}{% icon "clock" class="size-6 text-icon" %}{% endblock %}
 {% block heading %}Form expired{% endblock %}
 {% block body %}This form was open too long, or the browser blocked cookies. Go back, reload the page and try again.{% endblock %}
