@@ -39,7 +39,7 @@ import pytest
 from conftest import FakeClock, FakeTelegram
 from django.contrib.auth import get_user_model
 from django.test import Client
-from pages import messages
+from pages import assert_page, breadcrumbs, by_testid, definitions, h1, main, messages, text
 
 from powermon.alerts import ops, outbox
 from powermon.alerts.models import OutboxMessage
@@ -90,8 +90,7 @@ RESET_CONSEQUENCES = [
 RESET_ALTERNATIVE = (
     "To remove a single false outage instead, use Recent outages on the location page."
 )
-# 05-UI-SPEC Copywriting › Remove-outage confirmation, verbatim (Consequence 3 as amended on
-# 2026-10-03 for the refined D-04).
+# 06-UI-SPEC copy rows remove.*, verbatim (remove.c3 is amendment A3, the refined D-04).
 LEAD = "This cannot be undone. Removing this outage:"
 CONSEQUENCE_1 = (
     "records its off time as power on, so the chart and the daily totals no longer count it "
@@ -102,9 +101,9 @@ CONSEQUENCE_2 = (
     "monitored;"
 )
 CONSEQUENCE_3 = (
-    "sends no new message to the channel. If its OFF alert was never sent, its queued OFF and "
-    "ON alerts are dropped; if the OFF alert already went out, a queued ON alert is still "
-    "sent, so the channel is not left at power off;"
+    "sends nothing itself, and drops its queued OFF and ON alerts if the OFF alert was never "
+    "sent (if it already went out, its queued ON alert is still sent, so the channel is not "
+    "left at power off);"
 )
 CONSEQUENCE_4 = (
     "leaves the live status unchanged, including the On since time from which the next OFF "
@@ -184,6 +183,16 @@ def _consequences(page: str) -> list[str]:
     found = re.search(r'<ul class="list">(.*?)</ul>', page, re.S)
     assert found is not None, "no consequence list"
     return [unescape(item) for item in re.findall(r"<li>(.*?)</li>", found.group(1), re.S)]
+
+
+def _remove_trail(location: Any, name: str) -> list[tuple[str, str | None]]:
+    """The S10 breadcrumbs: Locations > {name} > Remove outage (the current page)."""
+    return [("Locations", "/"), (name, _page(location)), ("Remove outage", None)]
+
+
+def _items(root: Any, testid: str) -> list[str]:
+    """The text of each item of the list hook ``testid`` inside ``root``."""
+    return [text(item) for item in by_testid(root, testid).find_all("li")]
 
 
 def _intervals(location: Any) -> list[tuple[str, datetime, datetime | None, datetime | None]]:
@@ -288,39 +297,40 @@ def test_remove_confirmation_page(
 
     response = admin.get(url)
 
-    assert response.status_code == 200
-    html = response.content.decode()
-    page = _main(html)
-    assert "<title>Office · Remove outage · Power Monitor</title>" in html
-    assert _crumbs(page) == [
-        ("", '<a href="/">Locations</a>'),
-        ("", f'<a class="name" href="/locations/{location.pk}/">Office</a>'),
-        (' aria-current="page"', "Remove outage"),
+    # assert_page also proves there is no injected or inline script (R5).
+    soup = assert_page(response, app=True, title="Office · Remove outage")
+    root = by_testid(main(soup), "confirm")
+    assert breadcrumbs(soup) == _remove_trail(location, "Office")
+    # The h1 carries no name (UI5-D13).
+    assert text(h1(soup)) == "Remove this outage?"
+    assert definitions(root, "outage-details") == [
+        ("Start", "2026-10-01 12:00:00 EEST"),
+        ("End", "2026-10-01 13:00:00 EEST"),
+        ("Off time", "1h"),
     ]
-    assert "<h1>Remove this outage?</h1>" in page
-    assert _panel(page) == [
-        ("Start", '<span class="num">2026-10-01 12:00:00 EEST</span>'),
-        ("End", '<span class="num">2026-10-01 13:00:00 EEST</span>'),
-        ("Off time", '<span class="num">1h</span>'),
-    ]
-    assert f"<p>{LEAD}</p>" in page
     # No not-monitored time inside this outage: no Consequence 2.
-    assert _consequences(page) == [CONSEQUENCE_1, CONSEQUENCE_3, CONSEQUENCE_4]
-    # Consequence 3 states the refined D-04 (05-UI-SPEC, amended 2026-10-03).
-    assert _consequences(page)[1] == (
-        "sends no new message to the channel. If its OFF alert was never sent, its queued OFF "
-        "and ON alerts are dropped; "
-        "if the OFF alert already went out, a queued ON alert is still sent, so the channel is not left at power off;"  # noqa: E501
+    assert _items(root, "consequences") == [CONSEQUENCE_1, CONSEQUENCE_3, CONSEQUENCE_4]
+    # Consequence 3 states the refined D-04 in the 06-UI-SPEC amendment A3 wording.
+    assert _items(root, "consequences")[1] == (
+        "sends nothing itself, and drops its queued OFF and ON alerts if the OFF alert was "
+        "never sent (if it already went out, its queued ON alert is still sent, so the channel "
+        "is not left at power off);"
     )
-    assert f"<p>{CLOSING}</p>" in page
-    assert re.findall(r"<form\b[^>]*>", page) == [f'<form method="post" action="{url}">']
-    button = '<button class="btn btn--danger" type="submit">Remove outage</button>'
-    keep = f'<a class="btn btn--secondary" href="/locations/{location.pk}/">Keep outage</a>'
-    assert page.index(button) < page.index(keep)
-    assert page.count("btn--danger") == 1
-    assert "btn--primary" not in page
-    assert "autofocus" not in page
-    assert "<script" not in html
+    words = text(root)
+    assert words.index(LEAD) < words.index(CONSEQUENCE_1) < words.index(CLOSING)
+    # One form in main: the destructive POST, after Keep (back to Recent outages).
+    [form] = main(soup).find_all("form")
+    assert (form.get("method"), form.get("action")) == ("post", url)
+    assert form is by_testid(root, "confirm-form")
+    button = by_testid(form, "confirm-submit")
+    assert (button.get("data-variant"), text(button)) == ("danger", "Remove outage")
+    keep = by_testid(root, "keep")
+    assert (keep.get("href"), text(keep)) == (f"{_page(location)}#recent-outages", "Keep outage")
+    assert root.find_all(["a", "button"])[-2:] == [keep, button]
+    dangers = main(soup).find_all(attrs={"data-variant": "danger"})
+    assert [found.get("data-testid") for found in dangers] == ["confirm-submit"]
+    assert main(soup).find_all(attrs={"data-variant": "primary"}) == []
+    assert soup.find_all(autofocus=True) == []
     # The GET wrote nothing.
     assert _written(location) == before
 
@@ -336,17 +346,22 @@ def test_remove_confirmation_shows_the_not_monitored_consequence_only_when_neede
     assert transitions.record_heartbeat(paused.pk, _at(11, 0)) == "restored"
     _clock(monkeypatch, _at(16, 0))
 
-    page = _main(admin.get(_remove(paused, _at(9, 0))).content.decode())
+    page = main(assert_page(admin.get(_remove(paused, _at(9, 0))), app=True))
 
     # 09:00-11:00 with 10:00-10:10 not monitored: off time is shorter than the span.
-    assert _panel(page) == [
-        ("Start", '<span class="num">2026-10-01 12:00:00 EEST</span>'),
-        ("End", '<span class="num">2026-10-01 14:00:00 EEST</span>'),
-        ("Off time", '<span class="num">1h 50m</span>'),
+    assert definitions(page, "outage-details") == [
+        ("Start", "2026-10-01 12:00:00 EEST"),
+        ("End", "2026-10-01 14:00:00 EEST"),
+        ("Off time", "1h 50m"),
     ]
-    assert _consequences(page) == [CONSEQUENCE_1, CONSEQUENCE_2, CONSEQUENCE_3, CONSEQUENCE_4]
-    other = _main(admin.get(_remove(plain, _at(15, 0))).content.decode())
-    assert CONSEQUENCE_2 not in _consequences(other)
+    assert _items(page, "consequences") == [
+        CONSEQUENCE_1,
+        CONSEQUENCE_2,
+        CONSEQUENCE_3,
+        CONSEQUENCE_4,
+    ]
+    other = main(assert_page(admin.get(_remove(plain, _at(15, 0))), app=True))
+    assert CONSEQUENCE_2 not in _items(other, "consequences")
 
 
 # Screens D and E: results, refusals and edge responses
@@ -513,7 +528,10 @@ def test_remove_urls_answer_404(
         f"/locations/{location.pk}/outages/{'1' * 5000}/remove/",
         f"/locations/{location.pk}/outages/abc/remove/",
     ):
-        assert admin.get(url).status_code == 404, url[:80]
+        got = admin.get(url)
+        assert got.status_code == 404, url[:80]
+        # The start is never echoed (R12).
+        assert str(10**20) not in got.content.decode(), url[:80]
         assert admin.post(url).status_code == 404, url[:80]
 
     assert (_written(location), _written(gone)) == before
@@ -583,16 +601,14 @@ def test_remove_page_escapes_the_name(
     location = _two_outages(location_factory, name=XSS_NAME)
     _clock(monkeypatch, _at(16, 0))
 
-    html = admin.get(_remove(location, _at(9, 0))).content.decode()
+    response = admin.get(_remove(location, _at(9, 0)))
 
-    assert f"<title>{ESCAPED_XSS_NAME} · Remove outage · Power Monitor</title>" in html
-    assert _crumbs(html)[1] == (
-        "",
-        f'<a class="name" href="/locations/{location.pk}/">{ESCAPED_XSS_NAME}</a>',
-    )
-    # The h1 carries no name (UI5-D13), and nothing renders as a script.
-    assert "<h1>Remove this outage?</h1>" in html
-    assert "<script" not in html
+    # assert_page also proves nothing renders as a script (R1).
+    soup = assert_page(response, app=True, title=f"{XSS_NAME} · Remove outage")
+    assert breadcrumbs(soup)[1] == (XSS_NAME, _page(location))
+    # The h1 carries no name (UI5-D13).
+    assert text(h1(soup)) == "Remove this outage?"
+    assert XSS_NAME not in response.content.decode()
 
 
 @pytest.mark.django_db(transaction=True)
@@ -626,7 +642,7 @@ def test_removal_pages_show_no_secret(
         assert TOKEN not in html
         assert SECRET not in html
     # The confirmation page has no settings panel: not even the masked token.
-    assert "•" not in _main(confirm)
+    assert "•" not in str(main(confirm))
     for response in flash_pages:
         for url, _status in response.redirect_chain:
             assert key not in url
