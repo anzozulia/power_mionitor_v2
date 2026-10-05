@@ -18,6 +18,9 @@
   and delivery element carries ``data-live`` and the row's id; the count is
   ``data-live="count"``. The LIVE indicator and the live-chip slot render on S3, empty or
   not, and never on the sign-in or error pages. No meta refresh, no inline script.
+- The old frontend is gone (D6-01): the old stylesheet ``web/app.css``, ``base.html``,
+  ``web/_settings_panel.html`` and the stylesheet's tests are deleted, no template extends
+  or includes them, and the old stylesheet has no manifest entry.
 
 Rows and cells are read only through ``pages.table(page, "locations-table")`` or inside
 each ``tr[data-testid=location-row]``, never page-wide, because 06-18 adds the phone cards
@@ -30,6 +33,7 @@ import re
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -80,6 +84,19 @@ ROW_LIVE = {"status-pill": "status", "last-heartbeat": "last-heartbeat", "delive
 CHIPS = ["updated", "paused", "paused-reload", "changed"]
 EMPTY_TITLE = "No locations yet"
 EMPTY_BODY = "Add a location to get its heartbeat URL, device key and setup examples."
+
+# The old frontend, deleted by 06-21 (D6-01): its stylesheet, its layout, the settings panel
+# both old pages shared, and the tests of that stylesheet's cascade.
+ROOT = Path(__file__).resolve().parents[2]
+OLD_FRONTEND = (
+    "powermon/web/static/web/app.css",
+    "powermon/web/templates/base.html",
+    "powermon/web/templates/web/_settings_panel.html",
+    "tests/web/test_css.py",
+)
+OLD_TEMPLATE_USE = re.compile(
+    r"""\{%\s*(?:extends|include)\s+["'](?:base\.html|web/_settings_panel\.html)["']"""
+)
 
 
 @pytest.fixture
@@ -669,13 +686,25 @@ def test_UI05_live_indicator_only_on_polling_pages(
         assert main(soup).get("x-data") is None
 
 
-# Static assets
+# Static assets. The new assets (the built stylesheet, admin.js, the vendored files) are
+# pinned by tests/web/test_assets.py and tests/web/test_vendor_manifest.py.
 
 
-def test_app_css_is_in_the_manifest() -> None:
-    stored = staticfiles_storage.stored_name("web/app.css")
-
-    assert re.fullmatch(r"web/app\.[0-9a-f]{12}\.css", stored)
+def test_old_frontend_is_gone() -> None:
+    # Expected: the four files are deleted, and no template extends or includes them.
+    assert [path for path in OLD_FRONTEND if (ROOT / path).exists()] == []
+    templates = sorted((ROOT / "powermon" / "web" / "templates").rglob("*.html"))
+    assert len(templates) > 20, "the template walk found the rebuilt templates"
+    users = [str(t.relative_to(ROOT)) for t in templates if OLD_TEMPLATE_USE.search(t.read_text())]
+    assert users == []
+    # Edge: the pattern sees both tags, either quote and an include with options, and
+    # nothing else.
+    for tag in ('{% extends "base.html" %}', "{%include 'web/_settings_panel.html' only %}"):
+        assert OLD_TEMPLATE_USE.search(tag), tag
+    assert not OLD_TEMPLATE_USE.search('{% extends "layouts/app.html" %}')
+    # Failure: the old stylesheet is no longer collected, so its name has no manifest entry.
+    with pytest.raises(ValueError, match="Missing staticfiles manifest entry"):
+        staticfiles_storage.stored_name("web/app.css")
 
 
 def test_unknown_static_file_is_not_in_the_manifest() -> None:

@@ -6,8 +6,8 @@ it fails loudly on a page that breaks the contract.
 
 - ``text()`` is the screen-reader text: aria-hidden subtrees out, visually hidden text in.
 - ``by_testid()`` fails unless exactly one element matches.
-- ``messages()`` reads the toasts (level, region role, toast-text) and, on pages that still
-  extend the old base.html, the legacy flash callouts (no level).
+- ``messages()`` reads the toasts (level, region role, toast-text) and nothing else: a page
+  without the toast regions has no flash, and every flash on a real page has its level.
 - ``assert_no_injected_script()`` allows only empty scripts loaded from a hashed
   same-origin static path, and no inline event handler.
 - ``breadcrumbs()``, ``table()`` (hidden rows skipped), ``definitions()``, the form
@@ -21,10 +21,16 @@ The samples never write the attribute that holds CSS class names literally; wher
 needs one it is built by concatenation (06-09 adds a guard against assertions on classes).
 """
 
+from collections.abc import Callable
+from typing import Any
+
 import pytest
+from django.contrib.auth import get_user_model
 from django.http import HttpResponse, JsonResponse
+from django.test import Client
 from pages import (
     CSP,
+    LEVELS,
     Message,
     all_by_testid,
     assert_no_injected_script,
@@ -50,6 +56,11 @@ from pages import (
     title,
 )
 from secret_fixtures import MASKED, SECRET, SECRETS, TOKEN
+
+from powermon.web.location_views import ALREADY_DELETED_MESSAGE, LOCATION_DELETED_MESSAGE
+from powermon.web.views import SIGNED_OUT_MESSAGE
+
+User = get_user_model()
 
 # The sample attribute that holds CSS class names, spelled by concatenation.
 CLS = "cl" + "ass="
@@ -215,14 +226,27 @@ def test_messages_reads_empty_toast_regions_as_no_message() -> None:
     assert messages(page) == []
 
 
-def test_messages_reads_legacy_callouts() -> None:
-    assert messages(LEGACY) == [
-        Message(None, "status", "Location created."),
-        Message(None, "alert", "Not sent & refused."),
+@pytest.mark.django_db
+def test_messages_requires_toasts(client: Client, location_factory: Callable[..., Any]) -> None:
+    # Edge: flashes are read only from the toasts. A page without the toast regions has
+    # none, even with the old base.html's callouts in it, and a stray toast fails.
+    assert messages(LEGACY) == []
+    assert messages(HttpResponse(LEGACY)) == []
+    assert message_texts("<main><h1>Office</h1></main>") == []
+    with pytest.raises(AssertionError, match="outside the two toast regions"):
+        messages('<main><div data-testid="toast" data-level="info"></div></main>')
+    # Expected: every flash on the real pages (app and auth layout) has its level.
+    client.force_login(User.objects.create_user("admin", password="not-used-here"))
+    delete = f"/locations/{location_factory(name='Office').pk}/delete/"
+    responses = [client.post(delete, follow=True) for _ in range(2)]
+    responses.append(client.post("/logout/", follow=True))
+    found = [messages(response) for response in responses]
+    assert found == [
+        [Message("success", "status", LOCATION_DELETED_MESSAGE)],
+        [Message("info", "status", ALREADY_DELETED_MESSAGE)],
+        [Message("info", "status", SIGNED_OUT_MESSAGE)],
     ]
-    assert messages(HttpResponse(LEGACY)) == messages(LEGACY)
-    assert messages("<main><h1>Office</h1></main>") == []
-    assert message_texts("<main></main>") == []
+    assert all(message.level in LEVELS for shown in found for message in shown)
 
 
 def test_messages_fails_on_a_broken_toast_contract() -> None:
@@ -627,6 +651,18 @@ BROKEN = [
         '<input type="hidden" name="csrfmiddlewaretoken" value="csrf-value">',
         "",
         "has no CSRF input",
+    ),
+    # A partial included with ``only`` and without csrf_token=csrf_token renders the input
+    # with an empty value: present, but every POST from it would be refused.
+    (
+        'name="csrfmiddlewaretoken" value="csrf-value"',
+        'name="csrfmiddlewaretoken" value=""',
+        "form to '/logout/' has an empty CSRF token",
+    ),
+    (
+        'name="csrfmiddlewaretoken" value="csrf-value"',
+        'name="csrfmiddlewaretoken"',
+        "form to '/logout/' has an empty CSRF token",
     ),
     ('alt="Weekly chart" ', "", "<img> '/locations/1/chart.png' lacks alt"),
     ('width="1280" ', "", "<img> '/locations/1/chart.png' lacks width"),
