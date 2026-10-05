@@ -1531,9 +1531,10 @@
     // are hidden). Pressing a cell shows only the matching locations: a status cell by
     // data-status, Delivery failing by data-delivery; pressing the active cell or All shows
     // every location. Rows get data-filtered (the CSS collapses them, so columns never
-    // move), cards get hidden, the description says how many are shown, and the no-match
-    // line's "show all" resets the filter and focuses All. The filter is never in the URL;
-    // it is applied again after each poll (pm:status).
+    // move), cards get hidden, the description's parts say how many are shown (the counts
+    // in their mono spans), and the no-match line's "show all" resets the filter and
+    // focuses All. The filter is never in the URL; it is applied again after each poll
+    // (pm:status).
     window.Alpine.data("fleetFilter", function () {
       var FILTERS = ["all", "on", "off", "maintenance", "waiting", "failing"];
       return {
@@ -1568,12 +1569,41 @@
             });
           };
 
-          var describe = function (shown, total) {
-            var noun = total === 1 ? " location" : " locations";
-            if (active !== "all") {
-              return "Showing " + shown + " of " + total + noun;
+          // The writers of the description's parts.
+          var setText = function (element, value) {
+            if (element) {
+              element.textContent = value;
             }
-            return total === 1 ? "Showing 1 location" : "Showing all " + total + noun;
+          };
+          var setHidden = function (element, value) {
+            if (element) {
+              element.hidden = value;
+            }
+          };
+
+          // The description (list.fleet_showing): "Showing all {M} locations", "Showing 1
+          // location", or "Showing {N} of {M} locations" while a filter is active
+          // ("location" when M is 1). The counts stay in the mono [data-showing-shown] and
+          // [data-showing-total] spans and the words in Inter: only the parts' texts and the
+          // hidden flags of "all " and " of {M}" change. A description without the count
+          // span gets the whole sentence.
+          var describe = function (shown, total) {
+            var filtered = active !== "all";
+            var noun = total === 1 ? "location" : "locations";
+            var count = showing.querySelector("[data-showing-shown]");
+            if (!count) {
+              var sentence = "Showing " + shown + " of " + total + " " + noun;
+              if (!filtered) {
+                sentence = total === 1 ? "Showing 1 location" : "Showing all " + total + " " + noun;
+              }
+              setText(showing, sentence);
+              return;
+            }
+            setHidden(showing.querySelector("[data-showing-all]"), filtered || total === 1);
+            setText(count, String(filtered ? shown : total));
+            setHidden(showing.querySelector("[data-showing-of]"), !filtered);
+            setText(showing.querySelector("[data-showing-total]"), String(total));
+            setText(showing.querySelector("[data-showing-noun]"), noun);
           };
 
           var apply = function () {
@@ -1606,7 +1636,7 @@
               line.hidden = shown !== 0;
             });
             if (showing) {
-              showing.textContent = describe(shown, total);
+              describe(shown, total);
             }
           };
 

@@ -6,9 +6,14 @@ it only while it lists at least one location, inside the [data-fleet] wrapper th
 the fleetFilter component.
 
 - Header strip: the title "Fleet health" (copy row list.fleet_title) and the description
-  [data-testid=fleet-showing] (list.fleet_showing), polite, with data-total = total. The
-  server renders the unfiltered sentence; fleetFilter rewrites the whole text when a cell
-  is pressed, so the count in it is not a separate mono span.
+  [data-testid=fleet-showing] (list.fleet_showing), polite and atomic (a change reads the
+  whole sentence), with data-total = total. It is built from fixed parts: "Showing ", the
+  [data-showing-all] part "all " (hidden at one location), the shown count
+  [data-showing-shown] (mono), the [data-showing-of] part " of " and the total
+  [data-showing-total] (mono; hidden until a filter is active), then a space and the noun
+  [data-showing-noun] ("location" at a total of 1, else "locations"). The server renders
+  the unfiltered sentence; fleetFilter sets only those parts' texts and hidden flags,
+  never the whole text, so the counts stay mono and the words stay Inter.
 - The proportional bar [data-testid=fleet-bar]: aria-hidden, JS only (rendered hidden).
   Four segments in this order: on, off, maintenance (hatched), waiting, each with
   data-status and data-count. fleetFilter sets each segment's flex-grow from data-count and
@@ -34,7 +39,7 @@ Ids are fixed (one card per page). Every class is spelled out; no class name is 
 data.
 {% endcomment %}<section data-testid="fleet-summary" aria-labelledby="fleet-title" class="rounded-card border border-border bg-surface">
 <div class="flex flex-wrap items-baseline gap-x-2 rounded-t-[5px] border-b border-border bg-surface-muted px-4 py-2"><h2 id="fleet-title" class="text-label font-semibold uppercase tracking-label text-fg-muted">Fleet health</h2>
-<p data-testid="fleet-showing" data-total="{{ total }}" aria-live="polite" class="text-label text-fg-subtle">{% if total == 1 %}Showing 1 location{% else %}Showing all {{ total }} locations{% endif %}</p></div>
+<p data-testid="fleet-showing" data-total="{{ total }}" aria-live="polite" aria-atomic="true" class="text-label text-fg-subtle">Showing <span data-showing-all{% if total == 1 %} hidden{% endif %}>all </span><span data-showing-shown class="num">{{ total }}</span><span data-showing-of hidden> of <span data-showing-total class="num">{{ total }}</span></span> <span data-showing-noun>{% if total == 1 %}location{% else %}locations{% endif %}</span></p></div>
 <div class="flex flex-col gap-4 p-4">
 <div data-testid="fleet-bar" aria-hidden="true" data-js-only hidden class="h-2 overflow-hidden rounded-led bg-surface-sunken"><div class="-ml-0.5 flex h-full"><span data-status="on" data-count="{{ counts.on }}" class="min-w-0 basis-0 border-l-2 border-surface bg-st-on"></span><span data-status="off" data-count="{{ counts.off }}" class="min-w-0 basis-0 border-l-2 border-surface bg-st-off"></span><span data-status="maintenance" data-count="{{ counts.maintenance }}" class="min-w-0 basis-0 border-l-2 border-surface bg-hatch"></span><span data-status="waiting" data-count="{{ counts.waiting }}" class="min-w-0 basis-0 border-l-2 border-surface bg-st-wait"></span></div></div>
 <div role="group" aria-label="Filter the list by status" class="grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-[repeat(5,minmax(0,1fr))_minmax(0,1.3fr)]">
