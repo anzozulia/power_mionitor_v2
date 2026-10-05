@@ -43,8 +43,9 @@ Later plans extend the rule tables through ``violations(text, rules)``: 06-11 (a
 components) and 06-20 (the Alpine directive check: every x-data name registered in admin.js
 and every registered name used).
 
-No string literal in this file contains the text class= (06-09's class guard): patterns and
-samples that name the class attribute are built from CLASS.
+No string literal in this file (this docstring included) spells the class attribute with its
+equals sign, which 06-09's class guard rejects: patterns and samples that name the class
+attribute are built from CLASS.
 """
 
 import ast
@@ -89,7 +90,11 @@ def violations(text: str, rules: Rules) -> list[str]:
     A pattern fires when it is found anywhere in the text; a callable fires when it returns
     True for the text.
     """
-    return []  # RED stub
+    return sorted(
+        name
+        for name, rule in rules.items()
+        if (rule.search(text) is not None if isinstance(rule, re.Pattern) else rule(text))
+    )
 
 
 # Templates (R1, R5, UI-13)
@@ -153,17 +158,42 @@ TEMPLATE_RULES: Rules = {
 
 def script_violations(relpath: str, text: str) -> list[str]:
     """Script tags: only the two exact empty-body forms, once each, only in the two layouts."""
-    return []  # RED stub
+    found: set[str] = set()
+    seen: Counter[str] = Counter()
+    for match in _SCRIPT_TAG.finditer(text):
+        form = next((f for f in ALLOWED_SCRIPTS if text.startswith(f, match.start())), None)
+        if form is None:
+            found.add("script other than the two allowed forms")
+        elif relpath not in SCRIPT_LAYOUTS:
+            found.add("script outside the app and auth layouts")
+        else:
+            seen[form] += 1
+    if any(count > 1 for count in seen.values()):
+        found.add("script tag repeated")
+    return sorted(found)
 
 
 def icon_violations(text: str) -> list[str]:
     """{% icon %} tags (comments skipped): a literal name needs a file, every tag a class."""
-    return []  # RED stub
+    found: set[str] = set()
+    for match in _ICON_TAG.finditer(_TEMPLATE_COMMENT.sub("", text)):
+        args = match.group("args")
+        name = _ICON_NAME.match(args)
+        if name is not None and name.group("name") not in ICONS:
+            found.add("icon with no file")
+        if _ICON_CLASS.search(args) is None:
+            found.add("icon without class")
+    return sorted(found)
 
 
 def static_violations(text: str) -> list[str]:
     """{% static %} literal paths (comments skipped) that the manifest does not hold."""
-    return []  # RED stub
+    for match in _STATIC_TAG.finditer(_TEMPLATE_COMMENT.sub("", text)):
+        try:
+            staticfiles_storage.stored_name(match.group("path"))
+        except ValueError:
+            return ["static path with no manifest entry"]
+    return []
 
 
 def template_violations(relpath: str, text: str) -> list[str]:
@@ -216,12 +246,45 @@ def _mask_js(source: str) -> str:
     Regular-expression literals are not recognised; admin.js keeps quotes and braces out of
     them.
     """
-    return source  # RED stub
+    out = list(source)
+
+    def blank(start: int, end: int) -> None:
+        for index in range(start, end):
+            if out[index] != "\n":
+                out[index] = " "
+
+    index, size = 0, len(source)
+    while index < size:
+        pair, char = source[index : index + 2], source[index]
+        if pair in ("//", "/*"):
+            close = source.find("\n" if pair == "//" else "*/", index + 2)
+            end = size if close < 0 else close + (0 if pair == "//" else 2)
+            blank(index, end)
+            index = end
+        elif char in "\"'`":
+            end = index + 1
+            while end < size and source[end] != char:
+                end += 2 if source[end] == "\\" else 1
+            blank(index + 1, min(end, size))
+            index = end + 1
+        else:
+            index += 1
+    return "".join(out)
 
 
 def _try_catch_blocks(source: str) -> list[tuple[int, int]]:
     """(open brace, close brace) offsets of every try block followed by a catch clause."""
-    return []  # RED stub
+    code = _mask_js(source)
+    blocks: list[tuple[int, int]] = []
+    stack: list[tuple[int, bool]] = []
+    for index, char in enumerate(code):
+        if char == "{":
+            stack.append((index, bool(_TRY_BEFORE.search(code[max(0, index - 64) : index]))))
+        elif char == "}" and stack:
+            start, is_try = stack.pop()
+            if is_try and _CATCH_AFTER.match(code, index + 1):
+                blocks.append((start, index))
+    return blocks
 
 
 def _local_storage_misuse(source: str) -> bool:
@@ -236,8 +299,7 @@ def _local_storage_misuse(source: str) -> bool:
 
 def _cookie_misuse(source: str) -> bool:
     return any(
-        _THEME_COOKIE_WRITE.match(source, match.end()) is None
-        for match in _COOKIE.finditer(source)
+        _THEME_COOKIE_WRITE.match(source, match.end()) is None for match in _COOKIE.finditer(source)
     )
 
 
@@ -326,9 +388,7 @@ def _names_of(node: ast.AST) -> Iterator[str]:
             yield name.rsplit(".", 1)[-1]
             if asname is not None:
                 yield asname
-        case ast.FunctionDef(name=name) | ast.AsyncFunctionDef(name=name) | ast.ClassDef(
-            name=name
-        ):
+        case ast.FunctionDef(name=name) | ast.AsyncFunctionDef(name=name) | ast.ClassDef(name=name):
             yield name
 
 
@@ -340,8 +400,10 @@ def _bound_names(tree: ast.AST) -> Iterator[str]:
                 yield name
             case ast.arg(arg=name):
                 yield name
-            case ast.FunctionDef(name=name) | ast.AsyncFunctionDef(name=name) | ast.ClassDef(
-                name=name
+            case (
+                ast.FunctionDef(name=name)
+                | ast.AsyncFunctionDef(name=name)
+                | ast.ClassDef(name=name)
             ):
                 yield name
             case ast.alias(name=name, asname=asname):
@@ -364,7 +426,16 @@ def _string_constant(node: ast.AST | None) -> bool:
 
 def _literal_names(tree: ast.Module) -> frozenset[str]:
     """Names bound exactly once in the module, by a module-level string-constant assignment."""
-    return frozenset()  # RED stub
+    bindings = Counter(_bound_names(tree))
+    names: set[str] = set()
+    for statement in tree.body:
+        match statement:
+            case (
+                ast.Assign(targets=[ast.Name(id=name)], value=value)
+                | ast.AnnAssign(target=ast.Name(id=name), value=value)
+            ) if _string_constant(value) and bindings[name] == 1:
+                names.add(name)
+    return frozenset(names)
 
 
 def _format_string(call: ast.Call, position: int) -> ast.expr | None:
@@ -385,7 +456,29 @@ def _callee(call: ast.Call) -> str | None:
 
 def python_violations(relpath: str, source: str) -> list[str]:
     """R1 in the web module at ``relpath`` (relative to powermon/web)."""
-    return []  # RED stub
+    tree = ast.parse(source)
+    literal = _literal_names(tree)
+    called = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        names = set(_names_of(node))
+        found.update(f"{name} used" for name in _BANNED_NAMES if name in names)
+        if "mark_safe" in names and relpath != MARK_SAFE_MODULE:
+            found.add("mark_safe outside the icon tag")
+        if isinstance(node, ast.alias) and node.name.endswith("format_html"):
+            if node.asname not in (None, "format_html"):
+                found.add("format_html imported under another name")
+        if isinstance(node, ast.Name | ast.Attribute) and "format_html" in names:
+            if id(node) not in called:
+                found.add("format_html not called directly")
+        if isinstance(node, ast.Call) and (callee := _callee(node)) in _FORMAT_FUNCTIONS:
+            argument = _format_string(node, _FORMAT_FUNCTIONS[callee])
+            is_literal = _string_constant(argument) or (
+                isinstance(argument, ast.Name) and argument.id in literal
+            )
+            if not is_literal:
+                found.add(f"{callee} with a non-literal format string")
+    return sorted(found)
 
 
 def web_modules() -> list[Path]:
