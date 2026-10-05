@@ -1425,6 +1425,11 @@
           dialog.addEventListener("close", function () {
             // A load still running belongs to the closed dialog: it is ignored.
             request += 1;
+            if (pending()) {
+              // Closed anyway while the POST is on its way (a browser's second Esc): the
+              // submitted form stays in the page until the navigation replaces it.
+              return;
+            }
             body.textContent = "";
             reveal(loading);
             if (returnTo && document.contains(returnTo)) {
