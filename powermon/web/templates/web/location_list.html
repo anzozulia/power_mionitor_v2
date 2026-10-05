@@ -10,8 +10,9 @@ of those rows), ops_configured and now (the view clock's reading, passed to ever
   With no rows there is no meta count and no header button.
 - content, while there are rows: one [data-fleet] wrapper bound to the fleetFilter component
   (UI-04, N13) holding the Fleet health card (web/_fleet_health.html, from the view's counts
-  and the number of rows) and the table card. The filter is client-side only: no form,
-  nothing in the URL, and without JS every row shows.
+  and the number of rows), the table card (from md) and the phone cards (below md). The
+  filter is client-side only: no form, nothing in the URL, and without JS every row and
+  every card shows. Card, table and counts all read the same rows, so they always agree.
 - The table card "All locations" / "Sorted by name", shown from md. Caption Locations, scoped
   column headers, one row per location with its id, status and delivery as data hooks.
   A row the filter leaves out carries data-filtered and collapses, so the columns never
@@ -25,6 +26,12 @@ of those rows), ops_configured and now (the view clock's reading, passed to ever
   row ignores it).
   Delivery: OK or the failing pill, then the chevron. Off rows and failing rows get a 2 px
   tone bar on the first cell, from data-status / data-delivery.
+- The phone cards (UI-01, UI-12), shown below md: the micro heading "All locations"
+  (list.table_title) and a list with one item per row in the same order
+  (web/_location_card.html: the item carries data-status and data-delivery, its one link
+  is the location-card), then the list's own no-match item, hidden, with the same reset.
+  The second copy has its own testid, the same data-location-id and live hooks as the
+  table, and no repeated element id.
 - With no rows: the empty state (map-pin in the accent circle, list.empty_title,
   list.empty_body, list.add) and no table.
 - Live (UI-05, the 06-11 binding contract): main carries the poll component with the
@@ -72,6 +79,13 @@ spelled out; no class name is built from data.
 </tbody>
 </table>
 </div>
+</section>
+<section aria-labelledby="locations-cards-title" class="flex flex-col gap-2 md:hidden">
+<h2 id="locations-cards-title" class="text-label font-semibold uppercase tracking-label text-fg-muted">All locations</h2>
+<ul class="flex flex-col gap-2">
+{% for row in rows %}{% include "web/_location_card.html" with row=row now=now only %}
+{% endfor %}<li data-testid="no-match" hidden class="rounded-card border border-dashed border-border-strong px-4 py-2 text-fg-muted">No locations match — <button type="button" data-filter-reset class="inline-flex min-h-11 items-center rounded-control font-semibold text-accent-text underline underline-offset-3 hover:text-fg md:pointer-fine:min-h-6 motion-safe:transition-colors motion-safe:duration-150">show all</button></li>
+</ul>
 </section>
 </div>
 {% else %}{% url 'location-create' as add_url %}
