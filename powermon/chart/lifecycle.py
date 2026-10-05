@@ -1,8 +1,11 @@
 """The chart message lifecycle in the worker's Telegram I/O loop (D-01 to D-07, CHRT-05).
 
-Worker only. ``run_step`` is the last step of an I/O pass (``io_loop.run_iteration`` with
+Worker side. ``run_step`` is the last step of an I/O pass (``io_loop.run_iteration`` with
 ``charts=True``): it makes at most one chart call per pass, after every due alert and the
-ops head, so chart work delays an alert by at most one call (D-05, INV-14).
+ops head, so chart work delays an alert by at most one call (D-05, INV-14). The web process
+imports this module only inside its chart preview view (``powermon/web/chart_preview.py``,
+UI-06), never at import time, and calls ``chart_content`` alone: it runs no step and makes
+no Telegram call.
 
 Scheduling is condition-based, with all state in the database (INV-18, KD4): each pass
 reads a snapshot of the monitored locations and their chart records and asks the pure
@@ -126,8 +129,9 @@ holds the unpin.
 
 Rendering runs inline in the I/O thread right before its call (D-05), with the location's
 current name and language and the display time zone read at render time (D-14). The
-render module (Pillow) is imported inside ``chart_content`` only, so the web process,
-which imports the app's models, never loads Pillow.
+render module (Pillow) is imported inside ``chart_content`` only, so importing the app's
+models never loads Pillow; the web process loads it only when its chart preview view
+(UI-06) first calls ``chart_content``.
 
 Before each call the worker checks that its lease session (``RelayState.lease_pid``) still
 holds the worker lock, with the same ``pg_locks`` predicate as the outbox claim; a stale
@@ -629,9 +633,9 @@ def chart_content(
     all from the same ``now`` as the image's now pill (CHRT-04); a finished one has line 1
     only (D-13). A day with no on or off time at all (its row total is "—") is captioned
     "not monitored", never "no outages" (D-03). The render module is imported here, in the
-    worker, and called as a module attribute.
+    worker or in the web's chart preview view (UI-06), and called as a module attribute.
     """
-    from powermon.chart import render  # Pillow: worker only, never at import time
+    from powermon.chart import render  # Pillow: imported per call, never at import time
 
     week = source.load_week(location.location_id, today=day, now=now, tz=tz, live=live)
     png = render.render_png(week, lang=location.language, name=location.name)

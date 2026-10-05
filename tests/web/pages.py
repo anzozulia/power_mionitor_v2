@@ -21,9 +21,9 @@ attribute order or DOM depth (TEST-STRATEGY §1 rule 3, §5.1).
   §5.2), ``assert_no_injected_script`` and ``assert_no_secrets`` (§5.3).
 - ``text()`` is the text a screen reader gets: whitespace collapsed, visually hidden text
   kept, ``aria-hidden="true"`` subtrees (icons, masked glyphs) skipped.
-- ``messages()`` reads the 06-UI-SPEC toasts, and on pages that still extend the old
-  base.html the legacy flash callouts, so a flash assertion keeps its meaning whichever
-  layout its page uses (UI-09, TEST-STRATEGY §3.3). 06-21 removes the legacy branch.
+- ``messages()`` reads the 06-UI-SPEC toasts and nothing else: every flash is a toast with
+  its level, and a page without the toast regions (the error layout, R11) has no flash
+  (UI-09, TEST-STRATEGY §3.3).
 
 Assertions here raise ``AssertionError`` with a message that names what was looked for; the
 module is not rewritten by pytest, so every message is written out.
@@ -157,15 +157,14 @@ def text(element: Tag) -> str:
 
 @dataclass(frozen=True)
 class Message:
-    """One flash as the page shows it.
+    """One flash as the page shows it: a toast.
 
-    ``level`` is the toast's ``data-level`` (a Django level tag), or None for a legacy
-    callout, which carries no level. ``role`` is the live-region role it is announced
-    through, ``status`` or ``alert``. ``text`` is the flash text without the toast's
-    visually hidden "Warning: " / "Error: " prefix.
+    ``level`` is the toast's ``data-level``, a Django level tag (``LEVELS``). ``role`` is
+    the live-region role it is announced through, ``status`` or ``alert``. ``text`` is the
+    flash text without the toast's visually hidden "Warning: " / "Error: " prefix.
     """
 
-    level: str | None
+    level: str
     role: str
     text: str
 
@@ -181,21 +180,21 @@ def _toast(toast: Tag) -> Message:
 
 
 def messages(page: Page) -> list[Message]:
-    """Every flash on the page, in document order.
+    """Every flash on the page, in document order: its 06-UI-SPEC toasts.
 
-    With the 06-UI-SPEC toast regions on the page (both, exactly once each) these are the
-    toasts, ``(data-level, role of its region, toast-text)``. Without them the page still
-    extends the old base.html, and these are its flash callouts: each ``p`` with
-    ``role="status"`` or ``role="alert"`` inside ``<main>``, ``(None, role, text)``.
+    Each is ``(data-level, role of its region, toast-text)``. A page with the toast regions
+    has both, exactly once each. A page without them (the error layout, R11) shows no
+    flash and gives []; a toast there fails. No other markup is ever read as a flash, so
+    every flash has its level.
     """
     soup = _soup(page)
     regions = {name: all_by_testid(soup, name) for name in TOAST_REGIONS}
-    if any(regions.values()):
-        for name, found in regions.items():
-            _only(found, f"toast region {name!r}")
-        return [_toast(toast) for toast in all_by_testid(soup, "toast")]
-    callouts = soup.select('main p[role="status"], main p[role="alert"]')
-    return [Message(None, str(callout["role"]), text(callout)) for callout in callouts]
+    if not any(regions.values()):
+        assert not all_by_testid(soup, "toast"), "a toast outside the two toast regions"
+        return []
+    for name, found in regions.items():
+        _only(found, f"toast region {name!r}")
+    return [_toast(toast) for toast in all_by_testid(soup, "toast")]
 
 
 def message_texts(page: Page) -> list[str]:
@@ -650,15 +649,22 @@ def assert_page(
                     )
     for meta in metas:
         assert _lower(meta, "http-equiv") != "refresh", "the page has a meta refresh"
-    # 10. Every form POSTs with the CSRF input, or is the modal's method="dialog".
+    # 10. Every form POSTs with a CSRF input holding a token, or is the modal's
+    # method="dialog". A partial included with ``only`` loses the context processor's
+    # csrf_token unless the caller passes it, and its input then posts an empty token.
     for form in _tags(soup.find_all("form")):
         method, action = _lower(form, "method"), form.get("action")
         if method == "dialog":
             continue
         assert method == "post", f"form to {action!r} is not a POST form"
-        inputs = _tags(form.find_all("input"))
-        assert any(found.get("name") == "csrfmiddlewaretoken" for found in inputs), (
-            f"POST form to {action!r} has no CSRF input"
+        tokens = [
+            found.get("value")
+            for found in _tags(form.find_all("input"))
+            if found.get("name") == "csrfmiddlewaretoken"
+        ]
+        assert tokens, f"POST form to {action!r} has no CSRF input"
+        assert all(isinstance(token, str) and token.strip() for token in tokens), (
+            f"POST form to {action!r} has an empty CSRF token"
         )
     # 11. img alt/width/height; named buttons and links; labelled controls; hidden icons.
     for img in _tags(soup.find_all("img")):

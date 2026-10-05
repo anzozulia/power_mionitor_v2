@@ -26,8 +26,7 @@ fixture. Copy strings are 06-UI-SPEC's copy rows remove.* and reset.*, verbatim.
 confirmation pages are read through ``pages.py`` and the 06-UI-SPEC hooks (the ``confirm``
 root, ``confirm-title``, ``outage-details``, ``consequences``, ``confirm-form``, ``keep``
 and ``confirm-submit``); their modal fragments are tested in tests/web/test_fragments.py.
-Flashes are read through ``pages.messages()`` as (role, text), toast or legacy callout
-alike (UI-09).
+Flashes are the page's toasts, read through ``pages.messages()`` as (role, text) (UI-09).
 """
 
 from collections.abc import Callable
@@ -149,13 +148,13 @@ def _reset(location: Any) -> str:
 
 
 def _flashes(page: str) -> list[tuple[str, str]]:
-    """Each flash on a page as (role, text), toast or legacy callout alike (UI-09)."""
+    """Each flash (toast) on a page as (role, text) (UI-09)."""
     return [(flash.role, flash.text) for flash in messages(page)]
 
 
 def _is_info(page: str) -> bool:
-    """Every flash on the page is an info flash (a legacy callout carries no level)."""
-    return all(flash.level in (None, "info") for flash in messages(page))
+    """Every flash on the page is an info toast."""
+    return all(flash.level == "info" for flash in messages(page))
 
 
 def _remove_trail(location: Any, name: str) -> list[tuple[str, str | None]]:
@@ -799,7 +798,7 @@ def test_reset_flashes_stack_in_queue_order(
     location = _two_outages(location_factory)
     _clock(monkeypatch, _at(16, 0))
 
-    # Two actions before the page is read: each flash in its own callout, in order (E5).
+    # Two actions before the page is read: each flash in its own toast, in order (E5).
     admin.post(_reset(location))
     admin.post(_reset(location))
 

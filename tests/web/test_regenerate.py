@@ -124,11 +124,11 @@ def _marker(page: HttpResponse | str, location: Any) -> str:
 
 
 def _flashes(page: str) -> list[str]:
-    """The text of each flash announced as status, toast or legacy callout alike (UI-09)."""
+    """The text of each flash (toast) announced as status (UI-09)."""
     return [flash.text for flash in messages(page) if flash.role == "status"]
 
 
-def _toasts(page: str) -> list[tuple[str | None, str, bool]]:
+def _toasts(page: str) -> list[tuple[str, str, bool]]:
     """Each toast as (level, text, sticky): the sticky ones carry ``data-sticky`` (UI-09)."""
     found = all_by_testid(page, "toast")
     return [

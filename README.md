@@ -1203,3 +1203,174 @@ the new chart. Record the result in the phase verification file.
 
 DoD 7 (INV-26: a fresh VPS reaches a working deployment in at most 30 minutes by following
 this README, including one test message) is re-run at milestone close, not here.
+
+## 16. Admin UI (Phase 6)
+
+The admin panel is rendered on the server by Django templates. It is styled with Tailwind
+CSS v4, and the CSP build of Alpine.js plus one first-party `admin.js` enhance it. The
+browser loads every file from the app itself: no CDN and no font service. The CSP
+(`powermon/web/middleware.py`) allows only same-origin scripts, styles, fonts, images and
+fetches. Every form and every action also works with JavaScript off.
+
+### How the CSS is built
+
+- The Tailwind entry is `powermon/web/assets/css/app.css`. Its `@source` lines scan only
+  the templates and `admin.js`, so the build contains exactly the classes they use.
+- The Dockerfile's `css` stage fetches the pinned Tailwind CSS standalone CLI (v4.3.3; the
+  `tailwind-amd64` and `tailwind-arm64` stages, each checked by `ADD --checksum`) and builds
+  the minified stylesheet. The `base` stage copies only that file to
+  `powermon/web/static/web/build/app.css` before `collectstatic` hashes it. The runtime
+  image has no Node and no Tailwind binary.
+- `powermon/web/static/web/build/` is gitignored. The stylesheet is never committed, and
+  every deploy (`up -d --build`) and every test run (`run --build`) builds it again from the
+  templates.
+
+### Dev watcher (local only)
+
+```sh
+docker compose -f docker-compose.local.yml -f docker-compose.dev-ui.yml up -d --build
+```
+
+- `css` runs the same pinned CLI in watch mode. It rebuilds
+  `powermon/web/static/web/build/app.css` whenever a template, `admin.js` or the entry
+  changes.
+- `web` runs Django's `runserver` with `DEBUG=1` and `./powermon` mounted. A template edit
+  shows at the next reload, and the rebuilt stylesheet is served unhashed. The app is still
+  published on 127.0.0.1:8000 only.
+- Never use this override in production. Run the browser checks below without it: Django's
+  DEBUG error pages echo POST data and use inline script and style.
+- To return to the normal local stack:
+
+  ```sh
+  docker compose -f docker-compose.local.yml -f docker-compose.dev-ui.yml rm -sf css
+  docker compose -f docker-compose.local.yml up -d --build --wait
+  ```
+
+### Pinned assets and the vendor manifest
+
+`powermon/web/assets/vendor-manifest.json` (not served) lists every third-party frontend
+file with its name, exact version, source URL, sha256, size, SPDX licence and path:
+
+- the two Tailwind CLI binaries (paths `Dockerfile#tailwind-amd64` and
+  `Dockerfile#tailwind-arm64`; they never enter the repository);
+- the `@alpinejs/csp` build in `powermon/web/static/web/vendor/`;
+- the Inter Variable woff2 subsets in `powermon/web/static/web/fonts/`;
+- one entry per Lucide icon in `powermon/web/templates/icons/`;
+- the licence texts.
+
+`tests/web/test_vendor_manifest.py` recomputes every hash and size, and fails on any file in
+those directories that the manifest does not list. `tests/web/test_assets.py` checks that
+the Dockerfile's `--checksum` values equal the manifest's.
+
+To move a pinned file to a new version, or to add a new file:
+
+1. Review it first (INV-26), before it enters the repository or the Dockerfile: publisher,
+   release history and licence. An npm file must equal the file in the npm tarball whose
+   `dist.integrity` the registry publishes. For the Tailwind CLI, read the values from the
+   release's `sha256sums.txt`.
+2. Download it from the exact version URL and update its manifest entry: `version`,
+   `source_url`, `sha256` and `bytes`, and `path` when the file name carries the version
+   (the Alpine build: rename the file and its `{% static %}` reference too). A new file gets
+   a new entry. A new icon is also added to `ICON_NAMES` in
+   `tests/web/test_vendor_manifest.py`.
+3. For the Tailwind CLI, change the version in both `ADD` URLs of the Dockerfile and set
+   each `--checksum=sha256:…` to the manifest's value.
+4. Run `pytest -q tests/web/test_vendor_manifest.py tests/web/test_assets.py` in the stack
+   (section 9), then the full check.
+
+### Licences
+
+The licence texts ship with the static files, in `powermon/web/static/web/vendor/LICENSES/`:
+
+- Tailwind CSS (MIT), a build tool only, including its bundled forms plugin;
+- TailAdmin free (MIT), whose tokens and layout patterns are adapted;
+- Alpine.js (MIT);
+- Inter (OFL-1.1);
+- Lucide (ISC).
+
+Each text is also a manifest entry. The chart's Inter TTFs have their own licence in
+`powermon/chart/fonts/LICENSE.txt`.
+
+### Theme and sign-out
+
+- The theme (Light, Dark or System; System by default) is kept per browser in the `theme`
+  cookie: `light`, `dark` or `system`, path `/`, SameSite=Lax, about one year, `Secure` in
+  production. It is not HttpOnly, because the theme control writes it.
+- The server reads the cookie through an allowlist and renders `<html data-theme="…">`, so
+  a page never flashes the wrong theme. Without JavaScript the theme control posts to
+  `/theme/`, which sets the cookie and always redirects to `/`. The error pages always use
+  System.
+- Sign-out also sends `Clear-Site-Data: "cache"`, so cached admin pages and the chart
+  preview do not outlive the session.
+- The only value the admin keeps in browser storage is the sidebar's collapsed-rail flag
+  (`localStorage`). It never stores a secret.
+
+### Phase 6 recorded checks
+
+The test suite covers the server side of every page, endpoint and rule. The checks below
+need a real browser. Run them once after the phase merges, on the local stack with the
+demo data (section 9) and DEBUG off, in Chrome with spot checks in Firefox and Safari.
+Record the results in the Phase 6 UAT (`06-UAT.md`).
+
+1. **Console:** zero CSP violations and zero JS errors on every page (S1–S11, E1–E3), in
+   light and dark. "Open full size" on the weekly chart opens the PNG under the CSP.
+2. **No third-party requests:** the Network panel shows only same-origin requests.
+3. **JavaScript off:** sign in, add, edit, every switch, the test message, reveal and hide,
+   regenerate, remove outage, reset and delete all work through the full pages. No dead
+   button shows.
+4. **Theme:** Light, Dark and System persist across reloads, with no flash of the wrong
+   theme. System follows an OS change.
+5. **Live refresh:** unplug a demo device. The open Locations page and location page show
+   Off within the detection window plus 35 s, with no reload. A new location's setup page
+   flips to "first heartbeat received" by itself. A hidden tab stops polling. Signing out in
+   another tab shows "Live updates paused".
+6. **Modals:** each of the four opens with focus on Keep. Esc and Keep close it and return
+   focus. The destructive button shows a pending state and blocks a double submit. A
+   same-page link inside a dialog or a popover (for example "Recent outages" in the reset
+   dialog on the location page) leaves no dialog or popover open over the page.
+   - Remove an outage in a second tab, then click Remove on the same row in the first tab.
+     The browser lands on the location page with exactly one "already gone" info toast.
+   - Do the same for a reset.
+7. **Copy:** each copy button copies the exact text and announces "Copied". There is no
+   key copy while the key is masked.
+8. **Storage and history:** after Reveal and after Regenerate, DevTools shows no key in
+   localStorage, sessionStorage, IndexedDB or Cache Storage. In Chrome, Firefox and Safari,
+   Back never shows the full key after any of these:
+   - reveal, then Hide key;
+   - reveal, then the location page;
+   - reveal, then Sign out.
+9. **Keyboard only:** the skip link, sidebar, drawer, account menu, theme switch, example
+   tabs, modals and forms all work, with a visible focus ring. In the drawer, Tab wraps
+   inside it, and Esc closes it and returns focus to the menu button.
+10. **360 px:** no page-level horizontal scroll, and a 100-character name wraps at word
+    boundaries. The drawer opens and closes, and touch targets are at least 44 px. In
+    Safari, rows hidden by a Fleet health filter leave no gap in the Locations table
+    (`visibility: collapse`).
+11. **Contrast:** AA in both themes for text, pills, toasts and banners. Spot-check with
+    the DevTools contrast picker.
+12. **Screen reader (VoiceOver):**
+    - A success toast and an error toast are announced. A success closes after 10 s and
+      pauses on hover or focus. Warnings look different from success.
+    - On a waiting location's setup page, step 5 announces "First heartbeat received." once,
+      and never the ticking time.
+    - On the Locations page, a Fleet health filter press announces "Showing N of M
+      locations" once. A poll with no change announces nothing.
+13. **Chart preview:** the location page's chart is the channel's pinned chart, up to
+    15 minutes newer. On the VPS, `docker stats` during a preview stays within the memory
+    budget (about 25 MB more, for a moment).
+14. **Favicon on amd64:** `favicon.ico` was generated on arm64. On an amd64 host,
+    `tests/web/test_icons.py` must pass in the dev image (it regenerates the file and
+    compares the bytes). If it fails, regenerate the file there
+    (`powermon/web/assets/favicon.py`) and commit it.
+
+**Screenshots for `/gsd-ui-review 6`.** Sign in on the local stack with the demo data and
+capture every screen and state of `docs/phase-6/ADMIN-INVENTORY.md` S1–S13 and E1–E3, in
+light and dark, at 1440 px and 360 px. Save them in `.planning/ui-reviews/06-manual/` as
+`<NN>-<screen>-<theme>-<width>.png`, for example `05-location-page-dark-360.png`. That
+folder is gitignored, so a revealed demo key never reaches git. Then tell the next
+`/gsd-ui-review 6` to read that folder and `docs/phase-6/before/` (docs/phase-6/README.md,
+step 6). Target: at least 21/24, with no pillar below 3.
+
+**Earlier UAT items.** 04-UAT #5 and 05-UAT #5 (visual passes over the old pages) are
+superseded by Phase 6. 01-UAT #7 (a 100-character name at 360 px) is checked here as
+UI-12, in item 10.

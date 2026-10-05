@@ -2,8 +2,9 @@
 
 INV-21 #2: five failed sign-ins within 60 s from one client IP make every sign-in POST from
 that IP answer HTTP 429 for 5 minutes, counted from the fifth failure, even with the right
-password. The 429 page holds exactly one callout, "Too many failed sign-ins. Try again in 5
-minutes.", sends ``Retry-After: 300`` and checks no credentials (UI rule 6). The fifth
+password. The 429 page holds exactly one alert, the warning ``throttle-message`` "Too many
+failed sign-ins. Try again in 5 minutes." (never a toast), sends ``Retry-After: 300`` and
+checks no credentials (UI rule 6). The fifth
 failure itself still gets the normal wrong-credentials page, and a GET of /login/ stays a
 normal page during the cool-down.
 
