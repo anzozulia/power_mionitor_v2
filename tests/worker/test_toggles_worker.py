@@ -379,7 +379,7 @@ def test_INV05_1_chart_keeps_working_with_alerts_off(
         ("sendPhoto", None),
         ("pinChatMessage", 1001),
     ]
-    assert _caption(fake_telegram.chart_calls[0]) == "No outages today\nUpdated 12:05"
+    assert _caption(fake_telegram.chart_calls[0]) == "No outages today"
 
     # An outage: silent after 12:05, OFF recorded at 12:06:31, power back at 12:15.
     assert detection.run_cycle(_kyiv("2026-10-01 12:06:31")) == 1
@@ -392,7 +392,7 @@ def test_INV05_1_chart_keeps_working_with_alerts_off(
 
     refresh = fake_telegram.chart_calls[-1]
     assert _chart_steps([refresh]) == [("editMessageMedia", 1001)]
-    assert _caption(refresh) == "Today off: 10m · 1 outage\nUpdated 12:20"
+    assert _caption(refresh) == "Today off: 10m · 1 outage"
 
     # After local midnight, once detection has settled past it, the passes post and pin
     # the new day's chart and finalize and unpin yesterday's (the midnight re-pin).

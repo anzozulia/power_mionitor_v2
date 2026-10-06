@@ -20,6 +20,7 @@ import sys
 import textwrap
 from dataclasses import replace
 from datetime import date, datetime
+from typing import Any
 
 import pytest
 from chart_fixtures import (
@@ -294,6 +295,33 @@ def test_pill_is_clamped_at_both_ends(hm: str, edge: str) -> None:
     else:
         assert _px(img, lay.bar_x1 + 4, y) == render.INK_PRIMARY
         assert _px(img, lay.bar_x1 + 10, y) == render.SURFACE
+
+
+@pytest.mark.parametrize(
+    ("now", "live", "expected"),
+    [
+        (SAMPLE_NOW, True, "14:37"),
+        (kyiv("2026-10-01 00:00"), True, "00:00"),
+        (next_midnight(SAMPLE_TODAY, KYIV), False, None),
+    ],
+    ids=["live", "midnight", "finished"],
+)
+def test_pill_text_is_the_local_render_time(
+    monkeypatch: pytest.MonkeyPatch, now: datetime, live: bool, expected: str | None
+) -> None:
+    # The now pill shows the local render time: the chart's only "last updated" time, since
+    # the caption carries none (CHRT-04). A finished render has no pill.
+    seen: list[str | None] = []
+    real = render._draw_pill
+
+    def spy(canvas: Image.Image, lay: Any, week: Week) -> Any:
+        pill = real(canvas, lay, week)
+        seen.append(None if pill is None else pill.text)
+        return pill
+
+    monkeypatch.setattr(render, "_draw_pill", spy)
+    _render(_week(sample_pieces(), now=now, live=live))
+    assert seen == [expected]
 
 
 def test_now_at_midnight_leaves_an_empty_today_bar() -> None:

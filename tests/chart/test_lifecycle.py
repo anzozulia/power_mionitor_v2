@@ -193,6 +193,20 @@ def _spy_renders(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
     return seen
 
 
+def _spy_pills(monkeypatch: pytest.MonkeyPatch) -> list[str | None]:
+    """Record the now pill's text of every render (None: no pill); the real pill is drawn."""
+    seen: list[str | None] = []
+    real = render._draw_pill
+
+    def spy(canvas: Image.Image, lay: Any, week: Week) -> Any:
+        pill = real(canvas, lay, week)
+        seen.append(None if pill is None else pill.text)
+        return pill
+
+    monkeypatch.setattr(render, "_draw_pill", spy)
+    return seen
+
+
 def _location(
     location_id: int, token: str = DEFAULT_BOT_TOKEN, *, router_grace: bool = False
 ) -> lifecycle.ChartLocation:
@@ -246,7 +260,7 @@ def test_monitored_location_gets_todays_chart_posted_and_recorded(
     assert len(photos) == 1
     assert photos[0].fields == {
         "chat_id": str(DEFAULT_CHAT_ID),
-        "caption": "No outages today\nUpdated 12:05",
+        "caption": "No outages today",
         "disable_notification": "true",
     }
     assert _png_size(photos[0].files["photo"]) == (1280, 1000)
@@ -530,7 +544,7 @@ def test_CHRT02_refresh_is_due_15_minutes_after_the_last_render(
     assert json.loads(edit.fields["media"]) == {
         "type": "photo",
         "media": "attach://chart",
-        "caption": "No outages today\nUpdated 12:20",
+        "caption": "No outages today",
     }
     assert _png_size(edit.files["chart"]) == (1280, 1000)
     assert _rows()[0].last_rendered_at == NOON_05 + timedelta(minutes=15, seconds=1)
@@ -645,7 +659,7 @@ def test_D03_maintenance_all_day_caption(
     assert _pass(FakeClock(NOON_05), io_loop.RelayState()) is True
 
     [photo] = _chart_calls(fake_telegram, "sendPhoto")
-    assert photo.fields["caption"] == "Today: not monitored\nUpdated 12:05"
+    assert photo.fields["caption"] == "Today: not monitored"
     # The day's finished render: line 1 only, in the neutral form too (D-13).
     _, finished = lifecycle.chart_content(
         _location(location.pk), TODAY, kyiv("2026-10-02 00:00"), live=False, tz=KYIV
@@ -697,12 +711,12 @@ def test_D14_refresh_uses_the_current_name_and_language(
 
     [edit] = _chart_calls(fake_telegram, "editMessageMedia")
     caption = json.loads(edit.fields["media"])["caption"]
-    assert caption == "Сьогодні відключень не було\nОновлено о 12:20"
+    assert caption == "Сьогодні відключень не було"
     assert rendered == [("en", "Test location"), ("uk", "Дача")]
 
 
 def test_INV03_1_caption_matches_the_outage(
-    location_factory: Callable[..., Any], fake_telegram: Any
+    location_factory: Callable[..., Any], fake_telegram: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     location = location_factory()
     # Heartbeats until 10:00, the next one at 12:00: off 10:00-12:00 (INV-03 #1).
@@ -718,11 +732,15 @@ def test_INV03_1_caption_matches_the_outage(
     )
     set_status(location, "on", at=kyiv("2026-10-01 12:00"))
     fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    pills = _spy_pills(monkeypatch)
 
     _pass(FakeClock(NOON_05), io_loop.RelayState())
 
     [photo] = _chart_calls(fake_telegram, "sendPhoto")
-    assert photo.fields["caption"] == "Today off: 2h · 1 outage\nUpdated 12:05"
+    assert photo.fields["caption"] == "Today off: 2h · 1 outage"
+    # The image's now pill is the chart's last-updated time: the caption carries none
+    # (CHRT-04, INV-03 #1, critic correction 4).
+    assert pills == ["12:05"]
 
 
 def test_refresh_order_oldest_first(
