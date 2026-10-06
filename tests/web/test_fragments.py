@@ -139,7 +139,8 @@ REGEN_MAINTENANCE = (
     "Maintenance is on, so OFF is not detected while you update the device. Turn maintenance "
     "off on the location page once the device sends heartbeats with the new key."
 )
-# 06-UI-SPEC copy rows remove.*, verbatim (remove.c3 is amendment A3).
+# 06-UI-SPEC copy rows remove.*, verbatim (remove.c3 is amendments A3 and A9; remove.chart
+# is A9, 261006-qv7).
 REMOVE_LEAD = "This cannot be undone. Removing this outage:"
 REMOVE_C1 = (
     "records its off time as power on, so the chart and the daily totals no longer count it "
@@ -150,17 +151,19 @@ REMOVE_C2 = (
     "monitored;"
 )
 REMOVE_C3 = (
-    "sends nothing itself, and drops its queued OFF and ON alerts if the OFF alert was never "
-    "sent (if it already went out, its queued ON alert is still sent, so the channel is not "
-    "left at power off);"
+    "deletes its OFF and ON alerts from the channel and drops any still queued. If its OFF "
+    "alert cannot be deleted (sent more than 47 hours ago or before this update, or its "
+    "delivery is uncertain), both alerts stay and a queued ON alert is still sent, so the "
+    "channel is not left at power off;"
 )
 REMOVE_C4 = (
     "leaves the live status unchanged, including the On since time from which the next OFF "
     'alert counts "was ON for".'
 )
 REMOVE_CHART = (
-    "The chart shows the change at its next update. It shows the last 7 days; charts already "
-    "posted for earlier days do not change."
+    "The pinned chart is redrawn within seconds and keeps the time of its last update; the "
+    "next update comes on schedule. It shows the last 7 days; charts already posted for "
+    "earlier days do not change."
 )
 # A key whose tail has upper-case letters, so no page text or hex marker holds it by chance.
 KEY = "abcdefghijklmnopqrstuvwx0123QZXK"

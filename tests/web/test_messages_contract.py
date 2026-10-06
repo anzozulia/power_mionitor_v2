@@ -52,9 +52,9 @@ A4_REMOVAL_DEFERRED = (
     "again in a minute."
 )
 A7_OUTAGE_REMOVED = (
-    "Outage from {start} removed: its time now counts as power on. The removal sent no "
-    "message. If it is within the last 7 days, the pinned chart shows the change at its next "
-    "update."
+    "Outage from {start} removed: its time now counts as power on. Its alerts are deleted "
+    "from the channel where Telegram allows it. If it is within the last 7 days, the pinned "
+    "chart shows the change within seconds."
 )
 CLEAR_SITE_DATA = "Clear-Site-Data"
 CHAT_B = -1009876543210
@@ -219,8 +219,10 @@ def test_A4_A7_copy() -> None:
     assert history_views.OUTAGE_REMOVED_MESSAGE == A7_OUTAGE_REMOVED
     removed = history_views.OUTAGE_REMOVED_MESSAGE.format(start="2026-10-01 11:00")
     assert removed.startswith("Outage from 2026-10-01 11:00 removed:")
-    assert "The removal sent no message." in removed
+    assert "Its alerts are deleted from the channel where Telegram allows it." in removed
     assert "No message was sent." not in removed
+    # Not sticky: one stored time, no second placeholder (UI5-D15).
+    assert history_views.OUTAGE_REMOVED_MESSAGE.count("{") == 1
 
 
 # R6 (amended 2026-10-04): Clear-Site-Data on the sign-out response only
