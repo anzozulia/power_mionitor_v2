@@ -7,8 +7,9 @@ router-reconnect grace off, language en, display TZ Europe/Kyiv.
   views get a ``FakeClock`` by constructor injection (``SomeView.as_view(clock=...)``).
   There is no freezegun and no monkeypatching of time.
 - Telegram is faked at the HTTP boundary (``responses``), and any unregistered URL raises.
-  ``FakeTelegram`` answers sendMessage (``accept``, ``fail``, ``answer``) and the four chart
-  calls (``accept_chart``, ``fail_method``, ``answer_method``), records what each accepted
+  ``FakeTelegram`` answers sendMessage (``accept``, ``fail``, ``answer``) and the calls that
+  name a stored message, the four chart calls and deleteMessage (``accept_chart``,
+  ``fail_method``, ``answer_method``), records what each accepted
   call carried (``sent``; ``chart_calls``, multipart bodies read back by
   ``parse_multipart``) and counts every request per method (``count``).
 - pytest-socket (``--allow-hosts`` in pyproject.toml) fails every real outbound connection
@@ -179,10 +180,12 @@ class FakeTelegram:
     """The Telegram Bot API, faked at the HTTP boundary with ``responses``.
 
     ``accept(token)`` answers that bot's sendMessage calls with ok and records each JSON
-    body in ``sent``; ``fail(token, ...)`` answers them with an HTTP error or raises an
-    exception. ``accept_chart(token)`` answers that bot's chart calls with ok and records
-    each one in ``chart_calls``: sendPhoto answers the message ids 1001, 1002, ...,
-    editMessageMedia the edited message, pinChatMessage and unpinChatMessage ``true``.
+    body in ``sent`` (the n-th accepted message gets the message id n); ``fail(token, ...)``
+    answers them with an HTTP error or raises an exception. ``accept_chart(token)`` answers
+    that bot's chart calls and its deleteMessage calls (the calls that name a stored
+    message, ``CHART_METHODS``) with ok and records each one in ``chart_calls``: sendPhoto
+    answers the message ids 1001, 1002, ..., editMessageMedia the edited message,
+    pinChatMessage, unpinChatMessage and deleteMessage ``true``.
     ``fail_method`` and ``answer_method`` are ``fail`` and ``answer`` for one method;
     ``count(token, method)`` counts every request, failed ones included. Several
     registrations for one URL answer in registration order and the last one repeats, so
@@ -191,7 +194,13 @@ class FakeTelegram:
     """
 
     API = TELEGRAM_API
-    CHART_METHODS = ("sendPhoto", "editMessageMedia", "pinChatMessage", "unpinChatMessage")
+    CHART_METHODS = (
+        "sendPhoto",
+        "editMessageMedia",
+        "pinChatMessage",
+        "unpinChatMessage",
+        "deleteMessage",
+    )
     # The chart calls with a multipart body (a PNG upload); the others send JSON.
     MULTIPART_METHODS = ("sendPhoto", "editMessageMedia")
     FIRST_PHOTO_ID = 1001

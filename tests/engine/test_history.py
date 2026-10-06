@@ -10,10 +10,14 @@ location's ``location_state`` row lock first:
   piece is not monitored) is refused under the lock (INV-07 #3);
 - each off piece of the outage becomes on, one piece at a time, so not-monitored time inside
   it stays not monitored (D-02);
-- the outage's queued alerts are dropped only when its OFF alert never went out (D-04 as
-  refined on 2026-10-03): an OFF that is sent or uncertain keeps its ON; while the OFF is
-  sending the removal is deferred with nothing written (wave-1 audit amendment, W1-A1), and
-  so it is while the outage's own ON alert is sending (wave-2 audit, W2-A1);
+- the outage's queued alerts are dropped only when its OFF alert never went out or can be
+  deleted (D-04 as refined on 2026-10-03, amended by 261006-qv7): an OFF that is uncertain,
+  sent with no stored message id, or sent more than 47 h ago keeps its ON and nothing is
+  deleted; otherwise the queued alerts are dropped and the sent ones get a delete request
+  (``delete_requested_at``), and today's chart record is marked for a redraw
+  (``redraw_requested_at``), all in the removal's transaction; while the OFF is sending the
+  removal is deferred with nothing written (wave-1 audit amendment, W1-A1), and so it is
+  while the outage's own ON alert is sending (wave-2 audit, W2-A1);
 - live state (status, last heartbeat, on since, outage start, window start, state version)
   is never written, nothing is queued and nothing is sent (INV-07 #1).
 
@@ -42,19 +46,20 @@ from zoneinfo import ZoneInfo
 import pytest
 from conftest import (
     DEFAULT_BOT_TOKEN,
+    DEFAULT_CHAT_ID,
     Actor,
     FakeTelegram,
     blocked_on_lock,
     terminate_backends,
     wait_for,
 )
-from django.db import connection, transaction
+from django.db import IntegrityError, connection, transaction
 
 from powermon.alerts import delivery, outbox
 from powermon.alerts.models import OpsIncident, OutboxMessage
 from powermon.chart import source
 from powermon.chart.models import ChartMessage
-from powermon.engine import history, maintenance, restore, transitions
+from powermon.engine import history, maintenance, restore, timeline, transitions
 from powermon.engine.models import LocationState, PowerInterval, SystemState
 from powermon.i18n import chart_texts
 from powermon.locations.models import Location
@@ -81,6 +86,10 @@ def _us(**kwargs: float) -> int:
     return timedelta(**kwargs) // timedelta(microseconds=1)
 
 
+# When the tests remove an outage: after every outage of the fixed day (19:00 in Kyiv).
+REMOVAL = datetime(2026, 10, 1, 16, 0, tzinfo=UTC)
+
+
 def _intervals(location: Any) -> list[Interval]:
     """The location's stored intervals as (state, start_at, end_at, outage_start_at)."""
     rows = PowerInterval.objects.filter(location=location).order_by("start_at")
@@ -104,6 +113,24 @@ def _outbox() -> list[tuple[str, datetime, str, str]]:
     """Every outbox row as (kind, event_at, status, last_error), oldest first."""
     rows = OutboxMessage.objects.order_by("id")
     return [(r.kind, r.event_at, r.status, r.last_error) for r in rows]
+
+
+def _requests() -> list[tuple[str, datetime, datetime | None, str | None]]:
+    """Every outbox row with a delete request: (kind, event_at, requested at, result)."""
+    rows = OutboxMessage.objects.filter(delete_requested_at__isnull=False).order_by("id")
+    return [(r.kind, r.event_at, r.delete_requested_at, r.delete_result) for r in rows]
+
+
+def _redraws(location: Any) -> list[datetime | None]:
+    """The location's chart records' redraw marks, oldest record first (261006-qv7)."""
+    rows = ChartMessage.objects.filter(location=location).order_by("id")
+    return list(rows.values_list("redraw_requested_at", flat=True))
+
+
+def _send(row: OutboxMessage, at: datetime, message_id: int) -> None:
+    """The relay sent ``row`` at ``at`` and stored its chat and Telegram's message id."""
+    assert outbox.claim(row.pk) is True
+    assert outbox.mark_sent(row.pk, at, tg_chat_id=DEFAULT_CHAT_ID, tg_message_id=message_id)
 
 
 def _no_anchors() -> None:
@@ -192,7 +219,7 @@ def test_INV07_1_removing_the_first_outage_changes_only_that_day_total(
     live = _live(location)
     rows = OutboxMessage.objects.count()
 
-    assert history.remove_outage(location.pk, _at(9, 0)) == "removed"
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "removed"
 
     assert _total(_today_row(location, now)) == ("30m", " · 1")
     # 09:00-10:00 is on now; the 15:00 outage's off piece is unchanged.
@@ -439,7 +466,7 @@ def test_INV07_3_outage_in_progress_is_refused(location_factory: Callable[..., A
     location = _off_since_9(location_factory)
     before = (_intervals(location), _outbox(), _live(location))
 
-    assert history.remove_outage(location.pk, _at(9, 0)) == "in_progress"
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "in_progress"
 
     assert (_intervals(location), _outbox(), _live(location)) == before
 
@@ -448,7 +475,7 @@ def test_INV07_3_outage_in_progress_is_refused(location_factory: Callable[..., A
     assert _intervals(location)[-1] == ("not_monitored", _at(10, 0), None, None)
     before = (_intervals(location), _outbox(), _live(location))
 
-    assert history.remove_outage(location.pk, _at(9, 0)) == "in_progress"
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "in_progress"
 
     assert (_intervals(location), _outbox(), _live(location)) == before
 
@@ -463,7 +490,7 @@ def test_open_off_piece_is_refused_even_without_the_status(
     LocationState.objects.filter(location=location).update(outage_started_at=_at(8, 0))
     before = _intervals(location)
 
-    assert history.remove_outage(location.pk, _at(9, 0)) == "in_progress"
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "in_progress"
 
     assert _intervals(location) == before
 
@@ -487,7 +514,7 @@ def test_D02_not_monitored_inside_the_removed_outage_stays(
         ("on", _at(11, 0), None, None),
     ]
 
-    assert history.remove_outage(location.pk, _at(9, 0)) == "removed"
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "removed"
 
     assert _intervals(location) == [
         ("on", _at(8, 0), _at(9, 0), None),
@@ -510,7 +537,7 @@ def test_D04_pending_alerts_of_the_removed_outage_are_dropped(
 ) -> None:
     location = _two_outages(location_factory)
 
-    assert history.remove_outage(location.pk, _at(9, 0)) == "removed"
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "removed"
 
     assert _outbox() == [
         ("power_off", _at(9, 0), "dropped", history.OUTAGE_REMOVED),
@@ -539,7 +566,7 @@ def test_D04_on_alert_matched_by_payload_when_power_returned_during_maintenance(
         ("on", _at(10, 10), None, None),
     ]
 
-    assert history.remove_outage(location.pk, _at(9, 0)) == "removed"
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "removed"
 
     assert _status(_row_of(location, "power_off", _at(9, 0))) == (
         "dropped",
@@ -558,7 +585,7 @@ def test_D04_on_alert_kept_when_the_off_alert_went_out(
     OutboxMessage.objects.filter(pk=off.pk).update(status=off_status)
     on = _row_of(location, "power_on", _at(10, 0))
 
-    assert history.remove_outage(location.pk, _at(9, 0)) == "removed"
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "removed"
 
     # Subscribers may have seen "power off": its ON alert still goes out.
     assert _status(on) == ("pending", "")
@@ -580,12 +607,15 @@ def test_D04_W1_A1_removal_deferred_while_the_off_alert_is_sending(
     on = _row_of(location, "power_on", _at(10, 0))
     # The relay claimed the outage's OFF alert: an attempt is in flight.
     assert outbox.claim(off.pk) is True
+    _chart(location, message_id=1001)
     before = (_intervals(location), _outbox(), _live(location))
 
-    assert history.remove_outage(location.pk, _at(9, 0)) == "sending"
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "sending"
 
-    # Nothing written: the timeline, both alerts and the live state are unchanged.
+    # Nothing written: the timeline, both alerts and the live state are unchanged, and
+    # there is no delete request and no redraw mark (261006-qv7).
     assert (_intervals(location), _outbox(), _live(location)) == before
+    assert (_requests(), _redraws(location)) == ([], [None])
     assert _status(off) == ("sending", "")
     assert _status(on) == ("pending", "")
 
@@ -598,12 +628,12 @@ def test_D04_W1_A1_failed_attempt_then_removal_drops_both(
     off = _row_of(location, "power_off", _at(9, 0))
     on = _row_of(location, "power_on", _at(10, 0))
     assert outbox.claim(off.pk) is True
-    assert history.remove_outage(location.pk, _at(9, 0)) == "sending"
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "sending"
     # The attempt fails (e.g. a 502): the relay puts the OFF back to pending.
     assert outbox.mark_retry(off.pk, _at(16, 1), "http_502") is True
     assert _status(off) == ("pending", "http_502")
 
-    assert history.remove_outage(location.pk, _at(9, 0)) == "removed"
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "removed"
 
     # The OFF never went out: both alerts are dropped, so the outage is never announced.
     assert _status(off) == ("dropped", history.OUTAGE_REMOVED)
@@ -619,7 +649,7 @@ def test_D04_W1_A1_another_outage_sending_does_not_defer(
     other = _row_of(location, "power_off", _at(15, 0))
     assert outbox.claim(other.pk) is True
 
-    assert history.remove_outage(location.pk, _at(9, 0)) == "removed"
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "removed"
 
     # Only this outage's OFF rows decide; the other outage's attempt is untouched.
     assert _status(_row_of(location, "power_off", _at(9, 0))) == (
@@ -655,7 +685,7 @@ def test_D04_on_alert_dropped_when_the_off_alert_expired_or_never_existed(
         location = _alerts_off_at_the_off(location_factory)
     on = _row_of(location, "power_on", _at(10, 0))
 
-    assert history.remove_outage(location.pk, _at(9, 0)) == "removed"
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "removed"
 
     # The subscribers never saw this outage's OFF alert: its ON alert is never sent.
     assert _status(on) == ("dropped", history.OUTAGE_REMOVED)
@@ -690,12 +720,15 @@ def test_D04_W2_A1_removal_deferred_while_the_on_alert_is_sending(
     location_factory: Callable[..., Any], case: str
 ) -> None:
     location, on = _on_alert_sending(location_factory, case)
+    _chart(location, message_id=1001)
     before = (_intervals(location), _outbox(), _live(location))
 
-    assert history.remove_outage(location.pk, _at(9, 0)) == "sending"
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "sending"
 
-    # Nothing written: the timeline, every alert and the live state are unchanged.
+    # Nothing written: the timeline, every alert and the live state are unchanged, and
+    # there is no delete request and no redraw mark (261006-qv7).
     assert (_intervals(location), _outbox(), _live(location)) == before
+    assert (_requests(), _redraws(location)) == ([], [None])
     assert _status(on) == ("sending", "")
 
 
@@ -705,12 +738,12 @@ def test_D04_W2_A1_failed_on_attempt_then_removal_drops_the_on(
     location_factory: Callable[..., Any], case: str
 ) -> None:
     location, on = _on_alert_sending(location_factory, case)
-    assert history.remove_outage(location.pk, _at(9, 0)) == "sending"
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "sending"
     # The attempt fails (e.g. a 502): the relay puts the ON back to pending.
     assert outbox.mark_retry(on.pk, _at(10, 1), "http_502") is True
     assert _status(on) == ("pending", "http_502")
 
-    assert history.remove_outage(location.pk, _at(9, 0)) == "removed"
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "removed"
 
     # "Power is back" is never sent for an outage the subscribers never heard of.
     assert _status(on) == ("dropped", history.OUTAGE_REMOVED)
@@ -738,13 +771,13 @@ def test_D04_W2_A1_on_alert_sending_defers_even_when_the_off_alert_went_out(
     before = (_intervals(location), _outbox(), _live(location))
 
     # The simplest rule: any alert of the outage in flight defers its removal.
-    assert history.remove_outage(location.pk, _at(9, 0)) == "sending"
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "sending"
 
     assert (_intervals(location), _outbox(), _live(location)) == before
     # The ON goes out: the next removal keeps both alerts and drops nothing.
     assert outbox.mark_sent(on.pk, _at(10, 0, 1)) is True
 
-    assert history.remove_outage(location.pk, _at(9, 0)) == "removed"
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "removed"
 
     assert _outbox() == [
         ("power_off", _at(9, 0), "sent", ""),
@@ -771,7 +804,7 @@ def test_D04_W2_A1_another_outage_on_alert_sending_does_not_defer(
     other = _row_of(location, "power_on", other_restore)
     assert outbox.claim(other.pk) is True
 
-    assert history.remove_outage(location.pk, start) == "removed"
+    assert history.remove_outage(location.pk, start, now=REMOVAL, tz=KYIV) == "removed"
 
     # Only the ON alerts matched to this outage decide (``was_off_us``): the other
     # outage's ON attempt is untouched, also when it is dated after this outage's start.
@@ -787,7 +820,7 @@ def test_D04_on_alert_with_a_foreign_payload_is_kept(location_factory: Callable[
     # A row whose payload does not name this outage's duration is never matched.
     OutboxMessage.objects.filter(pk=on.pk).update(payload={"was_off_us": True})
 
-    assert history.remove_outage(location.pk, _at(9, 0)) == "removed"
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "removed"
 
     assert _status(on) == ("pending", "")
     assert _status(_row_of(location, "power_off", _at(9, 0))) == (
@@ -810,12 +843,14 @@ def test_D04_nothing_to_drop_when_no_alert_was_queued(
     assert _outbox() == []
     caplog.set_level(logging.INFO, logger=history.__name__)
 
-    assert history.remove_outage(location.pk, _at(9, 0)) == "removed"
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "removed"
 
     assert _outbox() == []
     assert _intervals(location)[1] == ("on", _at(9, 0), _at(10, 0), None)
     [record] = [r for r in caplog.records if r.name == history.__name__]
-    assert record.getMessage().endswith("removed, 0 queued alert(s) dropped")
+    assert record.getMessage().endswith(
+        "removed, 0 queued alert(s) dropped, 0 alert message(s) to delete"
+    )
 
 
 @pytest.mark.django_db(transaction=True)
@@ -826,14 +861,14 @@ def test_removal_queues_nothing_and_logs_one_info_line(
     rows = OutboxMessage.objects.count()
     caplog.set_level(logging.INFO, logger=history.__name__)
 
-    assert history.remove_outage(location.pk, _at(9, 0)) == "removed"
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "removed"
 
     [record] = [r for r in caplog.records if r.name == history.__name__]
     assert record.levelno == logging.INFO
     message = record.getMessage()
     assert message == (
         f"outage {_at(9, 0).isoformat()} of location {location.pk} removed, "
-        "2 queued alert(s) dropped"
+        "2 queued alert(s) dropped, 0 alert message(s) to delete"
     )
     assert DEFAULT_BOT_TOKEN not in message
     assert location.device_key not in message
@@ -847,10 +882,10 @@ def test_removal_queues_nothing_and_logs_one_info_line(
 @pytest.mark.django_db(transaction=True)
 def test_removal_twice_is_gone_and_writes_nothing(location_factory: Callable[..., Any]) -> None:
     location = _two_outages(location_factory)
-    assert history.remove_outage(location.pk, _at(9, 0)) == "removed"
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "removed"
     before = (_intervals(location), _outbox(), _live(location))
 
-    assert history.remove_outage(location.pk, _at(9, 0)) == "gone"
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "gone"
 
     assert (_intervals(location), _outbox(), _live(location)) == before
 
@@ -861,13 +896,13 @@ def test_removal_for_a_deleted_location_is_gone(location_factory: Callable[..., 
     Location.objects.filter(pk=location.pk).update(deleted_at=_at(16, 0))
     before = (_intervals(location), _outbox(), _live(location))
 
-    assert history.remove_outage(location.pk, _at(9, 0)) == "gone"
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "gone"
 
     assert (_intervals(location), _outbox(), _live(location)) == before
     # An unknown location (no state row) is gone too, and a naive start is refused.
-    assert history.remove_outage(location.pk + 1000, _at(9, 0)) == "gone"
+    assert history.remove_outage(location.pk + 1000, _at(9, 0), now=REMOVAL, tz=KYIV) == "gone"
     with pytest.raises(ValueError, match="naive"):
-        history.remove_outage(location.pk, datetime(2026, 10, 1, 9, 0))  # noqa: DTZ001
+        history.remove_outage(location.pk, datetime(2026, 10, 1, 9, 0), now=REMOVAL, tz=KYIV)  # noqa: DTZ001
     assert _intervals(location) == before[0]
 
 
@@ -880,7 +915,7 @@ def test_adjacent_on_pieces_after_removal_are_one_span(
 ) -> None:
     location = _two_outages(location_factory)
 
-    assert history.remove_outage(location.pk, _at(9, 0)) == "removed"
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "removed"
 
     row = _today_row(location, _at(16, 0))
     on = [(s.start_us, s.end_us) for s in row.segments if s.state == "on"]
@@ -915,7 +950,7 @@ def test_removal_waits_on_the_row_lock(
                 raise AssertionError("the lock holder was never released")
 
     holder = Actor(hold_the_row_lock)
-    remover = Actor(lambda: history.remove_outage(location.pk, _at(9, 0)))
+    remover = Actor(lambda: history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV))
     try:
         holder.start()
         assert inside.wait(5)
@@ -957,7 +992,7 @@ def test_removal_rereads_the_status_under_the_lock(
                 raise AssertionError("the lock holder was never released")
 
     holder = Actor(new_outage_at_the_same_start)
-    remover = Actor(lambda: history.remove_outage(location.pk, _at(15, 0)))
+    remover = Actor(lambda: history.remove_outage(location.pk, _at(15, 0), now=REMOVAL, tz=KYIV))
     try:
         holder.start()
         assert inside.wait(5)
@@ -1023,8 +1058,17 @@ def _config(location: Any) -> tuple[Any, ...]:
 
 
 def _everything(location: Any) -> tuple[Any, ...]:
-    """What a reset could write: timeline, live state, chart marks, outbox, configuration."""
-    return (_intervals(location), _live(location), _marks(location), _outbox(), _config(location))
+    """What a reset could write: timeline, live state, chart marks, outbox, configuration,
+    and the removal's delete requests and redraw marks (261006-qv7)."""
+    return (
+        _intervals(location),
+        _live(location),
+        _marks(location),
+        _outbox(),
+        _config(location),
+        _requests(),
+        _redraws(location),
+    )
 
 
 @pytest.mark.django_db(transaction=True)
@@ -1299,3 +1343,283 @@ def test_reset_logs_one_info_line(
     caplog.clear()
     assert history.reset_history(location.pk, _at(16, 1)) == "nothing"
     assert [r for r in caplog.records if r.name == history.__name__] == []
+
+
+# 261006-qv7 (DATA-02 amended): the removal requests the deletion of the outage's sent
+# alerts and marks today's chart for a redraw, in its one transaction, with no network I/O
+
+
+@pytest.mark.django_db(transaction=True)
+def test_DATA02_sent_off_and_on_are_requested_for_deletion(
+    location_factory: Callable[..., Any],
+    fake_telegram: FakeTelegram,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    location = _two_outages(location_factory)
+    _send(_row_of(location, "power_off", _at(9, 0)), _at(9, 1, 32), 1)
+    _send(_row_of(location, "power_on", _at(10, 0)), _at(10, 0, 1), 2)
+    rows = OutboxMessage.objects.count()
+    caplog.set_level(logging.INFO, logger=history.__name__)
+
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "removed"
+
+    assert _requests() == [
+        ("power_off", _at(9, 0), REMOVAL, None),
+        ("power_on", _at(10, 0), REMOVAL, None),
+    ]
+    # Nothing dropped, sent or added; the other outage's alerts are untouched.
+    assert _outbox() == [
+        ("power_off", _at(9, 0), "sent", ""),
+        ("power_on", _at(10, 0), "sent", ""),
+        ("power_off", _at(15, 0), "pending", ""),
+        ("power_on", _at(15, 30), "pending", ""),
+    ]
+    assert OutboxMessage.objects.count() == rows
+    assert len(fake_telegram.calls) == 0
+    [record] = [r for r in caplog.records if r.name == history.__name__]
+    assert record.getMessage().endswith(
+        "removed, 0 queued alert(s) dropped, 2 alert message(s) to delete"
+    )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_DATA02_sent_off_with_pending_on_drops_the_on(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = _two_outages(location_factory)
+    _send(_row_of(location, "power_off", _at(9, 0)), _at(9, 1, 32), 1)
+    on = _row_of(location, "power_on", _at(10, 0))
+
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "removed"
+
+    # The OFF will be deleted, so "power is back" for it is never sent.
+    assert _status(on) == ("dropped", history.OUTAGE_REMOVED)
+    assert _requests() == [("power_off", _at(9, 0), REMOVAL, None)]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_DATA02_off_sent_just_inside_47h_is_requested(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = _two_outages(location_factory)
+    _send(_row_of(location, "power_off", _at(9, 0)), _at(9, 1, 32), 1)
+    now = _at(9, 1, 32) + outbox.DELETE_REQUEST_WINDOW - timedelta(microseconds=1)
+
+    assert history.remove_outage(location.pk, _at(9, 0), now=now, tz=KYIV) == "removed"
+
+    assert _requests() == [("power_off", _at(9, 0), now, None)]
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("case", ["no_id", "uncertain", "sent_47h_ago"])
+def test_DATA02_off_that_cannot_be_deleted_keeps_both_alerts(
+    location_factory: Callable[..., Any], case: str
+) -> None:
+    location = _two_outages(location_factory)
+    off = _row_of(location, "power_off", _at(9, 0))
+    on = _row_of(location, "power_on", _at(10, 0))
+    now = REMOVAL
+    if case == "no_id":
+        # Sent before this release: no message id was stored.
+        assert outbox.claim(off.pk) is True
+        assert outbox.mark_sent(off.pk, _at(9, 1, 32)) is True
+    elif case == "uncertain":
+        assert outbox.claim(off.pk) is True
+        assert outbox.mark_uncertain(off.pk, "read_timeout") is True
+    else:
+        _send(off, _at(9, 1, 32), 1)
+        now = _at(9, 1, 32) + outbox.DELETE_REQUEST_WINDOW
+
+    assert history.remove_outage(location.pk, _at(9, 0), now=now, tz=KYIV) == "removed"
+
+    # Today's behaviour: nothing dropped or deleted, the ON alert still goes out.
+    assert _status(on) == ("pending", "")
+    assert _requests() == []
+    assert _intervals(location)[1] == ("on", _at(9, 0), _at(10, 0), None)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_DATA02_off_expired_and_on_sent_requests_the_on(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = _two_outages(location_factory)
+    off = _row_of(location, "power_off", _at(9, 0))
+    OutboxMessage.objects.filter(pk=off.pk).update(status="expired", last_error="expired")
+    _send(_row_of(location, "power_on", _at(10, 0)), _at(10, 0, 1), 2)
+
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "removed"
+
+    assert _requests() == [("power_on", _at(10, 0), REMOVAL, None)]
+    assert _status(off) == ("expired", "expired")
+
+
+@pytest.mark.django_db(transaction=True)
+def test_DATA02_off_deletable_and_on_uncertain_requests_only_the_off(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = _two_outages(location_factory)
+    _send(_row_of(location, "power_off", _at(9, 0)), _at(9, 1, 32), 1)
+    on = _row_of(location, "power_on", _at(10, 0))
+    assert outbox.claim(on.pk) is True
+    assert outbox.mark_uncertain(on.pk, "read_timeout") is True
+
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "removed"
+
+    # The ON may be in the channel and has no id: it stays (D8).
+    assert _requests() == [("power_off", _at(9, 0), REMOVAL, None)]
+    assert _status(on) == ("uncertain", "read_timeout")
+
+
+@pytest.mark.django_db(transaction=True)
+def test_DATA02_removal_marks_only_todays_active_record(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = _two_outages(location_factory)
+    other = location_factory()
+    older = _chart(location, YESTERDAY, message_id=1000)
+    retired = _chart(location, message_id=999, retired_at=_at(8, 30))
+    today = _chart(location, message_id=1001)
+    foreign = _chart(other, message_id=2001)
+
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "removed"
+
+    marks = dict(ChartMessage.objects.values_list("pk", "redraw_requested_at"))
+    assert marks == {older.pk: None, retired.pk: None, today.pk: REMOVAL, foreign.pk: None}
+    # A record a history reset marked is released by the worker, never redrawn.
+    ChartMessage.objects.filter(pk=today.pk).update(
+        redraw_requested_at=None, history_reset_at=REMOVAL
+    )
+
+    assert history.remove_outage(location.pk, _at(15, 0), now=REMOVAL, tz=KYIV) == "removed"
+
+    assert _redraws(location) == [None, None, None]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_DATA02_in_progress_and_gone_write_no_request_and_no_mark(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = _off_since_9(location_factory)
+    _chart(location, message_id=1001)
+    before = _everything(location)
+
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "in_progress"
+    assert history.remove_outage(location.pk, _at(7, 0), now=REMOVAL, tz=KYIV) == "gone"
+
+    assert _everything(location) == before
+    assert (_requests(), _redraws(location)) == ([], [None])
+
+
+@pytest.mark.django_db(transaction=True)
+def test_DATA02_naive_now_is_refused_before_any_write(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = _two_outages(location_factory)
+    before = _everything(location)
+
+    with pytest.raises(ValueError, match="naive"):
+        history.remove_outage(
+            location.pk,
+            _at(9, 0),
+            now=datetime(2026, 10, 1, 16, 0),  # noqa: DTZ001
+            tz=KYIV,
+        )
+
+    assert _everything(location) == before
+
+
+@pytest.mark.django_db(transaction=True)
+def test_DATA02_check_rejects_a_request_on_a_pending_row(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = _two_outages(location_factory)
+    off = _row_of(location, "power_off", _at(9, 0))
+
+    with pytest.raises(IntegrityError), transaction.atomic():
+        OutboxMessage.objects.filter(pk=off.pk).update(delete_requested_at=REMOVAL)
+
+    assert _requests() == []
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV02_mark_sent_committing_during_removal_is_requested(
+    location_factory: Callable[..., Any],
+    lock_holder: tuple[threading.Event, threading.Event],
+) -> None:
+    location = _two_outages(location_factory)
+    off = _row_of(location, "power_off", _at(9, 0))
+    on = _row_of(location, "power_on", _at(10, 0))
+    assert outbox.claim(off.pk) is True
+    inside, release = lock_holder
+
+    def sent_but_not_committed() -> None:
+        # The relay writes "sent" with its ids; its commit comes only when released.
+        with transaction.atomic():
+            ids = {"tg_chat_id": DEFAULT_CHAT_ID, "tg_message_id": 1}
+            if not outbox.mark_sent(off.pk, _at(9, 1, 32), **ids):
+                raise AssertionError("mark_sent found no claimed row")
+            inside.set()
+            if not release.wait(5):
+                raise AssertionError("the sender was never released")
+
+    sender = Actor(sent_but_not_committed)
+    remover = Actor(lambda: history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV))
+    try:
+        sender.start()
+        assert inside.wait(5)
+        remover.start()
+        # The removal waits on the OFF row's lock (FOR UPDATE), not on a stale read.
+        assert wait_for(lambda: remover.pid is not None and blocked_on_lock(remover.pid))
+        release.set()
+        remover.join(5)
+    finally:
+        _finish(sender, remover, release=release)
+
+    assert sender.exc is None, sender.exc
+    assert remover.exc is None, remover.exc
+    # It decided on the committed "sent" with its ids: the OFF is requested, the ON dropped.
+    assert remover.result == "removed"
+    assert _requests() == [("power_off", _at(9, 0), REMOVAL, None)]
+    assert _status(on) == ("dropped", history.OUTAGE_REMOVED)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV02_claim_of_the_dropped_on_waits_and_sends_nothing(
+    location_factory: Callable[..., Any],
+    lock_holder: tuple[threading.Event, threading.Event],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    location = _two_outages(location_factory)
+    _send(_row_of(location, "power_off", _at(9, 0)), _at(9, 1, 32), 1)
+    on = _row_of(location, "power_on", _at(10, 0))
+    inside, release = lock_holder
+    real = timeline.overwrite
+
+    def overwrite_and_wait(*args: Any, **kwargs: Any) -> Any:
+        # The removal holds its row locks (FOR UPDATE) here, inside its transaction.
+        inside.set()
+        if not release.wait(5):
+            raise AssertionError("the removal was never released")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(timeline, "overwrite", overwrite_and_wait)
+    remover = Actor(lambda: history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV))
+    claimer = Actor(lambda: outbox.claim(on.pk))
+    try:
+        remover.start()
+        assert inside.wait(5)
+        claimer.start()
+        assert wait_for(lambda: claimer.pid is not None and blocked_on_lock(claimer.pid))
+        release.set()
+        remover.join(5)
+        claimer.join(5)
+    finally:
+        _finish(remover, claimer, release=release)
+
+    assert remover.exc is None, remover.exc
+    assert claimer.exc is None, claimer.exc
+    assert remover.result == "removed"
+    # The relay's claim waited for the removal and then found the ON no longer pending.
+    assert claimer.result is False
+    assert _status(on) == ("dropped", history.OUTAGE_REMOVED)
+    assert _requests() == [("power_off", _at(9, 0), REMOVAL, None)]

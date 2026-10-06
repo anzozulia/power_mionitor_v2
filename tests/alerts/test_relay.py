@@ -901,7 +901,7 @@ def test_WR04_activation_retries_while_the_flush_fails(
     row, state = _kept_ok(location_factory(), answered)
     clock = FakeClock(T0 + timedelta(minutes=10))
 
-    def broken(message_id: int, now: datetime) -> bool:
+    def broken(message_id: int, now: datetime, **kwargs: Any) -> bool:
         raise _db_blip()
 
     monkeypatch.setattr(outbox, "mark_sent", broken)
@@ -1649,3 +1649,150 @@ def test_INV15_killed_after_claim_is_uncertain_never_sent(
         "sent",
     )
     assert _calls_to(fake_telegram, OPS_BOT_TOKEN) == 1
+
+
+# The relay stores the chat and Telegram's message id with "sent" (261006-qv7, DATA-02)
+
+
+def _ids(message: OutboxMessage) -> tuple[Any, ...]:
+    row = _row(message)
+    return row.status, row.tg_chat_id, row.tg_message_id
+
+
+@pytest.mark.django_db(transaction=True)
+def test_DATA02_sent_alert_stores_its_chat_and_message_id(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    location = location_factory()
+    off = _queue(location)
+    fake_telegram.accept(TOKEN_A)
+
+    assert io_loop.run_iteration(FakeClock(T0 + _seconds(60)), io_loop.RelayState()) is True
+
+    # The chat the alert went to and the id Telegram gave it (the fake's first id is 1).
+    assert _ids(off) == ("sent", DEFAULT_CHAT_ID, 1)
+    assert _row(off).delete_requested_at is None
+    assert _row(off).delete_result is None
+
+
+@pytest.mark.django_db(transaction=True)
+def test_DATA02_chat_change_after_the_send_keeps_the_old_chat(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    location = location_factory()
+    off = _queue(location)
+    on = _queue(location, "power_on", at=T0 + _seconds(30))
+    fake_telegram.accept(TOKEN_A)
+    state = io_loop.RelayState()
+    clock = FakeClock(T0 + _seconds(60))
+    assert io_loop.run_iteration(clock, state) is True
+    # The admin moves the location to another chat between the two sends.
+    type(location).objects.filter(pk=location.pk).update(chat_id=CHAT_B)
+
+    clock.advance(seconds=1)
+    assert io_loop.run_iteration(clock, state) is True
+
+    assert _ids(off) == ("sent", DEFAULT_CHAT_ID, 1)
+    assert _ids(on) == ("sent", CHAT_B, 2)
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    "result",
+    [True, {"message_id": 0}, {"message_id": "5"}],
+    ids=["result-true", "zero", "str"],
+)
+def test_DATA02_ok_without_an_id_is_sent_with_no_ids_and_no_notice(
+    location_factory: Callable[..., Any], fake_telegram: Any, ops_settings: Any, result: Any
+) -> None:
+    location = location_factory()
+    off = _queue(location)
+    fake_telegram.fail(TOKEN_A, status=200, json_body={"ok": True, "result": result})
+
+    assert io_loop.run_iteration(FakeClock(T0 + _seconds(60)), io_loop.RelayState()) is True
+
+    # Telegram accepted it: sent, never uncertain, and no "may not have been delivered".
+    assert _ids(off) == ("sent", None, None)
+    assert not OutboxMessage.objects.filter(channel="ops").exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_DATA02_ops_rows_store_no_ids(fake_telegram: Any, ops_settings: Any) -> None:
+    notice = _gap_notice(T0 - _seconds(120), T0 - _seconds(60))
+    fake_telegram.accept(OPS_BOT_TOKEN)
+
+    assert io_loop.run_iteration(FakeClock(T0 + _seconds(60)), io_loop.RelayState()) is True
+
+    assert _ids(notice) == ("sent", None, None)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_DATA02_read_timeout_is_uncertain_with_no_ids(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    location = location_factory()
+    off = _queue(location)
+    fake_telegram.fail(TOKEN_A, exc=requests.ReadTimeout("read timed out"))
+
+    assert io_loop.run_iteration(FakeClock(T0 + _seconds(60)), io_loop.RelayState()) is True
+
+    assert _ids(off) == ("uncertain", None, None)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_DATA02_kept_ok_flushed_later_writes_the_ids(
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    location = location_factory()
+    off = _queue(location)
+    fake_telegram.accept(TOKEN_A)
+    # Telegram accepts the OFF; writing "sent" fails once (WR-04), so the outcome is kept.
+    _fail_once(monkeypatch, outbox, "mark_sent")
+    state = io_loop.RelayState()
+    clock = FakeClock(T0 + _seconds(60))
+    assert io_loop.run_iteration(clock, state) is True
+    assert _ids(off) == ("sending", None, None)
+    assert state.unapplied[off.pk].chat_id == DEFAULT_CHAT_ID
+
+    clock.advance(seconds=1)
+    io_loop.run_iteration(clock, state)
+
+    assert _ids(off) == ("sent", DEFAULT_CHAT_ID, 1)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_DATA02_unapplied_built_positionally_still_works(
+    location_factory: Callable[..., Any],
+) -> None:
+    answered = T0 + _seconds(3)
+    row, state = _kept_ok(location_factory(), answered)
+    # Built with the six positional fields of before: no chat, so no ids are stored.
+    assert state.unapplied[row.pk].chat_id is None
+
+    assert io_loop.activate(state, FakeClock(T0 + timedelta(minutes=10))) == 0
+
+    assert _ids(row) == ("sent", None, None)
+
+
+@pytest.mark.django_db
+def test_DATA02_mark_sent_stores_ids_only_when_both_are_given(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = location_factory()
+    rows = [_queue(location, at=T0 + _seconds(n)) for n in range(3)]
+    for row in rows:
+        assert outbox.claim(row.pk) is True
+
+    assert outbox.mark_sent(rows[0].pk, T0, tg_chat_id=DEFAULT_CHAT_ID, tg_message_id=7)
+    assert outbox.mark_sent(rows[1].pk, T0, tg_chat_id=DEFAULT_CHAT_ID)
+    assert outbox.mark_sent(rows[2].pk, T0, tg_message_id=7)
+    # A row that is not "sending" is not touched, ids or not.
+    assert outbox.mark_sent(rows[0].pk, T0, tg_chat_id=CHAT_B, tg_message_id=8) is False
+
+    assert [_ids(row) for row in rows] == [
+        ("sent", DEFAULT_CHAT_ID, 7),
+        ("sent", None, None),
+        ("sent", None, None),
+    ]

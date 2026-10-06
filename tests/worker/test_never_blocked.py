@@ -12,6 +12,10 @@ While the I/O thread is stuck inside those sends, device heartbeats through
 least 10 times in 2 s with a 0.1 s interval. A heartbeat does no network I/O at all
 (KD2), and the I/O thread is the only thread that ever waits on Telegram.
 
+A delete of a removed outage's alert (261006-qv7) is a non-alert call like a chart call:
+a 429 on it holds only its own bot, so another bot's alert goes in the next pass at the
+same clock (INV-14 #1), checked on the I/O pass itself (``io_loop.run_iteration``).
+
 Time: the worker gets a ``FakeClock`` that never moves, so no location times out and no
 backoff elapses; real ``time.monotonic()`` only measures latency and cadence. The
 watchdog checks only every 30 s here, so it never runs during a test (its own tests are
@@ -37,7 +41,7 @@ from powermon.alerts import outbox
 from powermon.alerts.models import OutboxMessage
 from powermon.engine.models import SystemState
 from powermon.web.views import HeartbeatView
-from powermon.worker import detection, supervision
+from powermon.worker import detection, io_loop, supervision
 from powermon.worker.lease import Lease
 from powermon.worker.management.commands import run_worker
 
@@ -228,3 +232,87 @@ def test_INV14_connect_timeouts_never_slow_detection(
             1,
             "connect_timeout",
         )
+
+
+TOKEN_B = "987654321:" + "B" * 35
+CHAT_B = -1009876543210
+
+
+def _sent_off_requested(location: Any, at: datetime) -> OutboxMessage:
+    """A sent OFF alert of ``location`` with its stored ids, its deletion requested at ``at``."""
+    return OutboxMessage.objects.create(
+        channel=outbox.CHANNEL_SUBSCRIBER,
+        location=location,
+        kind=outbox.KIND_POWER_OFF,
+        event_at=at - timedelta(minutes=20),
+        recorded_at=at - timedelta(minutes=19),
+        payload={"was_on_us": 300_000_000},
+        status="sent",
+        attempts=1,
+        next_attempt_at=at - timedelta(minutes=19),
+        expires_at=at + timedelta(hours=24),
+        sent_at=at - timedelta(minutes=19),
+        tg_chat_id=DEFAULT_CHAT_ID,
+        tg_message_id=7,
+        delete_requested_at=at,
+    )
+
+
+def _queue_at(location: Any, at: datetime) -> OutboxMessage:
+    with transaction.atomic():
+        return outbox.enqueue(
+            outbox.KIND_POWER_OFF,
+            location.pk,
+            event_at=at - timedelta(seconds=91),
+            recorded_at=at,
+            payload={"was_on_us": 300_000_000},
+        )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV14_429_on_a_delete_never_delays_another_bot(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    bot_a = location_factory()
+    bot_b = location_factory(bot_token=TOKEN_B, chat_id=CHAT_B)
+    request = _sent_off_requested(bot_a, T0)
+    limited = {"ok": False, "error_code": 429, "parameters": {"retry_after": 30}}
+    fake_telegram.fail_method(DEFAULT_BOT_TOKEN, "deleteMessage", status=429, json_body=limited)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    fake_telegram.accept(DEFAULT_BOT_TOKEN)
+    fake_telegram.accept(TOKEN_B)
+    clock = FakeClock(T0)
+    state = io_loop.RelayState()
+
+    # Pass 1: bot A's delete is rate limited for 30 s.
+    assert io_loop.run_iteration(clock, state) is True
+    alert_a, alert_b = _queue_at(bot_a, T0), _queue_at(bot_b, T0)
+
+    # Pass 2, same clock: bot B's new alert goes at once; nothing is called for bot A.
+    assert io_loop.run_iteration(clock, state) is True
+    assert _urls(fake_telegram) == [("A", "deleteMessage"), ("B", "sendMessage")]
+    assert OutboxMessage.objects.get(pk=alert_a.pk).status == "pending"
+
+    # At +30 s bot A's alert goes first, then its delete.
+    clock.advance(seconds=30)
+    assert io_loop.run_iteration(clock, state) is True
+
+    assert _urls(fake_telegram) == [
+        ("A", "deleteMessage"),
+        ("B", "sendMessage"),
+        ("A", "sendMessage"),
+        ("A", "deleteMessage"),
+    ]
+    assert OutboxMessage.objects.get(pk=alert_b.pk).status == "sent"
+    assert OutboxMessage.objects.get(pk=alert_a.pk).status == "sent"
+    assert OutboxMessage.objects.get(pk=request.pk).delete_result == "deleted"
+
+
+def _urls(fake: Any) -> list[tuple[str, str]]:
+    """Every request as (bot, method): "A" is the default bot, "B" the other one."""
+    labels = {DEFAULT_BOT_TOKEN: "A", TOKEN_B: "B"}
+    out = []
+    for call in fake.calls:
+        token, method = call.request.url.split("/bot", 1)[1].rsplit("/", 1)
+        out.append((labels[token], method))
+    return out

@@ -278,7 +278,7 @@ def test_ok_over_real_tls(serve: Callable[[Handler], LoopbackServer]) -> None:
 
     result = _send(server.port)
 
-    assert result == SendResult("ok")
+    assert result == SendResult("ok", message_id=1)
     head, _, body = bytes(server.received).partition(b"\r\n\r\n")
     assert head.startswith(f"POST /bot{TOKEN}/sendMessage HTTP/1.1".encode())
     assert json.loads(body) == {"chat_id": DEFAULT_CHAT_ID, "text": TEXT, "parse_mode": "HTML"}
