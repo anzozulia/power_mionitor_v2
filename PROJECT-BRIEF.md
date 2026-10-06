@@ -143,7 +143,7 @@ If an alert is delivered more than ~2 min after its transition was recorded, it 
 - **Each row:** that day's total off time and outage count, e.g. `3h 20m · 2` under an "off time · outages" column header (exact formats and zero/empty-day rules in `docs/chart-spec.md` section 8).
 - **Caption:** today's summary (off time, outage count); the last-updated time is the image's now pill.
 - **Posting:** a new chart is posted and pinned in each location's chat at local 00:00. The previous day's message gets a final update and is unpinned.
-- **Updates:** the chart is edited in place every 15 minutes.
+- **Updates:** the chart is edited in place on its location's chart update period (1, 5, 10, 15, 30 or 60 min; default 15), on local clock minutes that are multiples of the period (60 = on the hour). (Amended 2026-10-06, quick task 261006-of9.)
 - **Look:** localized title and weekdays (uk: Пн Вт Ср Чт Пт Сб Нд; all strings in `docs/chart-spec.md` section 8), bundled fonts with Cyrillic, one light theme.
 
 ---
@@ -205,7 +205,7 @@ Each requirement is user-visible or observable and testable. Section 3 defines t
 ### Weekly chart (CHRT)
 
 - [ ] **CHRT-01**: Each location's chat has a pinned weekly chart (rows Mon–Sun × 24 h) that tells apart on, off, not monitored (maintenance / server downtime) and no data.
-- [ ] **CHRT-02**: The pinned chart refreshes every 15 minutes; today's row runs up to a "now" marker and the future is empty.
+- [ ] **CHRT-02**: The pinned chart refreshes on its location's chart update period (1, 5, 10, 15, 30 or 60 min; default 15), on local clock minutes that are multiples of the period (60 = on the hour); today's row runs up to a "now" marker and the future is empty. (Amended 2026-10-06, quick task 261006-of9.)
 - [ ] **CHRT-03**: Each day row shows that day's total off time and number of outages (daily totals).
 - [ ] **CHRT-04**: The chart caption shows today's summary (off time, outage count); the last-updated time is the image's now pill.
 - [ ] **CHRT-05**: At local midnight a new chart is posted and pinned, and the previous one gets a final update and is unpinned; midnights missed during downtime are caught up afterwards; no duplicate or orphaned pinned charts are left behind.
@@ -342,7 +342,7 @@ Status: undecided. `/gsd-discuss-phase` asks the maintainer in the phase that ow
 
 v1 is done when all of the following can be observed. Each item names its requirements and the phase (section 11) where it becomes checkable.
 
-1. **Outage alerts** (MON-02, MON-03, ALRT-01, ALRT-02; chart part CHRT-02). Phase 1; chart part phase 3. Unplug one device while the other locations keep reporting: an OFF alert arrives within period + grace + 30 s (+180 s when router-reconnect grace applies). Power back: an ON alert arrives within 30 s of the first heartbeat. The chart shows the outage within 15 min.
+1. **Outage alerts** (MON-02, MON-03, ALRT-01, ALRT-02; chart part CHRT-02). Phase 1; chart part phase 3. Unplug one device while the other locations keep reporting: an OFF alert arrives within period + grace + 30 s (+180 s when router-reconnect grace applies). Power back: an ON alert arrives within 30 s of the first heartbeat. The chart shows the outage by the location's next chart update (within one period; 15 min by default). (Amended 2026-10-06, quick task 261006-of9.)
 2. **Server downtime** (MON-05, OPS-02; chart part CHRT-01). Phase 2; chart part phase 3. Stop the whole stack for 10 min while all devices stay powered, then start it again: no location alerts, one admin ops message with the downtime window, and the chart shows that window as not monitored.
 3. **Telegram outage** (ALRT-03, ALRT-04, ALRT-05). Phase 2. Block the Telegram API for 10 min during an outage: alerts arrive after connectivity returns, each states the actual event time, and none are duplicated.
 4. **Database restart** (MON-06, OPS-02). Phase 2. Restart only the database: detection resumes within 1 min with no manual action.

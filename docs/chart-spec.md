@@ -43,7 +43,7 @@ chart, in scope for this milestone, has:
     the text is not resampled. The legacy 1400 px image was scaled down, which softened its text.
   - The ratio is 1.28:1. On a phone the photo is about 400 px wide and 312 px tall, so Telegram does
     not crop or letterbox it.
-  - Because the height is fixed, editing the message in place every 15 minutes never resizes the chat bubble.
+  - Because the height is fixed, editing the message in place at every update never resizes the chat bubble. (Amended 2026-10-06, quick task 261006-of9.)
 - Send the chart as a **photo**, not as a document, so it shows inline. Telegram re-encodes photos
   as JPEG. For that reason: use no hairline thinner than 1.5 px, no text smaller than 27 px, and a
   solid background. Telegram shows the photo exactly as it is in both its light and dark themes. A light
