@@ -141,7 +141,7 @@ If an alert is delivered more than ~2 min after its transition was recorded, it 
 - **Today's row:** runs up to a "now" marker; the future is empty.
 - **Days after today:** show the previous week's same weekday, dimmed.
 - **Each row:** that day's total off time and outage count, e.g. `3h 20m · 2` under an "off time · outages" column header (exact formats and zero/empty-day rules in `docs/chart-spec.md` section 8).
-- **Caption:** today's summary and the last-updated time.
+- **Caption:** today's summary (off time, outage count); the last-updated time is the image's now pill.
 - **Posting:** a new chart is posted and pinned in each location's chat at local 00:00. The previous day's message gets a final update and is unpinned.
 - **Updates:** the chart is edited in place every 15 minutes.
 - **Look:** localized title and weekdays (uk: Пн Вт Ср Чт Пт Сб Нд; all strings in `docs/chart-spec.md` section 8), bundled fonts with Cyrillic, one light theme.
@@ -207,7 +207,7 @@ Each requirement is user-visible or observable and testable. Section 3 defines t
 - [ ] **CHRT-01**: Each location's chat has a pinned weekly chart (rows Mon–Sun × 24 h) that tells apart on, off, not monitored (maintenance / server downtime) and no data.
 - [ ] **CHRT-02**: The pinned chart refreshes every 15 minutes; today's row runs up to a "now" marker and the future is empty.
 - [ ] **CHRT-03**: Each day row shows that day's total off time and number of outages (daily totals).
-- [ ] **CHRT-04**: The chart caption shows today's summary (off time, outage count) and the last-updated time.
+- [ ] **CHRT-04**: The chart caption shows today's summary (off time, outage count); the last-updated time is the image's now pill.
 - [ ] **CHRT-05**: At local midnight a new chart is posted and pinned, and the previous one gets a final update and is unpinned; midnights missed during downtime are caught up afterwards; no duplicate or orphaned pinned charts are left behind.
 - [ ] **CHRT-06**: The chart is correct on DST-transition days and for outages that cross midnight.
 - [ ] **CHRT-07**: Days after today show the previous week's same weekday, visually dimmed.
