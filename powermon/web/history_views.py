@@ -16,9 +16,10 @@ location's history (DATA-03; 05-UI-SPEC B, C, D, E).
   "nothing to reset" for a reset (UI5-D9).
 - An unknown or deleted location, or a start that is not a valid instant, answers 404,
   never 500 (05-UI-SPEC E).
-- No network I/O (KD2): the worker's next scheduled chart refresh (on the location's
-  chart update period) shows a removal (D-03), and its next I/O pass unpins a reset
-  location's old chart in its own chat (D-08). The web never retires a chart record itself.
+- No network I/O (KD2): a removal only writes rows in its transaction; the worker then
+  deletes the outage's alerts where Telegram allows it and redraws today's chart within
+  seconds (261006-qv7, D-03 amended). A reset's old chart is unpinned by the worker in its
+  own chat as before (D-08). The web never retires a chart record itself.
 - Flashes hold fixed copy plus at most one time formatted from a stored instant (UI5-D15),
   never a value echoed from the request, a token or a key (SEC-04, OPS-08).
 """
@@ -41,12 +42,13 @@ from powermon.web.status import location_status
 
 ONE_US = timedelta(microseconds=1)
 
-# 06-UI-SPEC amendment A7, verbatim, amended by quick task 261006-of9 ("at its next
-# update" holds for every chart update period). {start} is "YYYY-MM-DD HH:MM" in the
-# display TZ, formatted from the stored outage start (UI5-D15).
+# 06-UI-SPEC amendment A7, verbatim, amended by quick tasks 261006-of9 and 261006-qv7 (the
+# removal deletes the outage's alerts and redraws today's chart). {start} is
+# "YYYY-MM-DD HH:MM" in the display TZ, formatted from the stored outage start (UI5-D15).
 OUTAGE_REMOVED_MESSAGE = (
-    "Outage from {start} removed: its time now counts as power on. The removal sent no message. "
-    "If it is within the last 7 days, the pinned chart shows the change at its next update."
+    "Outage from {start} removed: its time now counts as power on. "
+    "Its alerts are deleted from the channel where Telegram allows it. "
+    "If it is within the last 7 days, the pinned chart shows the change within seconds."
 )
 REMOVAL_REFUSED_MESSAGE = "This outage is still in progress. It can be removed after power returns."
 OUTAGE_GONE_MESSAGE = (

@@ -2,7 +2,8 @@
 S10, the remove outage confirmation (06-UI-SPEC Page Contracts > Confirmations, Components
 > Modal; UI-07, D6-05, R7, R12). One partial for both variants: web/outage_remove.html
 includes it in its focus card, and fragments.confirm_response renders it alone, with
-fragment set, as the modal body. Copy rows remove.* (remove.c3 is amendment A3).
+fragment set, as the modal body. Copy rows remove.* (remove.c3 is amendments A3 and A9;
+remove.chart is A9).
 
 Context: location; start_us (from the stored outage, never the request's value, R12);
 outage (start, end); off_text (the chart's totals format); shows_unmonitored (off time is
@@ -34,10 +35,10 @@ shorter than the outage's span); fragment (set only for the modal).
 <ul data-testid="consequences" class="flex flex-col gap-2">
 <li class="relative pl-4 before:absolute before:top-2 before:left-0.5 before:size-1 before:rounded-full before:bg-fg-subtle">records its off time as power on, so the chart and the daily totals no longer count it as off time or as an outage;</li>
 {% if shows_unmonitored %}<li class="relative pl-4 before:absolute before:top-2 before:left-0.5 before:size-1 before:rounded-full before:bg-fg-subtle">keeps the time inside it that was not monitored (maintenance, server downtime) as not monitored;</li>
-{% endif %}<li class="relative pl-4 before:absolute before:top-2 before:left-0.5 before:size-1 before:rounded-full before:bg-fg-subtle">sends nothing itself, and drops its queued OFF and ON alerts if the OFF alert was never sent (if it already went out, its queued ON alert is still sent, so the channel is not left at power off);</li>
+{% endif %}<li class="relative pl-4 before:absolute before:top-2 before:left-0.5 before:size-1 before:rounded-full before:bg-fg-subtle">deletes its OFF and ON alerts from the channel and drops any still queued. If its OFF alert cannot be deleted (sent more than 47 hours ago or before this update, or its delivery is uncertain), both alerts stay and a queued ON alert is still sent, so the channel is not left at power off;</li>
 <li class="relative pl-4 before:absolute before:top-2 before:left-0.5 before:size-1 before:rounded-full before:bg-fg-subtle">leaves the live status unchanged, including the On since time from which the next OFF alert counts "was ON for".</li>
 </ul>
-<p>The chart shows the change at its next update. It shows the last 7 days; charts already posted for earlier days do not change.</p>
+<p>The pinned chart is redrawn within seconds and keeps the time of its last update; the next update comes on schedule. It shows the last 7 days; charts already posted for earlier days do not change.</p>
 </div>
 <div class="flex shrink-0 flex-col-reverse gap-2 border-t border-border bg-surface-muted px-6 py-3 sm:flex-row sm:justify-end">
 {% include "partials/_button.html" with variant="secondary" label="Keep outage" href=keep_url testid="keep" only %}

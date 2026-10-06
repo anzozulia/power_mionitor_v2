@@ -520,8 +520,9 @@ def test_DATA02_failed_redraw_keeps_the_mark_and_redraws_again(
 
     assert _pass(clock, state) is True
     assert _record(row) == (RENDERED, REMOVED)
-    # The step and its bot wait 30 s, then the redraw runs again, at the same time.
-    clock.advance(seconds=29)
+    # The bot waits 2 s and the step 30 s more (step_delay), then the redraw runs again,
+    # at the same time.
+    clock.advance(seconds=31)
     assert _pass(clock, state) is False
     clock.advance(seconds=1)
     assert _pass(clock, state) is True

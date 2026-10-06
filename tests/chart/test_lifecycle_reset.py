@@ -575,7 +575,12 @@ def test_existing_lifecycle_rows_and_locations_build_with_the_new_defaults() -> 
 
     assert (location.deleted, location.awaiting_heartbeat) == (False, False)
     assert row.history_reset_at is None
-    assert [f.name for f in dataclasses.fields(row)][-1] == "history_reset_at"
+    # 261006-qv7 appends the redraw mark after it, with a default too.
+    assert [f.name for f in dataclasses.fields(row)][-2:] == [
+        "history_reset_at",
+        "redraw_requested_at",
+    ]
+    assert row.redraw_requested_at is None
     assert lifecycle.stale(location, row) is False
     assert lifecycle.plan(
         [location], [row], today=TODAY, now=NOON_05, not_before={}, tz=KYIV
