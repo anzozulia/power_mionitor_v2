@@ -140,8 +140,8 @@ models never loads Pillow; the web process loads it only when its chart preview 
 (UI-06) first calls ``chart_content``.
 
 Before each call the worker checks that its lease session (``RelayState.lease_pid``) still
-holds the worker lock, with the same ``pg_locks`` predicate as the outbox claim; a stale
-worker makes no chart call (C1).
+holds the worker lock (``outbox.lease_holds``, the same ``pg_locks`` predicate as the outbox
+claim, shared with the I/O loop's delete step); a stale worker makes no chart call (C1).
 
 Backoff (D-02, D-06, INV-14). Chart calls share the alert relay's per-bot and per-chat
 backoff, read only: a bot whose ``bot_wide_key`` or a channel whose ``chat_key`` is in
@@ -208,7 +208,6 @@ from powermon.i18n import chart_texts
 from powermon.locations.models import DEFAULT_CHART_REFRESH_MIN
 from powermon.telegram.client import DEFAULT_RETRY_AFTER_S, SendResult, TelegramClient
 from powermon.worker import io_loop
-from powermon.worker.lease import LOCK_KEY
 
 log = logging.getLogger(__name__)
 
@@ -280,15 +279,6 @@ VALUES (%(location_id)s, %(local_date)s, %(chat_id)s, %(bot_key)s, %(message_id)
         NULL, %(answered)s, NULL, NULL, NULL, %(answered)s)
 ON CONFLICT DO NOTHING RETURNING id
 """
-# The C1 fence: the lease session holds the worker lock right now (outbox.CLAIM_HELD_SQL).
-LEASE_HELD_SQL = """
-SELECT 1 FROM pg_locks
- WHERE locktype = 'advisory' AND granted AND pid = %(pid)s
-   AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
-   AND classid = %(classid)s::oid AND objid = %(objid)s::oid AND objsubid = 1
-"""
-_LOCK_CLASSID = LOCK_KEY >> 32
-_LOCK_OBJID = LOCK_KEY & 0xFFFFFFFF
 
 
 @dataclass(frozen=True)
@@ -756,7 +746,7 @@ def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | No
                 )
                 return False
         render_ms = _ms(clock.monotonic() - started)
-        if _stopped(stop) or not _lease_holds(state.lease_pid):
+        if _stopped(stop) or not outbox.lease_holds(state.lease_pid):
             return False
         client = TelegramClient(location.bot_token)
         called = clock.monotonic()
@@ -1046,15 +1036,6 @@ def _stopped(stop: threading.Event | None) -> bool:
 
 def _ms(seconds: float) -> int:
     return int(seconds * 1000)
-
-
-def _lease_holds(pid: int | None) -> bool:
-    """True when ``pid`` (the lease session) holds the worker lock; no pid is unfenced."""
-    if pid is None:
-        return True
-    with connection.cursor() as cur:
-        cur.execute(LEASE_HELD_SQL, {"pid": pid, "classid": _LOCK_CLASSID, "objid": _LOCK_OBJID})
-        return cur.fetchone() is not None
 
 
 def _record_post(

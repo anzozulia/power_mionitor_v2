@@ -132,7 +132,7 @@ class OutageRemoveView(View):
     def post(self, request: HttpRequest, pk: int, start_us: int) -> HttpResponse:
         location_or_404(pk)
         start = instant_or_404(start_us)
-        result = history.remove_outage(pk, start)
+        result = history.remove_outage(pk, start, now=self.clock.now(), tz=settings.TIME_ZONE)
         if result == "removed":
             day, minute = local_minute(start, settings.TIME_ZONE)
             messages.success(request, OUTAGE_REMOVED_MESSAGE.format(start=f"{day} {minute}"))

@@ -1,7 +1,9 @@
 """Telegram Bot API client: the calls the app makes.
 
 - ``send_message``: an alert or an ops notice (``sendMessage``, Telegram HTML), or the
-  admin's test message, sent silently (``disable_notification``, D-11).
+  admin's test message, sent silently (``disable_notification``, D-11). An ok result
+  carries Telegram's id for the message when the answer has a usable one, so the relay can
+  store it and a later outage removal can delete the alert (261006-qv7).
 - ``send_photo``: post a chart silently (multipart ``sendPhoto`` with
   ``disable_notification``, D-01). The result carries the new message's id, which the chart
   lifecycle records before it pins (INV-17).
@@ -10,8 +12,14 @@
 - ``pin_chat_message`` / ``unpin_chat_message``: pin a chart silently, and unpin exactly
   that message (D-04). There is no call that unpins everything: pins the channel admin
   made stay (INV-19).
+- ``delete_message``: delete one stored alert message of a removed outage (JSON
+  ``deleteMessage``, 261006-qv7). A 400 whose description says "message to delete not
+  found" is ``ok`` with code ``not_found``: the message is gone, which is what the delete
+  wanted (Telegram may answer ok once and "not found" afterwards for the same message).
+  Every other answer follows the generic rules below; the batch ``deleteMessages`` is not
+  used.
 
-Edit, pin and unpin name a stored message, so a ``message_id`` that is not an int above 0
+Edit, pin, unpin and delete name a stored message, so a ``message_id`` that is not an int above 0
 is a programming error: ``ValueError``, before any request. For these three calls only, a
 400 whose description says the message is unchanged ("message is not modified", or
 ``CHAT_NOT_MODIFIED`` for a pin or unpin already in place) is ``ok`` with code
@@ -24,7 +32,8 @@ No method raises across its boundary. Every outcome comes back as a ``SendResult
 ``code`` is a short fixed string, never the token, a URL or Telegram's description text:
 
 - ``ok``: Telegram accepted the call. For ``send_photo``, ``message_id`` is the posted
-  message's id (an int above 0).
+  message's id (an int above 0). For ``send_message`` it is that id when the answer has a
+  storable one, else None; the alert still counts as sent (INV-16).
 - ``not_sent``: no request byte left the client (connect timeout, refused connection, DNS
   failure, a TLS handshake that failed or timed out). Safe to retry.
 - ``maybe_delivered``: the request may have reached Telegram (read timeout after the
@@ -97,6 +106,8 @@ _MAX_MESSAGE_ID = 2**63 - 1
 # A chat ID Telegram reports must fit a signed 64-bit integer (a location's chat_id).
 _MIN_CHAT_ID = -(2**63)
 _MAX_CHAT_ID = 2**63 - 1
+# Lower-case substring of Telegram's 400 description for a delete whose message is gone.
+_DELETE_GONE = ("message to delete not found",)
 # Lower-case substrings of Telegram's 400 descriptions for an edit, a pin or an unpin.
 _NOT_MODIFIED = ("message is not modified", "chat_not_modified")
 _TARGET_MISSING = (
@@ -112,7 +123,8 @@ _RETRY_AFTER_TEXT = re.compile(r"[0-9]{1,9}")
 class SendResult:
     """The outcome of one call. ``code`` is short and never holds the token or a URL.
 
-    ``message_id`` is set only on an ``ok`` from a call that posts a message (sendPhoto).
+    ``message_id`` is set only on an ``ok`` from a call that posts a message (sendPhoto,
+    and sendMessage when Telegram's answer carries a storable id).
     ``migrate_to_chat_id`` is set only on a ``permanent`` answer that reports the
     supergroup a group became (D-10); it is reported, never sent to (PITFALLS 6e).
     """
@@ -204,7 +216,7 @@ class TelegramClient:
         body: dict[str, Any] = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
         if disable_notification:
             body["disable_notification"] = True
-        result = self._call("sendMessage", json_body=body)
+        result = self._call("sendMessage", json_body=body, keep_message_id=True)
         if result.kind != "ok":
             log.warning("telegram sendMessage: %s (%s)", result.kind, result.code)
         return result
@@ -268,6 +280,20 @@ class TelegramClient:
         )
         return _logged("unpinChatMessage", result)
 
+    def delete_message(self, chat_id: int, message_id: int) -> SendResult:
+        """Delete the stored message ``message_id`` from ``chat_id`` (261006-qv7).
+
+        "message to delete not found" is ``ok`` with code ``not_found``; the description
+        is only matched, never logged.
+        """
+        _check_message_id(message_id)
+        result = self._call(
+            "deleteMessage",
+            json_body={"chat_id": chat_id, "message_id": message_id},
+            delete=True,
+        )
+        return _logged("deleteMessage", result)
+
     def _call(
         self,
         method: str,
@@ -276,7 +302,9 @@ class TelegramClient:
         data: dict[str, str] | None = None,
         files: dict[str, tuple[str, bytes, str]] | None = None,
         want_message_id: bool = False,
+        keep_message_id: bool = False,
         chart: bool = False,
+        delete: bool = False,
     ) -> SendResult:
         """POST one Bot API ``method`` (a JSON body, or ``data`` + ``files`` as multipart)."""
         try:
@@ -306,7 +334,13 @@ class TelegramClient:
         except Exception as exc:  # never raise across the boundary; the outcome is unknown
             log.warning("telegram %s: unexpected %s", method, type(exc).__name__)
             return SendResult("maybe_delivered", code="unexpected_error")
-        return _classify(resp, want_message_id=want_message_id, chart=chart)
+        return _classify(
+            resp,
+            want_message_id=want_message_id,
+            keep_message_id=keep_message_id,
+            chart=chart,
+            delete=delete,
+        )
 
 
 def _logged(method: str, result: SendResult) -> SendResult:
@@ -317,7 +351,8 @@ def _logged(method: str, result: SendResult) -> SendResult:
 
 
 def _check_message_id(message_id: object) -> None:
-    """An edit, pin or unpin names a stored message: anything but an int above 0 is a bug."""
+    """An edit, pin, unpin or delete names a stored message: anything but an int above 0 is a
+    bug."""
     if not isinstance(message_id, int) or isinstance(message_id, bool) or message_id <= 0:
         raise ValueError("message_id must be an int above 0")
 
@@ -335,13 +370,21 @@ def _not_sent_code(exc: requests.ConnectionError) -> str | None:
 
 
 def _classify(
-    resp: requests.Response, *, want_message_id: bool = False, chart: bool = False
+    resp: requests.Response,
+    *,
+    want_message_id: bool = False,
+    keep_message_id: bool = False,
+    chart: bool = False,
+    delete: bool = False,
 ) -> SendResult:
     """Classify an HTTP answer by its status and JSON body. The body is untrusted input.
 
     With ``want_message_id`` an ``ok`` needs ``result.message_id`` to be an int (not a
     bool) in 1..2**63-1, else the answer is ``maybe_delivered`` / ``no_message_id``. With
-    ``chart`` (edit, pin, unpin) a 400 is read by its description first.
+    ``keep_message_id`` (sendMessage) an ``ok`` carries that id when it is usable and None
+    otherwise, and stays ``ok`` either way. With ``chart`` (edit, pin, unpin) a 400 is read
+    by its description first; with ``delete`` (deleteMessage) only "message to delete not
+    found" is, and it is ``ok`` with code ``not_found``.
     """
     try:
         payload: Any = resp.json()
@@ -349,6 +392,8 @@ def _classify(
         payload = None
     data: dict[Any, Any] = payload if isinstance(payload, dict) else {}
     if resp.status_code == 200 and data.get("ok") is True:
+        if keep_message_id:
+            return SendResult("ok", message_id=_message_id(data.get("result")))
         if not want_message_id:
             return SendResult("ok")
         message_id = _message_id(data.get("result"))
@@ -370,6 +415,10 @@ def _classify(
         known = _chart_bad_request(data.get("description"))
         if known is not None:
             return known
+    if delete and code == 400:
+        known = _delete_bad_request(data.get("description"))
+        if known is not None:
+            return known
     return SendResult(
         "permanent",
         code=f"http_{code}",
@@ -389,6 +438,19 @@ def _chart_bad_request(description: object) -> SendResult | None:
         return SendResult("ok", code="not_modified")
     if any(part in text for part in _TARGET_MISSING):
         return SendResult("edit_target_missing", code="target_missing")
+    return None
+
+
+def _delete_bad_request(description: object) -> SendResult | None:
+    """``ok``/``not_found`` for a 400 on a delete whose message is already gone, else None.
+
+    The description is only matched here: it is never logged, stored or returned.
+    """
+    if not isinstance(description, str):
+        return None
+    text = description.lower()
+    if any(part in text for part in _DELETE_GONE):
+        return SendResult("ok", code="not_found")
     return None
 
 

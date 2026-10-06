@@ -21,19 +21,29 @@ timeline writer:
    removal is deferred with nothing written: "sending" is not final, because a failed
    attempt (not sent, 429, 4xx, 5xx) puts the row back to "pending", and the removed
    outage would then be announced late. That is its OFF alert (D-04 wave-1 audit
-   amendment, W1-A1) or its ON alert matched by ``_restores`` (wave-2 audit, W2-A1: when
-   the OFF alert expired or was never queued, the ON alert is its location's head and can
-   be sending itself). The attempt settles within seconds, and the next removal decides;
+   amendment, W1-A1) or its ON alert matched by ``outbox.restores`` (wave-2 audit, W2-A1:
+   when the OFF alert expired or was never queued, the ON alert is its location's head and
+   can be sending itself). The attempt settles within seconds, and the next removal decides;
 4. each off piece of the outage becomes ``on`` through ``timeline.overwrite``, one piece at
    a time: not-monitored time inside the outage stays not monitored (D-02);
-5. the outage's queued alerts are dropped only when its OFF alert never went out (D-04 as
-   refined by the maintainer on 2026-10-03, ``_drop_queued_alerts``).
+5. the outage's alerts are settled (``_settle_alerts``, D-04 as refined by the maintainer
+   on 2026-10-03 and amended by quick task 261006-qv7): when an OFF alert of the outage
+   cannot be deleted (uncertain, sent before message ids were stored, or sent more than 47
+   h ago), nothing is dropped or deleted and a queued ON alert is still sent, so the
+   channel is never left at "power off";
+6. otherwise its queued alerts are dropped, and its sent alerts get a delete request
+   (``delete_requested_at``), which the worker's delete step carries out, OFF first;
+7. today's active chart record of the location is marked for a redraw
+   (``MARK_REDRAW_SQL``): the worker redraws today's chart within seconds, at the time of
+   its last update (D-03 as amended by 261006-qv7).
 
 The removal never writes ``location_state`` (INV-07: the timeline only, never live
 detection), so detection carries on unchanged and the next OFF alert's "was ON for" still
-counts from ``on_since``. It queues nothing (no subscriber message, no ops notice) and
-logs one INFO line. Adjacent ``on`` pieces left by a removal are not merged: the chart sums
-pieces by state, so they read as one span.
+counts from ``on_since``. It queues no new message (no subscriber message, no ops notice):
+it only asks the worker, through rows written in its transaction, to delete the outage's
+alerts and to redraw today's chart (KD2, KD3), and logs one INFO line. The lock order is
+location_state, outbox_message, power_interval, chart_message. Adjacent ``on`` pieces left
+by a removal are not merged: the chart sums pieces by state, so they read as one span.
 
 The reset (``reset_history``, DATA-03) is one transaction under the same row lock, then the
 deleted check:
@@ -57,10 +67,12 @@ deleted check:
 
 The reset keeps the configuration, the device key, the three switches, an open
 ``delivery_failing`` or ``chart_pin_failed`` incident and every alert already queued: they
-report real events (D-05, D-07). It queues nothing and logs one INFO line.
+report real events (D-05, D-07). It queues nothing, deletes no message (owner default 2,
+261006-qv7) and logs one INFO line.
 
-Nothing here does network I/O (KD2), and time always comes from the caller (``now``),
-never from SQL ``now()``. Parameters go in as ``%(name)s`` / ``%s`` placeholders, never
+Nothing here does network I/O (KD2), and time always comes from the caller (``now``, and
+for the removal also the display zone ``tz`` that names today's chart), never from SQL
+``now()``. Parameters go in as ``%(name)s`` / ``%s`` placeholders, never
 formatted into the SQL.
 """
 
@@ -73,7 +85,7 @@ from typing import Literal
 from django.db import connection, transaction
 
 from powermon.alerts import outbox
-from powermon.alerts.models import OPEN_STATUSES, OutboxMessage
+from powermon.alerts.models import OutboxMessage
 from powermon.chart import model
 from powermon.engine import timeline
 from powermon.engine.transitions import DELETED_SQL, LOCK_SQL, WAITING_SQL
@@ -84,11 +96,9 @@ ONE_US = timedelta(microseconds=1)
 # The list covers today and the 13 local days before it (D-01, UI-SPEC A1).
 WINDOW_DAYS = 14
 # ``last_error`` of a subscriber alert dropped because its outage was removed (D-04).
-OUTAGE_REMOVED = "outage_removed"
-# An OFF alert in one of these statuses went out ("sent", or "uncertain": it may have), so
-# its ON alert must still go out (D-04 as refined): never leave the channel at power off.
-# "sending" is not here: it is not final (W1-A1), and a removal waits for it to settle.
-OFF_WENT_OUT = ("sent", "uncertain")
+OUTAGE_REMOVED = outbox.OUTAGE_REMOVED
+# The ON alerts a removal reads: queued, in flight (defers it) or sent (may be deleted).
+ON_STATUSES = ("pending", "sending", "sent")
 # An attempt to send one of the outage's alerts is in flight, its OFF alert (W1-A1) or its
 # matched ON alert (W2-A1): the removal is deferred.
 IN_FLIGHT = "sending"
@@ -123,6 +133,14 @@ SELECT start_at, end_at, outage_start_at
         WHERE location_id = %(id)s AND state = 'off'
           AND (end_at IS NULL OR end_at > %(since)s OR outage_start_at = %(current)s))
  ORDER BY outage_start_at, start_at
+"""
+
+# Today's active chart record of the location is redrawn by the worker (261006-qv7 D3). A
+# record a history reset marked is released, never redrawn.
+MARK_REDRAW_SQL = """
+UPDATE chart_message SET redraw_requested_at = %(now)s
+ WHERE location_id = %(id)s AND local_date = %(today)s
+   AND retired_at IS NULL AND history_reset_at IS NULL
 """
 
 # The off pieces of one outage of the location, oldest first.
@@ -267,27 +285,35 @@ def find_outage(location_id: int, outage_start: datetime, now: datetime) -> Outa
     return outage
 
 
-def remove_outage(location_id: int, outage_start: datetime) -> RemoveResult:
+def remove_outage(
+    location_id: int, outage_start: datetime, *, now: datetime, tz: str
+) -> RemoveResult:
     """Remove the location's outage that starts at ``outage_start`` (DATA-02, D-02, D-04).
 
-    One transaction under the location's row lock (see the module docstring). Returns:
+    One transaction under the location's row lock (see the module docstring), at ``now``
+    (the caller's clock); ``tz`` is the display zone, which names today's chart. Returns:
 
     - "removed": every off piece of the outage is ``on`` now, not-monitored pieces inside
-      it are kept, and its queued alerts are dropped when its OFF alert never went out;
+      it are kept, its alerts are settled (``_settle_alerts``: queued ones dropped and sent
+      ones requested for deletion, unless its OFF alert cannot be deleted) and today's
+      chart record is marked for a redraw;
     - "gone", with nothing written: the location is unknown or deleted, or it has no off
       piece with that outage start (a double click, a second tab, a reset in between, a
       hand-made start; UI5-D8);
     - "in_progress", with nothing written: it is the location's current outage, decided
       under the lock (INV-07 #3), or one of its pieces is still open;
     - "sending", with nothing written: an attempt to send one of the outage's alerts is in
-      flight, its OFF alert (W1-A1) or an ON alert matched to it by ``_restores`` (W2-A1).
-      Checked under the lock, after the checks above and before any timeline write. The
-      next removal decides from the settled rows: the ON alert is kept when the OFF alert
-      went out, and the alerts still pending are dropped when it never did.
+      flight, its OFF alert (W1-A1) or an ON alert matched to it by ``outbox.restores``
+      (W2-A1). Checked under the lock, after the checks above and before any timeline
+      write. The next removal decides from the settled rows.
 
-    ``location_state`` is never written. ValueError for a naive ``outage_start``.
+    "gone", "in_progress" and "sending" write nothing at all: no request and no mark.
+    ``location_state`` is never written. A restore needs no change for the delete requests
+    (``restore.DROP_QUEUED_SQL``): the requests in a dump match that dump's timeline.
+    ValueError for a naive ``outage_start`` or ``now``.
     """
     _aware(outage_start)
+    _aware(now)
     with transaction.atomic(), connection.cursor() as cur:
         # The row lock first, as every timeline writer takes it.
         cur.execute(LOCK_SQL, [location_id])
@@ -319,29 +345,19 @@ def remove_outage(location_id: int, outage_start: datetime) -> RemoveResult:
         # its not-monitored pieces into on (D-02).
         for start, end in pieces:
             timeline.overwrite(cur, location_id, start, end, "on")
-        dropped = _drop_queued_alerts(offs, ons)
-    # Ids, a time and a count only: never a key or a token (OPS-08).
+        dropped, requested = _settle_alerts(offs, ons, now)
+        today = model.local_today(now, tz)
+        cur.execute(MARK_REDRAW_SQL, {"id": location_id, "today": today, "now": now})
+    # Ids, a time and counts only: never a key or a token (OPS-08).
     log.info(
-        "outage %s of location %s removed, %s queued alert(s) dropped",
+        "outage %s of location %s removed, %s queued alert(s) dropped, "
+        "%s alert message(s) to delete",
         outage_start.isoformat(),
         location_id,
         dropped,
+        requested,
     )
     return "removed"
-
-
-def _restores(row: OutboxMessage, outage_start: datetime) -> bool:
-    """True when the power_on row ``row`` ends the outage that starts at ``outage_start``.
-
-    ``record_heartbeat`` queues the ON alert with ``event_at`` = the restore and
-    ``payload["was_off_us"]`` = restore - outage start, so the match is exact in integer
-    microseconds. It also holds when power returned while the location was not monitored,
-    where the timeline has no boundary at the restore (RESEARCH Pitfall 2).
-    """
-    was_off = row.payload.get("was_off_us") if isinstance(row.payload, dict) else None
-    if not isinstance(was_off, int) or isinstance(was_off, bool):
-        return False
-    return (row.event_at - outage_start) // ONE_US == was_off
 
 
 def _off_alerts(location_id: int, outage_start: datetime) -> list[OutboxMessage]:
@@ -362,46 +378,79 @@ def _off_alerts(location_id: int, outage_start: datetime) -> list[OutboxMessage]
 
 
 def _on_alerts(location_id: int, outage_start: datetime) -> list[OutboxMessage]:
-    """The outage's open ON alerts: the location's subscriber power_on rows in "pending" or
-    "sending" that ``_restores`` matches to the outage that starts at ``outage_start``.
+    """The outage's ON alerts a removal acts on: the location's subscriber power_on rows in
+    "pending", "sending" or "sent" that ``outbox.restores`` matches to the outage that
+    starts at ``outage_start``.
 
-    Read ``FOR UPDATE`` in the removal's transaction, like ``_off_alerts``. Only open rows
-    are read: a sent, uncertain, expired or dropped ON row is final, so it neither defers
-    the removal nor can be dropped. A row dated before the outage start never matches.
+    Read ``FOR UPDATE`` in the removal's transaction, like ``_off_alerts``. A pending row
+    may be dropped, a sending one defers the removal and a sent one may be deleted. An
+    uncertain, expired or dropped ON row is final and is not read: an uncertain ON stays in
+    the channel. A row dated before the outage start never matches.
     """
     rows = OutboxMessage.objects.select_for_update().filter(
         channel=outbox.CHANNEL_SUBSCRIBER,
         location_id=location_id,
         kind=outbox.KIND_POWER_ON,
-        status__in=OPEN_STATUSES,
+        status__in=ON_STATUSES,
         event_at__gte=outage_start,
     )
-    return [row for row in rows if _restores(row, outage_start)]
+    return [row for row in rows if outbox.restores(row, outage_start)]
 
 
-def _drop_queued_alerts(offs: list[OutboxMessage], ons: list[OutboxMessage]) -> int:
-    """Drop the removed outage's queued alerts in the removal's transaction; return how many.
+def _deletable(row: OutboxMessage, now: datetime) -> bool:
+    """True when the worker can still delete the sent alert ``row`` (261006-qv7 D2).
 
-    ``offs`` and ``ons`` are the outage's rows from ``_off_alerts`` and ``_on_alerts``, read
-    ``FOR UPDATE`` earlier in the same transaction, so their statuses are still current.
-
-    D-04 as refined by the maintainer (2026-10-03): when an OFF alert of the outage
-    (subscriber, power_off, ``event_at`` = the outage start) is sent or uncertain, the
-    subscribers saw (or may have seen) "power off", so nothing is dropped and its queued ON
-    alert is delivered. Otherwise the outage's pending OFF alert and its pending ON alert
-    become "dropped" with last_error "outage_removed", so a false outage is never announced
-    late. A row still "sending" never reaches this step: ``remove_outage`` defers the
-    removal first (W1-A1 for the OFF, W2-A1 for the ON). Alerts of other outages are never
-    touched. Each drop is a conditional update on status "pending".
+    Sent, with the chat and Telegram's message id stored (alerts sent before this release
+    have none), and sent within ``outbox.DELETE_REQUEST_WINDOW`` (47 h) of ``now``, which
+    leaves an hour before Telegram's 48 h limit.
     """
-    if any(row.status in OFF_WENT_OUT for row in offs):
-        return 0
-    ids = [row.pk for row in (*offs, *ons) if row.status == "pending"]
-    if not ids:
-        return 0
-    return OutboxMessage.objects.filter(pk__in=ids, status="pending").update(
-        status="dropped", last_error=OUTAGE_REMOVED
+    return (
+        row.status == "sent"
+        and row.tg_chat_id is not None
+        and row.tg_message_id is not None
+        and row.sent_at is not None
+        and row.sent_at > now - outbox.DELETE_REQUEST_WINDOW
     )
+
+
+def _settle_alerts(
+    offs: list[OutboxMessage], ons: list[OutboxMessage], now: datetime
+) -> tuple[int, int]:
+    """Drop the removed outage's queued alerts and request the deletion of its sent ones.
+
+    Returns (dropped, requested). ``offs`` and ``ons`` are the outage's rows from
+    ``_off_alerts`` and ``_on_alerts``, read ``FOR UPDATE`` earlier in the same
+    transaction, so their statuses are still current. A row still "sending" never reaches
+    this step: ``remove_outage`` defers the removal first (W1-A1, W2-A1).
+
+    The channel is never left at "power off" (D-04 as refined on 2026-10-03, owner default
+    3 of 261006-qv7): when an OFF alert of the outage went out, or may have, and cannot be
+    deleted (uncertain; sent before message ids were stored; sent more than 47 h ago),
+    nothing is dropped or requested and its queued ON alert is still sent. Otherwise the
+    outage's pending OFF and ON alerts become "dropped" with last_error "outage_removed",
+    exactly as before, so a false outage is never announced late, and each of its sent
+    alerts that can be deleted gets ``delete_requested_at = now``. Each write is
+    conditional (status "pending"; status "sent" and no request yet). Alerts of other
+    outages are never touched.
+    """
+    if any(
+        row.status == "uncertain" or (row.status == "sent" and not _deletable(row, now))
+        for row in offs
+    ):
+        return 0, 0
+    dropped = 0
+    pending = [row.pk for row in (*offs, *ons) if row.status == "pending"]
+    if pending:
+        dropped = OutboxMessage.objects.filter(pk__in=pending, status="pending").update(
+            status="dropped", last_error=OUTAGE_REMOVED
+        )
+    requested = 0
+    deletable = [row.pk for row in (*offs, *ons) if _deletable(row, now)]
+    if deletable:
+        requested = OutboxMessage.objects.filter(
+            pk__in=deletable, status="sent", delete_requested_at__isnull=True
+        ).update(delete_requested_at=now)
+    return dropped, requested
 
 
 def reset_history(location_id: int, now: datetime) -> ResetResult:

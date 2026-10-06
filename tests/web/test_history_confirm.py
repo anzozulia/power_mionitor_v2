@@ -526,10 +526,10 @@ def test_remove_post_for_a_location_deleted_mid_request_answers_404(
     before = _written(location)
     remove_outage = history.remove_outage
 
-    def delete_then_remove(pk: int, start: datetime) -> history.RemoveResult:
+    def delete_then_remove(pk: int, start: datetime, **kwargs: Any) -> history.RemoveResult:
         # A second tab deletes the location after the view's lookup, before the row lock.
         Location.objects.filter(pk=pk).update(deleted_at=_at(16, 0))
-        return remove_outage(pk, start)
+        return remove_outage(pk, start, **kwargs)
 
     monkeypatch.setattr(history, "remove_outage", delete_then_remove)
 

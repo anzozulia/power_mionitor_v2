@@ -22,10 +22,29 @@ ops notice that cannot be rendered is dropped at once with one WARNING naming it
 kind: its payload holds integers only, so the error is permanent, and left in place it
 would hold the one-line queue and block every later notice (B2).
 
+After its alerts and the ops notice a pass makes at most one non-alert call: a delete, if
+one is due, else the chart step. So an alert waits behind at most one delete or chart call
+(INV-14).
+
+The delete step (``_delete_one``, 261006-qv7, DATA-02 amended) carries out the delete
+requests an outage removal wrote on the outage's sent alerts (``outbox.deletion_heads``:
+each location's oldest unsettled request, so a removal's OFF goes before its ON). It runs
+on every pass, whatever ``charts`` says, and makes at most one ``deleteMessage`` call,
+with the location's current bot in the chat stored with the alert. Its skips are read
+only, like the chart step's: the location's ``delete_key``, its bot's ``bot_wide_key`` or
+the stored chat's ``chat_key`` in the future. A request older than Telegram's 48 h limit
+is settled "too_old" with no call. A delete is idempotent, so an ambiguous answer is
+retried after 30 s; INV-16's at-most-once rule is about sends. Its outcomes never touch
+``chat_key``, the ``delivery_failing`` incident, an ops notice or the row's status: an ok
+("not found" included) settles it, a 429 holds the delete key and the bot, a 5xx or an
+unsent request holds both for 30 s, and a refusal settles it with one WARNING; a refused
+or too-old OFF also cancels the rest of its removal and sends the ON alert the removal
+dropped (``outbox.fail_delete``), so the channel never shows only "power off".
+
 The chart step (``powermon.chart.lifecycle.run_step``, D-05) is the last step of the pass
-and makes at most one Telegram call, so chart work delays an alert by at most one call
-(INV-14). It runs only when the caller passes ``charts=True``; it is off by default, so a
-caller that does not ask for chart work makes no chart call. A chart outcome never sets
+and makes at most one Telegram call; a pass that made a delete call skips it. It runs only
+when the caller passes ``charts=True``; it is off by default, so a caller that does not ask
+for chart work makes no chart call. A chart outcome never sets
 ``chat_key``: a chart's per-chat, permanent or render failure must not hold that
 channel's alerts. Only a bot-wide outcome of a chart call (``BOT_WIDE_KINDS``: a 429, a
 5xx, a refused connection, which concern the whole bot) also sets ``bot_wide_key``, with
@@ -213,7 +232,9 @@ class Unapplied:
     Telegram's answer at ``answered_at``, applied as if it had been written then. ``key``
     is the backoff key of the chat the row went to (``chat_key`` or ``ops_key``);
     ``bot_wide`` is its bot's ``bot_wide_key`` for a subscriber row, which a bot-wide
-    outcome sets as well (D1), and None for an ops row (B1).
+    outcome sets as well (D1), and None for an ops row (B1). ``chat_id`` is the chat the
+    row was sent to: an ok subscriber row stores it with Telegram's message id
+    (261006-qv7).
     """
 
     row: OutboxMessage
@@ -222,6 +243,7 @@ class Unapplied:
     answered_at: datetime
     key: str
     bot_wide: str | None = None
+    chat_id: int | None = None
 
 
 @dataclass
@@ -229,7 +251,8 @@ class RelayState:
     """What the relay remembers between passes.
 
     ``not_before``: when each chat or bot may be called again, by its key (``chat_key``,
-    ``ops_key``, ``bot_wide_key``). ``unapplied``: outcomes kept after
+    ``ops_key``, ``bot_wide_key``), and when a location's next delete may be made
+    (``delete_key``). ``unapplied``: outcomes kept after
     a database error, by row id, written before the next claim (WR-04).
     ``db_down_notified``: this database outage's direct notice is done (D-11 #2).
     ``lease_pid``: the lease session of the HELD status the next pass runs under, set by
@@ -297,6 +320,11 @@ def bot_wide_key(token: str) -> str:
     return _BOT_WIDE_PREFIX + bot_key(token)
 
 
+def delete_key(location_id: int) -> str:
+    """A location's delete step backoff key: by location id, never a token (261006-qv7)."""
+    return f"delete:{location_id}"
+
+
 def activate(state: RelayState, clock: Clock) -> int:
     """Start a lease generation's relay term; return the sends marked uncertain.
 
@@ -329,15 +357,17 @@ def run_iteration(
     *,
     charts: bool = False,
 ) -> bool:
-    """One pass over each location's oldest open alert; True if any send was attempted.
+    """One pass over each location's oldest open alert; True if any call was attempted.
 
     Returns early, before claiming another row, once ``stop`` is set. ``tick`` (the
     watchdog's progress stamp) runs after every subscriber head, whether it was sent,
-    skipped or failed, after the ops step and after the chart step, so a long pass still
-    shows progress. A database error in the flush or in expiry ends the pass before any
-    claim and propagates to the caller. Every claim of the pass names ``state.lease_pid``
-    when it is set (C1). With ``charts`` the pass ends with at most one chart call
-    (``powermon.chart.lifecycle.run_step``); it is off unless the worker enables it.
+    skipped or failed, after the ops step, after the delete step and after the chart step,
+    so a long pass still shows progress. A database error in the flush or in expiry ends
+    the pass before any claim and propagates to the caller. Every claim of the pass names
+    ``state.lease_pid`` when it is set (C1). After the alerts and the ops notice the pass
+    makes at most one delete call (``_delete_one``, always on); only a pass that made none
+    goes on, with ``charts``, to at most one chart call
+    (``powermon.chart.lifecycle.run_step``), which is off unless the worker enables it.
     """
     close_old_connections()
     # Outcomes kept after a DB error are written before any new claim (WR-04).
@@ -367,8 +397,20 @@ def run_iteration(
             log.error("relay failed for the ops chat: %s", type(exc).__name__)
         if tick is not None:
             tick()
-    # Chart work goes last, after every alert and the ops head: one call at most (D-05).
-    if charts and not (stop is not None and stop.is_set()):
+    # Then at most one delete of a removed outage's alert (261006-qv7), never before alerts.
+    deleted = False
+    if not (stop is not None and stop.is_set()):
+        try:
+            deleted = _delete_one(clock, state)
+        except Exception as exc:
+            # Raised before any call: the chart step still runs. The type only (OPS-08).
+            log.error("delete step failed: %s", type(exc).__name__)
+        attempted = deleted or attempted
+        if tick is not None:
+            tick()
+    # Chart work goes last, after every alert and the ops head: one call at most (D-05),
+    # and none in a pass that made a delete call (INV-14: one non-alert call per pass).
+    if charts and not deleted and not (stop is not None and stop.is_set()):
         # Imported here: the lifecycle imports this module, and only the worker needs it.
         from powermon.chart import lifecycle
 
@@ -428,6 +470,106 @@ def notify_db_down(status: LeaseStatus, clock: Clock, state: RelayState) -> bool
         # The send may have blocked for seconds: the wait counts from its answer.
         state.not_before[key] = clock.now() + timedelta(seconds=wait)
     return True
+
+
+def _delete_one(clock: Clock, state: RelayState) -> bool:
+    """Make the one delete call due now, if any; True if a call was made (261006-qv7 D4).
+
+    Each location's oldest unsettled request, in location order. A request whose message
+    was sent 48 h ago or more (Telegram's limit) is settled "too_old" with no call, which
+    cancels the rest of its removal when it is the OFF (``outbox.fail_delete``), and the
+    next head is tried. A head whose location delete key, bot or stored chat waits is
+    skipped, read only. No call is made while the lease session no longer holds the worker
+    lock (C1). The call uses the location's current bot and the chat stored with the alert.
+    A database error writing the outcome holds that location's delete for 30 s and logs
+    the class only; the call was made, so this still returns True, and the repeated delete
+    answers "not found", which settles it.
+    """
+    for row in outbox.deletion_heads():
+        now = clock.now()
+        location = row.location
+        chat_id, message_id = row.tg_chat_id, row.tg_message_id
+        if location is None or chat_id is None or message_id is None:
+            # The CHECK outbox_delete_needs_ids and the removal's filters rule this out.
+            continue
+        key = delete_key(location.pk)
+        if row.sent_at is None or row.sent_at <= now - outbox.DELETE_LIMIT:
+            outbox.fail_delete(row, outbox.DELETE_TOO_OLD, now)
+            log.warning(
+                "alert delete for location %s: %s (%s) outbox %s",
+                row.location_id,
+                "permanent",
+                outbox.DELETE_TOO_OLD,
+                row.pk,
+            )
+            continue
+        token = location.bot_token
+        keys = (key, bot_wide_key(token), chat_key(token, chat_id))
+        if any(state.not_before.get(held, now) > now for held in keys):
+            continue
+        if not outbox.lease_holds(state.lease_pid):
+            return False
+        result = TelegramClient(token).delete_message(chat_id, message_id)
+        # The call may have blocked for seconds: waits count from its answer.
+        answered = clock.now()
+        log.log(
+            logging.WARNING if result.kind == "permanent" else logging.INFO,
+            "alert delete for location %s: %s (%s) outbox %s",
+            row.location_id,
+            result.kind,
+            result.code,
+            row.pk,
+        )
+        try:
+            _apply_delete(row, key, token, result, answered, state)
+        except Error as exc:
+            state.not_before[key] = answered + timedelta(seconds=BACKOFF_CAP_S)
+            log.error("delete step failed: %s", type(exc).__name__)
+        return True
+    return False
+
+
+def _apply_delete(
+    row: OutboxMessage,
+    key: str,
+    token: str,
+    result: SendResult,
+    answered: datetime,
+    state: RelayState,
+) -> None:
+    """Write a delete's outcome (261006-qv7 D6); the waits count from ``answered``.
+
+    ``key`` is the location's ``delete_key``.
+
+    - ok: "deleted", or "not_found" (the message was gone already); the delete key goes.
+    - permanent: the client's code (``http_400``, ...) through ``outbox.fail_delete``.
+    - rate_limited: the delete key and the bot wait ``retry_after`` (capped).
+    - transient, not_sent: both wait ``BACKOFF_CAP_S``.
+    - maybe_delivered and anything else: the delete key waits ``BACKOFF_CAP_S``; a
+      repeated delete is harmless.
+
+    Never ``chat_key``, ``state.failing``, a delivery incident, an ops notice, or the
+    row's status, attempts or ``next_attempt_at``.
+    """
+    if result.kind == "ok":
+        settled = outbox.DELETE_NOT_FOUND if result.code == "not_found" else outbox.DELETE_DELETED
+        outbox.settle_delete(row.pk, settled)
+        state.not_before.pop(key, None)
+        return
+    if result.kind == "permanent":
+        outbox.fail_delete(row, result.code or "permanent", answered)
+        state.not_before.pop(key, None)
+        return
+    if result.kind == "rate_limited":
+        wait = min(result.retry_after or DEFAULT_RETRY_AFTER_S, MAX_RETRY_AFTER_S)
+        until = answered + timedelta(seconds=wait)
+        state.not_before[key] = until
+        state.not_before[bot_wide_key(token)] = until
+        return
+    until = answered + timedelta(seconds=BACKOFF_CAP_S)
+    state.not_before[key] = until
+    if result.kind in ("transient", "not_sent"):
+        state.not_before[bot_wide_key(token)] = until
 
 
 def _expire(now: datetime) -> int:
@@ -585,7 +727,7 @@ def _send(
         return False
     result = client.send_message(chat_id, text)
     # The send may have blocked for seconds: waits and sent_at count from its answer.
-    _write(Unapplied(row, attempts, result, clock.now(), key, bot_wide), state)
+    _write(Unapplied(row, attempts, result, clock.now(), key, bot_wide, chat_id), state)
     return True
 
 
@@ -640,6 +782,7 @@ def _record(outcome: Unapplied, state: RelayState) -> None:
         state,
         outcome.key,
         outcome.bot_wide,
+        outcome.chat_id,
     )
 
 
@@ -669,9 +812,12 @@ def _apply(
     state: RelayState,
     key: str,
     bot_wide: str | None = None,
+    chat_id: int | None = None,
 ) -> None:
     """Record a send's outcome on the claimed row (and on the chat or bot, for a retry).
 
+    An ok subscriber row stores ``chat_id`` (the chat it went to) and Telegram's message id
+    with "sent", so a removal can delete it later (261006-qv7); an ops row stores nothing.
     For a subscriber row an ok or a permanent outcome also closes or opens the location's
     ``delivery_failing`` incident, in the transaction that writes the row (D-10). This is
     also the WR-04 flush path, so every write here is idempotent: the reset is fenced by
@@ -685,7 +831,7 @@ def _apply(
             outbox.mark_sent(row.pk, now)
             return
         with transaction.atomic():
-            outbox.mark_sent(row.pk, now)
+            outbox.mark_sent(row.pk, now, tg_chat_id=chat_id, tg_message_id=result.message_id)
             # Telegram took the alert, so the channel works: a failing location recovers.
             delivery.close_failing(location_id, now)
         # After the commit: the incident is closed, so nothing holds the channel for it.

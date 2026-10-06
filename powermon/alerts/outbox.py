@@ -23,6 +23,24 @@ during it:
     pending --mark_dropped (an ops notice that cannot be rendered)--> dropped (never sent)
     pending --drop_deleted_pending (its location was deleted)--> dropped (never sent, D-09)
     pending --make_due (a recorded success or a channel change)--> pending, due now
+    pending --remove_outage (its outage was removed)--> dropped (outage_removed)
+    dropped (outage_removed) --fail_delete of its OFF--> pending (sent after all)
+
+Delete requests (261006-qv7, DATA-02 amended) live on "sent" subscriber rows and never
+change a row's status, attempts or ``next_attempt_at``:
+
+    sent --remove_outage--> delete requested --worker delete step--> delete_result
+         (deleted | not_found | http_4xx | too_old | cancelled)
+
+``mark_sent`` stores the chat and Telegram's message id with "sent", in the same UPDATE,
+when the relay has both (``tg_chat_id``, ``tg_message_id``); an ops row stores nothing.
+``deletion_heads`` gives each location's oldest unsettled request, so a removal's OFF (the
+lower id) is always deleted before its ON. ``settle_delete`` and ``fail_delete`` are
+conditional on ``delete_result IS NULL``. When the OFF's delete is refused or too old,
+``fail_delete`` cancels the rest of that removal and puts back to "pending" the ON alert
+the removal dropped, in one transaction: the channel never ends up showing only "power
+off". Requests leave the relay's head-of-line, expiry, recovery and ``make_due`` paths
+alone: they select open rows only.
 
 A deleted location's subscriber alerts are never sent (D-09, INV-19 #2): its rows are not
 heads (``subscriber_heads``), and the relay drops its pending rows on every pass, before
@@ -70,7 +88,7 @@ from datetime import datetime, timedelta
 from typing import NamedTuple
 
 from django.conf import settings
-from django.db import connection
+from django.db import connection, transaction
 from django.db.models import F
 
 from powermon.alerts.models import OPEN_STATUSES, OutboxMessage
@@ -107,6 +125,22 @@ OPS_KINDS = (
 MAX_ERROR_LENGTH = 64
 # ``last_error`` of a subscriber row dropped because its location was deleted (D-09).
 LOCATION_DELETED = "location_deleted"
+# ``last_error`` of a subscriber alert dropped because its outage was removed (D-04).
+OUTAGE_REMOVED = "outage_removed"
+ONE_US = timedelta(microseconds=1)
+# Telegram deletes a message only if it was sent less than 48 hours ago (Bot API
+# deleteMessage): an older request is settled "too_old" with no call (261006-qv7 D4).
+DELETE_LIMIT = timedelta(hours=48)
+# A removal requests deletes only for messages sent within this window, which leaves the
+# worker an hour before the 48 h limit (261006-qv7 D2).
+DELETE_REQUEST_WINDOW = timedelta(hours=47)
+# ``delete_result`` values; a refusal stores the client's short code (``http_400``, ...).
+DELETE_DELETED = "deleted"
+DELETE_NOT_FOUND = "not_found"
+DELETE_TOO_OLD = "too_old"
+DELETE_CANCELLED = "cancelled"
+# The database column is varchar(32).
+MAX_DELETE_RESULT_LENGTH = 32
 
 RECOVER_SQL = """
 UPDATE outbox_message SET status = 'uncertain', last_error = 'interrupted'
@@ -145,6 +179,14 @@ UPDATE outbox_message
           AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
           AND classid = %(classid)s::oid AND objid = %(objid)s::oid AND objsubid = 1
    )
+"""
+# The C1 fence on its own: the lease session holds the worker lock right now. Used before
+# the chart lifecycle's and the delete step's Telegram calls (``lease_holds``).
+LEASE_HELD_SQL = """
+SELECT 1 FROM pg_locks
+ WHERE locktype = 'advisory' AND granted AND pid = %(pid)s
+   AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+   AND classid = %(classid)s::oid AND objid = %(objid)s::oid AND objsubid = 1
 """
 _LOCK_CLASSID = LOCK_KEY >> 32
 _LOCK_OBJID = LOCK_KEY & 0xFFFFFFFF
@@ -282,11 +324,23 @@ def claim(message_id: int, lease_pid: int | None = None) -> bool:
     return claimed == 1
 
 
-def mark_sent(message_id: int, now: datetime) -> bool:
-    """Telegram accepted the claimed row."""
-    updated = OutboxMessage.objects.filter(pk=message_id, status="sending").update(
-        status="sent", sent_at=now, last_error=""
-    )
+def mark_sent(
+    message_id: int,
+    now: datetime,
+    *,
+    tg_chat_id: int | None = None,
+    tg_message_id: int | None = None,
+) -> bool:
+    """Telegram accepted the claimed row.
+
+    With both ``tg_chat_id`` (the chat it went to) and ``tg_message_id`` (Telegram's id for
+    it) they are stored in the same UPDATE, so a later outage removal can delete the
+    message (261006-qv7); with either missing neither is stored.
+    """
+    fields: dict[str, object] = {"status": "sent", "sent_at": now, "last_error": ""}
+    if tg_chat_id is not None and tg_message_id is not None:
+        fields.update(tg_chat_id=tg_chat_id, tg_message_id=tg_message_id)
+    updated = OutboxMessage.objects.filter(pk=message_id, status="sending").update(**fields)
     return updated == 1
 
 
@@ -378,6 +432,94 @@ def make_due(location_id: int, now: datetime) -> int:
         status="pending",
         next_attempt_at__gt=now,
     ).update(next_attempt_at=now)
+
+
+def lease_holds(pid: int | None) -> bool:
+    """True when ``pid`` (the lease session) holds the worker lock; no pid is unfenced (C1).
+
+    The fence the chart lifecycle and the delete step check right before a Telegram call:
+    a worker whose lease session is gone makes no call.
+    """
+    if pid is None:
+        return True
+    with connection.cursor() as cur:
+        cur.execute(LEASE_HELD_SQL, {"pid": pid, "classid": _LOCK_CLASSID, "objid": _LOCK_OBJID})
+        return cur.fetchone() is not None
+
+
+def restores(row: OutboxMessage, outage_start: datetime) -> bool:
+    """True when the power_on row ``row`` ends the outage that starts at ``outage_start``.
+
+    ``record_heartbeat`` queues the ON alert with ``event_at`` = the restore and
+    ``payload["was_off_us"]`` = restore - outage start, so the match is exact in integer
+    microseconds. It also holds when power returned while the location was not monitored,
+    where the timeline has no boundary at the restore (RESEARCH Pitfall 2).
+    """
+    was_off = row.payload.get("was_off_us") if isinstance(row.payload, dict) else None
+    if not isinstance(was_off, int) or isinstance(was_off, bool):
+        return False
+    return (row.event_at - outage_start) // ONE_US == was_off
+
+
+def deletion_heads() -> list[OutboxMessage]:
+    """Each location's oldest delete request not settled yet, with its location loaded.
+
+    Only the head of a location is deleted, and a removal's OFF has a lower id than its ON,
+    so the OFF is always deleted first (261006-qv7 D4). A deleted location's requests are
+    still heads: a delete is not an alert (D8). PostgreSQL ``DISTINCT ON (location_id)``,
+    served by the partial index ``outbox_delete_due_idx``.
+    """
+    return list(
+        OutboxMessage.objects.filter(delete_requested_at__isnull=False, delete_result__isnull=True)
+        .select_related("location")
+        .order_by("location_id", "id")
+        .distinct("location_id")
+    )
+
+
+def settle_delete(message_id: int, result: str) -> bool:
+    """Record how a requested delete ended; False if it was settled already (or not asked)."""
+    updated = OutboxMessage.objects.filter(
+        pk=message_id, delete_requested_at__isnull=False, delete_result__isnull=True
+    ).update(delete_result=result[:MAX_DELETE_RESULT_LENGTH])
+    return updated == 1
+
+
+def fail_delete(row: OutboxMessage, code: str, now: datetime) -> int:
+    """Settle ``row``'s delete as refused (``code``) or too old; return how many were cancelled.
+
+    One transaction. When the row is an OFF alert, the rest of the same removal (the
+    location's unsettled requests made at the same ``delete_requested_at``) becomes
+    "cancelled" and is never called, and the ON alert that removal dropped while it was
+    still queued goes back to "pending", due at ``now``, so it is sent after all: the
+    channel keeps both alerts and never ends up showing only "power off" (owner default 3,
+    261006-qv7 D6). Expiry still applies to it. Nothing else changes when the row was
+    settled already.
+    """
+    with transaction.atomic():
+        if not settle_delete(row.pk, code):
+            return 0
+        if row.kind != KIND_POWER_OFF or row.location_id is None:
+            return 0
+        cancelled = OutboxMessage.objects.filter(
+            location_id=row.location_id,
+            delete_requested_at=row.delete_requested_at,
+            delete_result__isnull=True,
+        ).update(delete_result=DELETE_CANCELLED)
+        dropped = OutboxMessage.objects.select_for_update().filter(
+            channel=CHANNEL_SUBSCRIBER,
+            location_id=row.location_id,
+            kind=KIND_POWER_ON,
+            status="dropped",
+            last_error=OUTAGE_REMOVED,
+            event_at__gte=row.event_at,
+        )
+        kept = [on.pk for on in dropped if restores(on, row.event_at)]
+        if kept:
+            OutboxMessage.objects.filter(pk__in=kept, status="dropped").update(
+                status="pending", next_attempt_at=now, last_error=""
+            )
+    return cancelled
 
 
 def recover_interrupted() -> list[RowRef]:
