@@ -108,8 +108,8 @@ CONSEQUENCE_4 = (
     'alert counts "was ON for".'
 )
 CLOSING = (
-    "The chart updates within 15 minutes. It shows the last 7 days; charts already posted for "
-    "earlier days do not change."
+    "The chart shows the change at its next update. It shows the last 7 days; charts already "
+    "posted for earlier days do not change."
 )
 SECRET = "Sx_9-Qw7Lm" * 4
 TOKEN = f"987654321:{SECRET}"

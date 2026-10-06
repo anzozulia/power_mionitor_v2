@@ -451,6 +451,7 @@ def test_full_key_appears_in_no_other_response(admin: Client) -> None:
             "bot_token": TOKEN,
             "chat_id": "-1001234567890",
             "language": "en",
+            "chart_refresh_min": "15",
         },
     )
     location = LocationState.objects.get().location
@@ -669,6 +670,7 @@ def test_setup_guidance_copy(admin: Client, location_factory: Callable[..., Any]
     assert RESPONSES in text(_step(page, "first-heartbeat"))
     assert definitions(page, "settings-panel") == [
         ("Language", "Russian"),
+        ("Chart update period", "15 min"),
         ("Heartbeat period", "45 s"),
         ("Grace period", "20 s"),
         ("Reported OFF after", "65 s without a heartbeat"),
@@ -778,6 +780,7 @@ def test_location_page_settings_and_setup_sections_on_setup(
     # The location page's settings card shows these same rows (test_location_page.py).
     expected = [
         ("Language", "Russian"),
+        ("Chart update period", "15 min"),
         ("Heartbeat period", "45 s"),
         ("Grace period", "20 s"),
         (

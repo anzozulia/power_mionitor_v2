@@ -173,7 +173,7 @@ MAINTENANCE_COPY = {
 }
 ALERTS_HELP = (
     "While off, subscribers get no new alerts, and none are saved for later. Alerts already "
-    "queued still go out. The chart, its 15-minute refresh and the midnight re-pin carry on."
+    "queued still go out. The chart, its regular updates and the midnight re-pin carry on."
 )
 ALERTS_COPY = {
     "on": "Alerts are on. Subscribers get alerts for changes recorded from now on.",
@@ -567,6 +567,7 @@ def stored_settings(location: Location) -> dict[str, Any]:
         "grace_s": location.grace_s,
         "chat_id": location.chat_id,
         "language": location.language,
+        "chart_refresh_min": location.chart_refresh_min,
     }
 
 

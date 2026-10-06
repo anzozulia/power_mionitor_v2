@@ -384,10 +384,10 @@ def test_INV05_1_chart_keeps_working_with_alerts_off(
     # An outage: silent after 12:05, OFF recorded at 12:06:31, power back at 12:15.
     assert detection.run_cycle(_kyiv("2026-10-01 12:06:31")) == 1
     _beat(location, _kyiv("2026-10-01 12:15"))
-    # The 15-min refresh counts from the last render (12:05): nothing before 12:20.
-    clock.set(_kyiv("2026-10-01 12:19:59"))
+    # The refresh comes at the next 15-min slot (12:15): nothing before it.
+    clock.set(_kyiv("2026-10-01 12:14:59"))
     assert _pass(clock, state) is False
-    clock.set(_kyiv("2026-10-01 12:20"))
+    clock.set(_kyiv("2026-10-01 12:15"))
     assert _pass(clock, state) is True
 
     refresh = fake_telegram.chart_calls[-1]

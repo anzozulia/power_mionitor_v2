@@ -84,6 +84,7 @@ from powermon.locations.models import Location
 from powermon.locations.validators import CHAT_ID_EMPTY, TOKEN_FORMAT
 from powermon.web import location_views
 from powermon.web.forms import (
+    CHART_REFRESH_INVALID,
     EDIT_FORM_ERROR,
     GRACE_TOO_SHORT,
     HELP_NEW_BOT_TOKEN,
@@ -190,6 +191,7 @@ def _form(location: Any, **overrides: str) -> dict[str, str]:
         "bot_token": "",
         "chat_id": str(location.chat_id),
         "language": location.language,
+        "chart_refresh_min": str(location.chart_refresh_min),
         **overrides,
     }
 
@@ -318,6 +320,7 @@ def test_INV02_3_stale_edit_never_reverts_the_status(
         "bot_token": "",
         "chat_id": str(DEFAULT_CHAT_ID),
         "language": "en",
+        "chart_refresh_min": "15",
     }
 
     # The detector records OFF at 17:02:31 (17:02:30 is not past the 90 s timeout).
@@ -372,12 +375,13 @@ def test_edit_save_is_column_limited(
         "grace_s": "20",
         "chat_id": str(CHAT_B),
         "language": "ru",
+        "chart_refresh_min": "60",
     }
     response = admin.post(_edit(location), posted)
 
     assert response.status_code == 302
     saved = Location.objects.get(pk=location.pk)
-    # The five fields take the posted values; the empty token keeps the stored one.
+    # The six fields take the posted values; the empty token keeps the stored one.
     assert (saved.name, saved.period_s, saved.grace_s, saved.chat_id, saved.language) == (
         "Office, 2nd floor",
         45,
@@ -385,6 +389,7 @@ def test_edit_save_is_column_limited(
         CHAT_B,
         "ru",
     )
+    assert saved.chart_refresh_min == 60
     assert saved.bot_token == DEFAULT_BOT_TOKEN
     # What changed after the form was loaded keeps its newer value.
     assert (saved.maintenance, saved.alerts_enabled, saved.router_grace) == (True, False, True)
@@ -409,6 +414,7 @@ def test_edit_unknown_or_deleted_location_is_404(
         "bot_token": "",
         "chat_id": str(DEFAULT_CHAT_ID),
         "language": "en",
+        "chart_refresh_min": "15",
     }
 
     for pk in (gone.pk, unknown):
@@ -463,6 +469,72 @@ def test_edit_of_a_location_deleted_meanwhile_is_404(
     # The save's locking read sees the tombstone: nothing is written, the answer is 404.
     assert response.status_code == 404
     assert Location.objects.get(pk=location.pk).name == "Office"
+
+
+# The chart update period (CHRT-02 amended by quick task 261006-of9)
+
+
+@pytest.mark.django_db
+def test_edit_shows_and_keeps_the_stored_chart_update_period(
+    rf: RequestFactory,
+    admin: Client,
+    location_factory: Callable[..., Any],
+    fake_telegram: FakeTelegram,
+) -> None:
+    location = location_factory(name="Office", chart_refresh_min=5)
+    other = location_factory(name="Other")
+    clock = FakeClock(_at(9, 0))
+    held = _held_alert(location, _at(8, 55), held_until=_at(9, 10))
+
+    # Edge: the stored 5 is the selected option, and an untouched save keeps it.
+    page = parse(admin.get(_edit(location)).content.decode())
+    options = field(by_testid(page, "location-form"), "chart_refresh_min").find_all("option")
+    assert [option.get("value") for option in options if option.has_attr("selected")] == ["5"]
+    assert _loaded_form(page)["chart_refresh_min"] == "5"
+    response, flashes = _save(rf, location, clock)
+    assert (response.status_code, flashes) == (302, [CHANGES_SAVED])
+    assert Location.objects.get(pk=location.pk).chart_refresh_min == 5
+
+    # A period-only change is no channel change: the held alert stays held.
+    response, flashes = _save(rf, location, clock, chart_refresh_min="30")
+
+    assert (response.status_code, flashes) == (302, [CHANGES_SAVED])
+    assert Location.objects.get(pk=location.pk).chart_refresh_min == 30
+    assert Location.objects.get(pk=other.pk).chart_refresh_min == 15
+    held.refresh_from_db()
+    assert held.next_attempt_at == _at(9, 10)
+    assert len(fake_telegram.calls) == 0
+
+
+@pytest.mark.django_db
+def test_edit_refuses_a_chart_update_period_off_the_list(
+    admin: Client, location_factory: Callable[..., Any]
+) -> None:
+    location = location_factory(name="Office", chart_refresh_min=10)
+
+    page = _refused(admin.post(_edit(location), _form(location, chart_refresh_min="7")))
+
+    assert field_error(page, "chart_refresh_min") == CHART_REFRESH_INVALID
+    assert Location.objects.get(pk=location.pk).chart_refresh_min == 10
+
+
+@pytest.mark.django_db
+def test_update_config_writes_the_chart_update_period(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = location_factory(name="Office")
+    data = {
+        name: getattr(location, name)
+        for name in actions.CONFIG_FIELDS
+        if name != "chart_refresh_min"
+    }
+
+    saved = actions.update_config(
+        location.pk, {**data, "chart_refresh_min": 30, "bot_token": ""}, _at(9, 0)
+    )
+
+    assert saved == actions.ConfigSaved(found=True, channel_changed=False)
+    assert Location.objects.get(pk=location.pk).chart_refresh_min == 30
 
 
 @pytest.mark.django_db
@@ -955,6 +1027,7 @@ def test_edit_page_layout(admin: Client, location_factory: Callable[..., Any]) -
         "bot_token": "",
         "chat_id": str(DEFAULT_CHAT_ID),
         "language": "ru",
+        "chart_refresh_min": "15",
     }
     form = by_testid(page, "location-form")
     hidden = [
@@ -1003,6 +1076,7 @@ def test_UI01_edit_form_renders(admin: Client, location_factory: Callable[..., A
         "bot_token": "",
         "chat_id": str(DEFAULT_CHAT_ID),
         "language": "ru",
+        "chart_refresh_min": "15",
     }
     hidden = [
         found.get("name") for found in form.find_all("input") if found.get("type") == "hidden"

@@ -71,7 +71,8 @@ GAP_SAMPLE = "⏸ Monitoring gap 01.10 10:00:12 – 10:10:40 (10m 28s)"
 # D-07 (03-CONTEXT Specific Ideas): the bot posted today's chart but cannot pin it.
 PIN_FAILED = (
     "📌 Can't pin today's chart for Test location (Telegram: http_400). "
-    "The chart is still posted and refreshed; pinning is retried every 15 min. "
+    "The chart is still posted and refreshed; pinning is retried every 15 min, "
+    "or at each chart update if it updates less often. "
     "Check that the bot may pin messages in the chat."
 )
 PIN_RESTORED = "📌 Pinning works again for Test location."

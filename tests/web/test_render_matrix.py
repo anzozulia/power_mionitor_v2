@@ -340,6 +340,7 @@ def _edit_form(location: Any, **overrides: str) -> dict[str, str]:
         "bot_token": "",
         "chat_id": str(location.chat_id),
         "language": location.language,
+        "chart_refresh_min": str(location.chart_refresh_min),
         **overrides,
     }
 
@@ -353,6 +354,7 @@ def _add_form(**overrides: str) -> dict[str, str]:
         "bot_token": TOKEN,
         "chat_id": str(DEFAULT_CHAT_ID),
         "language": "en",
+        "chart_refresh_min": "15",
         **overrides,
     }
 

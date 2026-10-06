@@ -33,7 +33,7 @@ FLAG_FIELDS: tuple[str, ...] = get_args(FlagField)
 # The columns the edit form writes on every save (D-07). The bot token is written only
 # when a new one was typed. The switches, the device key and the live state are never
 # among them, so a form loaded earlier can never revert what changed since (INV-02 #3).
-CONFIG_FIELDS = ("name", "period_s", "grace_s", "chat_id", "language")
+CONFIG_FIELDS = ("name", "period_s", "grace_s", "chat_id", "language", "chart_refresh_min")
 
 
 @dataclass(frozen=True)
@@ -68,7 +68,9 @@ def update_config(location_id: int, data: Mapping[str, Any], now: datetime) -> C
     does not hold them; the relay renders them at send time with the current bot and chat,
     so they go to the new channel. The chart moves on its own: the worker's chart planner
     sees records whose chat or bot no longer match and releases them (04-06). A change of
-    only the name or the language needs neither: the next chart refresh shows it.
+    only the name or the language needs neither: the next chart refresh shows it. A new
+    chart update period needs nothing either: the worker's chart planner reads it on every
+    pass (quick task 261006-of9).
 
     ``found`` is False, with nothing written, for an unknown or deleted location (a
     delete that commits first is seen: the locking read re-checks ``deleted_at``). No

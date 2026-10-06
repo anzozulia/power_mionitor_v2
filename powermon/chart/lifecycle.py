@@ -33,8 +33,8 @@ worker was down is simply due on the next pass.
   location's ``chart_pin_failed`` incident and queues one ``ops_pin_failed`` notice; the
   pin that works again closes it and queues one ``ops_pin_restored`` notice. Each goes
   in the same transaction as the record's UPDATE, and only the opener (or closer) whose
-  write changed the database notifies, so a pin retried every 15 min never repeats a
-  notice (INV-20 shape).
+  write changed the database notifies, so a pin refused again after every refresh never
+  repeats a notice (INV-20 shape).
 - Today's chart deleted in the channel ("message to edit / pin not found" on a refresh
   or a pin): the record is retired (``retired_at``, unpinned) and never called again, and
   the next pass posts exactly one replacement, records it and pins it (INV-17 #3, D-06).
@@ -73,12 +73,17 @@ worker was down is simply due on the next pass.
   WARNING); an older chart deleted in the channel ("not found") is retired with no
   repost, or simply marked unpinned. Every record transition is a conditional UPDATE
   decided by row count, so a repeated or concurrent outcome changes nothing twice.
-- Refresh: today's chart is due ``REFRESH_EVERY`` (15 min) after its last successful
-  render (``last_rendered_at``, the answer time), and is edited in place in its recorded
-  chat; "message is not modified" counts as rendered (D-05, CHRT-02). The state is in the
-  database, so after downtime exactly one catch-up refresh is made, not one per missed
-  slot (INV-18). Midnight-class steps (post, pin, finalize, unpin) beat any refresh; among
-  due refreshes the oldest render goes first, ties to the lower location id.
+- Refresh: today's chart is due once a slot of its location's chart update period
+  (``refresh_min``: 1, 5, 10, 15, 30 or 60 min, default 15) has started since its last
+  successful render (``last_rendered_at``, the answer time). Slots start on the local
+  clock minutes that are multiples of the period (``refresh_slot``). It is edited in place
+  in its recorded chat; "message is not modified" counts as rendered (D-05 amended by
+  quick task 261006-of9, CHRT-02). The state is in the database, so after downtime exactly
+  one catch-up refresh is made, not one per missed slot, then the refreshes are aligned
+  again (INV-18). A refresh that starts just before a slot and is answered after it skips
+  that slot (accepted, 261006-of9 D7). Midnight-class steps (post, pin, finalize, unpin)
+  beat any refresh; among due refreshes the oldest render goes first, ties to the lower
+  location id.
 - Release (D-08, D-09, INV-19 #2): a record is ``stale`` once its channel is no longer its
   location's: the chat stored with it differs from the location's chat, the bot that
   posted it (``bot_key``) differs from the location's current bot (a token change is a
@@ -178,8 +183,9 @@ import threading
 from collections.abc import Callable
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 from django.conf import settings
 from django.db import (
@@ -199,6 +205,7 @@ from powermon.clock import Clock
 from powermon.engine import lapse, rules
 from powermon.engine.models import SystemState
 from powermon.i18n import chart_texts
+from powermon.locations.models import DEFAULT_CHART_REFRESH_MIN
 from powermon.telegram.client import DEFAULT_RETRY_AFTER_S, SendResult, TelegramClient
 from powermon.worker import io_loop
 from powermon.worker.lease import LOCK_KEY
@@ -214,12 +221,13 @@ _KEY_PREFIX = "chart:"
 # The HTTP status a pin-failure notice names when the result code carries none.
 _DEFAULT_PIN_STATUS = 400
 
-# Today's chart is due for a refresh this long after its last successful render (D-05).
-REFRESH_EVERY = timedelta(minutes=15)
 # A failed step's own wait: STEP_RETRY after its first consecutive failure, doubling with
 # each further one, at most STEP_RETRY_MAX (``step_delay``).
 STEP_RETRY = timedelta(seconds=io_loop.BACKOFF_CAP_S)
-STEP_RETRY_MAX = REFRESH_EVERY
+# A fixed cap, not tied to any location's chart update period: the bound of at most 4
+# untracked photos an hour from an ambiguous post (module docstring) depends on it
+# (261006-of9 D8).
+STEP_RETRY_MAX = timedelta(minutes=15)
 # Doublings after which STEP_RETRY is past STEP_RETRY_MAX (30 s * 2**5 = 16 min).
 _MAX_DOUBLINGS = 5
 # The steps that render a chart right before their call.
@@ -235,10 +243,11 @@ _TODAYS: tuple[Step, ...] = ("pin", "refresh")
 # active record (ROWS_SQL's predicate) to release: a deleted location's (D-09), or a
 # record a history reset marked (D-08), which brings in a location that waits for its
 # first heartbeat after the reset. Those only get their records released, and leave the
-# snapshot once every such record is retired. The last column flags a waiting location.
+# snapshot once every such record is retired. The last two columns flag a waiting
+# location and give its chart update period in minutes.
 LOCATIONS_SQL = """
 SELECT l.id, l.name, l.language, l.bot_token, l.chat_id, l.period_s, l.grace_s, l.router_grace,
-       l.deleted_at IS NOT NULL, s.status = 'waiting'
+       l.deleted_at IS NOT NULL, s.status = 'waiting', l.chart_refresh_min
   FROM location l
   JOIN location_state s ON s.location_id = l.id
  WHERE (s.status IN ('on', 'off') AND l.deleted_at IS NULL)
@@ -299,6 +308,9 @@ class ChartLocation:
     # A location waiting for its first heartbeat after a history reset (D-08): it gets
     # releases only.
     awaiting_heartbeat: bool = False
+    # The location's chart update period in minutes, one of 1, 5, 10, 15, 30, 60 (CHRT-02,
+    # 261006-of9); the DB CHECK location_chart_refresh_valid keeps any other value out.
+    refresh_min: int = DEFAULT_CHART_REFRESH_MIN
 
 
 @dataclass(frozen=True)
@@ -373,6 +385,26 @@ def step_delay(failures: int) -> timedelta:
     if failures < 1:
         raise ValueError(f"step_delay() needs at least 1 failure, not {failures}")
     return min(STEP_RETRY * 2 ** min(failures - 1, _MAX_DOUBLINGS), STEP_RETRY_MAX)
+
+
+def refresh_slot(now: datetime, every_min: int, tz: str) -> datetime:
+    """The start of the chart update slot ``now`` is in, as an aware UTC instant.
+
+    Slots start on the local clock minutes of ``tz`` that are multiples of ``every_min``:
+    every minute for 1, :00, :10 ... :50 for 10, on the hour for 60 (CHRT-02, amended by
+    quick task 261006-of9). On a fall-back day the repeated hour gets its slots twice, and
+    spring-forward has no gap (CHRT-06). A zone with a 30-min DST shift gets one
+    off-boundary slot and never raises (INV-13). ValueError only for a period that does
+    not divide 60 or a naive ``now``; the DB CHECK rules out the former.
+    """
+    if every_min < 1 or 60 % every_min:
+        raise ValueError(f"a chart update period must divide 60 minutes, not {every_min}")
+    if now.utcoffset() is None:
+        raise ValueError("refresh_slot needs an aware now, not a naive datetime")
+    local = now.astimezone(ZoneInfo(tz))
+    # On the UTC instant, never the local datetime: aware arithmetic is wall-clock arithmetic.
+    minute = now.astimezone(UTC).replace(second=0, microsecond=0)
+    return minute - timedelta(minutes=local.minute % every_min)
 
 
 def settle_time(period_s: int, grace_s: int, router_grace: bool) -> timedelta:
@@ -462,6 +494,7 @@ def read_snapshot(today: date) -> tuple[list[ChartLocation], list[ChartRow]]:
                 settle=settle_time(r[5], r[6], r[7]),
                 deleted=r[8],
                 awaiting_heartbeat=r[9],
+                refresh_min=r[10],
             )
             for r in cur.fetchall()
         ]
@@ -494,6 +527,7 @@ def plan(
     now: datetime,
     not_before: dict[str, datetime],
     settled: AbstractSet[int] = frozenset(),
+    tz: str,
 ) -> Action | None:
     """The one chart step due now, or None. Pure: reads nothing but its arguments.
 
@@ -514,8 +548,10 @@ def plan(
     INV-19). A final edit is due only for a record in ``settled`` (``settled_records``: its
     day's timeline is complete, INV-03); one not due yet never holds the unpin, so two
     charts are pinned for seconds only. Only when none is due anywhere, the refresh that
-    has waited longest goes: today's record with the oldest ``last_rendered_at`` at least
-    ``REFRESH_EVERY`` ago, ties to the lower location id (CHRT-02). A step whose own key
+    has waited longest goes: today's record whose ``last_rendered_at`` is before its
+    location's current slot (``refresh_slot``), oldest render first, ties to the lower
+    location id (CHRT-02). ``tz`` is the display zone the slots are aligned in. A step
+    whose own key
     in ``not_before`` is in the future is skipped, so the next due step goes instead: a
     failing post never blocks the older charts' cleanup (D-02, INV-19). The alert relay's
     backoff is respected, read only: a location whose bot waits (``bot_wide_key``) makes
@@ -549,7 +585,7 @@ def plan(
             return action
         if (
             today_row is not None
-            and now - today_row.last_rendered_at >= REFRESH_EVERY
+            and today_row.last_rendered_at < refresh_slot(now, location.refresh_min, tz)
             and not waiting(chart_key(location.location_id, "refresh"))
             and not waiting(io_loop.chat_key(location.bot_token, today_row.chat_id))
         ):
@@ -685,7 +721,13 @@ def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | No
     )
     _prune(state, locations, rows, today)
     action = plan(
-        locations, rows, today=today, now=now, not_before=state.not_before, settled=settled
+        locations,
+        rows,
+        today=today,
+        now=now,
+        not_before=state.not_before,
+        settled=settled,
+        tz=tz,
     )
     if action is None or _stopped(stop):
         return False

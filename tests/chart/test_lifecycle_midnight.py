@@ -603,7 +603,8 @@ def test_permanent_cleanup_errors_are_best_effort(
     assert older.pinned is False
 
     # Done for good: no retry on later passes, and no step key or failure count is left.
-    for minutes in (0, 1, 5, 14):
+    # The passes stay before the 00:15 slot, so today's chart is not refreshed meanwhile.
+    for minutes in (0, 1, 5, 7):
         clock.set(AFTER_MIDNIGHT + _min(minutes))
         assert _pass(clock, state) is False
     assert _requests(fake_telegram) == [("A", "editMessageMedia"), ("A", "unpinChatMessage")]
@@ -664,7 +665,7 @@ def test_midnight_work_of_one_location_finishes_before_the_next(
     assert a.pk < b.pk < c.pk
     _seed(a, YESTERDAY, message_id=501, pinned=True)
     _seed(b, YESTERDAY, message_id=601, pinned=True, chat_id=CHAT_B)
-    # C did its midnight work at 00:05; its refresh is due at 00:20.
+    # C did its midnight work at 00:05; its refresh is due at 00:15.
     _seed(c, TODAY, message_id=701, pinned=True, chat_id=CHAT_C, rendered=kyiv("2026-10-02 00:05"))
     for token in (DEFAULT_BOT_TOKEN, TOKEN_B, TOKEN_C):
         fake_telegram.accept_chart(token)

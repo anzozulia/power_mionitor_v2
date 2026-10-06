@@ -208,12 +208,25 @@ def _spy_pills(monkeypatch: pytest.MonkeyPatch) -> list[str | None]:
 
 
 def _location(
-    location_id: int, token: str = DEFAULT_BOT_TOKEN, *, router_grace: bool = False
+    location_id: int,
+    token: str = DEFAULT_BOT_TOKEN,
+    *,
+    router_grace: bool = False,
+    refresh_min: int = 15,
 ) -> lifecycle.ChartLocation:
-    """A monitored location as the planner sees it: period 60 s, grace 30 s."""
+    """A monitored location as the planner sees it: period 60 s, grace 30 s.
+
+    ``refresh_min`` is its chart update period in minutes (CHRT-02, 261006-of9).
+    """
     settle = lifecycle.settle_time(60, 30, router_grace)
     return lifecycle.ChartLocation(
-        location_id, f"L{location_id}", "en", token, DEFAULT_CHAT_ID, settle
+        location_id,
+        f"L{location_id}",
+        "en",
+        token,
+        DEFAULT_CHAT_ID,
+        settle,
+        refresh_min=refresh_min,
     )
 
 
@@ -506,7 +519,8 @@ def test_permanent_pin_failure_waits_for_the_next_refresh(
     assert row.pin_failed_at == NOON_05 + timedelta(seconds=2)
     assert io_loop.chat_key(DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID) not in state.not_before
     assert io_loop.bot_wide_key(DEFAULT_BOT_TOKEN) not in state.not_before
-    # No retry before the next render (the refresh 15 min after the post, Task 3).
+    # No retry before the next render (the refresh at the 12:15 slot, made by the 12:19
+    # pass) and the pin's 15-min hold (until 12:20:02).
     for minutes in (1, 5, 14):
         clock.set(NOON_05 + timedelta(minutes=minutes))
         _pass(clock, state)
@@ -514,12 +528,14 @@ def test_permanent_pin_failure_waits_for_the_next_refresh(
     assert ChartMessage.objects.get(location=location).pinned is False
 
 
-# Refresh every 15 min from DB state, catch-up, D-03, D-14, INV-05, INV-17 #2 (D-05)
+# Refresh at the location's chart update slots from DB state, catch-up, D-03, D-14, INV-05,
+# INV-17 #2 (D-05, CHRT-02 amended by quick task 261006-of9)
 
 
-def test_CHRT02_refresh_is_due_15_minutes_after_the_last_render(
+def test_CHRT02_refresh_is_due_at_the_next_period_boundary(
     location_factory: Callable[..., Any], fake_telegram: Any
 ) -> None:
+    # The default period is 15 min: slots at :00, :15, :30 and :45 local.
     _monitored(location_factory)
     clock = FakeClock(NOON_05)
     # The first edit takes 1 s: last_rendered_at is when Telegram answered.
@@ -532,11 +548,11 @@ def test_CHRT02_refresh_is_due_15_minutes_after_the_last_render(
     _pass(clock, state)
     assert _rows()[0].pinned is True
 
-    clock.set(NOON_05 + timedelta(minutes=14, seconds=59))
+    clock.set(kyiv("2026-10-01 12:14:59"))
     assert _pass(clock, state) is False
     assert fake_telegram.count(DEFAULT_BOT_TOKEN, "editMessageMedia") == 0
 
-    clock.set(NOON_05 + timedelta(minutes=15))
+    clock.set(kyiv("2026-10-01 12:15"))
     assert _pass(clock, state) is True
 
     [edit] = _chart_calls(fake_telegram, "editMessageMedia")
@@ -547,7 +563,92 @@ def test_CHRT02_refresh_is_due_15_minutes_after_the_last_render(
         "caption": "No outages today",
     }
     assert _png_size(edit.files["chart"]) == (1280, 1000)
-    assert _rows()[0].last_rendered_at == NOON_05 + timedelta(minutes=15, seconds=1)
+    assert _rows()[0].last_rendered_at == kyiv("2026-10-01 12:15:01")
+
+    # The next slot is 12:30, not 15 min after the answer (12:30:01): no drift.
+    clock.set(kyiv("2026-10-01 12:29:59"))
+    assert _pass(clock, state) is False
+    clock.set(kyiv("2026-10-01 12:30"))
+    assert _pass(clock, state) is True
+
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "editMessageMedia") == 2
+    assert _rows()[0].last_rendered_at == kyiv("2026-10-01 12:30")
+
+
+def test_CHRT02_period_comes_from_the_location_row(
+    location_factory: Callable[..., Any], fake_telegram: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A 10-min period read from the location row (read_snapshot): slots :00, :10, :20 ...
+    _monitored(location_factory, chart_refresh_min=10)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+    _pass(clock, state)
+    _pass(clock, state)
+    assert _rows()[0].pinned is True
+    pills = _spy_pills(monkeypatch)
+
+    for at, due in (("12:09:59", False), ("12:10", True), ("12:19:59", False), ("12:20", True)):
+        clock.set(kyiv(f"2026-10-01 {at}"))
+        assert _pass(clock, state) is due, at
+
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "editMessageMedia") == 2
+    assert pills == ["12:10", "12:20"]
+
+
+def test_INV18_catch_up_once_then_aligned(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    location = _monitored(location_factory)
+    _seed(location, rendered=kyiv("2026-10-01 09:03"))
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    clock = FakeClock(kyiv("2026-10-01 11:47"))
+    state = io_loop.RelayState()
+
+    # The worker comes back at 11:47: one catch-up refresh, not one per missed slot.
+    assert _pass(clock, state) is True
+    assert _pass(clock, state) is False
+    assert _rows()[0].last_rendered_at == kyiv("2026-10-01 11:47")
+    # Then the refreshes are on the slots again: none before 12:00, one at 12:00.
+    clock.set(kyiv("2026-10-01 11:59:59"))
+    assert _pass(clock, state) is False
+    clock.set(kyiv("2026-10-01 12:00"))
+    assert _pass(clock, state) is True
+
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "editMessageMedia") == 2
+    assert _rows()[0].last_rendered_at == kyiv("2026-10-01 12:00")
+
+
+def test_D07_pin_retry_waits_15_min_with_a_1_min_period(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    _monitored(location_factory, chart_refresh_min=1)
+    noon = kyiv("2026-10-01 12:00")
+    # The first pin is refused (the bot may post but not pin), later ones are accepted.
+    fake_telegram.fail_method(
+        DEFAULT_BOT_TOKEN, "pinChatMessage", status=400, json_body=NO_PIN_RIGHTS
+    )
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    clock = FakeClock(noon)
+    state = io_loop.RelayState()
+    _pass(clock, state)
+    _pass(clock, state)
+    assert _rows()[0].pin_failed_at == noon
+
+    # A refresh every minute does not retry the pin more often than every 15 min (D-07).
+    for at in ("12:05", "12:10", "12:14:59"):
+        clock.set(kyiv(f"2026-10-01 {at}"))
+        assert _pass(clock, state) is True, at
+        assert _pass(clock, state) is False, at
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "editMessageMedia") == 3
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "pinChatMessage") == 1
+
+    clock.set(kyiv("2026-10-01 12:15"))
+    assert _pass(clock, state) is True
+
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "pinChatMessage") == 2
+    [row] = _rows()
+    assert (row.pinned, row.pin_failed_at) == (True, None)
 
 
 def test_refresh_not_modified_counts_as_rendered(
@@ -780,7 +881,7 @@ def test_failed_pin_is_retried_after_the_next_refresh(
     _pass(clock, state)
     assert _rows()[0].pin_failed_at == NOON_05
 
-    for minutes in (5, 14):
+    for minutes in (5, 9):
         clock.set(NOON_05 + timedelta(minutes=minutes))
         assert _pass(clock, state) is False
     # 12:20: the refresh comes first (the pin is not due before a new render)...
@@ -798,13 +899,67 @@ def test_failed_pin_is_retried_after_the_next_refresh(
 # Pure planner ordering (CHRT-02, D-02)
 
 
+def test_plan_refresh_due_at_its_period_boundary() -> None:
+    a = _location(1, refresh_min=10)
+    rows = [_row(10, 1, rendered=kyiv("2026-10-01 12:03"))]
+
+    def plan_at(at: str) -> lifecycle.Action | None:
+        now = kyiv(f"2026-10-01 {at}")
+        return lifecycle.plan([a], rows, today=TODAY, now=now, not_before={}, tz=KYIV)
+
+    assert plan_at("12:09:59") is None
+    assert plan_at("12:10") == lifecycle.Action("refresh", a, rows[0])
+
+
+def test_plan_each_location_uses_its_own_period() -> None:
+    a = _location(1, refresh_min=1)
+    b = _location(2, refresh_min=60)
+    rendered = kyiv("2026-10-01 12:00:01")
+    rows = [_row(10, 1, rendered=rendered), _row(11, 2, rendered=rendered)]
+
+    def plan_at(at: str, rows: list[lifecycle.ChartRow]) -> lifecycle.Action | None:
+        now = kyiv(f"2026-10-01 {at}")
+        return lifecycle.plan([a, b], rows, today=TODAY, now=now, not_before={}, tz=KYIV)
+
+    # 12:01: only A's 1-min slot has started since the render.
+    assert plan_at("12:01", rows) == lifecycle.Action("refresh", a, rows[0])
+    # 13:00, A rendered at 12:59:01: both are due, and B's older render goes first.
+    a_later = _row(10, 1, rendered=kyiv("2026-10-01 12:59:01"))
+    assert plan_at("13:00", [a_later, rows[1]]) == lifecycle.Action("refresh", b, rows[1])
+    # 13:00 with equal render times: the lower location id goes first.
+    assert plan_at("13:00", rows) == lifecycle.Action("refresh", a, rows[0])
+
+
+def test_plan_period_change_applies_on_the_next_pass() -> None:
+    hourly = _location(1, refresh_min=60)
+    rows = [_row(10, 1, rendered=NOON_05)]
+    now = kyiv("2026-10-01 12:30")
+
+    assert lifecycle.plan([hourly], rows, today=TODAY, now=now, not_before={}, tz=KYIV) is None
+    # The admin picks 1 min: the next pass reads the new period, with no restart.
+    every_minute = dataclasses.replace(hourly, refresh_min=1)
+    assert lifecycle.plan(
+        [every_minute], rows, today=TODAY, now=now, not_before={}, tz=KYIV
+    ) == lifecycle.Action("refresh", every_minute, rows[0])
+
+
+def test_plan_render_in_the_future_is_not_due() -> None:
+    # The clock was stepped back: the last render (12:30) is after now (12:10).
+    rows = [_row(10, 1, rendered=kyiv("2026-10-01 12:30"))]
+    now = kyiv("2026-10-01 12:10")
+
+    for refresh_min in (10, 1):
+        a = _location(1, refresh_min=refresh_min)
+        assert lifecycle.plan([a], rows, today=TODAY, now=now, not_before={}, tz=KYIV) is None
+
+
 def test_plan_equal_render_times_refresh_the_lower_location_id_first() -> None:
     a = _location(1)
     b = _location(2)
     rows = [_row(10, 2, rendered=NOON_05), _row(11, 1, rendered=NOON_05)]
     now = NOON_05 + timedelta(minutes=15)
 
-    action = lifecycle.plan([a, b], rows, today=TODAY, now=now, not_before={})
+    action = lifecycle.plan([a, b], rows, today=TODAY, now=now, not_before={}, tz=KYIV)
 
     assert action == lifecycle.Action("refresh", a, rows[1])
 
@@ -815,7 +970,7 @@ def test_plan_midnight_steps_beat_any_refresh() -> None:
     b = _location(2)
     rows = [_row(10, 1, rendered=NOON_05 - timedelta(hours=2))]
 
-    action = lifecycle.plan([a, b], rows, today=TODAY, now=NOON_05, not_before={})
+    action = lifecycle.plan([a, b], rows, today=TODAY, now=NOON_05, not_before={}, tz=KYIV)
 
     assert action == lifecycle.Action("post", b)
 
@@ -824,8 +979,8 @@ def test_plan_nothing_due() -> None:
     a = _location(1)
     rows = [_row(10, 1, rendered=NOON_05)]
 
-    assert lifecycle.plan([a], rows, today=TODAY, now=NOON_05, not_before={}) is None
-    assert lifecycle.plan([], [], today=TODAY, now=NOON_05, not_before={}) is None
+    assert lifecycle.plan([a], rows, today=TODAY, now=NOON_05, not_before={}, tz=KYIV) is None
+    assert lifecycle.plan([], [], today=TODAY, now=NOON_05, not_before={}, tz=KYIV) is None
 
 
 def test_plan_skips_a_bot_or_channel_that_is_backing_off() -> None:
@@ -836,15 +991,18 @@ def test_plan_skips_a_bot_or_channel_that_is_backing_off() -> None:
 
     # A's bot is held (a 429 or 5xx, by an alert or a chart): none of its steps goes.
     held = {io_loop.bot_wide_key(DEFAULT_BOT_TOKEN): later}
-    assert lifecycle.plan([a, b], [unpinned], today=TODAY, now=NOON_05, not_before=held) == (
-        lifecycle.Action("post", b)
-    )
+    assert lifecycle.plan(
+        [a, b], [unpinned], today=TODAY, now=NOON_05, not_before=held, tz=KYIV
+    ) == (lifecycle.Action("post", b))
     # A's channel backs off (the alert relay's chat_key): no pin, no refresh, no post.
     channel = {io_loop.chat_key(DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID): later}
-    assert lifecycle.plan([a], [unpinned], today=TODAY, now=NOON_05, not_before=channel) is None
-    assert lifecycle.plan([a], [], today=TODAY, now=NOON_05, not_before=channel) is None
+    assert (
+        lifecycle.plan([a], [unpinned], today=TODAY, now=NOON_05, not_before=channel, tz=KYIV)
+        is None
+    )
+    assert lifecycle.plan([a], [], today=TODAY, now=NOON_05, not_before=channel, tz=KYIV) is None
     # At the key's own time the step is due again.
-    assert lifecycle.plan([a], [], today=TODAY, now=later, not_before=channel) == (
+    assert lifecycle.plan([a], [], today=TODAY, now=later, not_before=channel, tz=KYIV) == (
         lifecycle.Action("post", a)
     )
 
@@ -925,18 +1083,18 @@ def test_INV19_plan_unpins_an_older_record_not_known_to_be_pinned() -> None:
     older = _row(10, 1, rendered=NOON_05 - timedelta(days=1), day=yesterday, pinned=False)
     rows = [older, _row(11, 1, rendered=NOON_05)]
 
-    assert lifecycle.plan([a], rows, today=TODAY, now=NOON_05, not_before={}) == (
+    assert lifecycle.plan([a], rows, today=TODAY, now=NOON_05, not_before={}, tz=KYIV) == (
         lifecycle.Action("unpin", a, older)
     )
     # Its own key still holds it, as for any step.
     held = {lifecycle.chart_key(1, "unpin", 10): NOON_05 + timedelta(seconds=30)}
-    assert lifecycle.plan([a], rows, today=TODAY, now=NOON_05, not_before=held) is None
+    assert lifecycle.plan([a], rows, today=TODAY, now=NOON_05, not_before=held, tz=KYIV) is None
     # Once its unpin was made, it gets no second one, pinned flag or not.
     for pinned in (False, True):
         done = dataclasses.replace(older, pinned=pinned, unpinned_at=NOON_05)
-        assert lifecycle.plan([a], [done, rows[1]], today=TODAY, now=NOON_05, not_before={}) is (
-            None
-        )
+        assert lifecycle.plan(
+            [a], [done, rows[1]], today=TODAY, now=NOON_05, not_before={}, tz=KYIV
+        ) is (None)
 
 
 def test_plan_final_edit_waits_for_its_day_and_never_holds_the_unpin() -> None:
@@ -945,17 +1103,19 @@ def test_plan_final_edit_waits_for_its_day_and_never_holds_the_unpin() -> None:
     rows = [older, _row(11, 1, rendered=NOON_05)]
 
     # Today's chart is posted and pinned; yesterday's has not settled: it is unpinned now.
-    assert lifecycle.plan([a], rows, today=TODAY, now=NOON_05, not_before={}) == (
+    assert lifecycle.plan([a], rows, today=TODAY, now=NOON_05, not_before={}, tz=KYIV) == (
         lifecycle.Action("unpin", a, older)
     )
     # Once it has settled, its final edit goes first (D-02 order).
     assert lifecycle.plan(
-        [a], rows, today=TODAY, now=NOON_05, not_before={}, settled={10}
+        [a], rows, today=TODAY, now=NOON_05, not_before={}, settled={10}, tz=KYIV
     ) == lifecycle.Action("finalize", a, older)
     # A settled id of a record that is not older (today's) changes nothing.
     done = dataclasses.replace(older, pinned=False, finalized_at=NOON_05, unpinned_at=NOON_05)
     assert (
-        lifecycle.plan([a], [done, rows[1]], today=TODAY, now=NOON_05, not_before={}, settled={11})
+        lifecycle.plan(
+            [a], [done, rows[1]], today=TODAY, now=NOON_05, not_before={}, settled={11}, tz=KYIV
+        )
         is None
     )
 
@@ -1157,7 +1317,7 @@ def test_refused_post_holds_the_bot_briefly(
 
 def test_step_delay() -> None:
     assert lifecycle.STEP_RETRY == _seconds(30)
-    assert lifecycle.STEP_RETRY_MAX == lifecycle.REFRESH_EVERY == timedelta(minutes=15)
+    assert lifecycle.STEP_RETRY_MAX == timedelta(minutes=15)
     assert lifecycle.step_delay(1) == _seconds(30)
     assert lifecycle.step_delay(2) == _seconds(60)
     assert lifecycle.step_delay(5) == _seconds(480)
@@ -1186,8 +1346,9 @@ def test_chart_waits_for_the_relays_backoff(
         NOON_05 + timedelta(minutes=15)
     )
     assert _requests(fake_telegram) == [("A", "sendMessage"), ("B", "sendPhoto")]
-    # While A's channel backs off, B's pin goes and A still gets nothing.
-    clock.set(NOON_05 + timedelta(minutes=14, seconds=59))
+    # While A's channel backs off (until 12:20), B's pin goes and A still gets nothing;
+    # 12:14:59 is before B's first refresh slot (12:15).
+    clock.set(NOON_05 + timedelta(minutes=9, seconds=59))
     assert _pass(clock, state) is True
     assert _pass(clock, state) is False
 

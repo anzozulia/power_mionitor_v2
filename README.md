@@ -196,8 +196,10 @@ its OFF within one detection window (period plus grace) after the restart.
 1. Open `https://DOMAIN/` and sign in with `ADMIN_USERNAME` and `ADMIN_PASSWORD`.
 2. Click **Add location**. Enter a name, the heartbeat period and grace (seconds; defaults
    60 and 30, at least 10), the bot token from @BotFather, the numeric chat ID of the
-   private test channel (`-100...`; the form's help text says how to find it) and the
-   alert language (uk, en or ru). The bot must be an administrator of the channel with the
+   private test channel (`-100...`; the form's help text says how to find it), the
+   alert language (uk, en or ru) and the chart update period (1, 5, 10, 15 or 30 min or
+   1 hour; default 15 min). (Amended 2026-10-06, quick task 261006-of9.) The bot must be
+   an administrator of the channel with the
    "Post messages" and "Edit messages of others" rights (the second one to pin, unpin and
    edit the weekly chart; in a group it needs "Pin messages").
 3. On the location's setup page, click **Reveal key** and copy the curl or cron example
@@ -367,7 +369,7 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
     `❓ ON alert for Office (event 17:45) may not have been delivered (Telegram timed out after the request was sent). It will not be resent; please check the channel.`
   - The bot may post the weekly chart but not pin it (a missing pin right, section 2),
     once when pinning starts failing and once when it works again:
-    `📌 Can't pin today's chart for Office (Telegram: http_400). The chart is still posted and refreshed; pinning is retried every 15 min. Check that the bot may pin messages in the chat.`
+    `📌 Can't pin today's chart for Office (Telegram: http_400). The chart is still posted and refreshed; pinning is retried every 15 min, or at each chart update if it updates less often. Check that the bot may pin messages in the chat.` (Amended 2026-10-06, quick task 261006-of9.)
     and `📌 Pinning works again for Office.`
   - Telegram refuses a location's alerts for good (bot removed from the channel, wrong
     chat ID, bad token), once when it starts and once when an alert or a test message
@@ -399,8 +401,11 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
     counted, unless detection's checks failed in every cycle of that short margin (for
     example on database errors). Each such failure is logged, and the finished chart is
     not redrawn.
-  - Today's chart is edited in place every 15 minutes, so an outage shows on it within 15
-    minutes of its OFF alert.
+  - Today's chart is edited in place on its location's chart update period (1, 5, 10, 15,
+    30 or 60 minutes; default 15, set in the location form), on the local clock minutes
+    that are multiples of the period: every 10 minutes means :00, :10 … :50, every hour
+    means on the hour. An outage shows at the first update after its OFF alert, so within
+    one period. (Amended 2026-10-06, quick task 261006-of9.)
   - After the worker was down across one or more midnights, it posts exactly one chart
     for today and gives every older pinned chart its final render and unpins it. A day
     the worker missed entirely gets no chart. After any restart, the chart is first
@@ -412,7 +417,9 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
   - A channel pin may leave a "pinned a photo" service message in the channel each day
     (Telegram's behaviour; it is checked once in section 12).
   - Cost: a render takes about 0.1 to 0.3 s of CPU and about 35 MB of extra worker memory
-    while it runs. Chart work runs in the worker's Telegram thread only, at most one chart
+    while it runs. A 1-min chart update period redraws and uploads the chart every
+    minute. (Amended 2026-10-06, quick task 261006-of9.) Chart work runs in the worker's
+    Telegram thread only, at most one chart
     call per delivery pass and after all due alerts, so it never delays detection or
     heartbeats and delays an alert by one call at most. Each chart call logs one INFO
     line, `chart <post|pin|finalize|unpin|refresh|release> for location <id>: <result>
@@ -435,8 +442,8 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
       starts a fresh detection window: silence during maintenance does not count, and
       OFF can be reported at the earliest period + grace after the switch.
     - **Alerts:** while off, subscribers get no new alerts, and none are saved for
-      later. Alerts already queued still go out. The chart, its 15-minute refresh and the
-      midnight re-pin carry on.
+      later. Alerts already queued still go out. The chart, its regular updates and the
+      midnight re-pin carry on. (Amended 2026-10-06, quick task 261006-of9.)
     - **Router grace:** while on, OFF waits 180 s longer when the last heartbeat came
       within 5 minutes after power returned, so a router that restarts after a blackout
       is not reported as a second outage. It changes only decisions made after the
@@ -461,8 +468,8 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
     its cause is shown on the page only. If Telegram says the group became a supergroup,
     the page and the notice show the new chat ID (`-100…`): put it in Edit location, then
     send a test message. The chat ID is never changed automatically.
-  - **Edit location:** name, heartbeat period, grace, chat ID, language and, optionally,
-    a new bot token. The token field is always empty and the token is never shown again
+  - **Edit location:** name, heartbeat period, grace, chat ID, language, chart update
+    period and, optionally, a new bot token. (Amended 2026-10-06, quick task 261006-of9.) The token field is always empty and the token is never shown again
     (only `123456789:••••••••`); leave it empty to keep the current one. New period and
     grace values apply from the next check and never change past days or their totals.
     A lower value can report OFF at the next check if the device has already been silent
@@ -489,7 +496,8 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
     (for example the device or its internet connection was down while the power was on)
     into power on: its off time no longer counts in the chart or the daily totals, and time inside it
     that was not monitored stays not monitored. The pinned chart shows the change at its
-    next refresh, within 15 minutes; it draws the last 7 days, and charts already finished
+    next update (within the location's chart update period; amended 2026-10-06, quick task
+    261006-of9); it draws the last 7 days, and charts already finished
     for earlier days do not change. The live status stays as it is, so the next OFF
     alert's "was ON for" still counts from the end of the removed outage. An outage in
     progress cannot be removed: remove it after power returns. Alerts of the removed outage
@@ -737,14 +745,15 @@ Record: whether a "pinned a photo" service message appears in the channel, wheth
 phone showed a notification for it, and that the chart is pinned (the pinned-message bar
 at the top shows it) with no `📌 Can't pin …` notice in the ops chat.
 
-### (c) DoD 1, chart part: an outage shows within 15 minutes
+### (c) DoD 1, chart part: an outage shows within one chart update period
 
 1. Unplug a device whose location is on, and note the time.
 2. Wait for its OFF alert in the test channel (within its period plus grace) and note the
    time.
 3. Watch the pinned chart (open it again to see an edit).
 
-Expected: within 15 minutes of the OFF alert, today's row shows the outage in red, from
+Expected: within one chart update period of the OFF alert (15 min by default; amended
+2026-10-06, quick task 261006-of9), today's row shows the outage in red, from
 the last heartbeat (the outage start) to the now marker, and the caption's off time and
 outage count include it.
 
@@ -757,8 +766,9 @@ This can run together with section 11's DoD 2 drill.
 
 1. Note the time, then stop everything: `docker compose -f docker-compose.prod.yml stop`
 2. After 10 minutes, deploy: `docker compose -f docker-compose.prod.yml up -d --build --wait`
-3. Watch the pinned chart until it is edited, at most 15 minutes after the restart (open
-   it again to see an edit).
+3. Watch the pinned chart until it is edited, at most one chart update period (15 min by
+   default) after the restart (open it again to see an edit). (Amended 2026-10-06, quick
+   task 261006-of9.)
 
 Expected: from the first edit after the restart on, today's row shows the 10-minute
 window hatched (not monitored), never red and never green, and the caption's off time
@@ -1358,8 +1368,9 @@ Record the results in the Phase 6 UAT (`06-UAT.md`).
       and never the ticking time.
     - On the Locations page, a Fleet health filter press announces "Showing N of M
       locations" once. A poll with no change announces nothing.
-13. **Chart preview:** the location page's chart is the channel's pinned chart, up to
-    15 minutes newer. On the VPS, `docker stats` during a preview stays within the memory
+13. **Chart preview:** the location page's chart is the channel's pinned chart; the two
+    can differ by up to one chart update period (about 2 min at a 1-min period, since the
+    preview is cached for 60 s). (Amended 2026-10-06, quick task 261006-of9.) On the VPS, `docker stats` during a preview stays within the memory
     budget (about 25 MB more, for a moment).
 14. **Favicon on amd64:** `favicon.ico` was generated on arm64. On an amd64 host,
     `tests/web/test_icons.py` must pass in the dev image (it regenerates the file and

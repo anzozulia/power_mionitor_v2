@@ -300,9 +300,9 @@ def test_plan_releases_a_stale_record_and_never_posts_meanwhile() -> None:
     old_today = _row(10, rendered=NOON_05 - timedelta(hours=1))
 
     # The old today-record is released; no post in chat B, no refresh of the old chart.
-    assert lifecycle.plan([moved], [old_today], today=TODAY, now=NOON_05, not_before={}) == (
-        lifecycle.Action("release", moved, old_today)
-    )
+    assert lifecycle.plan(
+        [moved], [old_today], today=TODAY, now=NOON_05, not_before={}, tz=KYIV
+    ) == (lifecycle.Action("release", moved, old_today))
     # While its release waits (its own key, or its bot's hold: a 429, a 5xx or a refused
     # connection), the location makes no step at all: never a post (Pitfall 1).
     later = NOON_05 + timedelta(seconds=30)
@@ -311,21 +311,22 @@ def test_plan_releases_a_stale_record_and_never_posts_meanwhile() -> None:
         {io_loop.bot_wide_key(DEFAULT_BOT_TOKEN): later},
     ):
         assert (
-            lifecycle.plan([moved], [old_today], today=TODAY, now=NOON_05, not_before=held) is None
+            lifecycle.plan([moved], [old_today], today=TODAY, now=NOON_05, not_before=held, tz=KYIV)
+            is None
         )
     # The stored chat's own hold (an alert refused there) never holds the release (D-08).
     old_chat = {io_loop.chat_key(DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID): later}
     assert lifecycle.plan(
-        [moved], [old_today], today=TODAY, now=NOON_05, not_before=old_chat
+        [moved], [old_today], today=TODAY, now=NOON_05, not_before=old_chat, tz=KYIV
     ) == lifecycle.Action("release", moved, old_today)
     # Another location's chart work goes on meanwhile.
     other = _location(2, TOKEN_B, CHAT_B)
     held = {lifecycle.chart_key(1, "release", 10): later}
     assert lifecycle.plan(
-        [moved, other], [old_today], today=TODAY, now=NOON_05, not_before=held
+        [moved, other], [old_today], today=TODAY, now=NOON_05, not_before=held, tz=KYIV
     ) == lifecycle.Action("post", other)
     # Once the record is retired (it leaves the snapshot), today's chart is posted.
-    assert lifecycle.plan([moved], [], today=TODAY, now=NOON_05, not_before={}) == (
+    assert lifecycle.plan([moved], [], today=TODAY, now=NOON_05, not_before={}, tz=KYIV) == (
         lifecycle.Action("post", moved)
     )
 
@@ -338,20 +339,20 @@ def test_plan_releases_stale_records_oldest_first() -> None:
     rows = [today_row, older, oldest]
 
     # By local date, then id, whatever the snapshot order; one release per pass.
-    assert lifecycle.plan([moved], rows, today=TODAY, now=NOON_05, not_before={}) == (
+    assert lifecycle.plan([moved], rows, today=TODAY, now=NOON_05, not_before={}, tz=KYIV) == (
         lifecycle.Action("release", moved, oldest)
     )
     assert lifecycle.plan(
-        [moved], [today_row, older], today=TODAY, now=NOON_05, not_before={}
+        [moved], [today_row, older], today=TODAY, now=NOON_05, not_before={}, tz=KYIV
     ) == lifecycle.Action("release", moved, older)
     # A release that waits lets the next stale record of the location go.
     held = {lifecycle.chart_key(1, "release", 12): NOON_05 + timedelta(seconds=30)}
-    assert lifecycle.plan([moved], rows, today=TODAY, now=NOON_05, not_before=held) == (
+    assert lifecycle.plan([moved], rows, today=TODAY, now=NOON_05, not_before=held, tz=KYIV) == (
         lifecycle.Action("release", moved, older)
     )
     # A settled older record is still released, never finalized (D-08).
     assert lifecycle.plan(
-        [moved], [today_row, older], today=TODAY, now=NOON_05, not_before={}, settled={9}
+        [moved], [today_row, older], today=TODAY, now=NOON_05, not_before={}, settled={9}, tz=KYIV
     ) == lifecycle.Action("release", moved, older)
 
 
@@ -371,25 +372,26 @@ def test_plan_release_waits_for_its_bot_never_for_the_old_chats_hold() -> None:
     for location in (_location(chat_id=CHAT_B), _location(deleted=True)):
         # Oldest first, in spite of the old chat's hold.
         assert lifecycle.plan(
-            [location], rows, today=TODAY, now=NOON_05, not_before=old_chat
+            [location], rows, today=TODAY, now=NOON_05, not_before=old_chat, tz=KYIV
         ) == lifecycle.Action("release", location, older)
         assert lifecycle.plan(
-            [location], [old_today], today=TODAY, now=NOON_05, not_before=old_chat
+            [location], [old_today], today=TODAY, now=NOON_05, not_before=old_chat, tz=KYIV
         ) == lifecycle.Action("release", location, old_today)
         # A bot-wide hold still holds every release, and so every step (Pitfall 1)...
         assert (
-            lifecycle.plan([location], rows, today=TODAY, now=NOON_05, not_before=bot_held) is None
+            lifecycle.plan([location], rows, today=TODAY, now=NOON_05, not_before=bot_held, tz=KYIV)
+            is None
         )
         # ...and its end lets the release go, though the old chat's hold runs 14.5 min more.
         assert lifecycle.plan(
-            [location], rows, today=TODAY, now=bot_ends, not_before=bot_held
+            [location], rows, today=TODAY, now=bot_ends, not_before=bot_held, tz=KYIV
         ) == lifecycle.Action("release", location, older)
 
     # A token change: the new bot's hold in the old chat does not hold the release either.
     rebotted = _location(token=TOKEN_B)
     new_bot_old_chat = {io_loop.chat_key(TOKEN_B, DEFAULT_CHAT_ID): refused}
     assert lifecycle.plan(
-        [rebotted], [old_today], today=TODAY, now=NOON_05, not_before=new_bot_old_chat
+        [rebotted], [old_today], today=TODAY, now=NOON_05, not_before=new_bot_old_chat, tz=KYIV
     ) == lifecycle.Action("release", rebotted, old_today)
 
 
@@ -405,16 +407,20 @@ def test_plan_old_chats_hold_still_holds_every_other_step() -> None:
     stays_today = _row(20, 2, pinned=False, rendered=NOON_05 - timedelta(hours=1))
 
     assert lifecycle.plan(
-        [moved, stays], [old_today], today=TODAY, now=NOON_05, not_before=old_chat
+        [moved, stays], [old_today], today=TODAY, now=NOON_05, not_before=old_chat, tz=KYIV
     ) == lifecycle.Action("release", moved, old_today)
     # Once the record is retired: the post in chat B goes; the other location waits.
     assert lifecycle.plan(
-        [moved, stays], [], today=TODAY, now=NOON_05, not_before=old_chat
+        [moved, stays], [], today=TODAY, now=NOON_05, not_before=old_chat, tz=KYIV
     ) == lifecycle.Action("post", moved)
-    assert lifecycle.plan([stays], [], today=TODAY, now=NOON_05, not_before=old_chat) is None
+    assert (
+        lifecycle.plan([stays], [], today=TODAY, now=NOON_05, not_before=old_chat, tz=KYIV) is None
+    )
     # Its pin and its refresh in the held chat wait too.
     assert (
-        lifecycle.plan([stays], [stays_today], today=TODAY, now=NOON_05, not_before=old_chat)
+        lifecycle.plan(
+            [stays], [stays_today], today=TODAY, now=NOON_05, not_before=old_chat, tz=KYIV
+        )
         is None
     )
 
@@ -424,10 +430,10 @@ def test_plan_deleted_location_only_releases() -> None:
     gone = _location(deleted=True)
     today_row = _row(10, rendered=NOON_05 - timedelta(hours=1))
 
-    assert lifecycle.plan([gone], [today_row], today=TODAY, now=NOON_05, not_before={}) == (
-        lifecycle.Action("release", gone, today_row)
-    )
-    assert lifecycle.plan([gone], [], today=TODAY, now=NOON_05, not_before={}) is None
+    assert lifecycle.plan(
+        [gone], [today_row], today=TODAY, now=NOON_05, not_before={}, tz=KYIV
+    ) == (lifecycle.Action("release", gone, today_row))
+    assert lifecycle.plan([gone], [], today=TODAY, now=NOON_05, not_before={}, tz=KYIV) is None
 
 
 # INV-19 #2, D-08: a token change is a channel change
