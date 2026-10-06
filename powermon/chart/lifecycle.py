@@ -40,9 +40,10 @@ worker was down is simply due on the next pass.
   the next pass posts exactly one replacement, records it and pins it (INV-17 #3, D-06).
 - Finalize: every older record (``local_date`` before today) that has no final edit yet
   gets its finished-day render (chart-spec §7: now = the local midnight that ends its
-  day, no now line, no pill, the caption's line 1 only, D-01, D-13), edited in the chat
-  and message stored with it (D-04); oldest first. A finalized chart is never rendered
-  again (D-14), so the final edit waits until the day's timeline has settled (INV-03):
+  day, no now line, no pill, its one-line caption with the weekday and date, D-01, D-13),
+  edited in the chat and message stored with it (D-04); oldest first. A finalized chart
+  is never rendered again (D-14), so the final edit waits until the day's timeline has
+  settled (INV-03):
   OFF is recorded after the fact, backdated to the last heartbeat, so an outage that
   started in the day's last minutes is in the timeline only a timeout after midnight.
   The record's day has settled once the detection cursor
@@ -197,7 +198,7 @@ from powermon.chart.models import ChartMessage
 from powermon.clock import Clock
 from powermon.engine import lapse, rules
 from powermon.engine.models import SystemState
-from powermon.i18n import chart_texts, times
+from powermon.i18n import chart_texts
 from powermon.telegram.client import DEFAULT_RETRY_AFTER_S, SendResult, TelegramClient
 from powermon.worker import io_loop
 from powermon.worker.lease import LOCK_KEY
@@ -629,11 +630,12 @@ def chart_content(
 ) -> tuple[bytes, str]:
     """The chart PNG and its caption for ``day`` as of ``now``, in the location's language.
 
-    A live chart's caption carries today's off time, outage count and the update time,
-    all from the same ``now`` as the image's now pill (CHRT-04); a finished one has line 1
-    only (D-13). A day with no on or off time at all (its row total is "—") is captioned
-    "not monitored", never "no outages" (D-03). The render module is imported here, in the
-    worker or in the web's chart preview view (UI-06), and called as a module attribute.
+    A live chart's caption carries today's off time and outage count; the image's now pill,
+    rendered from the same ``now``, shows the update time (CHRT-04). A finished one puts the
+    weekday and date in place of "Today" (D-13); both are one line. A day with no on or off
+    time at all (its row total is "—") is captioned "not monitored", never "no outages"
+    (D-03). The render module is imported here, in the worker or in the web's chart preview
+    view (UI-06), and called as a module attribute.
     """
     from powermon.chart import render  # Pillow: imported per call, never at import time
 
@@ -642,11 +644,7 @@ def chart_content(
     row = week.today_row
     if live:
         caption = chart_texts.live_caption(
-            row.off_us,
-            row.count,
-            times.hm(now, tz),
-            location.language,
-            monitored=row.monitored,
+            row.off_us, row.count, location.language, monitored=row.monitored
         )
     else:
         caption = chart_texts.finished_caption(
@@ -664,8 +662,8 @@ def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | No
     Then the snapshot and the detection cursor are read (the cursor decides which older
     days have settled for their final edit) and the step keys no longer needed are dropped.
 
-    ``now`` is read once: today's date, the render, its now pill and the caption's update
-    time all come from it (CHRT-04, Pitfall 8); the outcome counts from the answer time.
+    ``now`` is read once: today's date, the render and its now pill all come from it
+    (CHRT-04, Pitfall 8); the outcome counts from the answer time.
     ``stop`` is checked before the render and again before the call. A render error backs
     off that step only, for 15 min, and makes no call (INV-13 pattern). A database error
     writing the outcome of a call that was made is handled: a post's is kept, and any
