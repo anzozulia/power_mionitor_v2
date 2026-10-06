@@ -603,15 +603,15 @@ def plan(
             or waiting(io_loop.chat_key(location.bot_token, today_row.chat_id))
         ):
             continue
-        rendered = today_row.last_rendered_at
-        slot_due = rendered < refresh_slot(now, location.refresh_min, tz)
+        slot_due = today_row.last_rendered_at < refresh_slot(now, location.refresh_min, tz)
         redraw = today_row.redraw_requested_at is not None
         if slot_due or redraw:
             # A due slot renders at now and serves the redraw too; otherwise the redraw
             # keeps the image's time, never later than now (a clock stepped back).
-            as_of = None if slot_due else min(rendered, now)
+            as_of = None if slot_due else min(today_row.last_rendered_at, now)
             refresh = Action("refresh", location, today_row, as_of)
-            due_refreshes.append((not redraw, rendered, location.location_id, refresh))
+            due = (not redraw, today_row.last_rendered_at, location.location_id, refresh)
+            due_refreshes.append(due)
     if not due_refreshes:
         return None
     return min(due_refreshes, key=lambda due: (due[0], due[1], due[2]))[3]
