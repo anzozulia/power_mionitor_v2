@@ -144,7 +144,8 @@ def pin_failed(status: int, name: str, *, escape: bool = True) -> str:
         raise ValueError("a pin failure needs an HTTP status from 100 to 599")
     return (
         f"📌 Can't pin today's chart for {_name(name, escape)} (Telegram: http_{status}). "
-        "The chart is still posted and refreshed; pinning is retried every 15 min. "
+        "The chart is still posted and refreshed; pinning is retried every 15 min, "
+        "or at each chart update if it updates less often. "
         "Check that the bot may pin messages in the chat."
     )
 
