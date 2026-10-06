@@ -63,7 +63,7 @@ ALERTS_ALREADY_OFF_FLASH = "Alerts were already off. Nothing changed."
 ALERTS_ALREADY_ON_FLASH = "Alerts were already on. Nothing changed."
 ALERTS_HELP = (
     "While off, subscribers get no new alerts, and none are saved for later. Alerts already "
-    "queued still go out. The chart, its 15-minute refresh and the midnight re-pin carry on."
+    "queued still go out. The chart, its regular updates and the midnight re-pin carry on."
 )
 ROUTER_GRACE_ON_FLASH = (
     "Router grace is on. From now on, OFF waits 180 seconds longer right after power returns."

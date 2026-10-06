@@ -465,6 +465,7 @@ def test_location_page_settings_and_setup_sections(
     # The setup page shows these same rows: *_on_setup in tests/web/test_setup_page.py.
     expected = [
         ("Language", "Russian"),
+        ("Chart update period", "15 min"),
         ("Heartbeat period", "45 s"),
         ("Grace period", "20 s"),
         (

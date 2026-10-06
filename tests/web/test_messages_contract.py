@@ -53,8 +53,8 @@ A4_REMOVAL_DEFERRED = (
 )
 A7_OUTAGE_REMOVED = (
     "Outage from {start} removed: its time now counts as power on. The removal sent no "
-    "message. If it is within the last 7 days, the pinned chart shows the change within 15 "
-    "minutes."
+    "message. If it is within the last 7 days, the pinned chart shows the change at its next "
+    "update."
 )
 CLEAR_SITE_DATA = "Clear-Site-Data"
 CHAT_B = -1009876543210
@@ -99,6 +99,7 @@ def _created(admin: Client, make: Make, monkeypatch: pytest.MonkeyPatch, now: da
         "bot_token": DEFAULT_BOT_TOKEN,
         "chat_id": str(DEFAULT_CHAT_ID),
         "language": "en",
+        "chart_refresh_min": "15",
     }
     return admin.post("/locations/new/", data)
 
@@ -111,6 +112,7 @@ def _edit_data(location: Any, **overrides: str) -> dict[str, str]:
         "bot_token": "",
         "chat_id": str(location.chat_id),
         "language": location.language,
+        "chart_refresh_min": str(location.chart_refresh_min),
         **overrides,
     }
 

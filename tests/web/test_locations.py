@@ -49,7 +49,7 @@ from pages import (
 
 from powermon.engine.models import LocationState
 from powermon.locations.keys import KEY_ALPHABET, KEY_LENGTH, generate_device_key, mask_key
-from powermon.locations.models import CHART_REFRESH_MINUTES, Location
+from powermon.locations.models import CHART_REFRESH_CHOICES, CHART_REFRESH_MINUTES, Location
 from powermon.locations.validators import (
     MAX_BOT_TOKEN_LENGTH,
     MAX_CHAT_ID_DIGITS,
@@ -59,6 +59,7 @@ from powermon.locations.validators import (
 )
 from powermon.logging_setup import RedactingFormatter
 from powermon.web.forms import (
+    CHART_REFRESH_INVALID,
     GRACE_TOO_SHORT,
     HELP_BOT_TOKEN,
     HELP_CHAT_ID,
@@ -488,7 +489,7 @@ SECTION_DESCRIPTIONS = [
 SECTION_FIELDS = {
     "basics": ["name"],
     "monitoring": ["period_s", "grace_s"],
-    "telegram": ["bot_token", "chat_id", "language"],
+    "telegram": ["bot_token", "chat_id", "language", "chart_refresh_min"],
 }
 SUFFIX = "s"
 OFF_AFTER = "Reported OFF after {} s without a heartbeat."
@@ -518,6 +519,7 @@ def _form(**overrides: str) -> dict[str, str]:
         "bot_token": GOOD_TOKEN,
         "chat_id": "-1001234567890",
         "language": "uk",
+        "chart_refresh_min": "15",
         **overrides,
     }
 
@@ -609,6 +611,7 @@ def test_UI01_add_form_renders(admin: Client) -> None:
         "bot_token": "",
         "chat_id": "",
         "language": "uk",
+        "chart_refresh_min": "15",
     }
     assert field(page, "name").has_attr("autofocus")
 
@@ -773,7 +776,14 @@ def test_token_and_chat_id_errors_shown_on_the_form(
 
 def test_missing_fields_show_field_messages_and_keep_the_rest(admin: Client) -> None:
     page = _rejected(
-        admin, name="", period_s="", grace_s="45", bot_token="", chat_id="", language="ru"
+        admin,
+        name="",
+        period_s="",
+        grace_s="45",
+        bot_token="",
+        chat_id="",
+        language="ru",
+        chart_refresh_min="30",
     )
 
     assert field_error(page, "name") == NAME_EMPTY
@@ -783,6 +793,9 @@ def test_missing_fields_show_field_messages_and_keep_the_rest(admin: Client) -> 
     assert field_error(page, "grace_s") is None
     values = form_values(page, "location-form")
     assert (values["grace_s"], values["language"]) == ("45", "ru")
+    # Edge: the chart update period picked before the invalid submit stays selected.
+    assert values["chart_refresh_min"] == "30"
+    assert field_error(page, "chart_refresh_min") is None
 
 
 def test_post_without_any_field_never_shows_djangos_required_text(admin: Client) -> None:
@@ -790,6 +803,36 @@ def test_post_without_any_field_never_shows_djangos_required_text(admin: Client)
 
     page = _refused(response)
     assert field_error(page, "language") == LANGUAGE_INVALID
+    assert field_error(page, "chart_refresh_min") == CHART_REFRESH_INVALID
+
+
+def test_add_form_offers_the_chart_update_periods(admin: Client) -> None:
+    page = assert_page(admin.get(NEW_URL), app=True, title=ADD_TITLE)
+
+    options = field(page, "chart_refresh_min").find_all("option")
+    assert [(option.get("value"), text(option)) for option in options] == [
+        (str(minutes), label) for minutes, label in CHART_REFRESH_CHOICES
+    ]
+    assert [option.get("value") for option in options if option.has_attr("selected")] == ["15"]
+
+
+def test_add_stores_the_chosen_chart_update_period(admin: Client) -> None:
+    response = admin.post(NEW_URL, _form(chart_refresh_min="5"))
+
+    assert response.status_code == 302
+    assert Location.objects.get().chart_refresh_min == 5
+
+
+@pytest.mark.parametrize("value", ["7", "0", "", "<b>60</b>", "015"])
+def test_add_refuses_a_chart_update_period_off_the_list(admin: Client, value: str) -> None:
+    response = admin.post(NEW_URL, _form(chart_refresh_min=value))
+
+    page = _refused(response)
+    assert field_error(page, "chart_refresh_min") == CHART_REFRESH_INVALID
+    html = response.content.decode()
+    assert "Select a valid choice" not in html
+    assert "This field is required." not in html
+    assert "60</b>" not in html
 
 
 def test_unknown_language_gets_ui_copy_not_the_posted_value(admin: Client) -> None:

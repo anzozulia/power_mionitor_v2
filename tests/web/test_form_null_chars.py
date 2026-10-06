@@ -75,6 +75,7 @@ def _form(**overrides: str) -> dict[str, str]:
         "bot_token": DEFAULT_BOT_TOKEN,
         "chat_id": GOOD_CHAT_ID,
         "language": "uk",
+        "chart_refresh_min": "15",
         **overrides,
     }
 

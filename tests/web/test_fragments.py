@@ -159,8 +159,8 @@ REMOVE_C4 = (
     'alert counts "was ON for".'
 )
 REMOVE_CHART = (
-    "The chart updates within 15 minutes. It shows the last 7 days; charts already posted for "
-    "earlier days do not change."
+    "The chart shows the change at its next update. It shows the last 7 days; charts already "
+    "posted for earlier days do not change."
 )
 # A key whose tail has upper-case letters, so no page text or hex marker holds it by chance.
 KEY = "abcdefghijklmnopqrstuvwx0123QZXK"

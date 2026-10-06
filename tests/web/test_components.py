@@ -62,7 +62,7 @@ from secret_fixtures import MASKED, SECRET, SECRETS, TOKEN
 from powermon.alerts.delivery import Failing
 from powermon.engine.rules import ROUTER_GRACE
 from powermon.locations import examples
-from powermon.locations.models import LANGUAGE_CHOICES, Location
+from powermon.locations.models import CHART_REFRESH_CHOICES, LANGUAGE_CHOICES, Location
 from powermon.locations.validators import mask_token
 from powermon.web.live import DELIVERY_OK
 from powermon.web.location_views import SwitchRow, settings_context, switch_rows
@@ -582,6 +582,7 @@ def test_settings_partial() -> None:
 
     assert definitions(html, "settings-panel") == [
         ("Language", LANGUAGE_LABELS["uk"]),
+        ("Chart update period", "15 min"),
         ("Heartbeat period", "60 s"),
         ("Grace period", "30 s"),
         ("Reported OFF after", "90 s without a heartbeat"),
@@ -630,6 +631,16 @@ def test_settings_partial_language_and_long_chat_id(language: str) -> None:
 
     assert rows["Language"] == LANGUAGE_LABELS[language]
     assert rows["Channel chat ID"] == "-1009999999999999"
+
+
+@pytest.mark.parametrize(("minutes", "label"), CHART_REFRESH_CHOICES)
+def test_settings_partial_chart_update_period(minutes: int, label: str) -> None:
+    # CHRT-02 (261006-of9): the option label, right after Language; the token row stays last.
+    rows = definitions(_settings_html(_location(chart_refresh_min=minutes)), "settings-panel")
+
+    assert rows[1] == ("Chart update period", label)
+    assert rows[0][0] == "Language"
+    assert rows[-1][0] == "Bot token"
 
 
 def test_settings_partial_never_shows_a_colon_less_token() -> None:
