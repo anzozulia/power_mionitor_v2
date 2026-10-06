@@ -73,7 +73,7 @@ SHORT_CODE = re.compile(r"[a-z0-9_]{0,64}")
 TELEGRAM_OK = {"ok": True, "result": {"message_id": 1}}
 # A chart upload: fixed bytes (the client never looks inside) and a UTF-8 caption.
 CHART_PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 64
-CHART_CAPTION = "Сьогодні без світла: 4 год 10 хв · 2 відключення\nОновлено о 14:37"
+CHART_CAPTION = "Сьогодні без світла: 4 год 10 хв · 2 відключення"
 # Telegram's description is untrusted text that must never reach a log line.
 MARKER = "SECRETMARKER"
 

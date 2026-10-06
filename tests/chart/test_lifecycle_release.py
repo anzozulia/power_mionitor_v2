@@ -824,9 +824,7 @@ def test_name_or_language_change_releases_nothing(
 
     assert _requests(fake_telegram) == [("A", "editMessageMedia")]
     [edit] = fake_telegram.chart_calls
-    assert json.loads(edit.fields["media"])["caption"] == (
-        "Сьогодні відключень не було\nОновлено о 12:20"
-    )
+    assert json.loads(edit.fields["media"])["caption"] == "Сьогодні відключень не було"
     assert seen == [("uk", "Дача")]
     assert ChartMessage.objects.get().retired_at is None
 

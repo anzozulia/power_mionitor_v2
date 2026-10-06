@@ -1,19 +1,19 @@
 """Subscriber-facing chart strings in uk, en and ru (CHRT-03, CHRT-04, CHRT-08).
 
 The labels of the chart image and the caption under it, verbatim from docs/chart-spec.md
-section 8, with the finished-day caption of D-13: line 1 only, with the weekday and date in
-place of "Today". A day with no on or off time at all (its row total is "—") gets the
+section 8. Both captions are one line; the finished-day one (D-13) puts the weekday and date
+in place of "Today". A day with no on or off time at all (its row total is "—") gets the
 neutral caption form, the legend's "Not monitored", instead of a claim of no outages
 (Phase 4 D-03). Every table has the same keys and shape in every language, and an unknown
 language falls back to en (docs/v1-lessons.md section 2). The renderer and the chart
 lifecycle only call into this module, so each string has one tested source.
 
 Text is built from integers and dates only: integer microseconds of OFF time, an outage
-count, a local date and the caller's local ``HH:MM``. Durations come from the one
-formatter, ``format_total_duration`` (D-16), so a row total, the caption and the alert's
-"was OFF for" agree once rounded to minutes (INV-03). No user-typed text and no markup ever
-reach a caption, which is sent as plain text. (The location name, the image's only
-user-typed text, is the renderer's business.)
+count and a local date. Durations come from the one formatter, ``format_total_duration``
+(D-16), so a row total, the caption and the alert's "was OFF for" agree once rounded to
+minutes (INV-03). No user-typed text and no markup ever reach a caption, which is sent as
+plain text. (The location name, the image's only user-typed text, is the renderer's
+business.)
 
 Inputs are checked up front, so a function fails the same way whichever branch it would
 take: a count or a duration that is not an int (a bool is not) raises TypeError, a negative
@@ -26,7 +26,6 @@ calls the built-in rounding (a test scans every file in this package); the plura
 "%" only.
 """
 
-import re
 from datetime import date, datetime
 
 from powermon.i18n.duration import MIN_US, format_total_duration
@@ -110,15 +109,14 @@ NO_OUTAGES: dict[str, str] = {
 }
 
 # Captions (chart-spec section 8, D-13). ``{count}`` is the plural phrase from ``outages``
-# ("2 відключення"), ``{duration}`` the shared total formatter's text, ``{time}`` HH:MM and
-# ``{day}`` the weekday and date ("Чт 01.10"). The ``*_unmonitored`` forms are for a day
-# with no on or off time at all, in the legend's "Not monitored" words (D-03).
+# ("2 відключення"), ``{duration}`` the shared total formatter's text and ``{day}`` the
+# weekday and date ("Чт 01.10"). The ``*_unmonitored`` forms are for a day with no on or off
+# time at all, in the legend's "Not monitored" words (D-03).
 CAPTIONS: dict[str, dict[str, str]] = {
     "uk": {
         "today_off": "Сьогодні без світла: {duration} · {count}",
         "today_none": "Сьогодні відключень не було",
         "today_unmonitored": "Сьогодні: не відстежувалось",
-        "updated": "Оновлено о {time}",
         "day_off": "{day} без світла: {duration} · {count}",
         "day_none": "{day} відключень не було",
         "day_unmonitored": "{day}: не відстежувалось",
@@ -127,7 +125,6 @@ CAPTIONS: dict[str, dict[str, str]] = {
         "today_off": "Today off: {duration} · {count}",
         "today_none": "No outages today",
         "today_unmonitored": "Today: not monitored",
-        "updated": "Updated {time}",
         "day_off": "{day} off: {duration} · {count}",
         "day_none": "No outages on {day}",
         "day_unmonitored": "{day}: not monitored",
@@ -136,7 +133,6 @@ CAPTIONS: dict[str, dict[str, str]] = {
         "today_off": "Сегодня без света: {duration} · {count}",
         "today_none": "Сегодня отключений не было",
         "today_unmonitored": "Сегодня: не отслеживалось",
-        "updated": "Обновлено в {time}",
         "day_off": "{day} без света: {duration} · {count}",
         "day_none": "{day} отключений не было",
         "day_unmonitored": "{day}: не отслеживалось",
@@ -154,9 +150,6 @@ OUTAGE_NOUN: dict[str, dict[str, str]] = {
 # The totals column's width probe (chart-spec section 3): the longest possible row total.
 _WORST_OFF_US = (23 * 60 + 59) * MIN_US
 _WORST_COUNT = 12
-
-# The update time as the caller formats it with strftime("%H:%M"); explicit ASCII digits.
-_HM_RE = re.compile(r"[0-9]{2}:[0-9]{2}")
 
 
 def _lang(lang: str) -> str:
@@ -271,7 +264,7 @@ def worst_total(lang: str) -> str:
 def _summary(
     kind: str, off_us: int, count: int, lang: str, *, monitored: bool = True, **fields: str
 ) -> str:
-    """Caption line 1 for ``kind`` "today" or "day": the off time and outages, or none.
+    """The caption for ``kind`` "today" or "day": the off time and outages, or none.
 
     A day with no on or off time at all (``monitored`` False) gets the neutral form, "not
     monitored", whatever the count: the chart shows it as unknown, so the caption must not
@@ -287,35 +280,27 @@ def _summary(
     )
 
 
-def live_caption(
-    off_us: int, count: int, updated_hm: str, lang: str, *, monitored: bool = True
-) -> str:
-    """Today's caption, two lines: the day so far, then the update time (CHRT-04).
+def live_caption(off_us: int, count: int, lang: str, *, monitored: bool = True) -> str:
+    """Today's caption, one line: the day so far, with no update time (CHRT-04).
 
-    ``Today off: 4h 10m · 2 outages`` + newline + ``Updated 14:37``; with no outage today,
-    ``No outages today`` + newline + ``Updated 14:37``; with no on or off time today at
-    all (``monitored`` False, the row total "—"), ``Today: not monitored`` + newline +
-    ``Updated 14:37`` (D-03). ``off_us`` is today's OFF time so far in integer
-    microseconds (the same integer as today's row total), ``count`` the number of
-    outages, ``updated_hm`` the render time as local ``HH:MM``, ``monitored`` the row's
-    flag (a bool; the default True is the monitored day).
+    ``Today off: 4h 10m · 2 outages``; with no outage today, ``No outages today``; with no
+    on or off time today at all (``monitored`` False, the row total "—"), ``Today: not
+    monitored`` (D-03). The image's now pill shows the render time, so the caption carries
+    none. ``off_us`` is today's OFF time so far in integer microseconds (the same integer
+    as today's row total), ``count`` the number of outages, ``monitored`` the row's flag (a
+    bool; the default True is the monitored day).
     """
     _check_count(off_us, "off_us")
     _check_count(count, "count")
-    if not isinstance(updated_hm, str):
-        raise TypeError(f"the update time must be a str, not {type(updated_hm).__name__}")
-    if not _HM_RE.fullmatch(updated_hm):
-        raise ValueError(f"the update time must be HH:MM, not {updated_hm!r}")
     _check_monitored(monitored)
     lang = _lang(lang)
-    updated = CAPTIONS[lang]["updated"].format(time=updated_hm)
-    return f"{_summary('today', off_us, count, lang, monitored=monitored)}\n{updated}"
+    return _summary("today", off_us, count, lang, monitored=monitored)
 
 
 def finished_caption(
     off_us: int, count: int, day: date, lang: str, *, monitored: bool = True
 ) -> str:
-    """A finished day's caption, one line, with no update time (D-13).
+    """A finished day's caption, one line like the live caption, with no update time (D-13).
 
     ``Thu 01.10 off: 4h 10m · 2 outages``, or ``No outages on Thu 01.10``; uk and ru put
     the weekday and date first in both forms (``Чт 01.10 відключень не було``). A day with

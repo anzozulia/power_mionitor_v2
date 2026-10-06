@@ -161,7 +161,8 @@ On a 400 px wide phone, the smallest text (27 px) shows at about 8.4 px, and the
   - Pill: 36 px high, fully rounded, horizontal padding 11 px. Its bottom edge is 2 px above the
     line's top. It shows `HH:MM` local time.
   - The pill is centred on the line but clamped to [bar_x0 − 8, bar_x1 + 8].
-  - The pill time is the render time, so it also works as the "last updated" time inside the image.
+  - The pill time is the render time, so it is the chart's only "last updated" time (the caption
+    carries none, section 8).
 - **Previous-week rows:**
   - Rows after today show the same weekday of the previous week: date = shown date − 7 days.
   - They use the dimmed colours and ink-muted text, and show their real dates (e.g. "Пт 25.09").
@@ -208,7 +209,8 @@ On a 400 px wide phone, the smallest text (27 px) shows at about 8.4 px, and the
   - Not-monitored time is never OFF time.
   - If the day has on or off time but no OFF interval, show the "zero outages" text in ink-secondary.
   - If the day has no on or off time at all (only no data and/or not monitored), show "—" in ink-muted.
-- **Caption (CHRT-04)** is plain text under the photo. Line 2 is the render time in local time:
+- **Caption (CHRT-04)** is plain text under the photo, one line. It carries no update time: the
+  image's now pill shows it (section 7). (Amended 2026-10-06, quick task 261006-m1e.)
 
 | | uk | en | ru |
 |---|---|---|---|
@@ -216,13 +218,12 @@ On a 400 px wide phone, the smallest text (27 px) shows at about 8.4 px, and the
 | None | `Сьогодні відключень не було` | `No outages today` | `Сегодня отключений не было` |
 | Today, not monitored | `Сьогодні: не відстежувалось` | `Today: not monitored` | `Сегодня: не отслеживалось` |
 | Finished day, not monitored | `Чт 01.10: не відстежувалось` | `Thu 01.10: not monitored` | `Чт 01.10: не отслеживалось` |
-| Line 2 | `Оновлено о 14:37` | `Updated 14:37` | `Обновлено в 14:37` |
 
   - The neutral "not monitored" form (amendment, Phase 4 D-03) is used when the day has no on or
     off time at all, i.e. its row total shows "—": the caption must not claim "no outages" for a day
-    the chart shows as unknown. The words are the legend's "Not monitored". Line 2 stays on the live
-    chart; the finished-day render keeps line 1 only. A day with any on or off time keeps the
-    "Outages" and "None" forms.
+    the chart shows as unknown. The words are the legend's "Not monitored". The live and the
+    finished-day captions are both one line. A day with any on or off time keeps the "Outages" and
+    "None" forms.
   - Plural forms follow CLDR rules:
     - uk: 1, 21 відключення (one); 2-4, 22 відключення (few); 5-20, 25 відключень (many).
     - ru: отключение / отключения / отключений.
@@ -279,7 +280,7 @@ Interval-level tests (unit, no image):
 - [ ] Nothing is drawn after *now*, and the open interval ends at *now*.
 - [ ] An OFF interval under 8 px is drawn 8 px wide and stays inside the bar, including at 00:00 and 24:00.
 - [ ] Caption plural forms are correct for n = 1, 2, 5, 11, 21, 22 in uk and ru, and the finished-day caption uses the date.
-- [ ] A day with no on or off time at all is captioned in the neutral form in uk, en and ru (`Today: not monitored` with line 2 on the live chart, `Thu 01.10: not monitored` on the finished day), never "no outages" (D-03).
+- [ ] A day with no on or off time at all is captioned in the neutral form in uk, en and ru (`Today: not monitored` on the live chart, `Thu 01.10: not monitored` on the finished day), never "no outages" (D-03).
 - [ ] Every character in every localized string (plus digits, "·", "–", "—", "<") is in the bundled
       font's cmap, so no tofu boxes.
 

@@ -39,8 +39,8 @@ from powermon.telegram.client import SendResult, TelegramClient
 TOKEN = DEFAULT_BOT_TOKEN
 # Fixed bytes stand in for a chart: the client never looks inside the PNG.
 PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 64
-CAPTION = "Today off: 4h 10m · 2 outages\nUpdated 14:37"
-CAPTION_UK = "Сьогодні без світла: 4 год 10 хв · 2 відключення\nОновлено о 14:37"
+CAPTION = "Today off: 4h 10m · 2 outages"
+CAPTION_UK = "Сьогодні без світла: 4 год 10 хв · 2 відключення"
 MESSAGE_ID = 1001
 CLIENT_SOURCE = pathlib.Path(__file__).resolve().parents[2] / "powermon/telegram/client.py"
 

@@ -1,7 +1,7 @@
 """Chart caption and labels, snapshot-tested in uk, en and ru (CHRT-03, CHRT-04, CHRT-08).
 
-docs/chart-spec.md section 8 fixes every string, D-13 the finished-day caption (line 1
-only, the weekday and date in place of "Today"), and Phase 4 D-03 the neutral caption of a
+docs/chart-spec.md section 8 fixes every string, D-13 the finished-day caption (one line,
+the weekday and date in place of "Today"), and Phase 4 D-03 the neutral caption of a
 day with no on or off time ("not monitored"). docs/v1-lessons.md section 4: snapshot
 every caption and label in all three languages, so each expected string is written out
 literally. The module is pure, so these tests need no database or settings.
@@ -10,6 +10,7 @@ Functions and tables are reached as ``chart_texts.<name>`` inside each test (bad
 name the function as a string), so a missing name fails its own test, not the collection.
 """
 
+import re
 import string
 from datetime import UTC, date, datetime
 from typing import Any
@@ -24,19 +25,20 @@ S = 1_000_000
 MIN = 60 * S
 H = 60 * MIN
 
-# 4 h 10 min of OFF time and 2 outages, rendered at 14:37 (03-CONTEXT Specific Ideas).
+# 4 h 10 min of OFF time and 2 outages. The live caption is one line, like the finished
+# one: the image's now pill carries the update time (CHRT-04).
 LIVE_WITH_OUTAGES = {
-    "uk": "Сьогодні без світла: 4 год 10 хв · 2 відключення\nОновлено о 14:37",
-    "en": "Today off: 4h 10m · 2 outages\nUpdated 14:37",
-    "ru": "Сегодня без света: 4 ч 10 мин · 2 отключения\nОбновлено в 14:37",
+    "uk": "Сьогодні без світла: 4 год 10 хв · 2 відключення",
+    "en": "Today off: 4h 10m · 2 outages",
+    "ru": "Сегодня без света: 4 ч 10 мин · 2 отключения",
 }
 LIVE_WITHOUT_OUTAGES = {
-    "uk": "Сьогодні відключень не було\nОновлено о 14:37",
-    "en": "No outages today\nUpdated 14:37",
-    "ru": "Сегодня отключений не было\nОбновлено в 14:37",
+    "uk": "Сьогодні відключень не було",
+    "en": "No outages today",
+    "ru": "Сегодня отключений не было",
 }
 
-# The finished-day caption for Thu 2026-10-01 (D-13): line 1 only, no "Updated" line.
+# The finished-day caption for Thu 2026-10-01 (D-13): one line, no update time.
 FINISHED_WITH_OUTAGES = {
     "uk": "Чт 01.10 без світла: 4 год 10 хв · 2 відключення",
     "en": "Thu 01.10 off: 4h 10m · 2 outages",
@@ -49,11 +51,12 @@ FINISHED_WITHOUT_OUTAGES = {
 }
 
 # D-03 (chart-spec §8 amendment): a day with no on or off time at all gets the neutral form,
-# the legend's "Not monitored"; the live chart keeps line 2, a finished day has line 1 only.
+# the legend's "Not monitored". The live and the finished captions are both one line; the
+# image's now pill carries the update time (CHRT-04).
 LIVE_UNMONITORED = {
-    "uk": "Сьогодні: не відстежувалось\nОновлено о 12:05",
-    "en": "Today: not monitored\nUpdated 12:05",
-    "ru": "Сегодня: не отслеживалось\nОбновлено в 12:05",
+    "uk": "Сьогодні: не відстежувалось",
+    "en": "Today: not monitored",
+    "ru": "Сегодня: не отслеживалось",
 }
 FINISHED_UNMONITORED = {
     "uk": "Чт 01.10: не відстежувалось",
@@ -166,31 +169,69 @@ def _fields(template: str) -> set[str]:
 
 @pytest.mark.parametrize("lang", ["uk", "en", "ru"])
 def test_live_caption_today_with_outages(lang: str) -> None:
-    caption = chart_texts.live_caption(4 * H + 10 * MIN, 2, "14:37", lang)
+    caption = chart_texts.live_caption(4 * H + 10 * MIN, 2, lang)
     assert caption == LIVE_WITH_OUTAGES[lang]
 
 
 @pytest.mark.parametrize("lang", ["uk", "en", "ru"])
 def test_live_caption_without_outages(lang: str) -> None:
-    assert chart_texts.live_caption(0, 0, "14:37", lang) == LIVE_WITHOUT_OUTAGES[lang]
+    assert chart_texts.live_caption(0, 0, lang) == LIVE_WITHOUT_OUTAGES[lang]
 
 
 @pytest.mark.parametrize(
-    ("off_us", "count", "updated_hm", "error"),
+    ("off_us", "count", "error"),
     [
-        (0, -1, "14:37", ValueError),
-        (0, True, "14:37", TypeError),
-        (0, 1, "14:37:05", ValueError),
-        (0, 1, "7:05", ValueError),
-        (1.5, 1, "14:37", TypeError),
+        (0, -1, ValueError),
+        (0, True, TypeError),
+        (1.5, 1, TypeError),
     ],
-    ids=["negative-count", "bool-count", "seconds-in-time", "one-digit-hour", "float-off-time"],
+    ids=["negative-count", "bool-count", "float-off-time"],
 )
-def test_live_caption_rejects_bad_input(
-    off_us: Any, count: Any, updated_hm: Any, error: type[Exception]
-) -> None:
+def test_live_caption_rejects_bad_input(off_us: Any, count: Any, error: type[Exception]) -> None:
     with pytest.raises(error):
-        chart_texts.live_caption(off_us, count, updated_hm, "uk")
+        chart_texts.live_caption(off_us, count, "uk")
+
+
+# (off_us, count, monitored) per live caption form.
+LIVE_FORMS = {
+    "outages": (4 * H + 10 * MIN, 2, True),
+    "none": (0, 0, True),
+    "not-monitored": (0, 0, False),
+}
+LIVE_EXPECTED = {
+    "outages": LIVE_WITH_OUTAGES,
+    "none": LIVE_WITHOUT_OUTAGES,
+    "not-monitored": LIVE_UNMONITORED,
+}
+UPDATE_WORDS = ("Оновлено", "Updated", "Обновлено")
+HH_MM = re.compile(r"\d{1,2}:\d{2}")
+
+
+@pytest.mark.parametrize("form", list(LIVE_FORMS))
+@pytest.mark.parametrize("lang", ["uk", "en", "ru"])
+def test_CHRT04_live_caption_is_one_line(lang: str, form: str) -> None:
+    # The live caption is today's summary only; the image's now pill shows the update time.
+    off_us, count, monitored = LIVE_FORMS[form]
+    caption = chart_texts.live_caption(off_us, count, lang, monitored=monitored)
+    assert caption == LIVE_EXPECTED[form][lang]
+    assert "\n" not in caption
+
+
+@pytest.mark.parametrize("lang", ["uk", "en", "ru"])
+def test_CHRT04_no_caption_carries_an_update_time(lang: str) -> None:
+    day = date(2026, 10, 1)
+    captions = [
+        chart_texts.live_caption(off_us, count, lang, monitored=monitored)
+        for off_us, count, monitored in LIVE_FORMS.values()
+    ] + [
+        chart_texts.finished_caption(off_us, count, day, lang, monitored=monitored)
+        for off_us, count, monitored in LIVE_FORMS.values()
+    ]
+    assert len(captions) == 6
+    for caption in captions:
+        assert HH_MM.search(caption) is None, caption
+        assert not [word for word in UPDATE_WORDS if word in caption], caption
+    assert "updated" not in chart_texts.CAPTIONS[lang]
 
 
 # --- Image labels (CHRT-08) ---------------------------------------------------------------
@@ -241,7 +282,6 @@ def test_tables_have_identical_shapes() -> None:
         "today_off",
         "today_none",
         "today_unmonitored",
-        "updated",
         "day_off",
         "day_none",
         "day_unmonitored",
@@ -392,8 +432,8 @@ def test_INV03_caption_and_row_total_share_the_formatter(off_us: int, lang: str)
     # same text the alert formatter's family produces for that integer.
     duration, suffix = chart_texts.row_total(off_us, 2, True, lang)
     assert duration == format_total_duration(off_us, lang)
-    line1 = chart_texts.live_caption(off_us, 2, "14:37", lang).split("\n")[0]
-    assert line1.endswith(f": {duration} · {chart_texts.outages(2, lang)}")
+    caption = chart_texts.live_caption(off_us, 2, lang)
+    assert caption.endswith(f": {duration} · {chart_texts.outages(2, lang)}")
     assert suffix == " · 2"
 
 
@@ -416,7 +456,7 @@ def test_finished_caption(lang: str) -> None:
 
 @pytest.mark.parametrize("lang", ["uk", "en", "ru"])
 def test_D03_live_caption_for_an_unmonitored_today(lang: str) -> None:
-    caption = chart_texts.live_caption(0, 0, "12:05", lang, monitored=False)
+    caption = chart_texts.live_caption(0, 0, lang, monitored=False)
     assert caption == LIVE_UNMONITORED[lang]
 
 
@@ -431,13 +471,8 @@ def test_D03_finished_caption_for_an_unmonitored_day(lang: str) -> None:
 def test_D03_monitored_day_keeps_the_existing_forms(lang: str) -> None:
     day = date(2026, 10, 1)
     off = 4 * H + 10 * MIN
-    assert (
-        chart_texts.live_caption(off, 2, "14:37", lang, monitored=True) == (LIVE_WITH_OUTAGES[lang])
-    )
-    assert (
-        chart_texts.live_caption(0, 0, "14:37", lang, monitored=True)
-        == (LIVE_WITHOUT_OUTAGES[lang])
-    )
+    assert chart_texts.live_caption(off, 2, lang, monitored=True) == (LIVE_WITH_OUTAGES[lang])
+    assert chart_texts.live_caption(0, 0, lang, monitored=True) == (LIVE_WITHOUT_OUTAGES[lang])
     assert (
         chart_texts.finished_caption(off, 2, day, lang, monitored=True)
         == (FINISHED_WITH_OUTAGES[lang])
@@ -459,7 +494,7 @@ def test_D03_neutral_caption_is_the_legends_not_monitored() -> None:
 @pytest.mark.parametrize("monitored", [0, 1, None], ids=["zero", "one", "none"])
 def test_D03_monitored_must_be_a_bool(monitored: Any) -> None:
     with pytest.raises(TypeError, match="monitored must be a bool"):
-        chart_texts.live_caption(0, 0, "12:05", "en", monitored=monitored)
+        chart_texts.live_caption(0, 0, "en", monitored=monitored)
     with pytest.raises(TypeError, match="monitored must be a bool"):
         chart_texts.finished_caption(0, 0, date(2026, 10, 1), "en", monitored=monitored)
 
@@ -497,12 +532,8 @@ def test_caption_plurals(n: int) -> None:
     # chart-spec section 10: the caption's plural forms for n = 1, 2, 5, 11, 21, 22.
     nouns = {row[0]: (row[1], row[2]) for row in PLURALS}
     uk, ru = nouns[n]
-    assert chart_texts.live_caption(H, n, "14:37", "uk").startswith(
-        f"Сьогодні без світла: 1 год · {n} {uk}\n"
-    )
-    assert chart_texts.live_caption(H, n, "14:37", "ru").startswith(
-        f"Сегодня без света: 1 ч · {n} {ru}\n"
-    )
+    assert chart_texts.live_caption(H, n, "uk") == f"Сьогодні без світла: 1 год · {n} {uk}"
+    assert chart_texts.live_caption(H, n, "ru") == f"Сегодня без света: 1 ч · {n} {ru}"
 
 
 # --- Fallback, the cmap list, bad inputs --------------------------------------------------
@@ -510,7 +541,7 @@ def test_caption_plurals(n: int) -> None:
 
 def test_unknown_language_falls_back_to_en() -> None:
     day = date(2026, 10, 1)
-    assert chart_texts.live_caption(4 * H + 10 * MIN, 2, "14:37", "de") == LIVE_WITH_OUTAGES["en"]
+    assert chart_texts.live_caption(4 * H + 10 * MIN, 2, "de") == LIVE_WITH_OUTAGES["en"]
     assert chart_texts.finished_caption(0, 0, day, "de") == FINISHED_WITHOUT_OUTAGES["en"]
     assert chart_texts.worst_total("de") == chart_texts.worst_total("en")
     assert chart_texts.row_total(0, 0, True, "de") == ("no outages", "")
@@ -551,8 +582,8 @@ BAD_INPUTS = [
     ("weekday", (datetime(2026, 10, 1, 12, tzinfo=UTC), "uk"), TypeError),
     ("row_date", (None,), TypeError),
     ("worst_total", (None,), TypeError),
-    ("live_caption", (0, 0, "14:37", None), TypeError),
-    ("live_caption", (0, 0, 1437, "uk"), TypeError),
+    ("live_caption", (0, 0, None), TypeError),
+    ("live_caption", (0, 0, "14:37", "uk"), TypeError),
 ]
 BAD_INPUT_IDS = [
     "plural_form-negative",
@@ -574,7 +605,7 @@ BAD_INPUT_IDS = [
     "row_date-none",
     "worst_total-none-lang",
     "live_caption-none-lang",
-    "live_caption-int-time",
+    "live_caption-stale-time-arg",
 ]
 
 
