@@ -28,7 +28,7 @@ from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, FakeClock, FakeTelegram
 from django.contrib.auth import get_user_model
 from django.contrib.messages.storage.fallback import FallbackStorage
 from django.contrib.sessions.backends.db import SessionStore
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, connection, transaction
 from django.test import Client, RequestFactory
 from django.test.html import Element, parse_html
 from pages import (
@@ -49,7 +49,7 @@ from pages import (
 
 from powermon.engine.models import LocationState
 from powermon.locations.keys import KEY_ALPHABET, KEY_LENGTH, generate_device_key, mask_key
-from powermon.locations.models import Location
+from powermon.locations.models import CHART_REFRESH_MINUTES, Location
 from powermon.locations.validators import (
     MAX_BOT_TOKEN_LENGTH,
     MAX_CHAT_ID_DIGITS,
@@ -113,6 +113,7 @@ def test_location_defaults_match_D10(fixed_now: datetime) -> None:
     assert location.maintenance is False
     assert location.alerts_enabled is True
     assert location.language == "uk"
+    assert location.chart_refresh_min == 15
     assert location.deleted_at is None
     assert location.created_at == fixed_now
     assert location.chat_id == DEFAULT_CHAT_ID
@@ -151,6 +152,42 @@ def test_db_rejects_unknown_language(fixed_now: datetime) -> None:
 
     for language in ("uk", "en", "ru"):
         assert _new_location(fixed_now, language=language).language == language
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("minutes", CHART_REFRESH_MINUTES)
+def test_chart_refresh_min_accepts_every_choice(fixed_now: datetime, minutes: int) -> None:
+    location = _new_location(fixed_now, chart_refresh_min=minutes)
+    location.refresh_from_db()
+
+    assert location.chart_refresh_min == minutes
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("minutes", [0, 7, 61, -1])
+def test_K6_db_rejects_chart_refresh_outside_the_choices(fixed_now: datetime, minutes: int) -> None:
+    # CHRT-02 (261006-of9): only 1, 5, 10, 15, 30 or 60 minutes, each dividing an hour.
+    _assert_rejected("location_chart_refresh_valid", fixed_now, chart_refresh_min=minutes)
+
+
+@pytest.mark.django_db
+def test_D2_raw_insert_without_the_column_gets_15(fixed_now: datetime) -> None:
+    # db_default keeps DEFAULT 15 in the database, so code that does not know the column
+    # (a rollback to the previous release, README section 8) can still add a location.
+    with connection.cursor() as cur:
+        cur.execute(
+            "INSERT INTO location (name, period_s, grace_s, router_grace, maintenance, "
+            "alerts_enabled, language, bot_token, chat_id, device_key, created_at) "
+            "VALUES (%s, 60, 30, false, false, true, 'uk', %s, %s, %s, %s) "
+            "RETURNING chart_refresh_min",
+            ["Old code", DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, generate_device_key(), fixed_now],
+        )
+        assert cur.fetchone()[0] == 15
+        cur.execute(
+            "SELECT column_default FROM information_schema.columns "
+            "WHERE table_name = 'location' AND column_name = 'chart_refresh_min'"
+        )
+        assert cur.fetchone()[0] == "15"
 
 
 @pytest.mark.django_db

@@ -482,22 +482,30 @@ def test_D08_plan_waiting_location_only_releases() -> None:
 
     # The older record first, though its final edit is due (no final edit, D-08).
     assert lifecycle.plan(
-        [waiting], rows, today=TODAY, now=NOON_05, not_before={}, settled={9}
+        [waiting], rows, today=TODAY, now=NOON_05, not_before={}, settled={9}, tz=KYIV
     ) == lifecycle.Action("release", waiting, older)
     # Its release backing off lets today's record go.
     assert lifecycle.plan(
-        [waiting], rows, today=TODAY, now=NOON_05, not_before=older_held, settled={9}
+        [waiting], rows, today=TODAY, now=NOON_05, not_before=older_held, settled={9}, tz=KYIV
     ) == lifecycle.Action("release", waiting, today_row)
     # Both backing off: no step at all for the location.
     assert (
-        lifecycle.plan([waiting], rows, today=TODAY, now=NOON_05, not_before=both_held, settled={9})
+        lifecycle.plan(
+            [waiting], rows, today=TODAY, now=NOON_05, not_before=both_held, settled={9}, tz=KYIV
+        )
         is None
     )
     # Never a post, pin, refresh, final edit or unpin, whatever is left or held.
     for not_before in ({}, older_held, both_held):
         for left in (rows, [today_row], [older], []):
             action = lifecycle.plan(
-                [waiting], left, today=TODAY, now=NOON_05, not_before=not_before, settled={9}
+                [waiting],
+                left,
+                today=TODAY,
+                now=NOON_05,
+                not_before=not_before,
+                settled={9},
+                tz=KYIV,
             )
             assert action is None or action.step == "release"
 
@@ -507,17 +515,20 @@ def test_D08_plan_waiting_location_without_stale_rows_plans_nothing() -> None:
     # snapshot's two reads, so the waiting location comes without rows.
     waiting = _location(awaiting_heartbeat=True)
 
-    assert lifecycle.plan([waiting], [], today=TODAY, now=NOON_05, not_before={}) is None
+    assert lifecycle.plan([waiting], [], today=TODAY, now=NOON_05, not_before={}, tz=KYIV) is None
     assert _keys_of(1, lifecycle._live_keys([waiting], [], TODAY)) == set()
     # Pitfall 12: a post in flight at the reset was recorded unmarked. It is not stale, and
     # the waiting location still makes no step: no pin, no refresh.
     unmarked = _row(10, pinned=False, rendered=NOON_05 - timedelta(hours=1))
-    assert lifecycle.plan([waiting], [unmarked], today=TODAY, now=NOON_05, not_before={}) is None
+    assert (
+        lifecycle.plan([waiting], [unmarked], today=TODAY, now=NOON_05, not_before={}, tz=KYIV)
+        is None
+    )
     assert _keys_of(1, lifecycle._live_keys([waiting], [unmarked], TODAY)) == set()
     # Another location's chart work goes on meanwhile.
     other = _location(2)
     assert lifecycle.plan(
-        [waiting, other], [], today=TODAY, now=NOON_05, not_before={}
+        [waiting, other], [], today=TODAY, now=NOON_05, not_before={}, tz=KYIV
     ) == lifecycle.Action("post", other)
     assert lifecycle._live_keys([waiting, other], [], TODAY) == {lifecycle.chart_key(2, "post")}
 
@@ -567,7 +578,7 @@ def test_existing_lifecycle_rows_and_locations_build_with_the_new_defaults() -> 
     assert [f.name for f in dataclasses.fields(row)][-1] == "history_reset_at"
     assert lifecycle.stale(location, row) is False
     assert lifecycle.plan(
-        [location], [row], today=TODAY, now=NOON_05, not_before={}
+        [location], [row], today=TODAY, now=NOON_05, not_before={}, tz=KYIV
     ) == lifecycle.Action("refresh", location, row)
 
 

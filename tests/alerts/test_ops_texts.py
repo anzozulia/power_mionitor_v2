@@ -50,7 +50,8 @@ UNCERTAIN = (
 # The chart pin notices (Phase 3 D-07, 03-CONTEXT "Specific Ideas").
 PIN_FAILED = (
     "📌 Can't pin today's chart for Office (Telegram: http_400). "
-    "The chart is still posted and refreshed; pinning is retried every 15 min. "
+    "The chart is still posted and refreshed; pinning is retried every 15 min, "
+    "or at each chart update if it updates less often. "
     "Check that the bot may pin messages in the chat."
 )
 PIN_RESTORED = "📌 Pinning works again for Office."
