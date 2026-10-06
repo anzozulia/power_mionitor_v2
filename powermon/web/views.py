@@ -204,6 +204,7 @@ def _create_location(data: dict[str, Any], now: datetime) -> Location:
             bot_token=data["bot_token"],
             chat_id=data["chat_id"],
             language=data["language"],
+            chart_refresh_min=data["chart_refresh_min"],
             device_key=keys.generate_device_key(),
             created_at=now,
         )

@@ -8,7 +8,13 @@ from django.forms.boundfield import BoundField
 from django.utils.html import format_html
 
 from powermon.locations import validators
-from powermon.locations.models import LANGUAGE_CHOICES, MAX_SECONDS, MIN_SECONDS
+from powermon.locations.models import (
+    CHART_REFRESH_CHOICES,
+    DEFAULT_CHART_REFRESH_MIN,
+    LANGUAGE_CHOICES,
+    MAX_SECONDS,
+    MIN_SECONDS,
+)
 
 # One message for every sign-in failure: it never says which credential was wrong.
 SIGN_IN_ERROR = "Wrong username or password. Check both and try again."
@@ -26,6 +32,9 @@ SECONDS_TOO_LONG = "Use at most 3600 seconds (1 hour)."
 # Not in the UI-SPEC: the select offers only valid choices, so only a hand-made request
 # gets this. It replaces Django's text, which would echo the posted value.
 LANGUAGE_INVALID = "Choose Ukrainian, English or Russian."
+# The same for the chart update period (quick task 261006-of9): the select offers only the
+# six choices, and this copy never echoes the posted value.
+CHART_REFRESH_INVALID = "Choose a chart update period from the list."
 
 HELP_NAME = "Subscribers will see this name in the weekly chart title."
 HELP_PERIOD = "How often the device sends a heartbeat. 10 to 3600 seconds."
@@ -46,6 +55,10 @@ HELP_CHAT_ID = (
     "is needed to update and pin the weekly chart)."
 )
 HELP_LANGUAGE = "Language of this location's alerts and weekly chart."
+HELP_CHART_REFRESH = (
+    "How often the weekly chart in the channel is redrawn. Updates run on the clock: "
+    "10 min means :00, :10, :20 and so on; 1 hour means on the hour."
+)
 
 # Edit-location form copy (Phase 4 UI-SPEC › Edit form, verbatim).
 EDIT_FORM_ERROR = "The changes were not saved. Fix the fields marked below."
@@ -181,6 +194,18 @@ class LocationForm(forms.Form):
         initial="uk",
         help_text=HELP_LANGUAGE,
         error_messages={"required": LANGUAGE_INVALID, "invalid_choice": LANGUAGE_INVALID},
+    )
+    # Required: a missing value must never silently reset the period to 15 (261006-of9).
+    chart_refresh_min = forms.TypedChoiceField(
+        label="Chart update period",
+        choices=CHART_REFRESH_CHOICES,
+        coerce=int,
+        initial=DEFAULT_CHART_REFRESH_MIN,
+        help_text=HELP_CHART_REFRESH,
+        error_messages={
+            "required": CHART_REFRESH_INVALID,
+            "invalid_choice": CHART_REFRESH_INVALID,
+        },
     )
 
     @property

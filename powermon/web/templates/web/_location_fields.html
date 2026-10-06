@@ -18,7 +18,8 @@ Contracts > S4 / S6, Test hooks > S4 Add / S6 Edit; UI-01, UI-12, N8, R3). Conte
     the field group), the channel chat ID with its long Python help in a disclosure, and
     the language select. The disclosure is details[data-testid="chat-id-help"] with the
     summary "How to find the chat ID"; the field group renders it from help_in_details
-    and help_testid, with #id_chat_id_helptext inside it.
+    and help_testid, with #id_chat_id_helptext inside it. Then the chart update period
+    select (quick task 261006-of9).
 - The OFF-after hint (N8, [data-testid="off-after-hint"]): the monitoring section binds
   x-data="offAfterHint", which recomputes it from #id_period_s and #id_grace_s while the
   admin types. The server renders its first state from off_after_initial: the sentence
@@ -68,6 +69,7 @@ Contracts > S4 / S6, Test hooks > S4 Add / S6 Edit; UI-01, UI-12, N8, R3). Conte
     </div>
     {% include "django/forms/field.html" with field=form.chat_id help_in_details="How to find the chat ID" help_testid="chat-id-help" only %}
     {% include "django/forms/field.html" with field=form.language only %}
+    {% include "django/forms/field.html" with field=form.chart_refresh_min only %}
     {% if edit %}<div data-testid="edit-note-telegram" data-tone="info" class="relative flex items-start gap-2 rounded-control border border-info-border bg-info-bg p-4 text-body [box-shadow:inset_3px_0_0_var(--info-text)]">{% icon "info" class="size-5 shrink-0 text-info-text" %}<p class="min-w-0 flex-1 break-words text-fg">A new chat ID or bot token moves the weekly chart: a new one is posted and pinned, and the old one is unpinned if this location's bot is an admin of the old channel. Otherwise the old pin stays: unpin it by hand in Telegram.</p></div>{% endif %}
   </div>
 </section>
