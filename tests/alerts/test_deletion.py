@@ -518,7 +518,8 @@ def test_DATA02_delete_outcomes_never_touch_delivery_or_the_row(
     location = location_factory()
     off, on = _pair(location)
     before = (_untouched(off), _untouched(on))
-    fake_telegram.fail_method(TOKEN_A, "deleteMessage", status=403, json_body=CANNOT)
+    kicked = {"ok": False, "error_code": 403, "description": "Forbidden: bot was kicked"}
+    fake_telegram.fail_method(TOKEN_A, "deleteMessage", status=403, json_body=kicked)
     state = io_loop.RelayState()
 
     assert io_loop.run_iteration(FakeClock(REMOVED), state) is True
