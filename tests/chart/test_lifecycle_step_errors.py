@@ -30,6 +30,7 @@ from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, FakeClock
 from django.db import InterfaceError, ProgrammingError
 
 from powermon import logging_setup
+from powermon.alerts import outbox
 from powermon.chart import lifecycle, source
 from powermon.chart.model import Week
 from powermon.chart.models import ChartMessage
@@ -234,7 +235,7 @@ def test_INV13_lost_connection_still_ends_the_pass(
     def gone(pid: int | None) -> bool:
         raise InterfaceError("connection already closed")
 
-    monkeypatch.setattr(lifecycle, "_lease_holds", gone)
+    monkeypatch.setattr(outbox, "lease_holds", gone)
     caplog.set_level(logging.WARNING)
     clock = FakeClock(NOON_05)
     state = io_loop.RelayState()

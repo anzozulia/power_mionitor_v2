@@ -82,8 +82,21 @@ worker was down is simply due on the next pass.
   one catch-up refresh is made, not one per missed slot, then the refreshes are aligned
   again (INV-18). A refresh that starts just before a slot and is answered after it skips
   that slot (accepted, 261006-of9 D7). Midnight-class steps (post, pin, finalize, unpin)
-  beat any refresh; among due refreshes the oldest render goes first, ties to the lower
-  location id.
+  beat any refresh; among due refreshes a redraw goes first, then the oldest render, ties
+  to the lower location id.
+  - Redraw (261006-qv7, DATA-02 amended): an outage removal marks today's record
+    (``redraw_requested_at``) in its transaction. A marked record is due at once, and when
+    no slot is due it is redrawn as of ``min(last_rendered_at, now)``
+    (``Action.as_of``): the pill keeps the time the image already showed, data after that
+    time is left out, and ``last_rendered_at`` is not changed, so the next regular update
+    comes on schedule and no slot is skipped when the redraw's answer crosses a boundary.
+    ``as_of`` is the last update's answer time, so the pill can show one minute later than
+    the image did when that update's call crossed a minute boundary (chart-spec §4). When a
+    slot is due anyway, one regular refresh at now serves both. The mark is cleared only
+    if it is still the value the snapshot saw, so a removal that commits during the call
+    gets its own redraw. A failed or unwritten redraw keeps the mark and is retried with
+    the same time; "message to edit not found" retires the record and today's chart is
+    posted again at now. The removal never marks a finished day's record (D-14).
 - Release (D-08, D-09, INV-19 #2): a record is ``stale`` once its channel is no longer its
   location's: the chat stored with it differs from the location's chat, the bot that
   posted it (``bot_key``) differs from the location's current bot (a token change is a
@@ -140,8 +153,8 @@ models never loads Pillow; the web process loads it only when its chart preview 
 (UI-06) first calls ``chart_content``.
 
 Before each call the worker checks that its lease session (``RelayState.lease_pid``) still
-holds the worker lock, with the same ``pg_locks`` predicate as the outbox claim; a stale
-worker makes no chart call (C1).
+holds the worker lock (``outbox.lease_holds``, the same ``pg_locks`` predicate as the outbox
+claim, shared with the I/O loop's delete step); a stale worker makes no chart call (C1).
 
 Backoff (D-02, D-06, INV-14). Chart calls share the alert relay's per-bot and per-chat
 backoff, read only: a bot whose ``bot_wide_key`` or a channel whose ``chat_key`` is in
@@ -175,7 +188,9 @@ releases, each until its record is retired; without them a transient release err
 would turn into a call per pass. The alert relay's keys are never touched.
 
 Each call logs one INFO line, ``chart <step> for location <id>: <kind> (<code>)
-render_ms=<n> call_ms=<n>``, with no token and no Telegram description (OPS-08).
+render_ms=<n> call_ms=<n>``, with no token and no Telegram description (OPS-08); a redraw
+after an outage removal says ``redraw`` in place of ``refresh`` (its key stays the
+refresh step's).
 """
 
 import logging
@@ -208,7 +223,6 @@ from powermon.i18n import chart_texts
 from powermon.locations.models import DEFAULT_CHART_REFRESH_MIN
 from powermon.telegram.client import DEFAULT_RETRY_AFTER_S, SendResult, TelegramClient
 from powermon.worker import io_loop
-from powermon.worker.lease import LOCK_KEY
 
 log = logging.getLogger(__name__)
 
@@ -263,7 +277,8 @@ SELECT l.id, l.name, l.language, l.bot_token, l.chat_id, l.period_s, l.grace_s, 
 # (whether or not they are known pinned, INV-19).
 ROWS_SQL = """
 SELECT id, location_id, local_date, chat_id, message_id, pinned, pin_failed_at,
-       last_rendered_at, finalized_at, unpinned_at, bot_key, history_reset_at
+       last_rendered_at, finalized_at, unpinned_at, bot_key, history_reset_at,
+       redraw_requested_at
   FROM chart_message
  WHERE retired_at IS NULL
    AND (local_date = %(today)s
@@ -280,15 +295,6 @@ VALUES (%(location_id)s, %(local_date)s, %(chat_id)s, %(bot_key)s, %(message_id)
         NULL, %(answered)s, NULL, NULL, NULL, %(answered)s)
 ON CONFLICT DO NOTHING RETURNING id
 """
-# The C1 fence: the lease session holds the worker lock right now (outbox.CLAIM_HELD_SQL).
-LEASE_HELD_SQL = """
-SELECT 1 FROM pg_locks
- WHERE locktype = 'advisory' AND granted AND pid = %(pid)s
-   AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
-   AND classid = %(classid)s::oid AND objid = %(objid)s::oid AND objsubid = 1
-"""
-_LOCK_CLASSID = LOCK_KEY >> 32
-_LOCK_OBJID = LOCK_KEY & 0xFFFFFFFF
 
 
 @dataclass(frozen=True)
@@ -332,6 +338,8 @@ class ChartRow:
     bot_key: str
     # Set by a history reset of its location (DATA-03, D-08): the record is released.
     history_reset_at: datetime | None = None
+    # Set by an outage removal (261006-qv7): today's record is redrawn at its last update.
+    redraw_requested_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -341,6 +349,9 @@ class Action:
     step: Step
     location: ChartLocation
     row: ChartRow | None = None
+    # A redraw's render time (261006-qv7): today's record's last update, never later than
+    # now. None for every other step, which renders as of now.
+    as_of: datetime | None = None
 
 
 def chart_key(location_id: int, step: Step, row_id: int | None = None) -> str:
@@ -513,6 +524,7 @@ def read_snapshot(today: date) -> tuple[list[ChartLocation], list[ChartRow]]:
                 unpinned_at=r[9],
                 bot_key=r[10],
                 history_reset_at=r[11],
+                redraw_requested_at=r[12],
             )
             for r in cur.fetchall()
         ]
@@ -547,11 +559,13 @@ def plan(
     unpinned yet, whatever ``pinned`` says (its pin may have taken effect unrecorded,
     INV-19). A final edit is due only for a record in ``settled`` (``settled_records``: its
     day's timeline is complete, INV-03); one not due yet never holds the unpin, so two
-    charts are pinned for seconds only. Only when none is due anywhere, the refresh that
-    has waited longest goes: today's record whose ``last_rendered_at`` is before its
-    location's current slot (``refresh_slot``), oldest render first, ties to the lower
-    location id (CHRT-02). ``tz`` is the display zone the slots are aligned in. A step
-    whose own key
+    charts are pinned for seconds only. Only when none is due anywhere, a refresh goes:
+    today's record whose ``last_rendered_at`` is before its location's current slot
+    (``refresh_slot``, CHRT-02), or that an outage removal marked (261006-qv7). A marked
+    record with no slot due is a redraw as of ``min(last_rendered_at, now)``
+    (``Action.as_of``); with a slot due it is a regular refresh at now. Redraws go first,
+    then the oldest render, ties to the lower location id. ``tz`` is the display zone the
+    slots are aligned in. A step whose own key
     in ``not_before`` is in the future is skipped, so the next due step goes instead: a
     failing post never blocks the older charts' cleanup (D-02, INV-19). The alert relay's
     backoff is respected, read only: a location whose bot waits (``bot_wide_key``) makes
@@ -566,7 +580,7 @@ def plan(
     def waiting(key: str) -> bool:
         return not_before.get(key, now) > now
 
-    due_refreshes: list[tuple[datetime, int, Action]] = []
+    due_refreshes: list[tuple[bool, datetime, int, Action]] = []
     for location in locations:
         if waiting(io_loop.bot_wide_key(location.bot_token)):
             continue
@@ -584,16 +598,23 @@ def plan(
         if action is not None:
             return action
         if (
-            today_row is not None
-            and today_row.last_rendered_at < refresh_slot(now, location.refresh_min, tz)
-            and not waiting(chart_key(location.location_id, "refresh"))
-            and not waiting(io_loop.chat_key(location.bot_token, today_row.chat_id))
+            today_row is None
+            or waiting(chart_key(location.location_id, "refresh"))
+            or waiting(io_loop.chat_key(location.bot_token, today_row.chat_id))
         ):
-            refresh = Action("refresh", location, today_row)
-            due_refreshes.append((today_row.last_rendered_at, location.location_id, refresh))
+            continue
+        slot_due = today_row.last_rendered_at < refresh_slot(now, location.refresh_min, tz)
+        redraw = today_row.redraw_requested_at is not None
+        if slot_due or redraw:
+            # A due slot renders at now and serves the redraw too; otherwise the redraw
+            # keeps the image's time, never later than now (a clock stepped back).
+            as_of = None if slot_due else min(today_row.last_rendered_at, now)
+            refresh = Action("refresh", location, today_row, as_of)
+            due = (not redraw, today_row.last_rendered_at, location.location_id, refresh)
+            due_refreshes.append(due)
     if not due_refreshes:
         return None
-    return min(due_refreshes, key=lambda due: (due[0], due[1]))[2]
+    return min(due_refreshes, key=lambda due: (due[0], due[1], due[2]))[3]
 
 
 def _today_row(rows: list[ChartRow], location_id: int, today: date) -> ChartRow | None:
@@ -698,8 +719,10 @@ def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | No
     Then the snapshot and the detection cursor are read (the cursor decides which older
     days have settled for their final edit) and the step keys no longer needed are dropped.
 
-    ``now`` is read once: today's date, the render and its now pill all come from it
-    (CHRT-04, Pitfall 8); the outcome counts from the answer time.
+    ``now`` is read once: today's date and a regular render with its now pill come from
+    it (CHRT-04, Pitfall 8), while a redraw after an outage removal renders as of the
+    record's last update (``Action.as_of``, 261006-qv7); the outcome counts from the
+    answer time.
     ``stop`` is checked before the render and again before the call. A render error backs
     off that step only, for 15 min, and makes no call (INV-13 pattern). A database error
     writing the outcome of a call that was made is handled: a post's is kept, and any
@@ -733,6 +756,8 @@ def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | No
         return False
     location = action.location
     key = _key(action)
+    # The log label: a redraw keeps the refresh step's key, but says what it was.
+    label = "redraw" if action.as_of is not None else action.step
     # Telegram's answer and its time, once the call returned: an accepted post must then
     # be recorded, never posted again.
     result: SendResult | None = None
@@ -750,13 +775,13 @@ def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | No
                 state.not_before[key] = now + io_loop.PERMANENT_BACKOFF
                 log.error(
                     "chart %s for location %s: render failed (%s); the step waits 15 min",
-                    action.step,
+                    label,
                     location.location_id,
                     type(exc).__name__,
                 )
                 return False
         render_ms = _ms(clock.monotonic() - started)
-        if _stopped(stop) or not _lease_holds(state.lease_pid):
+        if _stopped(stop) or not outbox.lease_holds(state.lease_pid):
             return False
         client = TelegramClient(location.bot_token)
         called = clock.monotonic()
@@ -765,7 +790,7 @@ def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | No
         answered = clock.now()
         log.info(
             "chart %s for location %s: %s (%s) render_ms=%d call_ms=%d",
-            action.step,
+            label,
             location.location_id,
             result.kind,
             result.code,
@@ -792,13 +817,15 @@ def _content(action: Action, today: date, now: datetime, tz: str) -> tuple[bytes
 
     A finished day is drawn as of the local midnight that ends it (chart-spec §7), never as
     of the time the final edit happens to run, so a catch-up after downtime draws the same
-    day as a final edit made at midnight.
+    day as a final edit made at midnight. A redraw after an outage removal is drawn as of
+    the record's last update (``action.as_of``, 261006-qv7); every other live render as of
+    ``now``.
     """
     row = action.row
     if action.step == "finalize" and row is not None:
         end_of_day = model.next_midnight(row.local_date, tz)
         return chart_content(action.location, row.local_date, end_of_day, live=False, tz=tz)
-    return chart_content(action.location, today, now, live=True, tz=tz)
+    return chart_content(action.location, today, action.as_of or now, live=True, tz=tz)
 
 
 def _call(client: TelegramClient, action: Action, content: tuple[bytes, str] | None) -> SendResult:
@@ -842,10 +869,14 @@ def _apply(
         elif action.step == "pin" and row is not None:
             _pinned(action.location, row, answered)
         elif action.step == "refresh" and row is not None:
-            # "message is not modified" is ok too: the chart shows this render (D-05).
-            ChartMessage.objects.filter(pk=row.id, retired_at__isnull=True).update(
-                last_rendered_at=answered
-            )
+            if action.as_of is None:
+                # "message is not modified" is ok too: the chart shows this render (D-05).
+                ChartMessage.objects.filter(pk=row.id, retired_at__isnull=True).update(
+                    last_rendered_at=answered
+                )
+            # A redraw keeps last_rendered_at, so the next slot comes on schedule.
+            if row.redraw_requested_at is not None:
+                _clear_redraw(row)
         elif action.step == "finalize" and row is not None:
             # Conditional: a repeated or concurrent final edit changes nothing twice.
             ChartMessage.objects.filter(pk=row.id, finalized_at__isnull=True).update(
@@ -876,6 +907,17 @@ def _apply(
         # The bot may not pin here: tried again after the next render, not before (D-07).
         _pin_refused(action.location, row, result, answered)
     _fail(action, key, result, answered, state)
+
+
+def _clear_redraw(row: ChartRow) -> None:
+    """Clear the removal's redraw mark, only if it is still the one the snapshot saw.
+
+    A removal that committed after the snapshot set a later mark: it stays, and that
+    removal gets its own redraw (261006-qv7).
+    """
+    ChartMessage.objects.filter(pk=row.id, redraw_requested_at=row.redraw_requested_at).update(
+        redraw_requested_at=None
+    )
 
 
 def _released(
@@ -1046,15 +1088,6 @@ def _stopped(stop: threading.Event | None) -> bool:
 
 def _ms(seconds: float) -> int:
     return int(seconds * 1000)
-
-
-def _lease_holds(pid: int | None) -> bool:
-    """True when ``pid`` (the lease session) holds the worker lock; no pid is unfenced."""
-    if pid is None:
-        return True
-    with connection.cursor() as cur:
-        cur.execute(LEASE_HELD_SQL, {"pid": pid, "classid": _LOCK_CLASSID, "objid": _LOCK_OBJID})
-        return cur.fetchone() is not None
 
 
 def _record_post(

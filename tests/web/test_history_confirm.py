@@ -30,7 +30,7 @@ Flashes are the page's toasts, read through ``pages.messages()`` as (role, text)
 """
 
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 import pytest
@@ -99,17 +99,19 @@ CONSEQUENCE_2 = (
     "monitored;"
 )
 CONSEQUENCE_3 = (
-    "sends nothing itself, and drops its queued OFF and ON alerts if the OFF alert was never "
-    "sent (if it already went out, its queued ON alert is still sent, so the channel is not "
-    "left at power off);"
+    "deletes its OFF and ON alerts from the channel and drops any still queued. If its OFF "
+    "alert cannot be deleted (sent more than 47 hours ago or before this update, or its "
+    "delivery is uncertain), both alerts stay and a queued ON alert is still sent, so the "
+    "channel is not left at power off;"
 )
 CONSEQUENCE_4 = (
     "leaves the live status unchanged, including the On since time from which the next OFF "
     'alert counts "was ON for".'
 )
 CLOSING = (
-    "The chart shows the change at its next update. It shows the last 7 days; charts already "
-    "posted for earlier days do not change."
+    "The pinned chart is redrawn within seconds and keeps the time of its last update; the "
+    "next update comes on schedule. It shows the last 7 days; charts already posted for "
+    "earlier days do not change."
 )
 SECRET = "Sx_9-Qw7Lm" * 4
 TOKEN = f"987654321:{SECRET}"
@@ -182,17 +184,22 @@ def _outbox() -> list[tuple[int, str, str]]:
 
 
 def _written(location: Any) -> tuple[Any, ...]:
-    """Everything a removal or a reset could write: the timeline, the outbox, the live state
-    and the chart records' reset marks."""
+    """Everything a removal or a reset could write: the timeline, the outbox (with the
+    removal's delete requests), the live state and the chart records' reset and redraw
+    marks (261006-qv7)."""
     state = LocationState.objects.filter(location=location).values_list(
         "status", "last_heartbeat_at", "on_since", "outage_started_at", "state_version"
     )
     marks = ChartMessage.objects.filter(location=location).order_by("id")
+    requests = OutboxMessage.objects.order_by("id").values_list(
+        "id", "delete_requested_at", "delete_result"
+    )
     return (
         _intervals(location),
         _outbox(),
         list(state),
-        list(marks.values_list("id", "history_reset_at", "retired_at")),
+        list(marks.values_list("id", "history_reset_at", "retired_at", "redraw_requested_at")),
+        list(requests),
     )
 
 
@@ -287,11 +294,12 @@ def test_remove_confirmation_page(
     ]
     # No not-monitored time inside this outage: no Consequence 2.
     assert _items(root, "consequences") == [CONSEQUENCE_1, CONSEQUENCE_3, CONSEQUENCE_4]
-    # Consequence 3 states the refined D-04 in the 06-UI-SPEC amendment A3 wording.
+    # Consequence 3 states D-04 in the 06-UI-SPEC amendment A3/A9 wording (261006-qv7).
     assert _items(root, "consequences")[1] == (
-        "sends nothing itself, and drops its queued OFF and ON alerts if the OFF alert was "
-        "never sent (if it already went out, its queued ON alert is still sent, so the channel "
-        "is not left at power off);"
+        "deletes its OFF and ON alerts from the channel and drops any still queued. If its "
+        "OFF alert cannot be deleted (sent more than 47 hours ago or before this update, or "
+        "its delivery is uncertain), both alerts stay and a queued ON alert is still sent, so "
+        "the channel is not left at power off;"
     )
     words = text(root)
     assert words.index(LEAD) < words.index(CONSEQUENCE_1) < words.index(CLOSING)
@@ -526,10 +534,10 @@ def test_remove_post_for_a_location_deleted_mid_request_answers_404(
     before = _written(location)
     remove_outage = history.remove_outage
 
-    def delete_then_remove(pk: int, start: datetime) -> history.RemoveResult:
+    def delete_then_remove(pk: int, start: datetime, **kwargs: Any) -> history.RemoveResult:
         # A second tab deletes the location after the view's lookup, before the row lock.
         Location.objects.filter(pk=pk).update(deleted_at=_at(16, 0))
-        return remove_outage(pk, start)
+        return remove_outage(pk, start, **kwargs)
 
     monkeypatch.setattr(history, "remove_outage", delete_then_remove)
 
@@ -921,3 +929,44 @@ def test_reset_pages_show_no_secret(
             for key in keys_shown:
                 assert key not in url
             assert SECRET not in url
+
+
+# 261006-qv7 (DATA-02 amended): the POST passes the view clock's now and the display zone
+
+
+@pytest.mark.django_db(transaction=True)
+def test_DATA02_remove_post_passes_the_clock_and_the_zone_and_marks_todays_chart(
+    admin: Client,
+    monkeypatch: pytest.MonkeyPatch,
+    location_factory: Callable[..., Any],
+    fake_telegram: FakeTelegram,
+) -> None:
+    location = _two_outages(location_factory)
+    clock = _clock(monkeypatch, _at(16, 0))
+    record = ChartMessage.objects.create(
+        location=location,
+        local_date=date(2026, 10, 1),
+        chat_id=location.chat_id,
+        bot_key=io_loop.bot_key(location.bot_token),
+        message_id=1001,
+        pinned=True,
+        last_rendered_at=_at(15, 45),
+        created_at=_at(8, 0),
+    )
+    seen: list[dict[str, Any]] = []
+    real = history.remove_outage
+
+    def spy(pk: int, start: datetime, **kwargs: Any) -> history.RemoveResult:
+        seen.append(kwargs)
+        return real(pk, start, **kwargs)
+
+    monkeypatch.setattr(history, "remove_outage", spy)
+
+    response = admin.post(_remove(location, _at(9, 0)))
+
+    assert response.status_code == 302
+    assert seen == [{"now": clock.now(), "tz": KYIV}]
+    # Today's record is marked at the view clock's time: the worker redraws it.
+    assert ChartMessage.objects.get(pk=record.pk).redraw_requested_at == _at(16, 0)
+    # The removal itself calls nothing: the worker deletes and redraws (KD2).
+    assert len(fake_telegram.calls) == 0

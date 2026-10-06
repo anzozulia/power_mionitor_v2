@@ -1465,8 +1465,8 @@ def test_database_error_in_the_chart_step_is_logged_and_the_watchdog_ticks(
     assert state.not_before == {}
     assert "chart step failed: OperationalError" in caplog.text
     assert "server closed" not in caplog.text
-    # The ops step and the chart step each stamp the watchdog (no subscriber head).
-    assert ticks == ["tick", "tick"]
+    # The ops, delete and chart steps each stamp the watchdog (no subscriber head).
+    assert ticks == ["tick", "tick", "tick"]
 
 
 def test_ambiguous_refresh_is_retried_after_the_step_delay(

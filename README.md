@@ -11,7 +11,8 @@ power was on and off, with daily totals, that updates itself (section 10, Weekly
 One admin manages the locations in a small web panel: add, edit and delete them, pause
 them for maintenance, switch their alerts off, rotate a device key, send a test message,
 see which locations cannot deliver alerts (section 10, Location page), and remove a false
-outage or reset a location's history (section 10, History corrections).
+outage or reset a location's history (section 10, History corrections). Removing a false
+outage also deletes its OFF and ON alerts from the channel where Telegram allows it. (Amended 2026-10-06, quick task 261006-qv7.)
 
 The stack is Django (web panel and heartbeat endpoint), one worker process (outage
 detection and Telegram delivery), PostgreSQL, Caddy (TLS) and a nightly backup job
@@ -34,7 +35,9 @@ connected.
   "Edit messages of others" rights. The second one lets the bot pin, unpin and edit the
   weekly chart in a channel. In a group (not recommended) the bot needs "Pin messages"
   instead. Without the pin right the chart is still posted and refreshed, and the admin
-  gets a 📌 notice (section 10).
+  gets a 📌 notice (section 10). "Post messages" also lets the bot delete its own alerts
+  within 48 hours, which removing a false outage uses; a bot that replaced another one
+  needs "Delete messages of others" to delete the old bot's alerts. (Amended 2026-10-06, quick task 261006-qv7.)
 - Optional, recommended: a private Telegram chat for the admin's ops notices (section 4).
 
 ## 3. Server prep
@@ -201,7 +204,10 @@ its OFF within one detection window (period plus grace) after the restart.
    1 hour; default 15 min). (Amended 2026-10-06, quick task 261006-of9.) The bot must be
    an administrator of the channel with the
    "Post messages" and "Edit messages of others" rights (the second one to pin, unpin and
-   edit the weekly chart; in a group it needs "Pin messages").
+   edit the weekly chart; in a group it needs "Pin messages"). "Post messages" also lets
+   it delete its own alerts within 48 hours, which removing a false outage uses; a bot
+   that replaced another one needs "Delete messages of others" for the old bot's alerts.
+   (Amended 2026-10-06, quick task 261006-qv7.)
 3. On the location's setup page, click **Reveal key** and copy the curl or cron example
    onto the device. The device must run on mains power only (no UPS): heartbeats measure
    power and internet at the device.
@@ -406,6 +412,9 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
     that are multiples of the period: every 10 minutes means :00, :10 … :50, every hour
     means on the hour. An outage shows at the first update after its OFF alert, so within
     one period. (Amended 2026-10-06, quick task 261006-of9.)
+  - After an outage removal (History corrections below), today's chart is redrawn within
+    seconds and keeps the time of its last update; the next update comes on schedule.
+    (Amended 2026-10-06, quick task 261006-qv7.)
   - After the worker was down across one or more midnights, it posts exactly one chart
     for today and gives every older pinned chart its final render and unpins it. A day
     the worker missed entirely gets no chart. After any restart, the chart is first
@@ -422,9 +431,12 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
     Telegram thread only, at most one chart
     call per delivery pass and after all due alerts, so it never delays detection or
     heartbeats and delays an alert by one call at most. Each chart call logs one INFO
-    line, `chart <post|pin|finalize|unpin|refresh|release> for location <id>: <result>
-    (<code>) render_ms=<n> call_ms=<n>` (`release` unpins a chart after a chat or token
-    change or a delete; "Location page" below).
+    line, `chart <post|pin|finalize|unpin|refresh|redraw|release> for location <id>:
+    <result> (<code>) render_ms=<n> call_ms=<n>` (`release` unpins a chart after a chat or
+    token change or a delete; "Location page" below; `redraw` follows an outage removal).
+    Each delete of a removed outage's alert logs `alert delete for location <id>: <kind>
+    (<code>) outbox <id>`, at WARNING when Telegram refused it or it was too old. A pass
+    makes either one delete or one chart call, never both. (Amended 2026-10-06, quick task 261006-qv7.)
 - **Location page:** click a location's name in the location list. Every action on it
   is a button; nothing changes on a page load, and a reload never repeats an action.
   - **Status:** On, Off, Maintenance or Waiting for first heartbeat. Under maintenance
@@ -488,25 +500,31 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
     monitor the place again, add a new location (a new key and an empty history). To
     pause a location instead, turn maintenance on or alerts off.
 - **History corrections:** two sections of the location page fix a wrong power history.
-  Each is a confirmation page, then the change. Neither sends a message to the channel,
-  and there is no undo.
+  Each is a confirmation page, then the change. Neither sends a new message to the
+  channel, and there is no undo. (Amended 2026-10-06, quick task 261006-qv7.)
   - **Recent outages:** every outage of the last 14 local days, newest first, with its
     start, end and off time (the chart's daily-total format). The outage in progress reads
     "in progress" and has no Remove link. **Remove** turns a false outage that has ended
     (for example the device or its internet connection was down while the power was on)
     into power on: its off time no longer counts in the chart or the daily totals, and time inside it
-    that was not monitored stays not monitored. The pinned chart shows the change at its
-    next update (within the location's chart update period; amended 2026-10-06, quick task
-    261006-of9); it draws the last 7 days, and charts already finished
-    for earlier days do not change. The live status stays as it is, so the next OFF
-    alert's "was ON for" still counts from the end of the removed outage. An outage in
-    progress cannot be removed: remove it after power returns. Alerts of the removed outage
-    that are still queued (for example while Telegram was unreachable) are dropped only if
-    its OFF alert never went out; if the OFF went out, its ON alert is still sent, so the
-    channel is not left at power off. If one of the outage's alerts (its OFF, or the ON
-    that ended it) is being sent at that moment, the page says so ("An alert about this
-    outage is being sent to the channel right now. Nothing changed. Try again in a
-    minute.") and nothing changes: try again a minute later.
+    that was not monitored stays not monitored. The pinned chart is redrawn within seconds
+    and keeps the time of its last update; the next update comes on schedule. It shows the
+    last 7 days; charts already posted for earlier days do not change. The live status
+    stays as it is, so the next OFF alert's "was ON for" still counts from the end of the
+    removed outage. An outage in progress cannot be removed: remove it after power returns.
+    The removal deletes the outage's OFF and ON alerts from the channel and drops any still
+    queued (for example while Telegram was unreachable): the worker deletes the OFF, then
+    the ON, within seconds (longer while Telegram makes the bot wait). If the OFF alert
+    cannot be deleted (sent more than 47 hours ago, sent before this update, or its
+    delivery is uncertain), both alerts stay and a queued ON alert is still sent, so the
+    channel is not left at power off. If Telegram refuses the OFF's delete, or it is too
+    old by then, its ON alert stays too (a queued ON that the removal dropped is sent after
+    all), with one WARNING in the worker log, no ops notice and no "delivery failing".
+    Delete such alerts by hand in Telegram. An alert already deleted by hand counts as
+    deleted. History reset deletes no message. If one of the outage's alerts (its OFF, or
+    the ON that ended it) is being sent at that moment, the page says so ("An alert about
+    this outage is being sent to the channel right now. Nothing changed. Try again in a
+    minute.") and nothing changes: try again a minute later. (Amended 2026-10-06, quick task 261006-qv7.)
   - **Reset history:** deletes the location's whole recorded power history. It is refused
     while an outage is in progress (reset after power returns, or delete the location).
     The location then shows **Waiting for first heartbeat**; its next heartbeat restarts
@@ -1079,7 +1097,7 @@ Rules:
 
 ## 15. History and backup checks (Phase 5 verification)
 
-These three checks cover what the tests cannot: a real restore on real containers, the
+These checks cover what the tests cannot: a real restore on real containers, the
 backup container on the real VPS, and a history reset seen in a real channel. Removing an
 outage, resetting a location's history, the backup script's schedule, rotation, health
 and restore refusal, the post-restore step, and that no new page shows a token or a key
@@ -1213,6 +1231,28 @@ before it.
 
 Record: the times, whether the old chart was unpinned, the log lines and a screenshot of
 the new chart. Record the result in the phase verification file.
+
+### (d) Outage removal on the private test channel (Amended 2026-10-06, quick task 261006-qv7.)
+
+1. On the private Test channel, make a fresh ~30 s outage (unplug the device, wait until
+   the OFF alert arrives, plug it back in).
+2. Wait for its OFF and ON alerts and one chart update, and note the pill time.
+3. Remove the outage between two updates (location page, Recent outages, **Remove**).
+4. Read the worker's lines:
+
+   ```sh
+   docker compose -f docker-compose.prod.yml logs --since 15m worker | grep -E 'alert delete|chart '
+   ```
+
+Expected: both alerts are gone from the channel within about 5 s
+(`alert delete for location <id>: ok` twice); exactly one `editMessageMedia` (a
+`chart redraw for location <id>: ok` line) shows the outage drawn as on with the same pill
+time; the next regular update comes on schedule; in the database `delete_result` is
+`deleted` on both alert rows. Removing an outage from before this update leaves its alerts
+in the channel (they have no stored message id) and only redraws the chart.
+
+Record: the times, the log lines and screenshots before and after. Record the result in
+the verification file.
 
 DoD 7 (INV-26: a fresh VPS reaches a working deployment in at most 30 minutes by following
 this README, including one test message) is re-run at milestone close, not here.

@@ -1,4 +1,5 @@
-"""TelegramClient chart calls: sendPhoto, editMessageMedia, pinChatMessage, unpinChatMessage.
+"""TelegramClient chart calls (sendPhoto, editMessageMedia, pinChatMessage, unpinChatMessage),
+deleteMessage, and the message id an ok sendMessage carries.
 
 Telegram is faked at the HTTP boundary (``fake_telegram``, built on ``responses``), and
 multipart bodies are read back with ``parse_multipart``.
@@ -15,6 +16,10 @@ multipart bodies are read back with ``parse_multipart``.
 - D-08: a fresh session per call, the short (5 s, 10 s) timeouts, no redirects, no client
   retries.
 - INV-23: result codes are short fixed strings, never the token or Telegram's text.
+- 261006-qv7 (DATA-02 amended): an ok sendMessage carries Telegram's message id when it is
+  usable, and stays ok without one; deleteMessage names a stored message, and "message to
+  delete not found" is ok with code ``not_found``. That text is matched for deleteMessage
+  only, and the chart calls' texts are never matched for it.
 """
 
 import email.policy
@@ -50,6 +55,7 @@ CALLS: dict[str, Callable[[TelegramClient], SendResult]] = {
     "editMessageMedia": lambda c: c.edit_message_media(DEFAULT_CHAT_ID, MESSAGE_ID, PNG, CAPTION),
     "pinChatMessage": lambda c: c.pin_chat_message(DEFAULT_CHAT_ID, MESSAGE_ID),
     "unpinChatMessage": lambda c: c.unpin_chat_message(DEFAULT_CHAT_ID, MESSAGE_ID),
+    "deleteMessage": lambda c: c.delete_message(DEFAULT_CHAT_ID, MESSAGE_ID),
 }
 METHODS = list(CALLS)
 # The calls that name a stored message (D-04): a bad id is a programming error.
@@ -57,6 +63,7 @@ BY_ID: dict[str, Callable[[TelegramClient, Any], SendResult]] = {
     "editMessageMedia": lambda c, m: c.edit_message_media(DEFAULT_CHAT_ID, m, PNG, CAPTION),
     "pinChatMessage": lambda c, m: c.pin_chat_message(DEFAULT_CHAT_ID, m),
     "unpinChatMessage": lambda c, m: c.unpin_chat_message(DEFAULT_CHAT_ID, m),
+    "deleteMessage": lambda c, m: c.delete_message(DEFAULT_CHAT_ID, m),
 }
 
 
@@ -134,15 +141,62 @@ def test_a_second_photo_gets_the_next_message_id(fake_telegram: Any) -> None:
     assert len(fake_telegram.calls) == 2
 
 
-def test_send_message_still_returns_ok_without_a_message_id(fake_telegram: Any) -> None:
-    # No regression: the alert path ignores the id Telegram sends back.
+def test_DATA02_send_message_ok_carries_the_message_id(fake_telegram: Any) -> None:
+    # The relay stores it, so a removal of the outage can delete the alert (261006-qv7).
     fake_telegram.accept(TOKEN)
+    client = _client()
+
+    first = client.send_message(DEFAULT_CHAT_ID, "x")
+    second = client.send_message(DEFAULT_CHAT_ID, "y")
+
+    assert (first, second) == (SendResult("ok", message_id=1), SendResult("ok", message_id=2))
+    assert fake_telegram.chart_calls == []
+
+
+@pytest.mark.parametrize(
+    "result",
+    [True, {"message_id": 0}, {"message_id": True}, {"message_id": "5"}, {"message_id": 2**63}],
+    ids=["result-true", "zero", "bool", "str", "too-big"],
+)
+def test_DATA02_send_message_ok_without_a_usable_id_is_still_plain_ok(
+    fake_telegram: Any, caplog: Any, result: Any
+) -> None:
+    # Telegram accepted the alert, so it counts as sent (INV-16): never maybe_delivered.
+    fake_telegram.fail(TOKEN, status=200, json_body={"ok": True, "result": result})
+
+    with caplog.at_level(logging.DEBUG, logger="powermon.telegram.client"):
+        sent = _client().send_message(DEFAULT_CHAT_ID, "x")
+
+    assert sent == SendResult("ok")
+    assert sent.message_id is None
+    assert caplog.text == ""
+
+
+def test_DATA02_send_message_failure_has_no_message_id(fake_telegram: Any) -> None:
+    fake_telegram.fail(TOKEN, **FORBIDDEN)
 
     result = _client().send_message(DEFAULT_CHAT_ID, "x")
 
-    assert result == SendResult("ok")
+    assert result == SendResult("permanent", code="http_403")
     assert result.message_id is None
-    assert fake_telegram.chart_calls == []
+
+
+# deleteMessage (261006-qv7, DATA-02 amended)
+
+
+def test_DATA02_delete_message_posts_the_chat_and_message_id_as_json(fake_telegram: Any) -> None:
+    fake_telegram.accept_chart(TOKEN)
+
+    result = _client().delete_message(DEFAULT_CHAT_ID, 42)
+
+    assert result == SendResult("ok")
+    [call] = fake_telegram.calls
+    assert (call.request.method, call.request.url) == ("POST", _url("deleteMessage"))
+    assert call.request.headers["Content-Type"] == "application/json"
+    assert json.loads(call.request.body) == {"chat_id": DEFAULT_CHAT_ID, "message_id": 42}
+    assert [(c.method, c.fields) for c in fake_telegram.chart_calls] == [
+        ("deleteMessage", {"chat_id": DEFAULT_CHAT_ID, "message_id": 42})
+    ]
 
 
 def test_send_photo_failure_is_logged_by_kind_and_code(fake_telegram: Any, caplog: Any) -> None:
@@ -353,6 +407,54 @@ CLASSIFICATION: list[tuple[str, str, dict[str, Any], SendResult]] = [
         {"status": 400, "json_body": {"ok": False, "error_code": 400}},
         SendResult("permanent", code="http_400"),
     ),
+    (
+        "delete-target-gone",
+        "deleteMessage",
+        _bad_request("Bad Request: message to delete not found"),
+        SendResult("ok", code="not_found"),
+    ),
+    (
+        "delete-target-gone-any-case",
+        "deleteMessage",
+        _bad_request("BAD REQUEST: MESSAGE TO DELETE NOT FOUND"),
+        SendResult("ok", code="not_found"),
+    ),
+    (
+        "delete-cannot-be-deleted",
+        "deleteMessage",
+        _bad_request("Bad Request: message can't be deleted"),
+        SendResult("permanent", code="http_400"),
+    ),
+    (
+        "delete-edit-text-is-permanent",
+        "deleteMessage",
+        _bad_request("Bad Request: message to edit not found"),
+        SendResult("permanent", code="http_400"),
+    ),
+    (
+        "delete-not-modified-is-permanent",
+        "deleteMessage",
+        _bad_request(NOT_MODIFIED),
+        SendResult("permanent", code="http_400"),
+    ),
+    (
+        "delete-description-not-text",
+        "deleteMessage",
+        _bad_request(["Bad Request: message to delete not found"]),
+        SendResult("permanent", code="http_400"),
+    ),
+    (
+        "edit-delete-text-is-permanent",
+        "editMessageMedia",
+        _bad_request("Bad Request: message to delete not found"),
+        SendResult("permanent", code="http_400"),
+    ),
+    (
+        "unpin-delete-text-is-permanent",
+        "unpinChatMessage",
+        _bad_request("Bad Request: message to delete not found"),
+        SendResult("permanent", code="http_400"),
+    ),
     *(
         (f"{method}-{case}", method, kwargs, result)
         for method in METHODS
@@ -388,8 +490,13 @@ def test_chart_call_classification(
 @pytest.mark.parametrize("method", ["sendPhoto", "sendMessage"])
 @pytest.mark.parametrize(
     "description",
-    ["Bad Request: message to edit not found", NOT_MODIFIED, "Bad Request: CHAT_NOT_MODIFIED"],
-    ids=["not-found", "not-modified", "chat-not-modified"],
+    [
+        "Bad Request: message to edit not found",
+        NOT_MODIFIED,
+        "Bad Request: CHAT_NOT_MODIFIED",
+        "Bad Request: message to delete not found",
+    ],
+    ids=["not-found", "not-modified", "chat-not-modified", "delete-not-found"],
 )
 def test_send_photo_and_send_message_keep_the_old_400_rule(
     fake_telegram: Any, method: str, description: str

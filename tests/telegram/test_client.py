@@ -160,7 +160,8 @@ def test_ok_response(fake_telegram: Any) -> None:
 
     result = _send()
 
-    assert result == SendResult("ok")
+    # Telegram's id for the message comes back with ok (261006-qv7).
+    assert result == SendResult("ok", message_id=1)
     assert fake_telegram.sent == [{"chat_id": DEFAULT_CHAT_ID, "text": TEXT, "parse_mode": "HTML"}]
     assert fake_telegram.calls[0].request.url == SEND_URL
 
@@ -171,13 +172,9 @@ def test_send_message_disable_notification(fake_telegram: Any) -> None:
     client = TelegramClient(TOKEN)
     body = {"chat_id": DEFAULT_CHAT_ID, "text": TEXT, "parse_mode": "HTML"}
 
-    assert client.send_message(DEFAULT_CHAT_ID, TEXT, disable_notification=True) == (
-        SendResult("ok")
-    )
-    assert client.send_message(DEFAULT_CHAT_ID, TEXT) == SendResult("ok")
-    assert client.send_message(DEFAULT_CHAT_ID, TEXT, disable_notification=False) == (
-        SendResult("ok")
-    )
+    assert client.send_message(DEFAULT_CHAT_ID, TEXT, disable_notification=True).kind == "ok"
+    assert client.send_message(DEFAULT_CHAT_ID, TEXT).kind == "ok"
+    assert client.send_message(DEFAULT_CHAT_ID, TEXT, disable_notification=False).kind == "ok"
 
     assert fake_telegram.sent == [{**body, "disable_notification": True}, body, body]
 
@@ -203,6 +200,7 @@ def test_api_base_is_configurable() -> None:
     with responses.RequestsMock() as rsps:
         rsps.add(responses.POST, f"https://tg.example.test{SEND_PATH}", json={"ok": True})
 
+        # An ok answer without a result has no message id: still plain ok.
         assert _send(api_base="https://tg.example.test") == SendResult("ok")
 
 

@@ -11,6 +11,9 @@ outcome that could not be written), so every older record gets one unpin whateve
 ``pinned`` says, and ``unpinned_at`` records that it was made (INV-19, 03-09). A history
 reset of the location sets ``history_reset_at`` on its active records: the worker then
 unpins each one in its own chat and retires it, with no final edit (DATA-03, D-08).
+An outage removal sets ``redraw_requested_at`` on today's active record (261006-qv7): the
+worker redraws today's chart at the time of its last update and clears the mark only if
+it is still the value it saw, so the next regular update still comes on schedule.
 
 The partial unique index ``chart_message_one_active_per_day`` allows at most one active
 (not retired) row per location and local date, so a second post for a day can never be
@@ -52,7 +55,8 @@ class ChartMessage(models.Model):
     pinned = models.BooleanField(default=False)
     # The last permanent pin failure; the pin is tried again after the next render (D-07).
     pin_failed_at = models.DateTimeField(null=True)
-    # When Telegram answered the last successful post or edit; the refresh cadence (D-05).
+    # When Telegram answered the last successful post or regular update; the refresh
+    # cadence (D-05). A redraw after an outage removal keeps it (261006-qv7).
     last_rendered_at = models.DateTimeField()
     # The finished-day edit is done (03-09).
     finalized_at = models.DateTimeField(null=True)
@@ -62,6 +66,9 @@ class ChartMessage(models.Model):
     retired_at = models.DateTimeField(null=True)
     # Set by a history reset (DATA-03, D-08): the record is released, never edited again.
     history_reset_at = models.DateTimeField(null=True)
+    # Set by an outage removal (261006-qv7): the worker redraws today's chart at its last
+    # update time and clears it.
+    redraw_requested_at = models.DateTimeField(null=True)
     created_at = models.DateTimeField()
 
     class Meta:

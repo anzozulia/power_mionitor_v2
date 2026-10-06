@@ -759,8 +759,8 @@ def test_run_iteration_ticks_after_every_row(
     )
 
     assert busy is True
-    # One tick per head (sent or skipped), one for the ops step.
-    assert len(ticks) == 3
+    # One tick per head (sent or skipped), one for the ops step, one for the delete step.
+    assert len(ticks) == 4
     assert (_status(sent), _status(not_due)) == (("sent", 1), ("pending", 0))
 
 

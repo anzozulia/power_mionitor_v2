@@ -162,7 +162,11 @@ On a 400 px wide phone, the smallest text (27 px) shows at about 8.4 px, and the
     line's top. It shows `HH:MM` local time.
   - The pill is centred on the line but clamped to [bar_x0 − 8, bar_x1 + 8].
   - The pill time is the render time, so it is the chart's only "last updated" time (the caption
-    carries none, section 8).
+    carries none, section 8). The exception is a redraw after an outage removal (DATA-02): it
+    keeps the time of the last update, so the pill does not move and the next update comes on
+    schedule. The kept time is the last update's answer time: when that update's render and
+    answer cross a minute boundary (a catch-up after a restart, or a retry), the redraw's pill
+    can show the following minute. (Amended 2026-10-06, quick task 261006-qv7.)
 - **Previous-week rows:**
   - Rows after today show the same weekday of the previous week: date = shown date − 7 days.
   - They use the dimmed colours and ink-muted text, and show their real dates (e.g. "Пт 25.09").
@@ -278,6 +282,10 @@ Interval-level tests (unit, no image):
   - today = Mon: 6 dimmed rows
   - today = Sun: no dimmed rows and no divider
 - [ ] Nothing is drawn after *now*, and the open interval ends at *now*.
+- [ ] A redraw after an outage removal keeps the last update's time: refresh answered at
+      18:30:00.8, period 15 min, removal at 18:43 → the redraw's pill shows 18:30, today's
+      segments end at 18:30, the removed outage is drawn as on, and the 18:45 update shows 18:45.
+      (Amended 2026-10-06, quick task 261006-qv7.)
 - [ ] An OFF interval under 8 px is drawn 8 px wide and stays inside the bar, including at 00:00 and 24:00.
 - [ ] Caption plural forms are correct for n = 1, 2, 5, 11, 21, 22 in uk and ru, and the finished-day caption uses the date.
 - [ ] A day with no on or off time at all is captioned in the neutral form in uk, en and ru (`Today: not monitored` on the live chart, `Thu 01.10: not monitored` on the finished day), never "no outages" (D-03).

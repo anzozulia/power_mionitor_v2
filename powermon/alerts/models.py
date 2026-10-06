@@ -17,6 +17,17 @@ Row statuses (RESEARCH Pattern 5):
 A row never holds secrets or text (T-01-45): ``payload`` carries integer microsecond
 durations only, the text is rendered at send time, the bot token and chat are read from
 the location at send time, and ``last_error`` is a short code, never a URL or a token.
+When Telegram accepts a subscriber alert, the chat it went to and Telegram's message id
+are stored with "sent" (``tg_chat_id``, ``tg_message_id``; 261006-qv7), so a removal of the
+outage can delete the message later: ids only, never the token.
+
+Delete requests (261006-qv7, DATA-02 amended): an outage removal sets
+``delete_requested_at`` on the outage's sent alerts that can still be deleted, and the
+worker's delete step settles each with ``delete_result`` (deleted, not_found, an
+``http_4xx`` code, too_old or cancelled). The CHECK ``outbox_delete_needs_ids`` allows a
+request only on a sent row with both ids, and the partial index ``outbox_delete_due_idx``
+covers the requests not settled yet. A request never changes the row's status, attempts
+or ``next_attempt_at``.
 ``OpsIncident`` (ARCHITECTURE Pattern 10, D-11) records an incident about the server's own
 state that the admin is told about: a monitoring gap (opened and closed in one
 transaction by the lapse carve, ``powermon.engine.lapse``), an all-silent spell (02-08)
@@ -45,6 +56,12 @@ OPEN_STATUSES = ("pending", "sending")
 CHANNEL_KNOWN = Q(channel__in=CHANNELS)
 STATUS_KNOWN = Q(status__in=STATUSES)
 IS_OPEN = Q(status__in=OPEN_STATUSES)
+# A delete request needs a sent row with the chat and Telegram's message id (261006-qv7).
+DELETE_NEEDS_IDS = Q(delete_requested_at__isnull=True) | Q(
+    status="sent", tg_chat_id__isnull=False, tg_message_id__isnull=False
+)
+# Delete requests the worker has not settled yet; the partial index covers only these.
+DELETE_DUE = Q(delete_requested_at__isnull=False, delete_result__isnull=True)
 # An incident is open until it has an end.
 INCIDENT_IS_OPEN = Q(ended_at__isnull=True)
 
@@ -74,18 +91,31 @@ class OutboxMessage(models.Model):
     # A short code such as "http_502" or "read_timeout"; never a URL or a token.
     last_error = models.CharField(max_length=64, default="", blank=True)
     sent_at = models.DateTimeField(null=True)
+    # The chat a subscriber alert was sent to, stored with "sent" (message ids are per chat).
+    tg_chat_id = models.BigIntegerField(null=True)
+    # Telegram's id for that message; NULL for ops rows and for an ok without a usable id.
+    tg_message_id = models.BigIntegerField(null=True)
+    # Set by an outage removal: the worker deletes this sent message from its chat.
+    delete_requested_at = models.DateTimeField(null=True)
+    # How the delete ended (deleted, not_found, http_4xx, too_old, cancelled); NULL while due.
+    delete_result = models.CharField(max_length=32, null=True)
 
     class Meta:
         db_table = "outbox_message"
         constraints = [
             models.CheckConstraint(condition=CHANNEL_KNOWN, name="outbox_channel_valid"),
             models.CheckConstraint(condition=STATUS_KNOWN, name="outbox_status_valid"),
+            models.CheckConstraint(condition=DELETE_NEEDS_IDS, name="outbox_delete_needs_ids"),
         ]
         indexes = [
             # The relay's head-of-line query: the oldest open row of each location.
             models.Index(
                 fields=["channel", "location", "id"], name="outbox_open_idx", condition=IS_OPEN
-            )
+            ),
+            # The delete step's query: each location's oldest delete request not settled.
+            models.Index(
+                fields=["location", "id"], name="outbox_delete_due_idx", condition=DELETE_DUE
+            ),
         ]
 
     def __str__(self) -> str:
