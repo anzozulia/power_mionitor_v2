@@ -505,26 +505,30 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
   - **Recent outages:** every outage of the last 14 local days, newest first, with its
     start, end and off time (the chart's daily-total format). The outage in progress reads
     "in progress" and has no Remove link. **Remove** turns a false outage that has ended
-    (for example the device or its internet connection was down while the power was on)
-    into power on: its off time no longer counts in the chart or the daily totals, and time inside it
-    that was not monitored stays not monitored. The pinned chart is redrawn within seconds
-    and keeps the time of its last update; the next update comes on schedule. It shows the
-    last 7 days; charts already posted for earlier days do not change. The live status
-    stays as it is, so the next OFF alert's "was ON for" still counts from the end of the
-    removed outage. An outage in progress cannot be removed: remove it after power returns.
-    The removal deletes the outage's OFF and ON alerts from the channel and drops any still
-    queued (for example while Telegram was unreachable): the worker deletes the OFF, then
-    the ON, within seconds (longer while Telegram makes the bot wait). If the OFF alert
-    cannot be deleted (sent more than 47 hours ago, sent before this update, or its
-    delivery is uncertain), both alerts stay and a queued ON alert is still sent, so the
-    channel is not left at power off. If Telegram refuses the OFF's delete, or it is too
-    old by then, its ON alert stays too (a queued ON that the removal dropped is sent after
-    all), with one WARNING in the worker log, no ops notice and no "delivery failing".
-    Delete such alerts by hand in Telegram. An alert already deleted by hand counts as
-    deleted. History reset deletes no message. If one of the outage's alerts (its OFF, or
-    the ON that ended it) is being sent at that moment, the page says so ("An alert about
-    this outage is being sent to the channel right now. Nothing changed. Try again in a
-    minute.") and nothing changes: try again a minute later. (Amended 2026-10-06, quick task 261006-qv7.)
+    (for example the device or its internet connection was down while the power was on) into
+    power on: its off time no longer counts in the chart or the daily totals, and time
+    inside it that was not monitored stays not monitored. The pinned chart is redrawn within
+    seconds and keeps the time of its last update; the next update comes on schedule. It
+    shows the last 7 days; charts already posted for earlier days do not change. The live
+    status stays as it is, except that removing the outage that last turned the power on
+    moves the location's On since time back to the end of the previous outage (or the start
+    of the history), so the next OFF alert's "was ON for" counts as if that outage never
+    happened. An OFF alert of a later outage that is still queued keeps the value it was
+    recorded with. (Amended 2026-10-07, quick task 261007-llg.) An outage in progress cannot
+    be removed: remove it after power returns. The removal deletes the outage's OFF and ON
+    alerts from the channel and drops any still queued (for example while Telegram was
+    unreachable): the worker deletes the OFF, then the ON, within seconds (longer while
+    Telegram makes the bot wait). If the OFF alert cannot be deleted (sent more than 47
+    hours ago, sent before this update, or its delivery is uncertain), both alerts stay and
+    a queued ON alert is still sent, so the channel is not left at power off. If Telegram
+    refuses the OFF's delete, or it is too old by then, its ON alert stays too (a queued ON
+    that the removal dropped is sent after all), with one WARNING in the worker log, no ops
+    notice and no "delivery failing". Delete such alerts by hand in Telegram. An alert
+    already deleted by hand counts as deleted. History reset deletes no message. If one of
+    the outage's alerts (its OFF, or the ON that ended it) is being sent at that moment, the
+    page says so ("An alert about this outage is being sent to the channel right now.
+    Nothing changed. Try again in a minute.") and nothing changes: try again a minute later.
+    (Amended 2026-10-06, quick task 261006-qv7.)
   - **Reset history:** deletes the location's whole recorded power history. It is refused
     while an outage is in progress (reset after power returns, or delete the location).
     The location then shows **Waiting for first heartbeat**; its next heartbeat restarts

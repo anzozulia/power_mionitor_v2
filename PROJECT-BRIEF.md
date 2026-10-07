@@ -216,7 +216,7 @@ Each requirement is user-visible or observable and testable. Section 3 defines t
 ### History (DATA)
 
 - [ ] **DATA-01**: Power history (on / off / not-monitored intervals) is kept indefinitely; raw heartbeats, if stored at all, are deleted after a configurable retention period (default 30 days).
-- [ ] **DATA-02**: Admin sees a location's recent outages and can remove a false one; the chart and totals update, and live monitoring is unaffected; removing an outage deletes its OFF/ON alerts from the channel where Telegram allows it and redraws today's chart at once, keeping its last update time. (Amended 2026-10-06, quick task 261006-qv7.)
+- [ ] **DATA-02**: Admin sees a location's recent outages and can remove a false one; the chart and totals update, and live monitoring is unaffected, except that the location's "on since" follows the corrected timeline; removing an outage deletes its OFF/ON alerts from the channel where Telegram allows it and redraws today's chart at once, keeping its last update time. (Amended 2026-10-06, quick task 261006-qv7.) (Amended 2026-10-07, quick task 261007-llg.)
 - [ ] **DATA-03**: Admin can reset a location's history.
 - [ ] **DATA-04**: Changing a location's thresholds never rewrites past history.
 
