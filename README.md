@@ -1468,9 +1468,15 @@ line in `/root/.ssh/authorized_keys` starts with
 `restrict,command="/usr/local/sbin/powermon-deploy"`, so the key can run nothing but that
 script, which:
 
-1. accepts only `deploy <40-hex commit>`, takes a lock (one deploy at a time) and fetches
-   `origin/master`. It refuses a commit that is not on `origin/master`;
-2. skips a commit that is not newer than the deployed one (a re-run of an old build);
+1. accepts only `deploy <40-hex commit>` and takes a lock (one deploy at a time). For a
+   commit other than the checked-out one, it fetches `origin/master` and refuses a commit
+   that is not on `origin/master`;
+2. skips a commit that is not newer than the deployed one (a re-run of an old build). The
+   commit that is already checked out comes again when GitHub starts two runs for one push
+   or a deploy job is re-run. While the site is healthy, it restarts nothing and logs
+   `ok <commit>: already deployed and healthy; nothing restarted`. While the site is not
+   healthy, it rebuilds and restarts that commit (steps 4, 6 and 7, with no rollback), so
+   re-running a failed deploy job retries it;
 3. checks the commit out and restarts nothing when only `docs/`, `tests/`, `.github/`,
    `deploy/`, `README.md`, `LICENSE` or `PROJECT-BRIEF.md` changed;
 4. builds the images first. A failed build changes nothing: the old commit stays checked
@@ -1585,22 +1591,28 @@ env file (section 7). Check the file with `python3 deploy/make-secrets.py --chec
 
 ### 17.7 Manual redeploy
 
-After an env change, or to retry a failed deploy of the commit that is checked out:
+After an env change, or to retry a failed deploy of the commit that is checked out, run
+from your machine:
 
 ```sh
-ssh hetzner 'SSH_ORIGINAL_COMMAND="deploy $(git -C /root/powermonitor rev-parse HEAD)" /usr/local/sbin/powermon-deploy'
+ssh hetzner /usr/local/sbin/powermon-deploy --redeploy
 ```
 
-It builds, runs `up --wait` and checks `/healthz` through nginx, and prints its log
-lines. Exit code 0 means deployed.
+It rebuilds the checked-out commit, runs `up --wait`, checks `/healthz` through nginx and
+prints its log lines. Exit code 0 means deployed. A CI re-run of the deployed commit does
+nothing while the site is healthy (17.2, step 2), so after an env change use this command,
+not a re-run. `--redeploy` works only as root on the server: the CI deploy key can send
+nothing but `deploy <commit>`, and the script refuses anything else.
 
 ### 17.8 Rollback
 
 - **Preferred:** `git revert` the bad commit on `master` and push. CI tests the revert
   and CD deploys it.
 - **Emergency:** on the server, `git -C /root/powermonitor checkout --detach <good commit>`,
-  then the manual redeploy (17.7). CD skips commits older than the deployed one, so the
-  next push to `master` moves the server forward again.
+  then `/usr/local/sbin/powermon-deploy --redeploy` (17.7). Run both: a CI run of the commit
+  that is checked out restarts nothing while the site is healthy, so after a checkout alone
+  the old images keep running. CD skips commits older than the deployed one, so the next
+  push to `master` moves the server forward again.
 - **After a migration:** section 8, and the restore in section 14.
 
 ### 17.9 Changing the deploy tooling
