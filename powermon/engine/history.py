@@ -26,24 +26,37 @@ timeline writer:
    can be sending itself). The attempt settles within seconds, and the next removal decides;
 4. each off piece of the outage becomes ``on`` through ``timeline.overwrite``, one piece at
    a time: not-monitored time inside the outage stays not monitored (D-02);
-5. the outage's alerts are settled (``_settle_alerts``, D-04 as refined by the maintainer
+5. if the outage is the one that last turned the location on (status on, no later off
+   piece, and no on piece starting between its end and ``on_since``, which rules out a
+   FIRST after a DB restore unless the outage was still in progress at the dump; that
+   corner rewinds across the restore gap, D-6), ``on_since`` goes back to where it would be
+   had the outage never been recorded. That is the end of the latest remaining off piece
+   before it, or else the start of the stored history (``transitions.REWIND_ON_SINCE_SQL``,
+   imported, never copied; quick task 261007-llg). Not-monitored pieces are ignored, as
+   lapses never move ``on_since``. The UPDATE bumps ``state_version`` only when it rewinds,
+   so a detector snapshot read before the removal loses its OFF CAS (INV-01); otherwise it
+   changes no row;
+6. the outage's alerts are settled (``_settle_alerts``, D-04 as refined by the maintainer
    on 2026-10-03 and amended by quick task 261006-qv7): when an OFF alert of the outage
    cannot be deleted (uncertain, sent before message ids were stored, or sent more than 47
    h ago), nothing is dropped or deleted and a queued ON alert is still sent, so the
    channel is never left at "power off";
-6. otherwise its queued alerts are dropped, and its sent alerts get a delete request
+7. otherwise its queued alerts are dropped, and its sent alerts get a delete request
    (``delete_requested_at``), which the worker's delete step carries out, OFF first;
-7. today's active chart record of the location is marked for a redraw
+8. today's active chart record of the location is marked for a redraw
    (``MARK_REDRAW_SQL``): the worker redraws today's chart within seconds, at the time of
    its last update (D-03 as amended by 261006-qv7).
 
-The removal never writes ``location_state`` (INV-07: the timeline only, never live
-detection), so detection carries on unchanged and the next OFF alert's "was ON for" still
-counts from ``on_since``. It queues no new message (no subscriber message, no ops notice):
-it only asks the worker, through rows written in its transaction, to delete the outage's
-alerts and to redraw today's chart (KD2, KD3), and logs one INFO line. The lock order is
-location_state, outbox_message, power_interval, chart_message. Adjacent ``on`` pieces left
-by a removal are not merged: the chart sums pieces by state, so they read as one span.
+Apart from that one conditional UPDATE, the removal never touches ``location_state``. The
+status, the last heartbeat, the outage start and the window start stay as they are
+(INV-07 as amended by 261007-llg), so detection carries on unchanged, and the next OFF
+alert's "was ON for" counts from the rewound ``on_since``. A later outage's OFF alert that
+is already queued keeps the value it was recorded with (261007-llg D-7). It queues no new
+message (no subscriber message, no ops notice): it only asks the worker, through rows
+written in its transaction, to delete the outage's alerts and to redraw today's chart
+(KD2, KD3), and logs one INFO line. The lock order is location_state, outbox_message,
+power_interval, chart_message. Adjacent ``on`` pieces left by a removal are not merged:
+the chart sums pieces by state, so they read as one span.
 
 The reset (``reset_history``, DATA-03) is one transaction under the same row lock, then the
 deleted check:
@@ -88,7 +101,7 @@ from powermon.alerts import outbox
 from powermon.alerts.models import OutboxMessage
 from powermon.chart import model
 from powermon.engine import timeline
-from powermon.engine.transitions import DELETED_SQL, LOCK_SQL, WAITING_SQL
+from powermon.engine.transitions import DELETED_SQL, LOCK_SQL, REWIND_ON_SINCE_SQL, WAITING_SQL
 
 log = logging.getLogger(__name__)
 
@@ -295,8 +308,9 @@ def remove_outage(
 
     - "removed": every off piece of the outage is ``on`` now, not-monitored pieces inside
       it are kept, its alerts are settled (``_settle_alerts``: queued ones dropped and sent
-      ones requested for deletion, unless its OFF alert cannot be deleted) and today's
-      chart record is marked for a redraw;
+      ones requested for deletion, unless its OFF alert cannot be deleted), today's chart
+      record is marked for a redraw and, when it is the outage that last turned the
+      location on, ``on_since`` is rewound (``REWIND_ON_SINCE_SQL``);
     - "gone", with nothing written: the location is unknown or deleted, or it has no off
       piece with that outage start (a double click, a second tab, a reset in between, a
       hand-made start; UI5-D8);
@@ -308,9 +322,9 @@ def remove_outage(
       write. The next removal decides from the settled rows.
 
     "gone", "in_progress" and "sending" write nothing at all: no request and no mark.
-    ``location_state`` is never written. A restore needs no change for the delete requests
-    (``restore.DROP_QUEUED_SQL``): the requests in a dump match that dump's timeline.
-    ValueError for a naive ``outage_start`` or ``now``.
+    ``location_state`` is written only by that rewind. A restore needs no change for the
+    delete requests (``restore.DROP_QUEUED_SQL``): the requests in a dump match that dump's
+    timeline. ValueError for a naive ``outage_start`` or ``now``.
     """
     _aware(outage_start)
     _aware(now)
@@ -345,6 +359,11 @@ def remove_outage(
         # its not-monitored pieces into on (D-02).
         for start, end in pieces:
             timeline.overwrite(cur, location_id, start, end, "on")
+        # The 261007-llg on_since rewind: a no-op unless this outage last turned it on.
+        outage_end = max(piece_end for _start, piece_end in pieces)
+        cur.execute(
+            REWIND_ON_SINCE_SQL, {"id": location_id, "start": outage_start, "end": outage_end}
+        )
         dropped, requested = _settle_alerts(offs, ons, now)
         today = model.local_today(now, tz)
         cur.execute(MARK_REDRAW_SQL, {"id": location_id, "today": today, "now": now})

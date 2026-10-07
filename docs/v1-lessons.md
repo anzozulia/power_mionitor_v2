@@ -98,13 +98,14 @@ Source: a September 2026 investigation of the v1 codebase (Django, last changed 
   - Given the last heartbeat 80 s ago, when the admin lowers grace from 30 s to 10 s, then the next cycle records off, starting at that last heartbeat.
 - **Covers:** DATA-04
 
-#### INV-07 Admin corrections edit the timeline only, never heartbeats or live detection
-- **Rule:** "Remove false outage" turns a closed off interval into on and recomputes that day's totals and chart. It sends no new message; it deletes the outage's OFF and ON alerts from the channel where Telegram allows it. (Amended 2026-10-06, quick task 261006-qv7.) "Reset history" clears the timeline and returns the location to "waiting for first heartbeat". Neither action touches raw heartbeats. No admin action may leave a location in a state the detector ignores. An outage still in progress cannot be removed (default).
+#### INV-07 Admin corrections edit the timeline only, never heartbeats or live detection (except the "on since" rewind)
+- **Rule:** "Remove false outage" turns a closed off interval into on and recomputes that day's totals and chart. It sends no new message; it deletes the outage's OFF and ON alerts from the channel where Telegram allows it. (Amended 2026-10-06, quick task 261006-qv7.) "Reset history" clears the timeline and returns the location to "waiting for first heartbeat". Neither action touches raw heartbeats. No admin action may leave a location in a state the detector ignores. An outage still in progress cannot be removed (default). Removing the outage that last turned the location on also moves the location's "on since" back to where it would be had that outage never been recorded: the end of the previous remaining outage, or the start of the stored history. So the next OFF alert's "was ON for" and the "On since" shown on the location page follow the corrected timeline. The status, the last heartbeat and the outage in progress are still never touched. (Amended 2026-10-07, quick task 261007-llg.)
 - **v1 failure:** Event delete was either broken or destructive. It returned HTTP 500 for any event that had a later event, because it saved a field that does not exist. Deleting the newest ON event deleted the real heartbeats that followed it (120 → 60), flipped the status to off, and made the next heartbeat send a false "POWER ON, was OFF for 1h 1m". Deleting a new location's only event left its status "unknown" forever, a state the detector never checked, so a later 1 h outage produced no alert.
 - **Acceptance:**
   - Given a day with outages 09:00-10:00 and 15:00-15:30, when the admin removes the first, then 09:00-10:00 becomes on; the totals change from "1h 30m · 2" to "30m · 1"; the second outage is untouched; 0 messages are sent; the current status is unchanged.
   - Given a location that has just started monitoring, when the admin resets its history, then later heartbeats restart monitoring (K-1), and a 1 h silence after that produces exactly one OFF alert.
   - Given an outage in progress, when the admin tries to remove it, then the action is refused with an explanation.
+  - Given on since 08:00 and a false outage 12:00-12:05 removed at 12:10, when power goes off at 14:00, then the OFF alert says "Power was ON for: 6h". (Amended 2026-10-07, quick task 261007-llg.)
 - **Covers:** DATA-02, DATA-03
 
 #### INV-08 Day geometry follows the local wall clock (DST, midnight, now)
@@ -353,7 +354,7 @@ Source: a September 2026 investigation of the v1 codebase (Django, last changed 
 | INV-04 not monitored ≠ off | LOC-08, MON-05, CHRT-01, CHRT-03 |
 | INV-05 one effect per toggle | LOC-08, LOC-09, LOC-10 |
 | INV-06 thresholds don't rewrite history | DATA-04 |
-| INV-07 admin corrections edit the timeline only | DATA-02, DATA-03 |
+| INV-07 admin corrections edit the timeline only (plus the on-since rewind) | DATA-02, DATA-03 |
 | INV-08 wall-clock day geometry | CHRT-06, CHRT-02, CHRT-03 |
 | INV-09 heartbeats are disposable | DATA-01 |
 | INV-10 lapses are not monitored, fresh window | MON-05, MON-06, OPS-02 |

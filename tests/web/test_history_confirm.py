@@ -105,8 +105,9 @@ CONSEQUENCE_3 = (
     "channel is not left at power off;"
 )
 CONSEQUENCE_4 = (
-    "leaves the live status unchanged, including the On since time from which the next OFF "
-    'alert counts "was ON for".'
+    "if it is the outage that last turned the power on, moves the On since time back to the "
+    "end of the previous outage (or the start of the history), so the next OFF alert's "
+    '"was ON for" counts as if this outage never happened.'
 )
 CLOSING = (
     "The pinned chart is redrawn within seconds and keeps the time of its last update; the "

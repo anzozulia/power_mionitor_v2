@@ -82,6 +82,37 @@ UPDATE location_state
  WHERE location_id = %(id)s
 """
 
+# Removing the outage that last turned the location on (DATA-02, INV-07 as amended by quick
+# task 261007-llg) moves on_since back to where it would be had that outage never been
+# recorded: the end of the latest earlier off piece, or else the start of the stored
+# history. history.remove_outage runs it under the row lock, right after the outage's off
+# pieces became on. It changes no row unless all three hold:
+# - the location is on;
+# - no off piece starts after the removed outage, so it is the latest one;
+# - no on piece starts between the removed outage's end and on_since, so on_since came from
+#   this outage's restore and not from a FIRST after a DB restore that followed it.
+#   Accepted corner (D-6): an outage still in progress at the dump was closed at the dump's
+#   cursor by the post-restore step, so the FIRST's on piece starts exactly at on_since and
+#   the rewind crosses the restore gap.
+# Not-monitored pieces are ignored, as lapses never move on_since. The state_version bump
+# comes only with a rewind, so a detector snapshot read before the removal loses its OFF CAS
+# (INV-01). Router grace then counts from the rewound value too, which is right: the power
+# never came back at the removed restore.
+REWIND_ON_SINCE_SQL = """
+UPDATE location_state s
+   SET on_since = COALESCE(
+         (SELECT max(p.end_at) FROM power_interval p
+           WHERE p.location_id = %(id)s AND p.state = 'off' AND p.start_at < %(start)s),
+         (SELECT min(p.start_at) FROM power_interval p WHERE p.location_id = %(id)s)),
+       state_version = s.state_version + 1
+ WHERE s.location_id = %(id)s AND s.status = 'on' AND s.on_since >= %(end)s
+   AND NOT EXISTS (SELECT 1 FROM power_interval p
+                    WHERE p.location_id = %(id)s AND p.state = 'off' AND p.start_at > %(start)s)
+   AND NOT EXISTS (SELECT 1 FROM power_interval p
+                    WHERE p.location_id = %(id)s AND p.state = 'on'
+                      AND p.start_at >= %(end)s AND p.start_at < s.on_since)
+"""
+
 # on: a plain heartbeat. GREATEST keeps an older timestamp from moving it back (D-08).
 PLAIN_SQL = """
 UPDATE location_state
