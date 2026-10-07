@@ -6,11 +6,16 @@
 #
 # Two callers:
 #   - GitHub Actions (.github/workflows/ci.yml, job deploy). This script is the forced command
-#     of the CI deploy key in /root/.ssh/authorized_keys, so the client's command arrives in
-#     SSH_ORIGINAL_COMMAND and must be exactly "deploy <40-hex commit>".
-#   - The owner, as root on the server. Passing the checked-out commit redeploys it, e.g.
-#     after an env file change:
-#       SSH_ORIGINAL_COMMAND="deploy $(git -C /root/powermonitor rev-parse HEAD)" /usr/local/sbin/powermon-deploy
+#     of the CI deploy key in /root/.ssh/authorized_keys, so it gets no arguments and the
+#     client's command arrives in SSH_ORIGINAL_COMMAND: exactly "deploy <40-hex commit>".
+#     GitHub can start two runs for one push, and a deploy job can be re-run: the commit
+#     that is already checked out restarts nothing while the site is healthy, and is rebuilt
+#     and restarted while it is not.
+#   - The owner, as root on the server: exactly one argument, --redeploy, and no
+#     SSH_ORIGINAL_COMMAND. It rebuilds and restarts the checked-out commit, e.g. after an
+#     env file change:
+#       ssh hetzner /usr/local/sbin/powermon-deploy --redeploy
+#   Anything else is refused.
 #
 # A new commit must be on origin/master. A commit that is not newer than the deployed one
 # is skipped. When only non-runtime paths changed, the commit is checked out and nothing
@@ -19,7 +24,8 @@
 # started and checked through the host nginx. A failed start rolls back to the previous
 # commit, except after a migration (README section 8).
 #
-# Prints no env value. Exit codes: 0 deployed or nothing to do; 1 failed; 2 refused.
+# Prints no env value. Exit codes: 0 deployed or nothing to do (an already deployed, healthy
+# commit included); 1 failed; 2 refused.
 
 set -Eeuo pipefail
 umask 022
@@ -87,12 +93,19 @@ prune() {
   fi
 }
 
+# The CI key's forced command runs with no arguments, so CI can send only "deploy <sha>",
+# through SSH_ORIGINAL_COMMAND. A root shell on the server has no SSH_ORIGINAL_COMMAND.
+# The input is never logged.
 cmd=${SSH_ORIGINAL_COMMAND:-}
-if [[ ! $cmd =~ ^deploy\ ([0-9a-f]{40})$ ]]; then
-  log "refused: the command must be 'deploy <40-hex commit>'"
+if [[ $# -eq 0 && $cmd =~ ^deploy\ ([0-9a-f]{40})$ ]]; then
+  mode=deploy
+  SHA=${BASH_REMATCH[1]}
+elif [[ $# -eq 1 && ${1:-} == --redeploy && -z $cmd ]]; then
+  mode=redeploy
+else
+  log "refused: the command must be 'deploy <40-hex commit>' (CI) or '--redeploy' (root on the server)"
   exit 2
 fi
-SHA=${BASH_REMATCH[1]}
 
 exec 9> "$LOCK"
 if ! flock -w 900 9; then
@@ -107,6 +120,10 @@ if [[ ! -f docker-compose.vps.yml ]]; then
 fi
 PREV=$(git rev-parse HEAD)
 started=$SECONDS
+# --redeploy: the checked-out commit, rebuilt and restarted below (README section 17.7).
+if [[ $mode == redeploy ]]; then
+  SHA=$PREV
+fi
 
 if [[ $SHA != "$PREV" ]]; then
   timeout 120 git fetch --quiet origin +refs/heads/master:refs/remotes/origin/master
@@ -140,6 +157,15 @@ if [[ $SHA != "$PREV" ]]; then
     log "ok $SHA: no runtime change since $PREV; checked out, nothing restarted"
     exit 0
   fi
+elif [[ $mode == deploy ]]; then
+  # The deployed commit again: GitHub can start two runs for one push, and a deploy job can
+  # be re-run. Nothing to do while the site is healthy. Otherwise the build and start below
+  # retry it, with no earlier commit to roll back to.
+  if healthy; then
+    log "ok $SHA: already deployed and healthy; nothing restarted"
+    exit 0
+  fi
+  log "redeploying $SHA: it is checked out but the site is not healthy"
 fi
 
 # Build first: a failed build restarts nothing.
