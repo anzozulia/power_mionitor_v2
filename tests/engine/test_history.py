@@ -1,5 +1,5 @@
 """History corrections in the engine (DATA-02, DATA-03; D-01, D-02, D-04, D-05, D-06, D-07,
-UI5-D9; INV-07 #1, #2, #3).
+UI5-D9; INV-07 #1, #2, #3, #4).
 
 ``history.recent_outages`` reads the stored timeline as the chart does (KD1): one outage per
 ``outage_start_at`` (D-01, the chart's count rule), newest first, over the last 14 local
@@ -18,8 +18,11 @@ location's ``location_state`` row lock first:
   (``redraw_requested_at``), all in the removal's transaction; while the OFF is sending the
   removal is deferred with nothing written (wave-1 audit amendment, W1-A1), and so it is
   while the outage's own ON alert is sending (wave-2 audit, W2-A1);
-- live state (status, last heartbeat, on since, outage start, window start, state version)
-  is never written, nothing is queued and nothing is sent (INV-07 #1).
+- live state (status, last heartbeat, outage start, window start) is never written, nothing
+  is queued and nothing is sent (INV-07 #1). ``on_since`` is written only when the removed
+  outage is the one that last turned the location on: it goes back to the end of the
+  previous remaining outage, or the start of the stored history, with ``state_version``
+  bumped (INV-07 #4, 261007-llg).
 
 ``history.reset_history`` is one transaction under the same row lock: refused while the
 locked status is off, maintenance or not (D-06); nothing written without history (UI5-D9);
@@ -55,7 +58,7 @@ from conftest import (
 )
 from django.db import IntegrityError, connection, transaction
 
-from powermon.alerts import delivery, outbox
+from powermon.alerts import delivery, outbox, texts
 from powermon.alerts.models import OpsIncident, OutboxMessage
 from powermon.chart import source
 from powermon.chart.models import ChartMessage
@@ -97,7 +100,10 @@ def _intervals(location: Any) -> list[Interval]:
 
 
 def _live(location: Any) -> tuple[Any, ...]:
-    """Every live detection field of the location's state row (INV-07: never written)."""
+    """Every live detection field of the location's state row.
+
+    INV-07: never written, except the on_since rewind of INV-07 #4 (261007-llg).
+    """
     state = LocationState.objects.get(location=location)
     return (
         state.status,
@@ -1623,3 +1629,258 @@ def test_INV02_claim_of_the_dropped_on_waits_and_sends_nothing(
     assert claimer.result is False
     assert _status(on) == ("dropped", history.OUTAGE_REMOVED)
     assert _requests() == [("power_off", _at(9, 0), REMOVAL, None)]
+
+
+# INV-07 #4 (261007-llg): removing the outage that last turned the location on rewinds on_since
+
+
+def _remove(location: Any, start: datetime, now: datetime) -> str:
+    """Remove the location's outage that starts at ``start``, at ``now`` (display TZ Kyiv)."""
+    return history.remove_outage(location.pk, start, now=now, tz=KYIV)
+
+
+def _rewound(location: Any) -> tuple[datetime | None, int]:
+    """The location's (on_since, state_version): the two fields the rewind writes."""
+    live = _live(location)
+    return live[2], live[5]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV07_4_K2_removing_the_latest_outage_rewinds_on_since(
+    location_factory: Callable[..., Any],
+) -> None:
+    _no_anchors()
+    location = location_factory()
+    assert transitions.record_heartbeat(location.pk, _at(8, 0)) == "started"
+    assert transitions.record_heartbeat(location.pk, _at(9, 0)) == "plain"
+    assert detection.run_cycle(_at(9, 1, 31)) == 1
+    assert transitions.record_heartbeat(location.pk, _at(10, 0)) == "restored"
+    # The false outage: 12:00-12:05.
+    assert transitions.record_heartbeat(location.pk, _at(12, 0)) == "plain"
+    assert detection.run_cycle(_at(12, 1, 31)) == 1
+    assert transitions.record_heartbeat(location.pk, _at(12, 5)) == "restored"
+    version = _live(location)[5]
+
+    assert _remove(location, _at(12, 0), _at(12, 10)) == "removed"
+
+    # on_since goes back to the end of the 09:00-10:00 outage, with the CAS token bumped;
+    # the status, the last heartbeat, the outage start and the window start stay.
+    assert _live(location) == ("on", _at(12, 5), _at(10, 0), _at(12, 0), None, version + 1)
+    # K-2: the next OFF is backdated to the last heartbeat and counts from 10:00 (4 h, not
+    # the 1h55m it said before 261007-llg).
+    assert transitions.record_heartbeat(location.pk, _at(14, 0)) == "plain"
+    assert detection.run_cycle(_at(14, 1, 31)) == 1
+    assert _row_of(location, "power_off", _at(14, 0)).payload == {"was_on_us": _us(hours=4)}
+    # D-1: the ON alert counts only the outage that ends, rewind or not.
+    assert transitions.record_heartbeat(location.pk, _at(14, 30)) == "restored"
+    on = _row_of(location, "power_on", _at(14, 30))
+    assert on.payload == {"was_off_us": _us(minutes=30)}
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("off_alert", ["queued", "sent_without_id"])
+def test_INV07_4_acceptance_off_alert_says_power_was_on_for_6h(
+    location_factory: Callable[..., Any], off_alert: str
+) -> None:
+    # Given on since 08:00 and a false outage 12:00-12:05 removed at 12:10,
+    _no_anchors()
+    location = location_factory()
+    assert transitions.record_heartbeat(location.pk, _at(8, 0)) == "started"
+    assert transitions.record_heartbeat(location.pk, _at(12, 0)) == "plain"
+    assert detection.run_cycle(_at(12, 1, 31)) == 1
+    if off_alert == "sent_without_id":
+        # D-8: its OFF alert went out with no stored message id, so it cannot be deleted
+        # and stays in the channel; the rewind still follows the corrected timeline.
+        off = _row_of(location, "power_off", _at(12, 0))
+        assert outbox.claim(off.pk) is True
+        assert outbox.mark_sent(off.pk, _at(12, 1, 32)) is True
+    assert transitions.record_heartbeat(location.pk, _at(12, 5)) == "restored"
+    assert _remove(location, _at(12, 0), _at(12, 10)) == "removed"
+    assert _live(location)[2] == _at(8, 0)
+
+    # when power goes off at 14:00,
+    assert transitions.record_heartbeat(location.pk, _at(14, 0)) == "plain"
+    assert detection.run_cycle(_at(14, 1, 31)) == 1
+
+    # then the OFF alert says "Power was ON for: 6h".
+    row = _row_of(location, "power_off", _at(14, 0))
+    assert row.payload == {"was_on_us": _us(hours=6)}
+    text = texts.render_alert(row.kind, "en", row.payload["was_on_us"])
+    assert "Power was ON for: <b>6h</b>" in text
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("order", ["newest_first", "oldest_first"])
+def test_INV07_4_removing_every_outage_counts_from_the_start_of_history(
+    location_factory: Callable[..., Any], order: str
+) -> None:
+    # The production replay: two false outages, both removed.
+    _no_anchors()
+    location = location_factory()
+    assert transitions.record_heartbeat(location.pk, _at(8, 0)) == "started"
+    assert transitions.record_heartbeat(location.pk, _at(9, 0)) == "plain"
+    assert detection.run_cycle(_at(9, 1, 31)) == 1
+    assert transitions.record_heartbeat(location.pk, _at(9, 2)) == "restored"
+    assert transitions.record_heartbeat(location.pk, _at(11, 0)) == "plain"
+    assert detection.run_cycle(_at(11, 1, 31)) == 1
+    assert transitions.record_heartbeat(location.pk, _at(11, 3)) == "restored"
+    version = _live(location)[5]
+
+    if order == "newest_first":
+        assert _remove(location, _at(11, 0), _at(11, 10)) == "removed"
+        assert _rewound(location) == (_at(9, 2), version + 1)
+        assert _remove(location, _at(9, 0), _at(11, 11)) == "removed"
+        assert _rewound(location) == (_at(8, 0), version + 2)
+    else:
+        before = _live(location)
+        # Not the latest outage: no live field changes, not even the CAS token.
+        assert _remove(location, _at(9, 0), _at(11, 10)) == "removed"
+        assert _live(location) == before
+        assert _remove(location, _at(11, 0), _at(11, 11)) == "removed"
+        assert _rewound(location) == (_at(8, 0), version + 1)
+
+    assert transitions.record_heartbeat(location.pk, _at(13, 0)) == "plain"
+    assert detection.run_cycle(_at(13, 1, 31)) == 1
+    assert _row_of(location, "power_off", _at(13, 0)).payload == {"was_on_us": _us(hours=5)}
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("exit_first", [True, False])
+def test_INV07_4_removed_outage_restored_during_maintenance_rewinds(
+    location_factory: Callable[..., Any], exit_first: bool
+) -> None:
+    _no_anchors()
+    location = location_factory()
+    assert transitions.record_heartbeat(location.pk, _at(8, 0)) == "started"
+    assert transitions.record_heartbeat(location.pk, _at(9, 0)) == "plain"
+    assert detection.run_cycle(_at(9, 1, 31)) == 1
+    assert transitions.record_heartbeat(location.pk, _at(10, 0)) == "restored"
+    assert transitions.record_heartbeat(location.pk, _at(12, 0)) == "plain"
+    assert detection.run_cycle(_at(12, 1, 31)) == 1
+    # Maintenance from 12:03 ends the off piece there (E = 12:03); the restore at 12:05
+    # sets on_since after it (R = 12:05).
+    assert maintenance.set_maintenance(location.pk, True, _at(12, 3)) is True
+    assert transitions.record_heartbeat(location.pk, _at(12, 5)) == "restored"
+
+    if exit_first:
+        assert maintenance.set_maintenance(location.pk, False, _at(12, 10)) is True
+        version = _live(location)[5]
+        assert _remove(location, _at(12, 0), _at(12, 15)) == "removed"
+        assert _rewound(location) == (_at(10, 0), version + 1)
+    else:
+        # D-6: removed while maintenance is on and the status is on.
+        version = _live(location)[5]
+        assert _remove(location, _at(12, 0), _at(12, 8)) == "removed"
+        assert _rewound(location) == (_at(10, 0), version + 1)
+        assert maintenance.set_maintenance(location.pk, False, _at(12, 10)) is True
+
+    # D-5: the not-monitored 12:03-12:10 counts as ON.
+    assert transitions.record_heartbeat(location.pk, _at(14, 0)) == "plain"
+    assert detection.run_cycle(_at(14, 1, 31)) == 1
+    assert _row_of(location, "power_off", _at(14, 0)).payload == {"was_on_us": _us(hours=4)}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV07_4_previous_outage_restored_during_maintenance_lands_on_its_off_end(
+    location_factory: Callable[..., Any],
+) -> None:
+    _no_anchors()
+    location = location_factory()
+    assert transitions.record_heartbeat(location.pk, _at(8, 0)) == "started"
+    assert transitions.record_heartbeat(location.pk, _at(9, 0)) == "plain"
+    assert detection.run_cycle(_at(9, 1, 31)) == 1
+    # The previous outage's off piece ends at the maintenance entry M0 = 10:00. Its restore
+    # R0 = 10:05 falls inside maintenance and is not stored in the timeline.
+    assert maintenance.set_maintenance(location.pk, True, _at(10, 0)) is True
+    assert transitions.record_heartbeat(location.pk, _at(10, 5)) == "restored"
+    assert maintenance.set_maintenance(location.pk, False, _at(10, 10)) is True
+    assert transitions.record_heartbeat(location.pk, _at(12, 0)) == "plain"
+    assert detection.run_cycle(_at(12, 1, 31)) == 1
+    assert transitions.record_heartbeat(location.pk, _at(12, 5)) == "restored"
+
+    assert _remove(location, _at(12, 0), _at(12, 10)) == "removed"
+
+    # D-6, accepted: the rewind lands on M0, not on R0.
+    assert _live(location)[2] == _at(10, 0)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV07_4_INV01_snapshot_read_before_the_removal_loses_its_off(
+    monkeypatch: pytest.MonkeyPatch, location_factory: Callable[..., Any]
+) -> None:
+    _no_anchors()
+    location = location_factory()
+    assert transitions.record_heartbeat(location.pk, _at(8, 0)) == "started"
+    assert transitions.record_heartbeat(location.pk, _at(9, 0)) == "plain"
+    assert detection.run_cycle(_at(9, 1, 31)) == 1
+    assert transitions.record_heartbeat(location.pk, _at(9, 30)) == "restored"
+    assert transitions.record_heartbeat(location.pk, _at(10, 0)) == "plain"
+    real = transitions.read_snapshots
+    removed: list[bool] = []
+
+    def snapshot_then_remove() -> Any:
+        snapshots = real()
+        if not removed:
+            # The admin removes the 09:00 outage between the detector's snapshot and its CAS.
+            assert _remove(location, _at(9, 0), _at(10, 1, 30)) == "removed"
+            removed.append(True)
+        return snapshots
+
+    monkeypatch.setattr(transitions, "read_snapshots", snapshot_then_remove)
+
+    # The snapshot's state_version is stale after the rewind: its OFF CAS changes no row.
+    assert detection.run_cycle(_at(10, 1, 31)) == 0
+    off_at_10 = OutboxMessage.objects.filter(
+        location=location, kind="power_off", event_at=_at(10, 0)
+    )
+    assert not off_at_10.exists()
+    assert _live(location)[2] == _at(8, 0)
+    # The next cycle reads the rewound on_since: "was ON for" is 2 h, not 30 min.
+    assert detection.run_cycle(_at(10, 1, 32)) == 1
+    assert _row_of(location, "power_off", _at(10, 0)).payload == {"was_on_us": _us(hours=2)}
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    "case", ["later_outage_in_progress", "first_after_db_restore", "waiting_after_db_restore"]
+)
+def test_INV07_4_removal_keeps_on_since(location_factory: Callable[..., Any], case: str) -> None:
+    _no_anchors()
+    location = location_factory()
+    assert transitions.record_heartbeat(location.pk, _at(8, 0)) == "started"
+    assert transitions.record_heartbeat(location.pk, _at(9, 0)) == "plain"
+    assert detection.run_cycle(_at(9, 1, 31)) == 1
+    # A: the false outage 09:00-09:30.
+    assert transitions.record_heartbeat(location.pk, _at(9, 30)) == "restored"
+
+    if case == "later_outage_in_progress":
+        # B, a later outage, is in progress: A is not the latest, and the status is off.
+        assert transitions.record_heartbeat(location.pk, _at(11, 0)) == "plain"
+        assert detection.run_cycle(_at(11, 1, 31)) == 1
+        before = _live(location)
+        assert _remove(location, _at(9, 0), _at(11, 10)) == "removed"
+        assert _live(location) == before
+        # D-7: B's pending OFF keeps the value it was recorded with (a documented limit).
+        b_off = _row_of(location, "power_off", _at(11, 0))
+        assert b_off.payload == {"was_on_us": _us(hours=1, minutes=30)}
+        # D-1: B's ON counts B only, and on_since moves to B's restore.
+        assert transitions.record_heartbeat(location.pk, _at(11, 30)) == "restored"
+        b_on = _row_of(location, "power_on", _at(11, 30))
+        assert b_on.payload == {"was_off_us": _us(minutes=30)}
+        assert _live(location)[2] == _at(11, 30)
+        return
+
+    # A database restore whose dump's last cycle ran at 10:00:30, after A ended. Without the
+    # cursor the post-restore step would replace the on piece from 09:30.
+    assert transitions.record_heartbeat(location.pk, _at(10, 0)) == "plain"
+    SystemState.objects.filter(pk=1).update(last_cycle_completed_at=_at(10, 0, 30))
+    restore.restart_after_restore(_at(10, 30))
+    if case == "first_after_db_restore":
+        # The FIRST sets on_since 10:31. The on piece 09:30-10:00:30 starts between A's end
+        # and on_since, so A's restore did not set on_since: no rewind across the gap.
+        assert transitions.record_heartbeat(location.pk, _at(10, 31)) == "started"
+    before = _live(location)
+
+    assert _remove(location, _at(9, 0), _at(10, 40)) == "removed"
+
+    assert _live(location) == before
