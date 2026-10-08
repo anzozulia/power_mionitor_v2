@@ -983,7 +983,10 @@ same `postgres:18.6-trixie` image as `db`, so `pg_dump` has the server's version
   hold every bot token and device key, so reading them needs `sudo`. There is no automated
   off-site copy: copy dumps off the VPS by hand (below).
 - **Health:** `docker compose -f docker-compose.prod.yml ps backup` shows `healthy` while
-  the newest dump is under 26 hours old. A failing backup shows only there and in
+  the newest dump is under 26 hours old. It also shows `unhealthy` while a dump is dated
+  more than 5 minutes in the future (taken while the server clock was ahead): the nightly
+  dumps go on, and it turns healthy once that file is moved out of the backup directory.
+  A failing backup shows only there and in
   `docker compose -f docker-compose.prod.yml logs backup`: each dump logs
   `backup: dump powermon-….dump ok`, each failure one `backup: error: …` line. There is no
   ops notice for it, so look at it after each deploy and now and then.
