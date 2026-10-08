@@ -377,6 +377,17 @@ def _db_unavailable() -> HttpResponse:
     return response
 
 
+def _unauthorized() -> HttpResponse:
+    """401 ``unauthorized`` for a missing, malformed or unknown key (HB-02)."""
+    response = HttpResponse("unauthorized", status=401, content_type="text/plain")
+    response["WWW-Authenticate"] = 'Bearer realm="heartbeat"'
+    # Like _db_unavailable: Django's log_response skips a response with this flag. Without
+    # it, a device on an old key writes one "Unauthorized: /hb" WARNING per beat (every
+    # 10 s); the DEBUG line in HeartbeatView._beat records the rejection (F-26).
+    response._has_been_logged = True  # type: ignore[attr-defined]
+    return response
+
+
 @method_decorator([login_not_required, csrf_exempt, no_append_slash], name="dispatch")
 class HeartbeatView(View):
     """``/hb``: a device reports that mains power (and internet) is up (HB-01, HB-02, D-06).
@@ -385,9 +396,11 @@ class HeartbeatView(View):
     or unknown key, 405 for any other method, never a redirect. The key is looked up before
     any write, a malformed key costs no query, and the request does no network I/O (KD2).
     While the database cannot be reached, the answer is 503 ``db unavailable`` with one
-    WARNING per outage per process (D-16). Any other database error is a bug: it
-    propagates, so Django answers 500 and logs the traceback through the redacting
-    formatter, and the outage flag stays as it was.
+    WARNING per outage per process (D-16). A 401 writes no ``django.request`` WARNING
+    either (F-26): a device on an old key would write one per beat, and the DEBUG line
+    records the rejection. Any other database error is a bug: it propagates, so Django
+    answers 500 and logs the traceback through the redacting formatter, and the outage
+    flag stays as it was.
     """
 
     # Everything else, HEAD and OPTIONS included, gets 405.
@@ -425,9 +438,7 @@ class HeartbeatView(View):
         if location_id is None:
             # Nothing is written for a rejected request (HB-02). Never log the key.
             log.debug("heartbeat rejected: missing, malformed or unknown key")
-            response = HttpResponse("unauthorized", status=401, content_type="text/plain")
-            response["WWW-Authenticate"] = 'Bearer realm="heartbeat"'
-            return response
+            return _unauthorized()
         _HEARTBEAT_DB.ok()
         log.debug("heartbeat: location %s %s", location_id, result)
         return HttpResponse("ok", content_type="text/plain")
