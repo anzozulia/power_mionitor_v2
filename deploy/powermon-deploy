@@ -44,6 +44,8 @@ COMPOSE=(docker compose -f docker-compose.prod.yml -f docker-compose.vps.yml)
 NON_RUNTIME_RE='^(docs/|tests/|\.github/|deploy/|README\.md$|LICENSE$|PROJECT-BRIEF\.md$|docker-compose\.(local|ci|dev-ui)\.yml$|\.gitignore$)'
 # A change here can change the schema: Django's own migrations come with uv.lock.
 SCHEMA_PATHS=(powermon/migrations uv.lock)
+# Present while a restore runs (README section 14): every deploy refuses.
+MAINTENANCE=$REPO_DIR/.maintenance
 SHA=""
 
 log() {
@@ -124,6 +126,12 @@ started=$SECONDS
 # --redeploy: the checked-out commit, rebuilt and restarted below (README section 17.7).
 if [[ $mode == redeploy ]]; then
   SHA=$PREV
+fi
+# A restore holds the marker from before its first step until after its last (README
+# section 14). Checked under the lock, before any fetch, build or restart.
+if [[ -e $MAINTENANCE ]]; then
+  log "FAILED $SHA: maintenance in progress ($MAINTENANCE exists; README section 14); nothing done"
+  exit 1
 fi
 
 if [[ $SHA != "$PREV" ]]; then

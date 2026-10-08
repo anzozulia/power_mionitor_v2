@@ -10,3 +10,4 @@ staticfiles
 powermon/web/static/web/build
 .github
 deploy
+.maintenance

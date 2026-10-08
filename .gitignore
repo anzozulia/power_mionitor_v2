@@ -7,3 +7,4 @@ staticfiles/
 __pycache__/
 .coverage*
 powermon/web/static/web/build/
+/.maintenance

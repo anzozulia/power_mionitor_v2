@@ -1039,6 +1039,7 @@ database that already has tables, and it never drops or cleans one.
 (for example `cd ~/power-monitor`), choose the dump, then run:
 
 ```sh
+sudo flock /run/lock/powermon-deploy.lock touch .maintenance
 sudo ls -l docker_data/prod/backups/
 F=powermon-20261003T030000Z.dump
 docker compose -f docker-compose.prod.yml stop web worker backup
@@ -1049,7 +1050,12 @@ docker compose -f docker-compose.prod.yml run --rm --no-deps backup bash /backup
 docker compose -f docker-compose.prod.yml run --rm --build migrate
 docker compose -f docker-compose.prod.yml run --rm --no-deps migrate python manage.py post_restore
 docker compose -f docker-compose.prod.yml up -d --build --wait
+sudo rm .maintenance
 ```
+
+The first line takes the maintenance marker `.maintenance` in the clone: `flock` waits
+until a deploy that is running has finished (17.2), and while the marker exists every new
+deploy and `--redeploy` refuses. The last line removes it.
 
 What each step does:
 
@@ -1079,7 +1085,11 @@ Rules:
   `db`, move the new `docker_data/prod/postgres` aside as well, and start again from
   `up -d --wait db`. To go back to the old database, stop `db`, move the new directory
   aside and the `postgres.before-restore-…` directory back to `docker_data/prod/postgres`,
-  then run the deploy command.
+  then `sudo rm .maintenance` and run the deploy command.
+- While `.maintenance` exists, every CI deploy and `--redeploy` refuses
+  (`FAILED <commit>: maintenance in progress …`). If a step fails, the marker stays until
+  you remove it with `sudo rm .maintenance`: only once `post_restore` and the last `up`
+  have run, or once the old database is back.
 - Once the restored stack has run correctly for a day, delete the moved-aside data
   directory by hand: `sudo rm -rf docker_data/prod/postgres.before-restore-…`.
 
@@ -1097,15 +1107,18 @@ Rules:
 
 3. From your computer, copy the dump into it (here the clone is `~/power-monitor`):
    `scp <file> <user>@<new-vps>:power-monitor/docker_data/prod/backups/`
-4. In the clone, run the same commands as above from `up -d --wait db` on:
+4. In the clone, run the same commands as above from `up -d --wait db` on, inside the
+   maintenance marker:
 
    ```sh
+   sudo flock /run/lock/powermon-deploy.lock touch .maintenance
    F=powermon-20261003T030000Z.dump
    docker compose -f docker-compose.prod.yml up -d --wait db
    docker compose -f docker-compose.prod.yml run --rm --no-deps backup bash /backup/backup.sh --restore "$F"
    docker compose -f docker-compose.prod.yml run --rm --build migrate
    docker compose -f docker-compose.prod.yml run --rm --no-deps migrate python manage.py post_restore
    docker compose -f docker-compose.prod.yml up -d --build --wait
+   sudo rm .maintenance
    ```
 
    The domain's DNS records must point at the new VPS before the last command: Caddy
@@ -1509,9 +1522,11 @@ line in `/root/.ssh/authorized_keys` starts with
 `restrict,command="/usr/local/sbin/powermon-deploy"`, so the key can run nothing but that
 script, which:
 
-1. accepts only `deploy <40-hex commit>` and takes a lock (one deploy at a time). For a
-   commit other than the checked-out one, it fetches `origin/master` and refuses a commit
-   that is not on `origin/master`;
+1. accepts only `deploy <40-hex commit>` and takes a lock (one deploy at a time). While
+   `/root/powermonitor/.maintenance` exists (a restore, section 14), it logs
+   `FAILED <commit>: maintenance in progress …` and does nothing else. For a commit other
+   than the checked-out one, it fetches `origin/master` and refuses a commit that is not
+   on `origin/master`;
 2. skips a commit that is not newer than the deployed one (a re-run of an old build). The
    commit that is already checked out comes again when GitHub starts two runs for one push
    or a deploy job is re-run. While the site is healthy, it restarts nothing and logs
@@ -1575,6 +1590,9 @@ host run, from `/root/powermonitor`:
 ```sh
 docker compose -f docker-compose.prod.yml -f docker-compose.vps.yml <command>
 ```
+
+A restore (section 14) on this host runs in `/root/powermonitor`, so its marker is
+`/root/powermonitor/.maintenance`, the file the deploy script checks (17.2, step 1).
 
 ### 17.4 First bring-up
 
@@ -1652,6 +1670,9 @@ prints its log lines. Exit code 0 means deployed. A CI re-run of the deployed co
 nothing while the site is healthy (17.2, step 2), so after an env change use this command,
 not a re-run. `--redeploy` works only as root on the server: the CI deploy key can send
 nothing but `deploy <commit>`, and the script refuses anything else.
+
+While `.maintenance` exists (a restore, section 14), it refuses like a CI deploy:
+`FAILED <commit>: maintenance in progress …`.
 
 ### 17.8 Rollback
 
