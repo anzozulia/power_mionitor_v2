@@ -1091,6 +1091,9 @@ Rules:
   section 6). Its history up to the dump is kept. The hours from the dump to that
   heartbeat are drawn as not monitored (hatched), never as an outage.
 - Subscribers get no message: the alerts the dump had queued are dropped, never sent.
+  A removed outage's alerts that the dump still had to delete are still deleted, and its
+  dropped ON alert is never sent, even if that delete is refused. (Amended 2026-10-08,
+  quick task 261008-vdk.)
 - The admin gets one monitoring-gap notice (`⏸ Monitoring gap …`, section 5) for the lost
   hours. The problems the dump had open (all-silent, failing delivery, a chart that cannot
   be pinned) are closed without a notice; a problem that persists is reported again.

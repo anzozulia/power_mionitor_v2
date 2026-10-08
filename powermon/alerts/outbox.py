@@ -26,6 +26,7 @@ during it:
     pending --remove_outage (its outage was removed)--> dropped (outage_removed)
     dropped (outage_removed) --fail_delete of its OFF--> pending (sent after all, unless a
         later alert went out, the chat changed or it expired)
+    dropped (outage_removed) --post_restore, its OFF's delete unsettled--> dropped (restored)
 
 Delete requests (261006-qv7, DATA-02 amended) live on "sent" subscriber rows and never
 change a row's status, attempts or ``next_attempt_at``:

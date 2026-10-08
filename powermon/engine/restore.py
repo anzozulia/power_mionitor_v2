@@ -24,7 +24,11 @@ dump into a clean start, before web and worker run on it (``manage.py post_resto
   into "uncertain" and queue an ops notice for it (RESEARCH Pitfall 5). Every open ops
   incident (all-silent, delivery failing, pin failed) is closed at ``now`` with no
   notice, so none can send a late recovery notice; a problem that persists opens a fresh
-  incident with its own notice.
+  incident with its own notice. A removed outage's dropped ON alert whose location still
+  has an OFF delete request the dump had not settled is re-tagged "restored" in the same
+  transaction (``KEEP_REMOVED_ON_DROPPED_SQL``), so a delete refused after the restore
+  never sends it; the delete requests themselves are kept, so the false OFF is still
+  removed (quick task 261008-vdk).
 - ``system_state`` is never written. The worker's first forced carve (a new lease
   generation) then records exactly one gap from the dump's cursor and queues the single
   "monitoring gap" ops notice: the only message after a restore. The carve rewrites only
@@ -59,6 +63,7 @@ from datetime import datetime
 
 from django.db import connection, transaction
 
+from powermon.alerts import outbox
 from powermon.engine import timeline
 from powermon.engine.models import SystemState
 from powermon.engine.transitions import LOCK_SQL, WAITING_SQL
@@ -81,6 +86,20 @@ SELECT s.location_id
 DROP_QUEUED_SQL = """
 UPDATE outbox_message SET status = 'dropped', last_error = %(code)s
  WHERE status IN ('pending', 'sending')
+"""
+# A removed outage's dropped ON alert while its location still has an OFF delete request
+# the dump had not settled: re-tagged "restored", so a delete refused after the restore
+# never sends it (outbox.fail_delete puts back only "outage_removed"). The delete request
+# itself is kept, so the false OFF is still removed from the channel (261008-vdk, F-13).
+# The EXISTS is served by the partial index outbox_delete_due_idx.
+KEEP_REMOVED_ON_DROPPED_SQL = """
+UPDATE outbox_message m SET last_error = %(code)s
+ WHERE m.channel = %(subscriber)s AND m.kind = %(on)s
+   AND m.status = 'dropped' AND m.last_error = %(removed)s
+   AND EXISTS (SELECT 1 FROM outbox_message d
+                WHERE d.location_id = m.location_id AND d.kind = %(off)s
+                  AND d.delete_requested_at IS NOT NULL AND d.delete_result IS NULL
+                  AND d.event_at <= m.event_at)
 """
 # Every open incident of any kind, closed quietly (D-14 as refined on 2026-10-03).
 CLOSE_INCIDENTS_SQL = "UPDATE ops_incident SET ended_at = %(now)s WHERE ended_at IS NULL"
@@ -189,9 +208,11 @@ def restart_after_restore(now: datetime) -> RestoreCounts:
     ``WorkerActive`` before any write while a worker holds the worker lock, and ValueError
     for a naive ``now``. Each location changes in its own transaction under its row lock
     (D-13); then one transaction drops every queued outbox row of both channels and closes
-    every open ops incident at ``now`` (D-14). ``system_state`` is left alone, so the
-    worker's first forced carve sends the single gap notice. Idempotent: a second run
-    returns zero counts and writes nothing.
+    every open ops incident at ``now`` (D-14); it also re-tags a removed outage's dropped
+    ON alert "restored" while its OFF's delete is unsettled, which the counts do not
+    include (F-13). ``system_state`` is left alone, so the worker's first forced carve
+    sends the single gap notice. Idempotent: a second run returns zero counts and writes
+    nothing.
     """
     if now.utcoffset() is None:
         raise ValueError("restart_after_restore needs an aware now, not a naive datetime")
@@ -205,6 +226,16 @@ def restart_after_restore(now: datetime) -> RestoreCounts:
     with transaction.atomic(), connection.cursor() as cur:
         cur.execute(DROP_QUEUED_SQL, {"code": RESTORED})
         dropped = cur.rowcount
+        cur.execute(
+            KEEP_REMOVED_ON_DROPPED_SQL,
+            {
+                "code": RESTORED,
+                "subscriber": outbox.CHANNEL_SUBSCRIBER,
+                "on": outbox.KIND_POWER_ON,
+                "off": outbox.KIND_POWER_OFF,
+                "removed": outbox.OUTAGE_REMOVED,
+            },
+        )
         cur.execute(CLOSE_INCIDENTS_SQL, {"now": now})
         closed = cur.rowcount
     counts = RestoreCounts(locations=restarted, dropped=dropped, incidents=closed)

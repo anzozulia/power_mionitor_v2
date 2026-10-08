@@ -322,9 +322,11 @@ def remove_outage(
       write. The next removal decides from the settled rows.
 
     "gone", "in_progress" and "sending" write nothing at all: no request and no mark.
-    ``location_state`` is written only by that rewind. A restore needs no change for the
-    delete requests (``restore.DROP_QUEUED_SQL``): the requests in a dump match that dump's
-    timeline. ValueError for a naive ``outage_start`` or ``now``.
+    ``location_state`` is written only by that rewind. A restore keeps the delete requests
+    (the requests in a dump match that dump's timeline) and re-tags a removed outage's
+    dropped ON "restored" while its OFF's delete is unsettled
+    (``restore.KEEP_REMOVED_ON_DROPPED_SQL``), so a refused delete after the restore never
+    sends it. ValueError for a naive ``outage_start`` or ``now``.
     """
     _aware(outage_start)
     _aware(now)
