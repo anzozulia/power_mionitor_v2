@@ -414,6 +414,22 @@ def test_backup_keep_one_keeps_only_the_new_dump(stubs: Stubs) -> None:
     assert _names(stubs) == [_name(now)]
 
 
+FUTURE = _utc(2031, 1, 1, 3, 0, 0)
+
+
+def test_INV25_1_a_future_dated_dump_does_not_stop_the_nightly_dumps(stubs: Stubs) -> None:
+    # F-15: a dump from a clock that was ahead must not count as the newest.
+    yesterday = _put_dump(stubs, _utc(2026, 10, 2, 3, 0, 10))
+    future = _put_dump(stubs, FUTURE)
+    now = _utc(2026, 10, 3, 3, 0, 10)
+
+    result = stubs.run("--once", "--now", str(_epoch_of(now)))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(stubs.calls("pg_dump")) == 1
+    assert _names(stubs) == [yesterday.name, _name(now), future.name]
+
+
 # Health: the newest dump's age, by its name (D-11)
 
 
@@ -447,6 +463,39 @@ def test_health_by_the_newest_dump_name(stubs: Stubs) -> None:
     for result in (no_directory, only_partial, stale, boundary, fresh):
         assert len(_lines(result)) == 1, _lines(result)
     assert stubs.calls() == []
+
+
+@pytest.mark.parametrize("ahead", ["year 2031", "301 s ahead"])
+def test_health_unhealthy_while_a_dump_is_dated_in_the_future(stubs: Stubs, ahead: str) -> None:
+    now = _utc(2026, 10, 4, 4, 0, 0)
+    _put_dump(stubs, now - timedelta(hours=1))
+    future = _put_dump(stubs, FUTURE if ahead == "year 2031" else now + timedelta(seconds=301))
+
+    result = stubs.run("--health", "--now", str(_epoch_of(now)), POSTGRES_PASSWORD=None)
+
+    assert result.returncode == 1
+    lines = _lines(result)
+    assert len(lines) == 1, lines
+    assert "future" in lines[0]
+    assert future.name in lines[0]
+    assert stubs.calls() == []
+
+
+@pytest.mark.parametrize("ahead_s", [240, 300])
+def test_a_dump_a_few_minutes_ahead_counts_as_newest(stubs: Stubs, ahead_s: int) -> None:
+    # Edge: up to FUTURE_SLACK_S (300 s) ahead is clock jitter, not a clock that was ahead.
+    now = _utc(2026, 10, 3, 10, 0, 0)
+    ahead = _put_dump(stubs, now + timedelta(seconds=ahead_s))
+    epoch = str(_epoch_of(now))
+
+    once = stubs.run("--once", "--now", epoch)
+    health = stubs.run("--health", "--now", epoch)
+
+    assert once.returncode == 0, once.stdout + once.stderr
+    assert stubs.calls("pg_dump") == []
+    assert _names(stubs) == [ahead.name]
+    assert health.returncode == 0, health.stdout + health.stderr
+    assert "healthy: newest dump" in health.stdout
 
 
 # Settings and secrets (D-11, T-05-21)
