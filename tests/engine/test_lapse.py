@@ -1087,6 +1087,148 @@ def test_MON05_heartbeat_after_clamp_is_recorded_normally(
     assert _heartbeat_at(location) == _at(9, 0, 10)
 
 
+# F-03 follow-up (quick task 261008-vdk R-1): a restore or first heartbeat after a backward
+# clock step keeps the location's detection anchors on the real clock. Only the timeline
+# and the ON alert's event_at use the clamped gate time.
+
+
+def _insert(location: Any, state: str, start: datetime, end: datetime | None, **extra: Any) -> None:
+    PowerInterval.objects.create(
+        location=location, state=state, start_at=start, end_at=end, **extra
+    )
+
+
+def _power_offs(location: Any) -> list[OutboxMessage]:
+    rows = OutboxMessage.objects.filter(location=location, kind=outbox.KIND_POWER_OFF)
+    return list(rows.order_by("id"))
+
+
+def _cycle_until_next_off(
+    clock: FakeClock, tracker: lapse.CycleTracker, location: Any, quiet_until: datetime
+) -> OutboxMessage:
+    """Cycle every 5 s: no new OFF through ``quiet_until``, then exactly one at the next cycle.
+
+    Unlike ``_cycle_until_off`` it allows earlier subscriber rows of the location.
+    """
+    n = len(_power_offs(location))
+    while clock.now() + timedelta(seconds=5) <= quiet_until:
+        clock.advance(seconds=5)
+        assert detection.run_detection(clock, 1, tracker) == 0, clock.now()
+        assert len(_power_offs(location)) == n, clock.now()
+    clock.advance(seconds=5)
+    assert detection.run_detection(clock, 1, tracker) == 1, clock.now()
+    offs = _power_offs(location)
+    assert len(offs) == n + 1
+    assert LocationState.objects.get(pk=location.pk).status == "off"
+    return offs[-1]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_MON05_restore_after_a_backward_step_keeps_off_detection_on_the_real_clock(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    # Case A: the clock ran 1 h ahead. The location went OFF at 09:50 by that clock, so its
+    # outage start and open off piece lie in the future after the step back to 09:00.
+    _system(cursor=None, resumed=_at(7, 0))
+    location = location_factory()
+    assert transitions.record_heartbeat(location.pk, _at(9, 0)) == "started"
+    assert transitions.record_heartbeat(location.pk, _at(9, 50)) == "plain"
+    assert detection.run_cycle(_at(9, 51, 31)) == 1
+    _system(cursor=_at(10, 0), resumed=_at(7, 0))
+    clock = FakeClock(_at(9, 0))
+    tracker = lapse.CycleTracker()
+    assert detection.run_detection(clock, 1, tracker) == 0
+    state = LocationState.objects.get(pk=location.pk)
+    assert (state.status, state.outage_started_at) == ("off", _at(9, 50))
+
+    # Power returns at 09:00:10 by the stepped (real) clock.
+    received = _at(9, 0, 10)
+    assert transitions.record_heartbeat(location.pk, received) == "restored"
+
+    state = LocationState.objects.get(pk=location.pk)
+    assert (state.status, state.on_since, state.last_heartbeat_at) == ("on", received, received)
+    on = OutboxMessage.objects.get(location=location, kind=outbox.KIND_POWER_ON)
+    # The ON alert keeps the clamped gate time (the open off piece's start) as its event.
+    assert (on.event_at, on.recorded_at) == (_at(9, 50), received)
+    assert on.payload == {"was_off_us": 0}
+
+    # Silent again: one OFF one timeout (60 + 30 s, strict) after the real heartbeat,
+    # nothing through 09:01:40, long before the old 09:50 stamp.
+    off = _cycle_until_next_off(clock, tracker, location, _at(9, 1, 40))
+    assert clock.now() == _at(9, 1, 45)
+    assert off.payload == {"was_on_us": 0}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_MON05_future_open_on_piece_goes_off_on_and_off_again_after_a_step(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    # Case B: an ON location whose open on piece starts at 10:00, 1 h after the step.
+    location = location_factory()
+    assert transitions.record_heartbeat(location.pk, _at(10, 0)) == "started"
+    _system(cursor=_at(10, 0), resumed=_at(10, 0))
+    clock = FakeClock(_at(9, 0))
+    tracker = lapse.CycleTracker()
+    assert detection.run_detection(clock, 1, tracker) == 0
+    first = _cycle_until_off(clock, tracker, location, _at(9, 1, 30))
+    # mark_off's clamp: the outage starts at the future open piece's start (accepted).
+    assert first.event_at == _at(10, 0)
+
+    received = _at(9, 2)
+    assert transitions.record_heartbeat(location.pk, received) == "restored"
+
+    state = LocationState.objects.get(pk=location.pk)
+    assert (state.status, state.on_since, state.last_heartbeat_at) == ("on", received, received)
+    on = OutboxMessage.objects.get(location=location, kind=outbox.KIND_POWER_ON)
+    assert (on.event_at, on.recorded_at) == (_at(10, 0), received)
+    # Silent again: a second OFF one timeout after 09:02, at the 09:03:35 cycle.
+    second = _cycle_until_next_off(clock, tracker, location, _at(9, 3, 30))
+    assert clock.now() == _at(9, 3, 35)
+    assert second.payload == {"was_on_us": 0}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_MON05_first_heartbeat_with_a_future_open_piece_keeps_the_real_clock(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    # A database restore with the server clock behind the dump: the waiting location holds
+    # an open not_monitored piece from 10:00, and its first heartbeat comes at 09:00.
+    location = location_factory()
+    _insert(location, "not_monitored", _at(10, 0), None)
+    received = _at(9, 0)
+
+    assert transitions.record_heartbeat(location.pk, received) == "started"
+
+    state = LocationState.objects.get(pk=location.pk)
+    assert (state.status, state.on_since, state.last_heartbeat_at) == ("on", received, received)
+    # The timeline still opens "on" at the piece's start, and the start is silent.
+    assert _intervals(location) == [("on", _at(10, 0), None, None)]
+    assert not OutboxMessage.objects.exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_MON05_restore_without_a_clamp_keeps_the_state_as_before(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    # Failure guard: with no clamp (at == now) the restore writes exactly what it always did.
+    _system(cursor=None, resumed=_at(7, 0))
+    location = location_factory()
+    transitions.record_heartbeat(location.pk, _at(9, 0))
+    assert detection.run_cycle(_at(9, 1, 31)) == 1
+
+    assert transitions.record_heartbeat(location.pk, _at(9, 30)) == "restored"
+
+    state = LocationState.objects.get(pk=location.pk)
+    assert (state.status, state.on_since, state.last_heartbeat_at) == (
+        "on",
+        _at(9, 30),
+        _at(9, 30),
+    )
+    on = OutboxMessage.objects.get(location=location, kind=outbox.KIND_POWER_ON)
+    assert (on.event_at, on.recorded_at) == (_at(9, 30), _at(9, 30))
+    assert on.payload == {"was_off_us": 30 * 60 * 1_000_000}
+
+
 # Pitfall 5: a heartbeat that waited on the carve's row lock
 
 
