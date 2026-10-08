@@ -1521,11 +1521,13 @@ script, which:
    `docker/Caddyfile` always count as a runtime change;
 4. builds the images first. A failed build changes nothing: the old commit stays checked
    out and the old containers keep running;
-5. takes a dump (section 14) when `powermon/migrations` changed;
+5. takes a dump (section 14) when `powermon/migrations` or `uv.lock` changed (Django's own
+   migrations come with `uv.lock`);
 6. runs `up -d --wait`, which runs `migrate` once and then starts `web` and `worker`;
 7. checks `https://powermonitor.anzozulia.com/healthz` through the host nginx;
 8. if that fails, rolls back to the previous commit and starts it again, except after a
-   migration: then it stops and leaves the recovery to you (section 8, and the dump);
+   change to `powermon/migrations` or `uv.lock`: then it stops and leaves the recovery to
+   you (section 8, and the dump);
 9. removes this project's dangling images, never anything else on the host.
 
 Each outcome is one line in `/var/log/powermon-deploy.log` (rotated weekly, 8 kept,

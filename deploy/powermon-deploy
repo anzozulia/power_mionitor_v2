@@ -42,7 +42,8 @@ PROJECT=powermon-prod
 COMPOSE=(docker compose -f docker-compose.prod.yml -f docker-compose.vps.yml)
 # A change only under these paths needs no build and no restart.
 NON_RUNTIME_RE='^(docs/|tests/|\.github/|deploy/|README\.md$|LICENSE$|PROJECT-BRIEF\.md$|docker-compose\.(local|ci|dev-ui)\.yml$|\.gitignore$)'
-MIGRATIONS=powermon/migrations
+# A change here can change the schema: Django's own migrations come with uv.lock.
+SCHEMA_PATHS=(powermon/migrations uv.lock)
 SHA=""
 
 log() {
@@ -176,7 +177,7 @@ if ! timeout 1800 "${COMPOSE[@]}" build; then
 fi
 
 migrated=no
-if [[ $SHA != "$PREV" ]] && ! git diff --quiet "$PREV" "$SHA" -- "$MIGRATIONS"; then
+if [[ $SHA != "$PREV" ]] && ! git diff --quiet "$PREV" "$SHA" -- "${SCHEMA_PATHS[@]}"; then
   migrated=yes
   if ! timeout 600 "${COMPOSE[@]}" exec -T backup bash /backup/backup.sh --dump-now; then
     checkout "$PREV"
