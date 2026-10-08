@@ -5,12 +5,11 @@
   ``render.render_png(source.load_week(pk, today=..., now=..., tz=..., live=True),
   lang=..., name=...)``, the call the worker makes for today's live chart, a PNG of the
   renderer's width x height.
-- Headers: ``image/png``; ``Cache-Control`` private with max-age=60, never public and
-  never s-maxage; ``Vary: Cookie``.
-- Cache: per location and per process for 60 s (``cache_key(pk)``): two GETs within the
-  TTL render once, and two locations never share an entry.
-- 404 for an unknown or soft-deleted location, decided before the cache and without a
-  render, even while that location's PNG is still cached.
+- Headers: ``image/png``; ``Cache-Control`` private, no-cache, never max-age, public or
+  s-maxage; ``Vary: Cookie``.
+- Rendered per request (F-25, quick task 261008-vdk): every GET renders again, so a
+  change shows on the next view, and two locations never get each other's bytes.
+- 404 for an unknown or soft-deleted location, decided before any render.
 - A location without stored history answers 200 with the all-no-data week, never 500.
 - Login-required, GET only, writes nothing and never reaches Telegram.
 - INV-23 #2: the bytes hold no token, secret part, mask, device key, key mask or key tail,
@@ -21,7 +20,7 @@ The chart helpers are copied from tests/chart/chart_fixtures.py (tests have no
 """
 
 import io
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -29,7 +28,6 @@ import pytest
 from conftest import FakeClock, FakeTelegram
 from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.core.cache import cache
 from django.db import connection
 from django.db.models import F
 from django.http import HttpResponse
@@ -43,8 +41,7 @@ from powermon.chart.model import Piece
 from powermon.engine.models import LocationState, PowerInterval
 from powermon.locations import keys
 from powermon.locations.models import Location
-from powermon.web import chart_preview
-from powermon.web.chart_preview import CHART_TTL_S, LocationChartView, cache_key
+from powermon.web.chart_preview import LocationChartView
 
 User = get_user_model()
 
@@ -52,14 +49,6 @@ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 WRITES = ("INSERT", "UPDATE", "DELETE")
 # A fixed device key, so the key-tail scan is deterministic.
 DEVICE_KEY = "Hb7Yt2Kq9Wm4Xz6Rn1Vc8Lp3Jd5Gs0Fa"
-
-
-@pytest.fixture(autouse=True)
-def empty_cache() -> Iterator[None]:
-    """Every test starts and ends with an empty per-process cache."""
-    cache.clear()
-    yield
-    cache.clear()
 
 
 @pytest.fixture
@@ -156,21 +145,6 @@ def _expected(location: Any, now: datetime) -> bytes:
     return render.render_png(week, lang=location.language, name=location.name)
 
 
-class RecordingCache:
-    """The default cache, recording every ``set`` (key and timeout)."""
-
-    def __init__(self, real: Any) -> None:
-        self.real = real
-        self.sets: list[tuple[str, int]] = []
-
-    def get(self, key: str, default: Any = None) -> Any:
-        return self.real.get(key, default)
-
-    def set(self, key: str, value: Any, timeout: int) -> None:
-        self.sets.append((key, timeout))
-        self.real.set(key, value, timeout)
-
-
 # The channel's own chart (UI-06)
 
 
@@ -200,59 +174,53 @@ def test_UI06_chart_png_headers(admin: Client, location_factory: Callable[..., A
     assert response.status_code == 200
     assert response["Content-Type"] == "image/png"
     cache_control = {part.strip() for part in response["Cache-Control"].split(",")}
-    assert {"private", f"max-age={CHART_TTL_S}"} <= cache_control
-    assert CHART_TTL_S == 60
+    # F-25: the browser asks again on every view; no cache keeps a stale copy.
+    assert {"private", "no-cache"} <= cache_control
+    assert not any(part.startswith("max-age") for part in cache_control)
     assert "public" not in cache_control
-    assert "no-cache" not in cache_control
     assert not any(part.startswith("s-maxage") for part in cache_control)
     assert "Cookie" in {part.strip() for part in response["Vary"].split(",")}
     assert not response.cookies
 
 
-# The per-location render cache
+# Rendered per request (F-25)
 
 
 @pytest.mark.django_db
-def test_UI06_chart_png_cache(
+def test_UI06_chart_png_is_fresh_after_a_change(
     kyiv: Any,
-    monkeypatch: pytest.MonkeyPatch,
     renders: list[tuple[str, str]],
     location_factory: Callable[..., Any],
     fixed_now: datetime,
 ) -> None:
-    recording = RecordingCache(chart_preview.cache)
-    monkeypatch.setattr(chart_preview, "cache", recording)
     home = location_factory(name="Home")
     office = location_factory(name="Office")
     _history(home, fixed_now)
     _history(office, fixed_now)
 
     first = _get(home.pk, fixed_now)
-    second = _get(home.pk, fixed_now + timedelta(seconds=30))
+    second = _get(home.pk, fixed_now)
 
-    # Within the TTL: one render, the same bytes, stored for 60 s under the pk's key.
-    assert renders == [("en", "Home")]
+    # Expected: every GET renders; the same state gives the same bytes.
+    assert renders == [("en", "Home"), ("en", "Home")]
     assert second.content == first.content
-    assert recording.sets == [(cache_key(home.pk), 60)]
-    assert cache.get(cache_key(home.pk)) == first.content
+
+    Location.objects.filter(pk=home.pk).update(name="Home, renamed")
+    third = _get(home.pk, fixed_now)
+
+    # Edge: the next GET after a change shows it at once (no 60 s stale copy).
+    assert renders[-1] == ("en", "Home, renamed")
+    assert third.content != first.content
+    assert third.content == _expected(Location.objects.get(pk=home.pk), fixed_now)
 
     other = _get(office.pk, fixed_now)
 
-    # Another location never shares the entry.
-    assert renders == [("en", "Home"), ("en", "Office")]
-    assert cache_key(office.pk) != cache_key(home.pk)
-    assert other.content != first.content
-    assert cache.get(cache_key(office.pk)) == other.content
+    # Failure: one location never gets another's bytes.
+    assert renders[-1] == ("en", "Office")
+    assert other.content not in (first.content, second.content, third.content)
 
 
-def test_UI06_cache_key() -> None:
-    # Expected, edge (the smallest id) and failure (distinct ids never collide).
-    assert cache_key(12) == "chart-png:12"
-    assert cache_key(1) == "chart-png:1"
-    assert cache_key(1) != cache_key(11)
-
-
-# 404 before the cache (R14 surface, TEST-STRATEGY §8.2)
+# 404 before the render (R14 surface, TEST-STRATEGY §8.2)
 
 
 @pytest.mark.django_db
@@ -261,9 +229,6 @@ def test_UI06_chart_png_404(
 ) -> None:
     gone = location_factory(name="Gone")
     unknown = gone.pk + 1000
-    # Both still hold a cached PNG: the lookup comes first.
-    cache.set(cache_key(gone.pk), PNG_SIGNATURE + b"cached", 60)
-    cache.set(cache_key(unknown), PNG_SIGNATURE + b"cached", 60)
     Location.objects.filter(pk=gone.pk).update(deleted_at=gone.created_at)
 
     for pk in (unknown, gone.pk):

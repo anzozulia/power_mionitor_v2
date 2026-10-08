@@ -15,13 +15,13 @@ Weekly chart; TEST-STRATEGY §8.2, §7.5 UI-06).
   short ``http_NNN`` code and the start time, never the location name (F-04, quick task
   261008-vdk).
 - Rendering the page never renders the chart: the browser requests the PNG lazily, and the
-  route renders and caches it (T-06-48). Polling never touches the card.
+  route renders it per request (T-06-48; F-25, quick task 261008-vdk). Polling never
+  touches the card.
 
-Pages are read through tests/web/pages.py and the 06-UI-SPEC hooks only. Tests that
-request the PNG start and end with an empty per-process chart cache.
+Pages are read through tests/web/pages.py and the 06-UI-SPEC hooks only.
 """
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -30,7 +30,6 @@ from bs4 import Tag
 from conftest import FakeClock
 from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.core.cache import cache
 from django.test import Client
 from django.urls import reverse
 from pages import all_by_testid, assert_page, by_testid, main, parse, section, text
@@ -39,7 +38,6 @@ from powermon.alerts.models import OpsIncident
 from powermon.chart import render
 from powermon.engine.models import LocationState, PowerInterval
 from powermon.locations.models import Location
-from powermon.web.chart_preview import cache_key
 from powermon.web.location_views import LocationDetailView
 from powermon.web.status import failing_since_text
 
@@ -56,14 +54,6 @@ CHART_EMPTY = (
 CHART_ERROR = "The chart could not be drawn right now. Reload the page to try again."
 LANGUAGE_LABELS = {"uk": "Ukrainian", "en": "English", "ru": "Russian"}
 NAME = 'Office <b>"main"</b> & Co'
-
-
-@pytest.fixture(autouse=True)
-def empty_cache() -> Iterator[None]:
-    """Every test starts and ends with an empty per-process chart cache."""
-    cache.clear()
-    yield
-    cache.clear()
 
 
 @pytest.fixture
@@ -224,22 +214,23 @@ def test_UI06_page_render_does_not_render_the_chart(
 
     response = admin.get(_page(location))
 
-    # The page only points at the PNG (lazily); it never renders or caches the chart (T-06-48).
+    # The page only points at the PNG (lazily); it never renders the chart (T-06-48).
     assert response.status_code == 200
     assert by_testid(main(parse(response)), "weekly-chart").find("img") is not None
     assert calls == []
-    assert cache.get(cache_key(location.pk)) is None
-    # The browser's request for the image renders it once, and the cache serves the next.
+    # Every request for the image renders it (F-25). No byte equality: the live chart's
+    # "now" moves under the real clock.
     first = admin.get(_chart(location))
     second = admin.get(_chart(location))
     assert (first.status_code, second.status_code) == (200, 200)
-    assert first.content == second.content
-    assert calls == ["Office"]
+    assert first.content.startswith(PNG_SIGNATURE)
+    assert second.content.startswith(PNG_SIGNATURE)
+    assert calls == ["Office", "Office"]
     # A deleted location's page and chart answer 404, the chart without a render.
     Location.objects.filter(pk=location.pk).update(deleted_at=_at(16))
     assert admin.get(_page(location)).status_code == 404
     assert admin.get(_chart(location)).status_code == 404
-    assert calls == ["Office"]
+    assert calls == ["Office", "Office"]
 
 
 # F-04 (quick task 261008-vdk): the card warns while the channel's chart fails
