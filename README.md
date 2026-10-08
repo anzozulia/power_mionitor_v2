@@ -1514,7 +1514,11 @@ script, which:
    healthy, it rebuilds and restarts that commit (steps 4, 6 and 7, with no rollback), so
    re-running a failed deploy job retries it;
 3. checks the commit out and restarts nothing when only `docs/`, `tests/`, `.github/`,
-   `deploy/`, `README.md`, `LICENSE` or `PROJECT-BRIEF.md` changed;
+   `deploy/`, `README.md`, `LICENSE`, `PROJECT-BRIEF.md`, `.gitignore` or the local and CI
+   Compose files (`docker-compose.local.yml`, `docker-compose.ci.yml`,
+   `docker-compose.dev-ui.yml`) changed. `docker-compose.prod.yml`,
+   `docker-compose.vps.yml`, the `Dockerfile`, `.dockerignore`, `.env.example` and
+   `docker/Caddyfile` always count as a runtime change;
 4. builds the images first. A failed build changes nothing: the old commit stays checked
    out and the old containers keep running;
 5. takes a dump (section 14) when `powermon/migrations` changed;

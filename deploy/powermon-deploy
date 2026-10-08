@@ -41,7 +41,7 @@ LOCK=/run/lock/powermon-deploy.lock
 PROJECT=powermon-prod
 COMPOSE=(docker compose -f docker-compose.prod.yml -f docker-compose.vps.yml)
 # A change only under these paths needs no build and no restart.
-NON_RUNTIME_RE='^(docs/|tests/|\.github/|deploy/|README\.md$|LICENSE$|PROJECT-BRIEF\.md$)'
+NON_RUNTIME_RE='^(docs/|tests/|\.github/|deploy/|README\.md$|LICENSE$|PROJECT-BRIEF\.md$|docker-compose\.(local|ci|dev-ui)\.yml$|\.gitignore$)'
 MIGRATIONS=powermon/migrations
 SHA=""
 
