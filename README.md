@@ -1560,9 +1560,10 @@ script, which:
    commit was already checked out (a retry or `--redeploy`). A backup that does not start
    or is unhealthy is one `warning <commit>: …` line, not a failed deploy;
 7. checks `https://powermonitor.anzozulia.com/healthz` through the host nginx;
-8. if that fails, rolls back to the previous commit and starts it again, except after a
-   change to `powermon/migrations` or `uv.lock`: then it stops and leaves the recovery to
-   you (section 8, and the dump);
+8. if that fails, rolls back to the previous commit and starts the images it ran before
+   (it rebuilds them only when one is missing), except after a change to
+   `powermon/migrations` or `uv.lock`: then it stops and leaves the recovery to you
+   (section 8, and the dump);
 9. removes this project's dangling images, never anything else on the host.
 
 Each outcome is one line in `/var/log/powermon-deploy.log` (rotated weekly, 8 kept,

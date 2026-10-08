@@ -26,7 +26,8 @@
 # powermon/migrations or uv.lock changed, a dump is taken first. Then web and worker are
 # started and checked through the host nginx, and backup is started apart: a stale backup
 # is a warning line, never a failed deploy. A failed start rolls back to the previous
-# commit, except after a schema change (README section 8).
+# commit and starts the images that ran before (rebuilt only when one is missing), except
+# after a schema change (README section 8).
 #
 # Prints no env value. Exit codes: 0 deployed or nothing to do (an already deployed, healthy
 # commit included); 1 failed; 2 refused.
@@ -52,6 +53,9 @@ SCHEMA_PATHS=(powermon/migrations uv.lock)
 # Present while a restore runs (README section 14): every deploy refuses.
 MAINTENANCE=$REPO_DIR/.maintenance
 SHA=""
+# The app services whose images a rollback starts again (images $PROJECT-<service>).
+APP_IMAGES=(web worker migrate)
+declare -A PREV_IMAGE=()
 
 log() {
   # The log file first: a dropped SSH client must not keep the deploy from being recorded.
@@ -121,6 +125,35 @@ refresh_backup() {
   elif [[ $(service_health backup) == unhealthy ]]; then
     log "warning $SHA: backup is unhealthy (no dump in the last 26 h, or one dated in the future); README section 14"
   fi
+}
+
+keep_images() {
+  # The image ID of each app service's existing container, for a rollback. Read from the
+  # containers, never from the $PROJECT-<service> tags: a build whose configuration check or
+  # pre-migration dump failed (nothing restarted), or one that failed half way, has already
+  # moved a tag to an image that never ran. prune never removes an image a container uses.
+  local s cid id
+  for s in "${APP_IMAGES[@]}"; do
+    cid=$("${COMPOSE[@]}" ps -a -q "$s") || cid=""
+    cid=${cid%%$'\n'*}
+    id=""
+    if [[ -n $cid ]]; then
+      id=$(docker inspect -f '{{.Image}}' "$cid" 2> /dev/null) || id=""
+    fi
+    PREV_IMAGE[$s]=$id
+  done
+}
+
+reuse_images() {
+  # Point every app image tag back at the image kept by keep_images; 1 when one is missing
+  # or a tag fails (the caller then rebuilds).
+  local s
+  for s in "${APP_IMAGES[@]}"; do
+    [[ -n ${PREV_IMAGE[$s]:-} ]] || return 1
+  done
+  for s in "${APP_IMAGES[@]}"; do
+    docker tag "${PREV_IMAGE[$s]}" "$PROJECT-$s" || return 1
+  done
 }
 
 backup_changed() {
@@ -227,8 +260,10 @@ elif [[ $mode == deploy ]]; then
 fi
 
 # Build first: a failed build restarts nothing. --pull refreshes the base images (time-zone
-# rules, security fixes); a registry outage fails here, before any restart. The rollback
-# build below does without it.
+# rules, security fixes); a registry outage fails here, before any restart. The images that
+# run now are kept first: a rollback starts them again instead of rebuilding the previous
+# commit on a freshly pulled base (only a commit change can roll back).
+if [[ $SHA != "$PREV" ]]; then keep_images; fi
 if ! timeout 1800 "${COMPOSE[@]}" build --pull; then
   if [[ $SHA != "$PREV" ]]; then checkout "$PREV"; fi
   log "FAILED $SHA: build failed; still running $PREV, nothing restarted"
@@ -272,7 +307,14 @@ if [[ $SHA == "$PREV" ]]; then
   exit 1
 fi
 checkout "$PREV"
-if timeout 1800 "${COMPOSE[@]}" build && start; then
+# The previous images when all of them are known and re-tagged; otherwise rebuild them.
+rolled_back=no
+if reuse_images; then
+  if start; then rolled_back=yes; fi
+elif timeout 1800 "${COMPOSE[@]}" build && start; then
+  rolled_back=yes
+fi
+if [[ $rolled_back == yes ]]; then
   log "FAILED $SHA: not healthy; rolled back to $PREV, which is healthy"
 else
   log "FAILED $SHA: not healthy; the rollback to $PREV is not healthy either"
