@@ -57,6 +57,8 @@ REQUIRED = (
     "ACME_EMAIL",
 )
 MIN_SECRET_KEY_LENGTH = 50
+# powermon/config.py MIN_ADMIN_PASSWORD_LENGTH.
+MIN_ADMIN_PASSWORD_LENGTH = 12
 
 
 def _error(message: str) -> None:
@@ -154,6 +156,8 @@ def check(repo: Path) -> int:
             problems.append(f"{name}: still the example value from {EXAMPLE_NAME}")
     if len(values.get("SECRET_KEY", "").strip()) < MIN_SECRET_KEY_LENGTH:
         problems.append(f"SECRET_KEY: shorter than {MIN_SECRET_KEY_LENGTH} characters")
+    if len(values.get("ADMIN_PASSWORD", "").strip()) < MIN_ADMIN_PASSWORD_LENGTH:
+        problems.append(f"ADMIN_PASSWORD: shorter than {MIN_ADMIN_PASSWORD_LENGTH} characters")
     for name in ("APP_ENV", "DEBUG", "DOMAIN"):
         if values.get(name, "").strip() != FIXED[name]:
             problems.append(f"{name}: must be {FIXED[name]}")

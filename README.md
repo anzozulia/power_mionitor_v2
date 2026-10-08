@@ -107,7 +107,10 @@ Edit `.env.docker_production`:
 
 - `SECRET_KEY`: at least 50 random characters. Generate one with
   `python3 -c 'import secrets; print(secrets.token_urlsafe(50))'`.
-- `ADMIN_USERNAME`, `ADMIN_PASSWORD`: the single admin account of the web panel.
+- `ADMIN_USERNAME`, `ADMIN_PASSWORD`: the single admin account of the web panel. In
+  production `ADMIN_PASSWORD` must be at least 12 characters (surrounding spaces do not
+  count), or the app refuses to start. `deploy/make-secrets.py` generates about 67.
+  (Amended 2026-10-08, quick task 261008-vdk.)
 - `POSTGRES_PASSWORD`: the database password.
 - `DOMAIN`: the bare host name, e.g. `power.example.org` (no `https://`, no path).
 - `ACME_EMAIL`: your email for the Let's Encrypt account.
@@ -559,7 +562,10 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
 - **Sign-in throttle:** 5 failed sign-ins within a minute from one IP lock sign-in for
   that IP for 5 minutes: every sign-in from it then gets HTTP 429 and "Too many failed
   sign-ins. Try again in 5 minutes.", even with the right password. The IP is the one
-  Caddy reports in `X-Forwarded-For` (locally, the direct client address).
+  the reverse proxy (Caddy, or the host nginx on a shared VPS) reports in
+  `X-Forwarded-For` (locally, the direct client address). An IPv6 client counts by its
+  /64, so rotating addresses inside one /64 does not escape the lock, and a successful
+  sign-in from that /64 clears its failures. (Amended 2026-10-08, quick task 261008-vdk.)
 - **All-silent and maintenance (Pitfall 7):** an all-silent incident starts only when at
   least 2 active locations (monitored, not in maintenance) are all silent, and its start
   is the moment the last of them fell quiet. It ends at the first heartbeat after that
