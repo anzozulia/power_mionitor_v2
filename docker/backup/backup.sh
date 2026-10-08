@@ -32,10 +32,12 @@
 #
 # Dump, verify, rotate (D-10): pg_dump -Fc writes a dot-prefixed .partial file in the backup
 # directory. Only a non-empty file that passes pg_restore --list is renamed to
-# powermon-YYYYMMDDTHHMMSSZ.dump (UTC), and only after that rename are the dumps beyond the
-# newest BACKUP_KEEP deleted, by name. A failed dump removes its own temp file, deletes no
-# dump and logs one error line. No ops notice is sent: the healthcheck and the log show a
-# failing backup (D-12).
+# powermon-YYYYMMDDTHHMMSSZ.dump (UTC), and only after that rename does the rotation run, by
+# name: a dump is deleted only when it is beyond the newest BACKUP_KEEP and dated before the
+# last BACKUP_KEEP nightly slots (or its name holds an impossible time). So every nightly dump
+# of the last BACKUP_KEEP nights stays, and a dump on demand never pushes one out (F-16). A
+# failed dump removes its own temp file, deletes no dump and logs one error line. No ops
+# notice is sent: the healthcheck and the log show a failing backup (D-12).
 #
 # Permissions (D-11): dumps hold every bot token and device key. umask 077 makes a new
 # directory 0700 and every dump 0600. The container starts as root (the image has no USER):
@@ -178,10 +180,15 @@ discard() {
 }
 
 rotate() {
-  # Keep the newest BACKUP_KEEP dumps by name; runs only after a verified rename (D-10).
-  local all=() i
+  # Delete a dump only when it is beyond the newest BACKUP_KEEP AND from before the last
+  # BACKUP_KEEP nightly slots at epoch $1, or its name holds an impossible time: a dump on
+  # demand never pushes a nightly one out early (INV-25, F-16). Runs only after a verified
+  # rename (D-10).
+  local all=() i epoch cutoff
+  cutoff=$(( $(last_slot "$1") - (BACKUP_KEEP - 1) * 86400 ))
   mapfile -t all < <(dumps)
   for (( i = 0; i < ${#all[@]} - BACKUP_KEEP; i++ )); do
+    if epoch=$(name_epoch "${all[i]}") && (( epoch >= cutoff )); then continue; fi
     if rm -f -- "${all[i]}"; then
       log "removed ${all[i]##*/}"
     else
@@ -213,7 +220,7 @@ dump() {
     return 1
   fi
   CURRENT_TMP=""
-  rotate
+  rotate "$1"
   log "dump $name ok"
 }
 
@@ -250,7 +257,7 @@ run_loop() {
   # The container's command (D-09): check every BACKUP_CHECK_EVERY_S, dump when due.
   local failures=0 retry_at=0 wait_s=0 now path
   trap stop_loop TERM INT
-  log "started: a dump every night at $BACKUP_TIME_UTC UTC, the newest $BACKUP_KEEP kept"
+  log "started: a dump every night at $BACKUP_TIME_UTC UTC, kept for $BACKUP_KEEP nights (at least the newest $BACKUP_KEEP)"
   # A dump cut off by a stop or a crash leaves its temp file behind.
   for path in "$BACKUP_DIR"/.powermon-*.dump.partial; do
     if rm -f -- "$path"; then log "removed leftover ${path##*/}"; fi

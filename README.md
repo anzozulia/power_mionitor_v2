@@ -146,7 +146,8 @@ Optional settings:
 - `BACKUP_TIME_UTC`: the time of the nightly database dump, in UTC, as `HH:MM` (default
   `03:00`, which is 05:00 or 06:00 in Kyiv). The default is clear of local midnight, when
   the charts are posted, and of the DST change (section 14).
-- `BACKUP_KEEP`: how many nightly dumps are kept, 1 to 365 (default 14).
+- `BACKUP_KEEP`: nightly dumps are kept for this many days, and at least this many dumps
+  are kept, 1 to 365 (default 14).
 
 A `BACKUP_TIME_UTC` or `BACKUP_KEEP` of the wrong shape makes no dump and keeps the
 `backup` service restarting (`docker compose -f docker-compose.prod.yml ps` shows
@@ -974,8 +975,10 @@ same `postgres:18.6-trixie` image as `db`, so `pg_dump` has the server's version
   server was down over night. It checks once a minute. A failed dump is retried after 5
   minutes, then at growing intervals of up to 1 hour.
 - **How:** `pg_dump` in PostgreSQL's custom format. Each dump is checked with
-  `pg_restore --list` before it replaces anything; only then are the dumps beyond the
-  newest `BACKUP_KEEP` (default 14) deleted. A failed dump deletes nothing.
+  `pg_restore --list` before it replaces anything; only then are old dumps deleted: a dump
+  goes only when it is beyond the newest `BACKUP_KEEP` (default 14) and older than the last
+  `BACKUP_KEEP` nightly slots. So the nightly dump of each of the last `BACKUP_KEEP` nights
+  stays, however many dumps on demand were taken. A failed dump deletes nothing.
 - **Where:** `docker_data/prod/backups/` (locally `docker_data/local/backups/`), outside
   the PostgreSQL data directory. Each file is named by its UTC start time, for example
   `powermon-20261003T030000Z.dump`. The directory is 0700 and every dump 0600, owned by
@@ -999,8 +1002,9 @@ Before a risky change (a large update, a manual database edit), take a dump at o
 docker compose -f docker-compose.prod.yml exec backup bash /backup/backup.sh --dump-now
 ```
 
-It logs `backup: dump powermon-….dump ok`. As after a nightly dump, only the newest
-`BACKUP_KEEP` dumps are kept.
+It logs `backup: dump powermon-….dump ok`. It never pushes a nightly dump out: the
+nightly dumps of the last `BACKUP_KEEP` nights stay, so each dump on demand adds one file
+until it is older than that window.
 
 ### Copying a dump off the VPS
 
@@ -1234,8 +1238,8 @@ WARNING) and the grep result. Record the result in the phase verification file.
    ```
 
    Expected: `backup` is `healthy`. Its log has
-   `backup: started: a dump every night at 03:00 UTC, the newest 14 kept` and one
-   `backup: dump powermon-<deploy time>.dump ok`. The listing shows the directory (`.`) as
+   `backup: started: a dump every night at 03:00 UTC, kept for 14 nights (at least the newest 14)`
+   and one `backup: dump powermon-<deploy time>.dump ok`. The listing shows the directory (`.`) as
    `drwx------` and one `-rw-------` dump named with the deploy time (UTC).
 2. The next day, after `BACKUP_TIME_UTC`, run the same three commands.
 
