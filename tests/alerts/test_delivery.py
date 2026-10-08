@@ -1091,19 +1091,33 @@ def test_chart_trouble_prefers_chart_failing_and_reads_its_status(
 
 
 @pytest.mark.django_db
-@pytest.mark.parametrize("details", [{"http_status": "403"}, {}, {"http_status": True}, []])
-def test_chart_trouble_reads_a_malformed_status_as_400(
+@pytest.mark.parametrize(
+    "details",
+    [
+        {"http_status": "403"},
+        {},
+        {"http_status": True},
+        [],
+        {"http_status": 99},
+        {"http_status": 600},
+    ],
+)
+def test_chart_trouble_reads_a_missing_or_malformed_status_as_none(
     location_factory: Callable[..., Any], details: Any
 ) -> None:
+    # Details from before this release hold {}: the true status cannot be recovered, so
+    # none is shown, never a made-up 400 (quick task 261008-vdk R-3).
     location = location_factory()
     OpsIncident.objects.create(
         kind="chart_failing", location=location, started_at=T0, details=details
     )
     other = location_factory()
-    OpsIncident.objects.create(kind="chart_pin_failed", location=other, started_at=T0, details={})
+    OpsIncident.objects.create(
+        kind="chart_pin_failed", location=other, started_at=T0, details=details
+    )
 
-    assert delivery.chart_trouble(location.pk) == delivery.ChartTrouble("chart_failing", T0, 400)
-    assert delivery.chart_trouble(other.pk) == delivery.ChartTrouble("chart_pin_failed", T0, 400)
+    assert delivery.chart_trouble(location.pk) == delivery.ChartTrouble("chart_failing", T0, None)
+    assert delivery.chart_trouble(other.pk) == delivery.ChartTrouble("chart_pin_failed", T0, None)
 
 
 @pytest.mark.django_db

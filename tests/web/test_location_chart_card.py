@@ -12,8 +12,8 @@ Weekly chart; TEST-STRATEGY §8.2, §7.5 UI-06).
   image too: what decides is the stored history, not the status.
 - While the channel's chart fails (an open ``chart_failing`` or ``chart_pin_failed``
   incident) the card shows one ``weekly-chart-trouble`` warning with fixed copy, the
-  short ``http_NNN`` code and the start time, never the location name (F-04, quick task
-  261008-vdk).
+  short ``http_NNN`` code only when one was stored, and the start time, never the
+  location name (F-04, R-3, quick task 261008-vdk).
 - Rendering the page never renders the chart: the browser requests the PNG lazily, and the
   route renders it per request (T-06-48; F-25, quick task 261008-vdk). Polling never
   touches the card.
@@ -282,7 +282,8 @@ def test_weekly_chart_card_warns_while_the_chart_fails(
         body = text(warning)
         if case == "pin_only":
             assert CHART_PIN_TITLE in body
-            assert f"Telegram refused the pin (http_400) since {since}." in body
+            assert f"Telegram refused the pin since {since}." in body
+            assert "(http_" not in body
             assert CHART_FAILING_TITLE not in body
         else:
             assert CHART_FAILING_TITLE in body
@@ -296,3 +297,47 @@ def test_weekly_chart_card_warns_while_the_chart_fails(
     html = response.content.decode()
     assert location.device_key not in html
     assert location.bot_token not in html
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("kind", "details", "expected"),
+    [
+        ("chart_pin_failed", {}, "Telegram refused the pin since {since}."),
+        ("chart_failing", {}, "Telegram refused to post or update it since {since}."),
+        ("chart_pin_failed", {"http_status": 403}, "Telegram refused the pin (http_403) since"),
+        (
+            "chart_failing",
+            {"http_status": 403},
+            "Telegram refused to post or update it (http_403) since",
+        ),
+    ],
+    ids=["pin-no-status", "failing-no-status", "pin-403", "failing-403"],
+)
+def test_weekly_chart_card_shows_the_status_code_only_when_one_was_stored(
+    admin: Client,
+    location_factory: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    details: dict[str, Any],
+    expected: str,
+) -> None:
+    # R-3 (quick task 261008-vdk): incidents from before this release hold details {}.
+    monkeypatch.setattr(LocationDetailView, "clock", FakeClock(_at(15)))
+    location = location_factory(name=NAME)
+    _history(location)
+    _on(location)
+    _incident(location, kind, details)
+    since = failing_since_text(_at(9, 5), _at(15), settings.TIME_ZONE)
+
+    soup = assert_page(admin.get(_page(location)), title=NAME, app=True)
+
+    [warning] = all_by_testid(_card(soup), "weekly-chart-trouble")
+    body = text(warning)
+    assert expected.format(since=since) in body
+    if details:
+        assert f"(http_403) since {since}." in body
+    else:
+        assert "(http_" not in body
+    title = CHART_PIN_TITLE if kind == "chart_pin_failed" else CHART_FAILING_TITLE
+    assert title in body
