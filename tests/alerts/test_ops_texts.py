@@ -55,6 +55,13 @@ PIN_FAILED = (
     "Check that the bot may pin messages in the chat."
 )
 PIN_RESTORED = "📌 Pinning works again for Office."
+# The chart failure notices (F-04, quick task 261008-vdk).
+CHART_FAILING = (
+    "🖼 Can't post or update the weekly chart for Office (Telegram: http_400). "
+    "Subscribers see no chart, or an old one. It is retried every 15 min. "
+    "Check that the bot is an admin of the channel and may post photos."
+)
+CHART_RESTORED = "🖼 The weekly chart for Office is posted and updated again."
 
 
 def _utc(text: str) -> datetime:
@@ -161,6 +168,15 @@ def test_pin_restored() -> None:
     assert ops_texts.pin_restored("Office") == PIN_RESTORED
 
 
+def test_chart_failing() -> None:
+    assert ops_texts.chart_failing(400, "Office") == CHART_FAILING
+    assert "(Telegram: http_403)" in ops_texts.chart_failing(403, "Office")
+
+
+def test_chart_restored() -> None:
+    assert ops_texts.chart_restored("Office") == CHART_RESTORED
+
+
 # Names are escaped for Telegram HTML, and raw for the log (D-09, D-10)
 
 
@@ -174,6 +190,8 @@ def _named_texts(name: str, escape: bool) -> list[str]:
         ),
         ops_texts.pin_failed(400, name, escape=escape),
         ops_texts.pin_restored(name, escape=escape),
+        ops_texts.chart_failing(400, name, escape=escape),
+        ops_texts.chart_restored(name, escape=escape),
     ]
 
 
@@ -185,6 +203,8 @@ def test_every_name_is_escaped_by_default() -> None:
         ops_texts.uncertain("power_off", at, RAW, interrupted=False, now=now, tz=KYIV),
         ops_texts.pin_failed(400, RAW),
         ops_texts.pin_restored(RAW),
+        ops_texts.chart_failing(400, RAW),
+        ops_texts.chart_restored(RAW),
     ]
 
     for text in texts:
@@ -252,6 +272,13 @@ def test_pin_failed_refuses_a_status_that_is_not_a_short_http_code(status: Any) 
     # Only a short "http_NNN" code may reach the text (OPS-08, D-07).
     with pytest.raises(ValueError, match="HTTP status"):
         ops_texts.pin_failed(status, "Office")
+
+
+@pytest.mark.parametrize("status", [True, 99, 600, "400"], ids=repr)
+def test_chart_failing_refuses_a_status_that_is_not_a_short_http_code(status: Any) -> None:
+    # Only a short "http_NNN" code may reach the text (OPS-08, F-04).
+    with pytest.raises(ValueError, match="HTTP status"):
+        ops_texts.chart_failing(status, "Office")
 
 
 # ops.render_text: integers from the payload, names read at call time
@@ -424,6 +451,54 @@ def test_render_text_refuses_a_broken_pin_notice(location_factory: Callable[...,
         ops.render_text(outbox.KIND_OPS_PIN_FAILED, {"http_status": True}, location.pk, now=now)
     with pytest.raises(ValueError):
         ops.render_text(outbox.KIND_OPS_PIN_FAILED, {"http_status": 1000}, location.pk, now=now)
+
+
+@pytest.mark.django_db
+def test_render_text_reads_the_chart_location_name_at_send_time(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = location_factory(name="Home")
+    now = _utc("2026-10-01T12:00:00")
+    failing: dict[str, Any] = {"http_status": 400}
+    # Renamed after the notices were queued: the payloads hold no name.
+    Location.objects.filter(pk=location.pk).update(name="Office")
+
+    assert ops.render_text(outbox.KIND_OPS_CHART_FAILING, failing, location.pk, now=now) == (
+        CHART_FAILING
+    )
+    assert ops.render_text(outbox.KIND_OPS_CHART_RESTORED, {}, location.pk, now=now) == (
+        CHART_RESTORED
+    )
+    Location.objects.filter(pk=location.pk).update(name=RAW)
+    for kind, payload in (
+        (outbox.KIND_OPS_CHART_FAILING, failing),
+        (outbox.KIND_OPS_CHART_RESTORED, {}),
+    ):
+        escaped = ops.render_text(kind, payload, location.pk, now=now)
+        raw = ops.render_text(kind, payload, location.pk, now=now, escape=False)
+        assert ESCAPED in escaped and RAW not in escaped
+        assert RAW in raw and ESCAPED not in raw
+
+
+@pytest.mark.django_db
+def test_render_text_refuses_a_broken_chart_notice(location_factory: Callable[..., Any]) -> None:
+    location = location_factory()
+    now = _utc("2026-10-01T12:00:00")
+
+    # The chart's location must exist.
+    with pytest.raises(LookupError):
+        ops.render_text(outbox.KIND_OPS_CHART_FAILING, {"http_status": 400}, None, now=now)
+    with pytest.raises(LookupError):
+        ops.render_text(outbox.KIND_OPS_CHART_RESTORED, {}, location.pk + 1000, now=now)
+    # A missing, non-integer or implausible status is a broken payload.
+    with pytest.raises(KeyError):
+        ops.render_text(outbox.KIND_OPS_CHART_FAILING, {}, location.pk, now=now)
+    with pytest.raises(TypeError):
+        ops.render_text(
+            outbox.KIND_OPS_CHART_FAILING, {"http_status": True}, location.pk, now=now
+        )
+    with pytest.raises(ValueError):
+        ops.render_text(outbox.KIND_OPS_CHART_FAILING, {"http_status": 1000}, location.pk, now=now)
 
 
 # The delivery notices (Phase 4 D-10, 04-CONTEXT "Specific Ideas")
