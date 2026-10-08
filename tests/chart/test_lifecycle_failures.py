@@ -751,18 +751,14 @@ def test_INV20_chart_refresh_refused_opens_once_and_closes_on_the_next_refresh(
     assert record.retired_at is None
 
 
-@pytest.mark.parametrize(
-    "case", ["post_502", "post_429", "refresh_timeout", "refresh_target_gone"]
-)
+@pytest.mark.parametrize("case", ["post_502", "post_429", "refresh_timeout", "refresh_target_gone"])
 def test_chart_transient_or_missing_target_opens_no_chart_incident(
     case: str, location_factory: Callable[..., Any], fake_telegram: Any, ops_settings: Any
 ) -> None:
     location = _monitored(location_factory)
     record = None
     if case == "post_502":
-        fake_telegram.fail_method(
-            DEFAULT_BOT_TOKEN, "sendPhoto", status=502, json_body=BAD_GATEWAY
-        )
+        fake_telegram.fail_method(DEFAULT_BOT_TOKEN, "sendPhoto", status=502, json_body=BAD_GATEWAY)
     elif case == "post_429":
         fake_telegram.fail_method(DEFAULT_BOT_TOKEN, "sendPhoto", status=429, json_body=TOO_MANY)
     else:

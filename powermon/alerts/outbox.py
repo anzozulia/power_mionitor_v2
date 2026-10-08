@@ -117,6 +117,9 @@ KIND_OPS_PIN_RESTORED = "ops_pin_restored"  # {}; location = the chart's
 # A location's subscriber alerts are refused / delivered again (D-10); location = the alert's.
 KIND_OPS_DELIVERY_FAILING = "ops_delivery_failing"  # {http_status[, migrate_to_chat_id]}
 KIND_OPS_DELIVERY_RESTORED = "ops_delivery_restored"  # {}
+# Today's chart is refused for good / posted or updated again (F-04); location = the chart's.
+KIND_OPS_CHART_FAILING = "ops_chart_failing"  # {http_status}
+KIND_OPS_CHART_RESTORED = "ops_chart_restored"  # {}
 OPS_KINDS = (
     KIND_OPS_GAP,
     KIND_OPS_ALL_SILENT_START,
@@ -127,6 +130,8 @@ OPS_KINDS = (
     KIND_OPS_PIN_RESTORED,
     KIND_OPS_DELIVERY_FAILING,
     KIND_OPS_DELIVERY_RESTORED,
+    KIND_OPS_CHART_FAILING,
+    KIND_OPS_CHART_RESTORED,
 )
 # The database column is varchar(64).
 MAX_ERROR_LENGTH = 64

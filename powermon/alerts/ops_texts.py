@@ -20,6 +20,8 @@ Telegram reported that the group became a supergroup (``migrate_to_chat_id``), t
 text also gives the new chat ID, so the admin can paste it into the location's edit form;
 the chat is never changed automatically (PITFALLS 6e).
 
+The chart failure texts (F-04) do the same for a refused chart post or update.
+
 Pure: imports nothing from Django.
 """
 
@@ -191,3 +193,24 @@ def delivery_failing(
 def delivery_restored(name: str, *, escape: bool = True) -> str:
     """D-10: a location's subscriber alerts are delivered again after a failure."""
     return f"✅ Alerts for {_name(name, escape)} are delivered again."
+
+
+def chart_failing(status: int, name: str, *, escape: bool = True) -> str:
+    """F-04: Telegram refused a location's chart post or update for good.
+
+    ``status`` is the HTTP status of the refusal, checked like ``pin_failed``'s (an int, not
+    a bool, from 100 to 599, else ValueError), so the text never shows Telegram's description.
+    """
+    if not isinstance(status, int) or isinstance(status, bool) or not 100 <= status <= 599:
+        raise ValueError("a chart failure needs an HTTP status from 100 to 599")
+    return (
+        f"🖼 Can't post or update the weekly chart for {_name(name, escape)} "
+        f"(Telegram: http_{status}). Subscribers see no chart, or an old one. "
+        "It is retried every 15 min. "
+        "Check that the bot is an admin of the channel and may post photos."
+    )
+
+
+def chart_restored(name: str, *, escape: bool = True) -> str:
+    """F-04: a location's chart is posted and updated again after a failure."""
+    return f"🖼 The weekly chart for {_name(name, escape)} is posted and updated again."

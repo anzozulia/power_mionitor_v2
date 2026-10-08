@@ -494,9 +494,7 @@ def test_render_text_refuses_a_broken_chart_notice(location_factory: Callable[..
     with pytest.raises(KeyError):
         ops.render_text(outbox.KIND_OPS_CHART_FAILING, {}, location.pk, now=now)
     with pytest.raises(TypeError):
-        ops.render_text(
-            outbox.KIND_OPS_CHART_FAILING, {"http_status": True}, location.pk, now=now
-        )
+        ops.render_text(outbox.KIND_OPS_CHART_FAILING, {"http_status": True}, location.pk, now=now)
     with pytest.raises(ValueError):
         ops.render_text(outbox.KIND_OPS_CHART_FAILING, {"http_status": 1000}, location.pk, now=now)
 
