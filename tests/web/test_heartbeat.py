@@ -379,6 +379,51 @@ def test_deleted_location_key_401(
     assert _state(location).status == "waiting"
 
 
+@pytest.mark.django_db
+@pytest.mark.parametrize("case", ["missing", "malformed", "unknown", "deleted"])
+def test_INV24_rejected_heartbeat_writes_no_request_warning(
+    client: Client,
+    location_factory: Callable[..., Any],
+    fixed_now: datetime,
+    caplog: pytest.LogCaptureFixture,
+    case: str,
+) -> None:
+    # F-26: a device on an old key beats every 10 s; each 401 must not cost a
+    # django.request WARNING. The DEBUG line still records the rejection.
+    location_factory(name="Home")
+    gone = location_factory(name="Gone", deleted_at=fixed_now)
+    key = {
+        "missing": None,
+        "malformed": "too-short",
+        "unknown": generate_device_key(),
+        "deleted": gone.device_key,
+    }[case]
+    caplog.set_level(logging.DEBUG)
+
+    response = client.get("/hb") if key is None else client.get("/hb", headers=_bearer(key))
+
+    _assert_unauthorized(response)
+    assert _request_records(caplog) == []
+    assert "heartbeat rejected" in caplog.text
+    if key is not None:
+        assert key not in caplog.text
+
+
+@pytest.mark.django_db
+def test_INV24_other_methods_keep_their_request_warning(
+    client: Client, location_factory: Callable[..., Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    # Contrast to F-26: the no-log flag is limited to the 401 path.
+    key = location_factory().device_key
+    caplog.set_level(logging.DEBUG)
+
+    response = client.put("/hb", headers=_bearer(key))
+
+    assert response.status_code == 405
+    assert [r for r in _request_records(caplog) if r.levelno == logging.WARNING]
+    assert key not in caplog.text
+
+
 # Routing: the exact URL, never a redirect (INV-24, D-06)
 
 
