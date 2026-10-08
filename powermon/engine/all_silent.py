@@ -2,12 +2,12 @@
 
 *All-silent* (D-01, INV-12) starts when there are at least 2 active locations (status on
 or off, not in maintenance, not deleted) and each of them has gone longer than its own
-heartbeat period without a heartbeat, counted from max(last heartbeat, end of the last
-lapse). ``system_state.detection_resumed_at`` is that lapse end. Silence is strict: at
-exactly its period a location is not silent yet. The incident starts at the latest of
-those counting points, the moment the last location fell quiet, and is opened (detected)
-about one period later. The admin gets exactly one start notice and one end notice per
-incident.
+OFF timeout (period + grace, without router grace) without a heartbeat, counted from
+max(last heartbeat, end of the last lapse). ``system_state.detection_resumed_at`` is that
+lapse end. Silence is strict: at exactly its timeout a location is not silent yet. The
+incident starts at the latest of those counting points, the moment the last location fell
+quiet, and is opened (detected) about one timeout later. The admin gets exactly one start
+notice and one end notice per incident.
 
 An open incident ends at the first of these heartbeats (D-04, refined after the wave-1
 audit):
@@ -105,7 +105,7 @@ OPENED_KEY = "opened_us"
 # The active locations: monitored (on or off), not in maintenance, not deleted. Raw SQL in
 # the style of transitions.SNAPSHOT_SQL.
 ACTIVE_SQL = """
-SELECT s.location_id, l.period_s, s.last_heartbeat_at
+SELECT s.location_id, l.period_s + l.grace_s, s.last_heartbeat_at
   FROM location_state s
   JOIN location l ON l.id = s.location_id
  WHERE s.status IN ('on', 'off') AND NOT l.maintenance AND l.deleted_at IS NULL
@@ -119,8 +119,8 @@ SELECT s.location_id, l.period_s, s.last_heartbeat_at
 # location on) and whether it is off. One statement, so a location toggled meanwhile is
 # seen once, in one state.
 END_SQL = """
-SELECT s.location_id, l.period_s, s.last_heartbeat_at, l.maintenance, s.window_start_at,
-       s.status = 'off'
+SELECT s.location_id, l.period_s + l.grace_s, s.last_heartbeat_at, l.maintenance,
+       s.window_start_at, s.status = 'off'
   FROM location_state s
   JOIN location l ON l.id = s.location_id
  WHERE s.status IN ('on', 'off') AND l.deleted_at IS NULL
@@ -138,10 +138,15 @@ UPDATE ops_incident
 
 @dataclass(frozen=True)
 class Active:
-    """One location as the all-silent check sees it (ACTIVE_SQL, or END_SQL for the end)."""
+    """One location as the all-silent check sees it (ACTIVE_SQL, or END_SQL for the end).
+
+    ``timeout_s`` is the second column of both queries: the location's period + grace.
+    """
 
     location_id: int
-    period_s: int
+    # Period + grace: the location's OFF timeout without router grace (F-02; INV-12 as
+    # amended 2026-10-08). Bare period let heartbeat jitter open false incidents.
+    timeout_s: int
     # Always set for a location that is on or off; None is handled as "cannot tell".
     last_heartbeat_at: datetime | None
     # Only an end candidate can be in maintenance (END_SQL); its heartbeat ends an
@@ -167,16 +172,17 @@ def silence_since(
     """When all-silent started, or None if it has not (pure, INV-12).
 
     It has started when there are at least MIN_ACTIVE rows and every one of them has been
-    quiet for longer than its own period at ``now`` (strict ``>``), counted from max(last
-    heartbeat, ``lapse_end``); it started at the latest of those counting points. A row
-    with neither a heartbeat nor a lapse end cannot be measured, so nothing starts.
+    quiet for longer than its own OFF timeout (period + grace) at ``now`` (strict ``>``),
+    counted from max(last heartbeat, ``lapse_end``); it started at the latest of those
+    counting points. A row with neither a heartbeat nor a lapse end cannot be measured, so
+    nothing starts.
     """
     if len(rows) < MIN_ACTIVE:
         return None
     started: datetime | None = None
     for row in rows:
         since = _quiet_since(row, lapse_end)
-        if since is None or now - since <= timedelta(seconds=row.period_s):
+        if since is None or now - since <= timedelta(seconds=row.timeout_s):
             return None
         if started is None or since > started:
             started = since

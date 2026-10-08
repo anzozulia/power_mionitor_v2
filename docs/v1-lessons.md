@@ -150,12 +150,12 @@ Source: a September 2026 investigation of the v1 codebase (Django, last changed 
 
 #### INV-12 When every location goes silent at once, tell the admin
 - **Rule** (recommended default, brief section 9 question 2: notify only, no hold):
-  - *All-silent* starts when there are at least 2 active locations (monitored, not in maintenance) and each has gone longer than its own heartbeat period without a heartbeat, counted from max(last heartbeat, end of the last lapse). It ends when any heartbeat arrives. The admin gets 1 ops alert when it starts and 1 when it ends (INV-20).
+  - *All-silent* starts when there are at least 2 active locations (monitored, not in maintenance) and each has gone longer than its own OFF timeout (heartbeat period + grace, without router grace) without a heartbeat, counted from max(last heartbeat, end of the last lapse). It ends when any heartbeat arrives. The admin gets 1 ops alert when it starts and 1 when it ends (INV-20). (Amended 2026-10-08, quick task 261008-vdk: the bare period let heartbeat jitter open false incidents while the other locations were off.)
   - Subscriber alerts are not changed by all-silent. The legacy trigger for mass false alerts is removed at its source instead: only the proxy is exposed (INV-22), and web-app restarts give a fresh detection window (INV-10).
   - If the maintainer opts into the hold in discuss-phase, the brief's section 9 question 2 defines it. The planner then replaces the acceptance scenarios below: during the hold subscribers get 0 alerts and the silent spans become not monitored; silence that outlasts the 3-min hold leads to each OFF alert being sent once, stating its real outage start.
 - **v1 failure:** With 3 locations and ingress down 14:10-14:13 while the worker ran, v1 sent 6 alerts (3 false OFF + 3 false ON), and the admin was never told the server side was the problem. The app port was public, with 2 sync workers, so 2 idle slow clients blocked all heartbeats. In the reproduction a heartbeat timed out after 12 s.
 - **Acceptance (default):**
-  - Given 3 active locations whose last heartbeats fall between 14:09:10 and 14:10:00, when heartbeats resume only at 14:13:00-14:13:30, then the admin gets 1 ops alert at about 14:11:00 and 1 recovery notice, and subscriber alerts follow the normal rules.
+  - Given 3 active locations whose last heartbeats fall between 14:09:10 and 14:10:00, when heartbeats resume only at 14:13:00-14:13:30, then the admin gets 1 ops alert at about 14:11:30 (period 60 s + grace 30 s) and 1 recovery notice, and subscriber alerts follow the normal rules. (Amended 2026-10-08, quick task 261008-vdk.)
   - Given 2 active locations and only A goes silent, then no ops alert is sent and A's OFF alert is sent normally.
   - Given only 1 active location, then all-silent never triggers.
 - **Covers:** OPS-04, MON-05
