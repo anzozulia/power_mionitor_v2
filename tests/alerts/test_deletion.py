@@ -1026,7 +1026,11 @@ def test_DATA02_both_outages_removed_first_delete_refused_sends_the_dropped_on(
     assert io_loop.run_iteration(clock, state) is True
     assert _result(off_a) == "http_400"
     stored = OutboxMessage.objects.get(pk=on_a.pk)
-    assert (stored.status, stored.next_attempt_at, stored.last_error) == ("pending", clock.now(), "")
+    assert (stored.status, stored.next_attempt_at, stored.last_error) == (
+        "pending",
+        clock.now(),
+        "",
+    )
 
     # Next pass: ON A goes out, then OFF B's delete succeeds. The channel ends showing
     # OFF A and ON A: never only "power off" while the power is on.
