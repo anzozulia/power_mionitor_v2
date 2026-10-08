@@ -1288,7 +1288,7 @@ def test_INV10_heartbeat_during_carve_clamps_no_500(
     assert beat.exc is None, beat.exc  # never an IntegrityError (power_interval_end_after_start)
     assert (carve.result, beat.result) == (1, 200)
     state = LocationState.objects.get(pk=location.pk)
-    assert (state.status, state.on_since) == ("on", _at(10, 10))
+    assert (state.status, state.on_since) == ("on", _at(10, 9, 59))
     [_off, on] = _subscriber_rows(location)
     assert (on.kind, on.event_at) == (outbox.KIND_POWER_ON, _at(10, 10))
     assert on.payload == {"was_off_us": 70 * 60 * 1_000_000}

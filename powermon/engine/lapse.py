@@ -29,7 +29,11 @@ A backward wall-clock step carves nothing (the window before the cursor is histo
 stored instants stamped while the clock was ahead would blind OFF detection for the size
 of the step. When the cursor is more than CLOCK_STEP_LIMIT_S ahead of now,
 ``clamp_future`` moves them back to now (F-03); that signal also covers a worker restarted
-after the step.
+after the step. A location that was off at the step keeps its future outage start, and its
+restore stamps the receive time into the state (``transitions.RESTORE_SQL``, quick task
+261008-vdk R-1), so OFF detection resumes about one timeout after the step for restored
+locations too. "Was OFF for" after a step can still be off by up to the step size when
+the stored timeline pushes the restore time forward (accepted, like a future OFF time).
 
 Lock ordering (no deadlock): every transaction that writes ``power_interval`` locks
 exactly one ``location_state`` row, and takes that lock first. That covers heartbeats,
@@ -98,6 +102,10 @@ UPDATE system_state
 # After a backward wall-clock step (F-03): every stored detection instant that lies in the
 # future moves back to now. CASE, never LEAST: LEAST ignores NULL and would fill the NULL
 # columns of a waiting row. on_since moves too, so "was ON for" is never negative.
+# outage_started_at stays: it must keep equal to the open off piece's outage_start_at (a
+# clamp would only overstate "was OFF for", split the outage at a maintenance exit and let
+# history.remove_outage remove a running outage); the restore gate writes receive-time
+# anchors instead (R-1).
 CLAMP_STATE_SQL = """
 UPDATE location_state
    SET last_heartbeat_at = CASE WHEN last_heartbeat_at > %(now)s THEN %(now)s
@@ -255,7 +263,10 @@ def clamp_future(cursor: datetime, now: datetime) -> bool:
     error in between leaves the cursor ahead, and the next cycle re-runs the clamp. The
     multi-row UPDATE writes no power_interval, so it joins no timeline lock cycle. The
     timeline, chart records and incidents are left alone, and no gap notice is sent: the
-    window before the cursor is history. Returns whether this call moved the cursor.
+    window before the cursor is history. outage_started_at is not clamped (see
+    CLAMP_STATE_SQL); a later restore writes receive-time anchors (R-1), so OFF detection
+    resumes about one timeout after the step for every location. Returns whether this
+    call moved the cursor.
     """
     with connection.cursor() as cur:
         cur.execute(CLAMP_STATE_SQL, {"now": now})
@@ -285,7 +296,7 @@ def carve_if_needed(
       history before the cursor is never rewritten. When the cursor is more than
       CLOCK_STEP_LIMIT_S ahead, the future-stamped anchors and held outbox rows move back
       to ``now`` first (``clamp_future``, F-03), so OFF detection resumes about one
-      timeout after the step.
+      timeout after the step, for locations restored after it too (R-1).
     - Otherwise the gap is carved when ``force`` is set (a new lease generation, a
       re-established connection, a failed cycle or a forward clock step, D-04), or when it
       is longer than LAPSE_THRESHOLD (strict ``>``).

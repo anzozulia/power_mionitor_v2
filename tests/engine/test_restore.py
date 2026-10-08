@@ -705,7 +705,7 @@ def test_Pitfall3_first_gate_clamps_to_the_open_start(
     # The new server's clock is behind the dump: the first heartbeat is received at 09:59.
     assert transitions.record_heartbeat(location.pk, _at(9, 59)) == "started"
 
-    assert _state(location) == ("on", _at(10, 0), _at(10, 0), None, None)
+    assert _state(location) == ("on", _at(9, 59), _at(9, 59), None, None)
     # The not-monitored piece would end where it starts: it is deleted, never closed
     # before its start (no IntegrityError, no 500 on every heartbeat).
     assert _intervals(location) == [
