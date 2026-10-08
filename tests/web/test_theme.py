@@ -9,9 +9,10 @@ TEST-STRATEGY §8.4).
   ``/`` and sets ``theme=<value>`` with Path=/, SameSite=Lax, Max-Age one year, Secure
   exactly when ``SESSION_COOKIE_SECURE`` is true, and not HttpOnly (the JS toggle writes
   it too). Any other or missing value answers 400 with an empty body and sets no cookie.
-  GET is 405; a POST without a CSRF token is 403 and an anonymous POST goes to sign-in,
-  neither with a cookie. ``next`` and the Referer never change the target (no open
-  redirect, R8). The POST writes nothing, adds no flash and is never cached.
+  GET redirects to / and sets nothing (F-24); a POST without a CSRF token is 403 and an
+  anonymous POST goes to sign-in, neither with a cookie. ``next`` and the Referer never
+  change the target (no open redirect, R8). The POST writes nothing, adds no flash and is
+  never cached.
 - Rendered (S1, the first page on the auth layout): ``<html data-theme>`` is the
   processor's value for every cookie above, the page keeps the page invariants in each
   state, and a hostile value never reaches the HTML. No GET sets the cookie (D6-03).
@@ -188,8 +189,18 @@ def test_UI02_theme_post_rejects_bad_values(admin: Client) -> None:
 
 
 @pytest.mark.django_db
-def test_UI02_theme_get_is_405(admin: Client) -> None:
-    for method in (admin.get, admin.put, admin.delete):
+def test_UI02_theme_get_redirects_and_sets_nothing(admin: Client) -> None:
+    # Expected (F-24): the sign-in redirect after an ended session GETs /theme/; edge: a
+    # query value is ignored. No cookie, no flash, never cached, only the fixed target.
+    for response in (admin.get(URL), admin.get(URL, {"theme": "dark"})):
+        assert response.status_code == 302
+        assert response["Location"] == "/"
+        assert "theme" not in response.cookies
+        assert {"no-store", "private"} <= _cache_control(response)
+    assert list(admin.get("/").context["messages"]) == []
+
+    # Failure: every other method still answers 405, with no cookie.
+    for method in (admin.put, admin.delete):
         response = method(URL)
         assert response.status_code == 405
         assert "theme" not in response.cookies

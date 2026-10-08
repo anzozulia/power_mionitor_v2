@@ -12,6 +12,8 @@
 - N11: the throttled sign-in page's context carries ``retry_after`` (the 429's
   ``Retry-After``), the countdown's start, next to the unchanged throttle message (R9).
 - R3: the setup page's context carries the public bot id, never the secret part.
+- F-24 (quick task 261008-vdk): a GET of a switch or the test-message URL (a stale tab
+  after sign-in) queues one plain, not sticky, warning that nothing was changed.
 
 Everything is read from the message storage, the response headers or the template
 context, never from the HTML.
@@ -56,6 +58,8 @@ A7_OUTAGE_REMOVED = (
     "from the channel where Telegram allows it. If it is within the last 7 days, the pinned "
     "chart shows the change within seconds."
 )
+# F-24 (quick task 261008-vdk), verbatim: pinned here once.
+F24_ACTION_NOT_DONE = "Nothing was changed. If you were signed out, use the button again."
 CLEAR_SITE_DATA = "Clear-Site-Data"
 CHAT_B = -1009876543210
 SECRET = "Sx_9-Qw7Lm" * 4
@@ -194,6 +198,18 @@ def test_UI09_other_flashes_are_not_sticky(admin: Client, location_factory: Make
     assert signed_out.message == views.SIGNED_OUT_MESSAGE
     for message in (saved, switched, again, already, signed_out):
         assert not _sticky(message), message.message
+
+
+def test_F24_action_not_done_copy_and_level(admin: Client, location_factory: Make) -> None:
+    pk = location_factory().pk
+
+    alerts = _only(admin, admin.get(f"/locations/{pk}/alerts/"))
+    test_message = _only(admin, admin.get(f"/locations/{pk}/test-message/"))
+
+    for message in (alerts, test_message):
+        assert (message.level, message.message) == (messages.WARNING, F24_ACTION_NOT_DONE)
+        assert not _sticky(message)
+    assert location_views.ACTION_NOT_DONE_MESSAGE == F24_ACTION_NOT_DONE
 
 
 # Amendments A1, A4 and A7

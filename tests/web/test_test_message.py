@@ -61,6 +61,7 @@ from powermon.alerts import delivery, outbox
 from powermon.alerts.models import OpsIncident, OutboxMessage
 from powermon.locations.models import Location
 from powermon.telegram.client import SendResult
+from powermon.web import location_views
 from powermon.web.location_views import (
     TEST_SERVER_ERROR_MESSAGE,
     TEST_UNREACHABLE_MESSAGE,
@@ -399,13 +400,25 @@ def test_test_message_is_never_retried(
 
 
 @pytest.mark.django_db
-def test_test_message_get_is_405(
+def test_test_message_get_sends_nothing_and_redirects(
     admin: Client, location_factory: Callable[..., Any], fake_telegram: FakeTelegram
 ) -> None:
     location = location_factory()
+    gone = location_factory(name="Gone", deleted_at=T0)
+    page = f"/locations/{location.pk}/"
 
-    for method in (admin.get, admin.put, admin.delete):
+    # Expected (F-24): a GET sends nothing and lands on the page with a warning.
+    response = admin.get(_url(location))
+    assert (response.status_code, response.url) == (302, page)
+    followed = admin.get(response.url)
+    assert [(m.level, m.text) for m in page_messages(followed)] == [
+        ("warning", location_views.ACTION_NOT_DONE_MESSAGE)
+    ]
+    # Failure: every other method still answers 405.
+    for method in (admin.put, admin.delete):
         assert method(_url(location)).status_code == 405
+    # Edge: a deleted location answers 404.
+    assert admin.get(_url(gone)).status_code == 404
 
     assert len(fake_telegram.calls) == 0
 

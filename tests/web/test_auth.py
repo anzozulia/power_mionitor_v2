@@ -11,11 +11,13 @@ regions), never through classes or raw markup. Python-owned copy is imported; te
 is pinned against the 06-UI-SPEC copy table (signin.*).
 """
 
+from collections.abc import Callable
 from io import StringIO
 from typing import Any
 
 import pytest
 from bs4 import Tag
+from conftest import FakeTelegram
 from django.conf import settings
 from django.contrib.auth import authenticate, get_user, get_user_model
 from django.contrib.staticfiles.storage import staticfiles_storage
@@ -39,8 +41,10 @@ from pages import (
     title,
 )
 
+from powermon.locations.models import Location
 from powermon.web.admin_sync import sync_admin
 from powermon.web.forms import SIGN_IN_ERROR
+from powermon.web.location_views import ACTION_NOT_DONE_MESSAGE
 from powermon.web.templatetags.icons import ICONS
 from powermon.web.views import SIGNED_OUT_MESSAGE
 
@@ -497,6 +501,42 @@ def test_sign_out_when_already_signed_out_lands_on_login(client: Client) -> None
 
     assert response.status_code == 302
     assert response.url == "/login/"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("name", ["maintenance", "alerts", "router-grace", "test-message", "theme"])
+def test_P23_stale_tab_action_after_sign_in_lands_on_its_page(
+    client: Client, location_factory: Callable[..., Any], fake_telegram: FakeTelegram, name: str
+) -> None:
+    # F-24: a stale tab's POST after the session ended goes through sign-in, which sends
+    # the admin back to the action URL with a GET. That GET never acts and never 405s.
+    sync_admin("admin", "pw-one")
+    location = location_factory(name="Office")
+    page = f"/locations/{location.pk}/"
+    url = "/theme/" if name == "theme" else f"{page}{name}/"
+    data = (
+        {"theme": "dark"} if name == "theme" else {} if name == "test-message" else {"value": "on"}
+    )
+
+    def flags() -> tuple[Any, ...]:
+        row = Location.objects.get(pk=location.pk)
+        return (row.maintenance, row.alerts_enabled, row.router_grace)
+
+    before = flags()
+
+    anonymous = client.post(url, data)
+    assert (anonymous.status_code, anonymous.url) == (302, f"/login/?next={url}")
+    signed_in = _sign_in(client, "admin", "pw-one", next=url)
+    assert (signed_in.status_code, signed_in.url) == (302, url)
+
+    landed = client.get(url)
+    assert (landed.status_code, landed.url) == (302, "/" if name == "theme" else page)
+    assert "theme" not in landed.cookies
+    shown = [(m.level, m.text) for m in messages(client.get(landed.url))]
+    assert shown == ([] if name == "theme" else [("warning", ACTION_NOT_DONE_MESSAGE)])
+
+    assert flags() == before
+    assert len(fake_telegram.calls) == 0
 
 
 @pytest.mark.django_db
