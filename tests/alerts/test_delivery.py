@@ -1061,3 +1061,71 @@ def test_D08_refusal_waits_for_an_uncommitted_chat_save_and_is_due_now(
     assert (row.status, row.next_attempt_at, row.last_error) == ("pending", T0, "http_403")
     assert _incidents(location) == []
     assert state.failing == {}
+
+
+# F-04 (quick task 261008-vdk): the location page's chart warning reads the chart incidents
+
+
+@pytest.mark.django_db
+def test_chart_trouble_prefers_chart_failing_and_reads_its_status(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = location_factory()
+    OpsIncident.objects.create(
+        kind="chart_pin_failed", location=location, started_at=T0, details={"http_status": 400}
+    )
+    started = T0 + _min(5)
+    OpsIncident.objects.create(
+        kind="chart_failing", location=location, started_at=started, details={"http_status": 403}
+    )
+
+    assert delivery.chart_trouble(location.pk) == delivery.ChartTrouble(
+        "chart_failing", started, 403
+    )
+    assert (delivery.KIND_CHART_FAILING, delivery.KIND_CHART_PIN_FAILED) == (
+        "chart_failing",
+        "chart_pin_failed",
+    )
+    assert lifecycle.KIND_CHART_FAILING == delivery.KIND_CHART_FAILING
+    assert lifecycle.KIND_CHART_PIN_FAILED == delivery.KIND_CHART_PIN_FAILED
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("details", [{"http_status": "403"}, {}, {"http_status": True}, []])
+def test_chart_trouble_reads_a_malformed_status_as_400(
+    location_factory: Callable[..., Any], details: Any
+) -> None:
+    location = location_factory()
+    OpsIncident.objects.create(
+        kind="chart_failing", location=location, started_at=T0, details=details
+    )
+    other = location_factory()
+    OpsIncident.objects.create(kind="chart_pin_failed", location=other, started_at=T0, details={})
+
+    assert delivery.chart_trouble(location.pk) == delivery.ChartTrouble("chart_failing", T0, 400)
+    assert delivery.chart_trouble(other.pk) == delivery.ChartTrouble("chart_pin_failed", T0, 400)
+
+
+@pytest.mark.django_db
+def test_chart_trouble_is_none_without_an_open_chart_incident(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = location_factory()
+    other = location_factory()
+    for kind in ("chart_failing", "chart_pin_failed"):
+        OpsIncident.objects.create(
+            kind=kind,
+            location=location,
+            started_at=T0,
+            ended_at=T0 + _min(1),
+            details={"http_status": 403},
+        )
+    OpsIncident.objects.create(
+        kind="delivery_failing", location=location, started_at=T0, details={"http_status": 403}
+    )
+    OpsIncident.objects.create(
+        kind="chart_failing", location=other, started_at=T0, details={"http_status": 403}
+    )
+
+    assert delivery.chart_trouble(location.pk) is None
+    assert delivery.chart_trouble(other.pk + 1000) is None

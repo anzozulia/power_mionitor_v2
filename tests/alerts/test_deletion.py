@@ -49,6 +49,7 @@ from powermon.engine import history, transitions
 from powermon.engine.models import LocationState, PowerInterval, SystemState
 from powermon.locations import actions
 from powermon.locations.models import Location
+from powermon.telegram.client import SendResult
 from powermon.worker import detection, io_loop
 
 DB = pytest.mark.django_db(transaction=True)
@@ -1014,3 +1015,44 @@ def test_DATA02_a_request_from_another_removal_is_not_cancelled(
 
     assert (_result(off), _result(on)) == ("http_400", "deleted")
     assert json.loads(fake_telegram.calls[1].request.body)["message_id"] == 2
+
+
+def _chart_location(location: Any) -> lifecycle.ChartLocation:
+    return lifecycle.ChartLocation(
+        location.pk,
+        location.name,
+        location.language,
+        location.bot_token,
+        location.chat_id,
+        timedelta(0),
+    )
+
+
+@DB
+def test_delete_closes_chart_failing_without_notice(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    # F-04 (quick task 261008-vdk): a refused chart opens chart_failing; a delete closes it
+    # with no recovery notice (D-09), like every other incident of the location.
+    location = location_factory()
+    other = location_factory()
+    refused = SendResult("permanent", code="http_403")
+    lifecycle._chart_refused(_chart_location(location), refused, REMOVED)
+    lifecycle._chart_refused(_chart_location(other), refused, REMOVED)
+    chart = OpsIncident.objects.filter(kind="chart_failing")
+    assert chart.filter(location=location, ended_at__isnull=True).count() == 1
+    notices = OutboxMessage.objects.filter(channel=outbox.CHANNEL_OPS)
+    assert notices.filter(kind="ops_chart_failing", location=location).count() == 1
+    later = REMOVED + timedelta(minutes=5)
+
+    assert actions.delete_location(location.pk, later) is True
+
+    [incident] = chart.filter(location=location)
+    assert incident.ended_at == later
+    assert not notices.filter(kind="ops_chart_restored").exists()
+    # Another location's open incident stays open.
+    assert chart.filter(location=other, ended_at__isnull=True).count() == 1
+    # A refusal answered after the delete adds no incident and no notice.
+    lifecycle._chart_refused(_chart_location(location), refused, later + US)
+    assert chart.filter(location=location).count() == 1
+    assert notices.filter(location=location).count() == 1

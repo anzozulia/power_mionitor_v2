@@ -10,6 +10,10 @@ Weekly chart; TEST-STRATEGY §8.2, §7.5 UI-06).
   image anywhere on the page, so the browser requests no PNG, and no header action.
 - A waiting location with history (after a restore) and a location in maintenance show the
   image too: what decides is the stored history, not the status.
+- While the channel's chart fails (an open ``chart_failing`` or ``chart_pin_failed``
+  incident) the card shows one ``weekly-chart-trouble`` warning with fixed copy, the
+  short ``http_NNN`` code and the start time, never the location name (F-04, quick task
+  261008-vdk).
 - Rendering the page never renders the chart: the browser requests the PNG lazily, and the
   route renders and caches it (T-06-48). Polling never touches the card.
 
@@ -23,16 +27,21 @@ from typing import Any
 
 import pytest
 from bs4 import Tag
+from conftest import FakeClock
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.test import Client
 from django.urls import reverse
 from pages import all_by_testid, assert_page, by_testid, main, parse, section, text
 
+from powermon.alerts.models import OpsIncident
 from powermon.chart import render
 from powermon.engine.models import LocationState, PowerInterval
 from powermon.locations.models import Location
 from powermon.web.chart_preview import cache_key
+from powermon.web.location_views import LocationDetailView
+from powermon.web.status import failing_since_text
 
 User = get_user_model()
 
@@ -231,3 +240,68 @@ def test_UI06_page_render_does_not_render_the_chart(
     assert admin.get(_page(location)).status_code == 404
     assert admin.get(_chart(location)).status_code == 404
     assert calls == ["Office"]
+
+
+# F-04 (quick task 261008-vdk): the card warns while the channel's chart fails
+
+CHART_FAILING_TITLE = "The channel's chart is not being updated"
+CHART_PIN_TITLE = "Today's chart is not pinned"
+
+
+def _incident(location: Any, kind: str, details: dict[str, Any], **kw: Any) -> OpsIncident:
+    return OpsIncident.objects.create(
+        kind=kind, location=location, started_at=_at(9, 5), details=details, **kw
+    )
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("case", ["failing", "pin_only", "both", "closed", "delivery_only"])
+def test_weekly_chart_card_warns_while_the_chart_fails(
+    admin: Client,
+    location_factory: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    monkeypatch.setattr(LocationDetailView, "clock", FakeClock(_at(15)))
+    location = location_factory(name=NAME)
+    _history(location)
+    _on(location)
+    if case in ("failing", "both"):
+        _incident(location, "chart_failing", {"http_status": 403})
+    if case in ("pin_only", "both"):
+        _incident(location, "chart_pin_failed", {})
+    if case == "closed":
+        _incident(location, "chart_failing", {"http_status": 403}, ended_at=_at(10))
+        _incident(location, "chart_pin_failed", {}, ended_at=_at(10))
+    if case == "delivery_only":
+        _incident(location, "delivery_failing", {"http_status": 403})
+    since = failing_since_text(_at(9, 5), _at(15), settings.TIME_ZONE)
+
+    response = admin.get(_page(location))
+    soup = assert_page(response, title=NAME, app=True)
+
+    card = _card(soup)
+    found = all_by_testid(card, "weekly-chart-trouble")
+    assert all_by_testid(soup, "weekly-chart-trouble") == found
+    if case in ("closed", "delivery_only"):
+        assert found == []
+    else:
+        [warning] = found
+        assert warning["data-tone"] == "warning"
+        body = text(warning)
+        if case == "pin_only":
+            assert CHART_PIN_TITLE in body
+            assert f"Telegram refused the pin (http_400) since {since}." in body
+            assert CHART_FAILING_TITLE not in body
+        else:
+            assert CHART_FAILING_TITLE in body
+            assert f"Telegram refused to post or update it (http_403) since {since}." in body
+            assert CHART_PIN_TITLE not in body
+        # Fixed copy: never the location name, raw or escaped.
+        assert NAME not in body
+        assert "Office" not in body
+        assert "Office" not in str(warning)
+    # INV-23: the page shows no secret.
+    html = response.content.decode()
+    assert location.device_key not in html
+    assert location.bot_token not in html
