@@ -997,7 +997,9 @@ same `postgres:18.6-trixie` image as `db`, so `pg_dump` has the server's version
   A failing backup shows only there and in
   `docker compose -f docker-compose.prod.yml logs backup`: each dump logs
   `backup: dump powermon-….dump ok`, each failure one `backup: error: …` line. There is no
-  ops notice for it, so look at it after each deploy and now and then.
+  ops notice for it, so look at it after each deploy and now and then. A deploy (17.2,
+  step 6) logs one `warning <commit>: backup is unhealthy …` line for it and still
+  completes.
 
 ### A dump on demand
 
@@ -1549,7 +1551,9 @@ script, which:
    restarted`, again with the old commit and containers left as they were;
 5. takes a dump (section 14) when `powermon/migrations` or `uv.lock` changed (Django's own
    migrations come with `uv.lock`);
-6. runs `up -d --wait`, which runs `migrate` once and then starts `web` and `worker`;
+6. runs `up -d --wait web worker`, which runs `migrate` once and then starts `web` and
+   `worker`. Then it starts `backup` apart. A backup that does not start or is unhealthy
+   is one `warning <commit>: …` line, not a failed deploy;
 7. checks `https://powermonitor.anzozulia.com/healthz` through the host nginx;
 8. if that fails, rolls back to the previous commit and starts it again, except after a
    change to `powermon/migrations` or `uv.lock`: then it stops and leaves the recovery to
@@ -1671,7 +1675,8 @@ from your machine:
 ssh hetzner /usr/local/sbin/powermon-deploy --redeploy
 ```
 
-It rebuilds the checked-out commit, runs `up --wait`, checks `/healthz` through nginx and
+It rebuilds the checked-out commit, checks the configuration (17.2, step 4), runs
+`up --wait web worker`, checks `/healthz` through nginx, starts `backup` (17.2, step 6) and
 prints its log lines. Exit code 0 means deployed. A CI re-run of the deployed commit does
 nothing while web and worker are healthy (17.2, step 2), so after an env change use this
 command, not a re-run. `--redeploy` works only as root on the server: the CI deploy key
