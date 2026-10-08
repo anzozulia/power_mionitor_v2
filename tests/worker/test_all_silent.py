@@ -239,11 +239,11 @@ def test_INV12_all_silent_one_alert_one_recovery(
 
     outcomes = _run_inv12(locations, evaluate=True)
 
-    # The start at the first cycle after 14:11:00 (C silent for more than 60 s), the end
-    # at the first cycle after A's heartbeat.
-    assert outcomes == {_at(11, 11, 5): "started", _at(11, 13, 5): "ended"}
+    # The start at the first cycle after 14:11:30 (C silent for more than 90 s: period 60 +
+    # grace 30), the end at the first cycle after A's heartbeat.
+    assert outcomes == {_at(11, 11, 35): "started", _at(11, 13, 5): "ended"}
     [start] = _starts()
-    assert (start.recorded_at, start.location_id) == (_at(11, 11, 5), None)
+    assert (start.recorded_at, start.location_id) == (_at(11, 11, 35), None)
     assert start.payload == {"since_us": ops.instant_us(_at(11, 10)), "count": 3}
     assert _render(start) == START_3_SINCE_14_10
     [end] = _ends()
@@ -392,16 +392,98 @@ def test_INV12_single_location_never_triggers(
     assert _subscriber_alerts() == [("power_off", "A", _at(11, 0))]
 
 
+# INV-12 as amended 2026-10-08 (F-02): the threshold is the OFF timeout, period + grace
+
+# A's device beats every 60.9 s: inside its 90 s timeout, but more than its 60 s period.
+JITTER_EVERY = timedelta(seconds=60, milliseconds=900)
+
+
+def _run_jitter(a: Any, beats: int | None, last_step: datetime) -> list[tuple[datetime, str]]:
+    """A cycle and the all-silent check every 5 s from 11:00:05 to ``last_step``.
+
+    A's beats (at 11:00 + k * 60.9 s, k = 1, 2, ..., up to ``beats`` if given) that are
+    due by a step's time arrive just before that step's cycle. Returns the non-None
+    results of the check with their step.
+    """
+    results: list[tuple[datetime, str]] = []
+    k = 1
+    for at in _steps(_at(11, 0, 5), last_step, timedelta(seconds=5)):
+        while (beats is None or k <= beats) and _at(11, 0) + k * JITTER_EVERY <= at:
+            assert transitions.record_heartbeat(a.pk, _at(11, 0) + k * JITTER_EVERY) == "plain"
+            k += 1
+        detection.run_cycle(at)
+        result = all_silent.evaluate(at)
+        if result is not None:
+            results.append((at, result))
+    return results
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV12_jitter_within_grace_never_starts_all_silent_while_the_others_are_off(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    _system(cursor=None, resumed=_at(9, 0))
+    a = _silent(location_factory, "A", _at(11, 0))
+    b = _silent(location_factory, "B", _at(11, 0))
+
+    results = _run_jitter(a, None, _at(11, 30))
+
+    # B went off at its own timeout; A, beating inside its timeout, stays on.
+    assert LocationState.objects.get(pk=b.pk).status == "off"
+    assert LocationState.objects.get(pk=a.pk).status == "on"
+    # Under the old bare-period rule A's beat at 11:05:04.5 followed by the 11:06:05 cycle
+    # (60.5 s of quiet, more than its 60 s period) opened a false incident, and A's next
+    # beat closed it: a false start/end pair for the admin while only B was off.
+    assert results == []
+    assert (_incidents(), _starts(), _ends()) == ([], [], [])
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV12_jitter_then_real_silence_starts_once_at_the_first_cycle_past_the_timeout(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    _system(cursor=None, resumed=_at(9, 0))
+    a = _silent(location_factory, "A", _at(11, 0))
+    _silent(location_factory, "B", _at(11, 0))
+    last = _at(11, 0) + 9 * JITTER_EVERY
+    assert last == _at(11, 9, 8, 100_000)
+
+    results = _run_jitter(a, 9, _at(11, 14))
+
+    # A falls quiet at 11:09:08.1; 11:10:40 is the first cycle more than 90 s later.
+    assert results == [(_at(11, 10, 40), "started")]
+    [start] = _starts()
+    assert start.payload["since_us"] == ops.instant_us(last)
+    assert start.recorded_at == _at(11, 10, 40)
+    assert _incidents() == [(None, last, None)]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV12_a_long_grace_location_keeps_all_silent_closed_until_its_own_timeout(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    _system(cursor=None, resumed=_at(9, 0))
+    _silent(location_factory, "A", _at(11, 0))
+    _silent(location_factory, "B", _at(11, 0), grace_s=300)
+
+    # A is past its 90 s timeout, B (period 60 + grace 300) is not.
+    assert all_silent.evaluate(_at(11, 1, 31)) is None
+    # Exactly B's 360 s timeout: not silent yet (strict).
+    assert all_silent.evaluate(_at(11, 6)) is None
+    assert all_silent.evaluate(_at(11, 6) + timedelta(microseconds=1)) == "started"
+    assert _incidents() == [(None, _at(11, 0), None)]
+
+
 # The silence rule itself (pure)
 
 
-def test_all_silent_boundary_exactly_one_period() -> None:
+def test_all_silent_boundary_exactly_one_timeout() -> None:
     last = _at(11, 10)
-    rows = [all_silent.Active(1, 60, last), all_silent.Active(2, 60, last - timedelta(seconds=5))]
+    rows = [all_silent.Active(1, 90, last), all_silent.Active(2, 90, last - timedelta(seconds=5))]
 
-    # Exactly one period after the last heartbeat a location is not silent yet (strict).
-    assert all_silent.silence_since(rows, None, last + timedelta(seconds=60)) is None
-    assert all_silent.silence_since(rows, None, last + timedelta(seconds=60, microseconds=1)) == (
+    # Exactly one timeout after the last heartbeat a location is not silent yet (strict).
+    assert all_silent.silence_since(rows, None, last + timedelta(seconds=90)) is None
+    assert all_silent.silence_since(rows, None, last + timedelta(seconds=90, microseconds=1)) == (
         last
     )
 
@@ -420,7 +502,7 @@ def test_silence_is_counted_from_the_end_of_the_last_lapse() -> None:
     assert all_silent.silence_since(one_after, lapse_end, _at(11, 31, 21)) == _at(11, 30, 20)
 
 
-def test_each_location_is_silent_after_its_own_period() -> None:
+def test_each_location_is_silent_after_its_own_timeout() -> None:
     last = _at(11, 0)
     rows = [all_silent.Active(1, 60, last), all_silent.Active(2, 300, last)]
 
@@ -983,7 +1065,7 @@ def test_all_silent_is_not_ended_by_a_lapse_carve(
 ) -> None:
     _system(cursor=_at(11, 2), resumed=_at(9, 0))
     _silent(location_factory, "A", _at(11, 0))
-    b = _silent(location_factory, "B", _at(11, 0, 30))
+    b = _silent(location_factory, "B", _at(11, 0, 20))
     assert all_silent.evaluate(_at(11, 2)) == "started"
 
     # A lapse ends now: nobody counts as silent any more, yet nobody sent a heartbeat.
@@ -991,7 +1073,7 @@ def test_all_silent_is_not_ended_by_a_lapse_carve(
     assert SystemState.objects.get(pk=1).detection_resumed_at == _at(11, 5)
     assert all_silent.evaluate(_at(11, 5)) is None
     assert all_silent.evaluate(_at(11, 7)) is None
-    assert _incidents() == [(None, _at(11, 0, 30), None)]
+    assert _incidents() == [(None, _at(11, 0, 20), None)]
     assert _ends() == []
 
     # Only a heartbeat ends it.
@@ -1000,7 +1082,7 @@ def test_all_silent_is_not_ended_by_a_lapse_carve(
     [end] = _ends()
     assert end.location_id == b.pk
     assert end.payload["first_us"] == ops.instant_us(_at(11, 8))
-    assert _incidents() == [(None, _at(11, 0, 30), _at(11, 8))]
+    assert _incidents() == [(None, _at(11, 0, 20), _at(11, 8))]
 
 
 @pytest.mark.django_db(transaction=True)
