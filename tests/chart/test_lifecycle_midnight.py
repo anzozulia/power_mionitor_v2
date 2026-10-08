@@ -33,7 +33,7 @@ import io
 import json
 import logging
 from collections.abc import Callable
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -733,3 +733,37 @@ def test_a_concurrent_final_edit_is_not_written_twice(
         "editMessageMedia",
         "unpinChatMessage",
     ]
+
+
+# F-21 (quick task 261008-vdk): a finished day that is "today" again keeps its final image
+
+
+def test_INV19_display_tz_moved_west_after_finalize_makes_no_chart_call(
+    location_factory: Callable[..., Any], fake_telegram: Any, settings: Any
+) -> None:
+    location = _monitored(location_factory)
+    older = _seed(location, YESTERDAY, message_id=501, pinned=False, finalized=True)
+    unpinned = kyiv("2026-10-02 00:01")
+    ChartMessage.objects.filter(pk=older.pk).update(unpinned_at=unpinned)
+    older.refresh_from_db()
+    _seed(location, TODAY, message_id=502, pinned=True, rendered=kyiv("2026-10-02 00:30"))
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    # 00:30 in Kyiv is 21:30 UTC on 10-01: in UTC, yesterday's finished record is today's.
+    clock = FakeClock(kyiv("2026-10-02 00:30"))
+    state = io_loop.RelayState()
+    settings.CFG = dataclasses.replace(settings.CFG, display_tz="UTC")
+
+    assert _run_until_idle(clock, state) == 0
+    assert fake_telegram.chart_calls == []
+
+    # Once the UTC date reaches 10-02, today's chart resumes; 501 is left as it is.
+    clock.set(datetime(2026, 10, 2, 0, 5, tzinfo=UTC))
+    assert _run_until_idle(clock, state) == 1
+    assert _calls(fake_telegram) == [("editMessageMedia", DEFAULT_CHAT_ID, 502)]
+    after = ChartMessage.objects.get(pk=older.pk)
+    assert (after.finalized_at, after.unpinned_at, after.last_rendered_at) == (
+        older.finalized_at,
+        unpinned,
+        older.last_rendered_at,
+    )
+    assert after.pinned is False
