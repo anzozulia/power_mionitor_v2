@@ -17,12 +17,16 @@
 #       ssh hetzner /usr/local/sbin/powermon-deploy --redeploy
 #   Anything else is refused.
 #
-# A new commit must be on origin/master. A commit that is not newer than the deployed one
-# is skipped. When only non-runtime paths changed, the commit is checked out and nothing
-# restarts. Otherwise the images are built before anything restarts (a failed build changes
-# nothing). When powermon/migrations changed, a dump is taken first. Then the stack is
-# started and checked through the host nginx. A failed start rolls back to the previous
-# commit, except after a migration (README section 8).
+# While $REPO_DIR/.maintenance exists (a restore, README section 14), every deploy is
+# refused. A new commit must be on origin/master. A commit that is not newer than the
+# deployed one is skipped. When only non-runtime paths changed, the commit is checked out
+# and web and worker do not restart; a change under docker/backup recreates only backup.
+# Otherwise the images are built with --pull and the new image checks the configuration
+# before anything restarts (a failed build or check changes nothing). When
+# powermon/migrations or uv.lock changed, a dump is taken first. Then web and worker are
+# started and checked through the host nginx, and backup is started apart: a stale backup
+# is a warning line, never a failed deploy. A failed start rolls back to the previous
+# commit, except after a schema change (README section 8).
 #
 # Prints no env value. Exit codes: 0 deployed or nothing to do (an already deployed, healthy
 # commit included); 1 failed; 2 refused.
@@ -40,8 +44,9 @@ OUT=/var/log/powermon-deploy.out
 LOCK=/run/lock/powermon-deploy.lock
 PROJECT=powermon-prod
 COMPOSE=(docker compose -f docker-compose.prod.yml -f docker-compose.vps.yml)
-# A change only under these paths needs no build and no restart.
-NON_RUNTIME_RE='^(docs/|tests/|\.github/|deploy/|README\.md$|LICENSE$|PROJECT-BRIEF\.md$|docker-compose\.(local|ci|dev-ui)\.yml$|\.gitignore$)'
+# A change only under these paths needs no build and no restart of web and worker
+# (docker/backup/ recreates only backup).
+NON_RUNTIME_RE='^(docs/|tests/|\.github/|deploy/|docker/backup/|README\.md$|LICENSE$|PROJECT-BRIEF\.md$|docker-compose\.(local|ci|dev-ui)\.yml$|\.gitignore$)'
 # A change here can change the schema: Django's own migrations come with uv.lock.
 SCHEMA_PATHS=(powermon/migrations uv.lock)
 # Present while a restore runs (README section 14): every deploy refuses.
@@ -118,6 +123,11 @@ refresh_backup() {
   fi
 }
 
+backup_changed() {
+  # The running backup loop keeps the old backup.sh until its container is recreated.
+  [[ $SHA != "$PREV" ]] && ! git diff --quiet "$PREV" "$SHA" -- docker/backup
+}
+
 prune() {
   # Only dangling images of this Compose project, and only while Compose labels its images
   # with the project. Never a host-wide prune: other projects share this host.
@@ -191,11 +201,18 @@ if [[ $SHA != "$PREV" ]]; then
     exit 1
   fi
   if [[ $runtime == 0 ]]; then
+    # backup runs apart from web and worker, and a FAILED below leaves this commit checked
+    # out: its backup.sh must reach the loop either way.
+    if backup_changed; then refresh_backup --force-recreate; fi
     if ! stack_healthy; then
       log "FAILED $SHA: no runtime change since $PREV and nothing restarted, but web or worker is not healthy"
       exit 1
     fi
-    log "ok $SHA: no runtime change since $PREV; checked out, nothing restarted"
+    if backup_changed; then
+      log "ok $SHA: no app change since $PREV; checked out, backup recreated for its script change, web and worker not restarted"
+    else
+      log "ok $SHA: no runtime change since $PREV; checked out, nothing restarted"
+    fi
     exit 0
   fi
 elif [[ $mode == deploy ]]; then
@@ -238,7 +255,9 @@ if [[ $SHA != "$PREV" ]] && ! git diff --quiet "$PREV" "$SHA" -- "${SCHEMA_PATHS
 fi
 
 if start; then
-  refresh_backup
+  # The same commit again (a retry, --redeploy, a checkout by hand): the running loop may
+  # still hold another commit's backup.sh.
+  if [[ $SHA == "$PREV" ]] || backup_changed; then refresh_backup --force-recreate; else refresh_backup; fi
   prune
   log "ok $SHA (was $PREV) in $((SECONDS - started)) s"
   exit 0

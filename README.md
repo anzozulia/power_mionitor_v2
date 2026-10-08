@@ -1539,7 +1539,9 @@ script, which:
 3. checks the commit out and restarts nothing when only `docs/`, `tests/`, `.github/`,
    `deploy/`, `README.md`, `LICENSE`, `PROJECT-BRIEF.md`, `.gitignore` or the local and CI
    Compose files (`docker-compose.local.yml`, `docker-compose.ci.yml`,
-   `docker-compose.dev-ui.yml`) changed. `docker-compose.prod.yml`,
+   `docker-compose.dev-ui.yml`) changed. A change under `docker/backup/` among them
+   recreates only `backup`, whose running loop keeps the old script until then; web and
+   worker do not restart. `docker-compose.prod.yml`,
    `docker-compose.vps.yml`, the `Dockerfile`, `.dockerignore`, `.env.example` and
    `docker/Caddyfile` always count as a runtime change;
 4. builds the images first, with `--pull`, so a newer build of a pinned base image (Debian
@@ -1552,8 +1554,9 @@ script, which:
 5. takes a dump (section 14) when `powermon/migrations` or `uv.lock` changed (Django's own
    migrations come with `uv.lock`);
 6. runs `up -d --wait web worker`, which runs `migrate` once and then starts `web` and
-   `worker`. Then it starts `backup` apart. A backup that does not start or is unhealthy
-   is one `warning <commit>: …` line, not a failed deploy;
+   `worker`. Then it starts `backup` apart, recreated when `docker/backup/` changed or the
+   commit was already checked out (a retry or `--redeploy`). A backup that does not start
+   or is unhealthy is one `warning <commit>: …` line, not a failed deploy;
 7. checks `https://powermonitor.anzozulia.com/healthz` through the host nginx;
 8. if that fails, rolls back to the previous commit and starts it again, except after a
    change to `powermon/migrations` or `uv.lock`: then it stops and leaves the recovery to
