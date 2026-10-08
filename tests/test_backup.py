@@ -430,6 +430,46 @@ def test_INV25_1_a_future_dated_dump_does_not_stop_the_nightly_dumps(stubs: Stub
     assert _names(stubs) == [yesterday.name, _name(now), future.name]
 
 
+def test_INV25_1_dumps_on_demand_do_not_shorten_the_nightly_window(stubs: Stubs) -> None:
+    # F-16: two midday dumps on demand (e.g. pre-migration) must not push a nightly one out.
+    nightly = [_put_dump(stubs, night).name for night in _nights(2, 15)]
+    midday = [_put_dump(stubs, _utc(2026, 10, day, 12, 0, 0)).name for day in (10, 12)]
+    now = _utc(2026, 10, 16, 3, 0, 10)
+
+    result = stubs.run("--once", "--now", str(_epoch_of(now)))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _names(stubs) == sorted([*nightly[1:], *midday, _name(now)])
+    assert len(_names(stubs)) == 16
+    assert f"removed {nightly[0]}" in result.stdout
+
+
+def test_rotation_keeps_at_least_backup_keep_however_old(stubs: Stubs) -> None:
+    # Edge: the count floor holds even when every kept dump is far older than the window.
+    old = [_put_dump(stubs, _utc(2026, 8, day, 3, 0, 10)).name for day in range(1, 6)]
+    now = _utc(2026, 10, 3, 3, 0, 10)
+
+    result = stubs.run("--once", "--now", str(_epoch_of(now)), BACKUP_KEEP="3")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _names(stubs) == [*old[3:], _name(now)]
+
+
+def test_rotation_deletes_an_undatable_name_beyond_the_keep(stubs: Stubs) -> None:
+    # Failure: 31 February matches the name pattern but is no real time; it sorts first.
+    undatable = stubs.backups / "powermon-20260231T030000Z.dump"
+    nightly = [_put_dump(stubs, night).name for night in _nights(3, 15)]
+    undatable.write_text(DUMP_BYTES)
+    now = _utc(2026, 10, 16, 3, 0, 10)
+
+    result = stubs.run("--once", "--now", str(_epoch_of(now)))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not undatable.exists()
+    assert _names(stubs) == [*nightly, _name(now)]
+    assert f"removed {undatable.name}" in result.stdout
+
+
 # Health: the newest dump's age, by its name (D-11)
 
 
@@ -629,8 +669,8 @@ def test_dump_now_dumps_even_when_not_due(stubs: Stubs) -> None:
     new = [name for name in names if name not in [*older, recent]]
     assert len(new) == 1
     assert new[0] > recent
-    # Rotation applied: 15 dumps, the oldest one removed.
-    assert names == [*older[1:], recent, new[0]]
+    # A dump on demand does not push out a nightly one (INV-25, F-16): all 15 dumps kept.
+    assert names == [*older, recent, new[0]]
     assert len(stubs.calls("pg_dump")) == 1
 
 
