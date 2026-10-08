@@ -1000,8 +1000,10 @@ same `postgres:18.6-trixie` image as `db`, so `pg_dump` has the server's version
   `docker compose -f docker-compose.prod.yml logs backup`: each dump logs
   `backup: dump powermon-….dump ok`, each failure one `backup: error: …` line. There is no
   ops notice for it, so look at it after each deploy and now and then. A deploy (17.2,
-  step 6) logs one `warning <commit>: backup is unhealthy …` line for it and still
-  completes.
+  step 6) runs the same check (`backup.sh --health`) after starting backup, for about 2
+  minutes when each check answers at once and at most about 6 minutes when the check
+  hangs, logs one `warning <commit>: backup is unhealthy …` line when it still fails, and
+  still completes. Compose shows `starting` for up to 5 minutes after a recreate.
 
 ### A dump on demand
 
@@ -1557,8 +1559,11 @@ script, which:
    migrations come with `uv.lock`);
 6. runs `up -d --wait web worker`, which runs `migrate` once and then starts `web` and
    `worker`. Then it starts `backup` apart, recreated when `docker/backup/` changed or the
-   commit was already checked out (a retry or `--redeploy`). A backup that does not start
-   or is unhealthy is one `warning <commit>: …` line, not a failed deploy;
+   commit was already checked out (a retry or `--redeploy`), and runs its own check
+   (`backup.sh --health`, up to 8 tries 15 s apart). A backup that does not start, or whose
+   check still fails, is one `warning <commit>: …` line, not a failed deploy. When only
+   `docker/backup/` changed and backup does not start, the `ok` line says it was not
+   recreated;
 7. checks `https://powermonitor.anzozulia.com/healthz` through the host nginx;
 8. if that fails, rolls back to the previous commit and starts the images it ran before
    (it rebuilds them only when one is missing), except after a change to

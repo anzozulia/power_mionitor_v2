@@ -24,8 +24,8 @@
 # Otherwise the images are built with --pull and the new image checks the configuration
 # before anything restarts (a failed build or check changes nothing). When
 # powermon/migrations or uv.lock changed, a dump is taken first. Then web and worker are
-# started and checked through the host nginx, and backup is started apart: a stale backup
-# is a warning line, never a failed deploy. A failed start rolls back to the previous
+# started and checked through the host nginx, and backup is started apart: a backup whose
+# own --health check keeps failing is a warning line, never a failed deploy. A failed start rolls back to the previous
 # commit and starts the images that ran before (rebuilt only when one is missing), except
 # after a schema change (README section 8).
 #
@@ -117,14 +117,32 @@ start() {
   timeout 900 "${COMPOSE[@]}" up -d --wait --wait-timeout 300 web worker && healthy
 }
 
+backup_probe() {
+  # backup.sh --health in the running container, up to 8 tries 15 s apart: about 2 min when
+  # each check answers at once, at most about 6 min (8 x 30 s + 7 x 15 s) when it hangs. Not
+  # Compose's health status: it shows "starting" for up to 5 min after a recreate.
+  local i
+  for i in 1 2 3 4 5 6 7 8; do
+    if timeout 30 "${COMPOSE[@]}" exec -T backup bash /backup/backup.sh --health; then
+      return 0
+    fi
+    if ((i < 8)); then sleep 15; fi
+  done
+  return 1
+}
+
 refresh_backup() {
   # "$@": --force-recreate or nothing. --no-deps: db is already up to date (and must never be
-  # recreated from the non-runtime path). Never fails the deploy.
+  # recreated from the non-runtime path). 1 only when backup did not start; the callers never
+  # fail the deploy on it.
   if ! timeout 300 "${COMPOSE[@]}" up -d --no-deps "$@" backup; then
     log "warning $SHA: the backup service did not start; see $OUT and README section 14"
-  elif [[ $(service_health backup) == unhealthy ]]; then
+    return 1
+  fi
+  if ! backup_probe; then
     log "warning $SHA: backup is unhealthy (no dump in the last 26 h, or one dated in the future); README section 14"
   fi
+  return 0
 }
 
 keep_images() {
@@ -236,13 +254,17 @@ if [[ $SHA != "$PREV" ]]; then
   if [[ $runtime == 0 ]]; then
     # backup runs apart from web and worker, and a FAILED below leaves this commit checked
     # out: its backup.sh must reach the loop either way.
-    if backup_changed; then refresh_backup --force-recreate; fi
+    # A flag, not a bare call: a failed recreate must not trip set -e.
+    backup_ok=yes
+    if backup_changed; then refresh_backup --force-recreate || backup_ok=no; fi
     if ! stack_healthy; then
       log "FAILED $SHA: no runtime change since $PREV and nothing restarted, but web or worker is not healthy"
       exit 1
     fi
-    if backup_changed; then
+    if backup_changed && [[ $backup_ok == yes ]]; then
       log "ok $SHA: no app change since $PREV; checked out, backup recreated for its script change, web and worker not restarted"
+    elif [[ $backup_ok == no ]]; then
+      log "ok $SHA: no app change since $PREV; checked out, but backup was not recreated (see the warning above); web and worker not restarted"
     else
       log "ok $SHA: no runtime change since $PREV; checked out, nothing restarted"
     fi
@@ -292,7 +314,12 @@ fi
 if start; then
   # The same commit again (a retry, --redeploy, a checkout by hand): the running loop may
   # still hold another commit's backup.sh.
-  if [[ $SHA == "$PREV" ]] || backup_changed; then refresh_backup --force-recreate; else refresh_backup; fi
+  # backup never decides the deploy's result (F-06).
+  if [[ $SHA == "$PREV" ]] || backup_changed; then
+    refresh_backup --force-recreate || true
+  else
+    refresh_backup || true
+  fi
   prune
   log "ok $SHA (was $PREV) in $((SECONDS - started)) s"
   exit 0
