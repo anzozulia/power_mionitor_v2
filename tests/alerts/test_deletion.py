@@ -12,7 +12,8 @@ delete and the bot; a 5xx or an unsent request holds both for 30 s; an ambiguous
 retried after 30 s (a delete is idempotent; INV-16's at-most-once rule is about sends); a
 refusal, or a request older than Telegram's 48 h limit, settles it with one WARNING and,
 on the OFF, cancels the rest of the removal and sends the ON alert the removal dropped,
-so the channel is never left showing only "power off" (owner default 3). No outcome
+unless a later alert went out, the chat changed or it expired (261008-vdk, F-01), so the
+channel is never left showing only "power off" (owner default 3). No outcome
 touches ``chat_key``, the delivery incident, an ops notice or the row's status.
 
 Migration 0012 is expand-only (D10): the previous release's inserts still work on it.
@@ -833,6 +834,17 @@ def test_DATA02_too_old_delete_keeps_an_expired_on_dropped_and_sends_no_ops_noti
     assert not OutboxMessage.objects.filter(kind=outbox.KIND_OPS_EXPIRED).exists()
     assert _on_state(on) == ("dropped", outbox.OUTAGE_REMOVED)
     assert len(fake_telegram.calls) == 0
+
+
+@pytest.mark.django_db
+def test_DATA02_stale_on_without_a_location_keeps_the_on_dropped(
+    location_factory: Callable[..., Any],
+) -> None:
+    # fail_delete never passes such an OFF; with no location there is no chat to match.
+    on = _dropped_on(location_factory())
+    orphan = OutboxMessage(location_id=None, tg_chat_id=DEFAULT_CHAT_ID)
+
+    assert outbox._stale_on(on, orphan, REMOVED) == "chat_changed"
 
 
 @DB

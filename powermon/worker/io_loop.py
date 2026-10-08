@@ -39,7 +39,8 @@ retried after 30 s; INV-16's at-most-once rule is about sends. Its outcomes neve
 ("not found" included) settles it, a 429 holds the delete key and the bot, a 5xx or an
 unsent request holds both for 30 s, and a refusal settles it with one WARNING; a refused
 or too-old OFF also cancels the rest of its removal and sends the ON alert the removal
-dropped (``outbox.fail_delete``), so the channel never shows only "power off".
+dropped unless a later alert went out, the chat changed or it expired
+(``outbox.fail_delete``), so the channel never shows only "power off".
 
 The chart step (``powermon.chart.lifecycle.run_step``, D-05) is the last step of the pass
 and makes at most one Telegram call; a pass that made a delete call skips it. It runs only

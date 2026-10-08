@@ -522,13 +522,15 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
     hours ago, sent before this update, or its delivery is uncertain), both alerts stay and
     a queued ON alert is still sent, so the channel is not left at power off. If Telegram
     refuses the OFF's delete, or it is too old by then, its ON alert stays too (a queued ON
-    that the removal dropped is sent after all), with one WARNING in the worker log, no ops
-    notice and no "delivery failing". Delete such alerts by hand in Telegram. An alert
-    already deleted by hand counts as deleted. History reset deletes no message. If one of
-    the outage's alerts (its OFF, or the ON that ended it) is being sent at that moment, the
-    page says so ("An alert about this outage is being sent to the channel right now.
-    Nothing changed. Try again in a minute.") and nothing changes: try again a minute later.
-    (Amended 2026-10-06, quick task 261006-qv7.)
+    that the removal dropped is sent after all, unless a later alert has gone out since,
+    the location has moved to another chat, or the ON is past its maximum age), with one
+    WARNING in the worker log, no ops notice and no "delivery failing". Delete such alerts
+    by hand in Telegram. An alert already deleted by hand counts as deleted. History reset
+    deletes no message. If one of the outage's alerts (its OFF, or the ON that ended it) is
+    being sent at that moment, the page says so ("An alert about this outage is being sent
+    to the channel right now. Nothing changed. Try again in a minute.") and nothing
+    changes: try again a minute later. (Amended 2026-10-06, quick task 261006-qv7.)
+    (Amended 2026-10-08, quick task 261008-vdk.)
   - **Reset history:** deletes the location's whole recorded power history. It is refused
     while an outage is in progress (reset after power returns, or delete the location).
     The location then shows **Waiting for first heartbeat**; its next heartbeat restarts
