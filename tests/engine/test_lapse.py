@@ -16,7 +16,8 @@ What these scenarios prove:
   lease generation, a re-established connection or a failed cycle forces the carve
   whatever the gap's length; otherwise a gap over 15 s since the last completed cycle (a
   stall, INV-10 #3 and #4) does. A wall-clock step over 5 s against the monotonic clock
-  skips the cycle's decisions: forward it is a lapse, backward it records nothing.
+  skips the cycle's decisions: forward it is a lapse, backward it records no gap and moves
+  the future-stamped anchors back to now (F-03).
 - A heartbeat that waited on the carve's row lock restores at the carve end with 200,
   never a CHECK violation (Pitfall 5).
 
@@ -334,19 +335,27 @@ def test_MON05_gap_at_the_threshold_is_not_a_lapse(
 
 
 @pytest.mark.django_db(transaction=True)
-@pytest.mark.parametrize("now", [_at(10, 0), _at(9, 0)], ids=["same-instant", "an-hour-back"])
+@pytest.mark.parametrize(
+    ("now", "anchors"),
+    [(_at(10, 0), (_at(10, 0), _at(8, 0))), (_at(9, 0), (_at(9, 0), _at(9, 0)))],
+    ids=["same-instant", "an-hour-back"],
+)
 def test_MON05_backward_clock_step_never_carves(
-    location_factory: Callable[..., Any], ops_settings: Any, now: datetime
+    location_factory: Callable[..., Any],
+    ops_settings: Any,
+    now: datetime,
+    anchors: tuple[datetime, datetime],
 ) -> None:
     location = location_factory()
     transitions.record_heartbeat(location.pk, _at(8, 0))
     _system(cursor=_at(10, 0), resumed=_at(8, 0))
 
-    # Even a forced carve has an empty window when now is not after the cursor.
+    # Even a forced carve has an empty window when now is not after the cursor. An hour
+    # back, the cursor and the detection window move back to now (F-03), with no gap.
     assert lapse.carve_if_needed(now, force=True) is None
 
     assert _intervals(location) == [("on", _at(8, 0), None, None)]
-    assert _anchors() == (_at(10, 0), _at(8, 0))
+    assert _anchors() == anchors
     assert (_incidents(), _ops_rows()) == ([], [])
 
 
@@ -842,8 +851,39 @@ def test_MON05_forward_clock_step_records_lapse_skips_decisions(
     assert len(_incidents()) == 1
 
 
+CLAMP_LOGGERS = (detection.__name__, lapse.__name__)
+
+
+def _clamp_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name in CLAMP_LOGGERS and r.levelno >= logging.WARNING
+    ]
+
+
+def _heartbeat_at(location: Any) -> datetime | None:
+    return LocationState.objects.get(pk=location.pk).last_heartbeat_at
+
+
+def _cycle_until_off(
+    clock: FakeClock, tracker: lapse.CycleTracker, location: Any, quiet_until: datetime
+) -> OutboxMessage:
+    """Cycle every 5 s: no OFF through ``quiet_until``, then exactly one at the next cycle."""
+    while clock.now() + timedelta(seconds=5) <= quiet_until:
+        clock.advance(seconds=5)
+        assert detection.run_detection(clock, 1, tracker) == 0
+        assert _subscriber_rows() == []
+    clock.advance(seconds=5)
+    assert detection.run_detection(clock, 1, tracker) == 1
+    [off] = _subscriber_rows(location)
+    assert off.kind == "power_off"
+    assert LocationState.objects.get(pk=location.pk).status == "off"
+    return off
+
+
 @pytest.mark.django_db(transaction=True)
-def test_MON05_backward_clock_step_no_carve_no_off(
+def test_MON05_backward_clock_step_rewinds_anchors_and_off_follows_the_timeout(
     location_factory: Callable[..., Any],
     ops_settings: Any,
     monkeypatch: pytest.MonkeyPatch,
@@ -851,36 +891,200 @@ def test_MON05_backward_clock_step_no_carve_no_off(
 ) -> None:
     _system(cursor=None)
     location = location_factory()
+    transitions.record_heartbeat(location.pk, _at(8, 0))
     transitions.record_heartbeat(location.pk, _at(10, 0))
     clock = FakeClock(_at(10, 0))
     tracker = lapse.CycleTracker()
     detection.run_detection(clock, 1, tracker)
     decisions = _spy_on_decisions(monkeypatch)
-    caplog.set_level(logging.WARNING, logger=detection.__name__)
+    caplog.set_level(logging.WARNING)
     clock.advance(seconds=5)
     # The wall clock steps an hour back (Δwall -3595 s, Δmono 5 s: a step of -3600 s).
     clock.set(clock.now() - timedelta(hours=1))
+    step = _at(9, 0, 5)
+    assert clock.now() == step
 
     assert detection.run_detection(clock, 1, tracker) == 0
 
     assert decisions == []
+    # The future-stamped anchors move back to the step instant (F-03); history before the
+    # cursor is never rewritten and no gap is recorded.
+    assert _anchors() == (step, step)
+    state = LocationState.objects.get(pk=location.pk)
+    assert (state.last_heartbeat_at, state.on_since) == (step, _at(8, 0))
+    assert _intervals(location) == [("on", _at(8, 0), None, None)]
     assert (_incidents(), _ops_rows()) == ([], [])
-    # The cursor never moves backwards and history before it is never rewritten.
-    assert _anchors() == (_at(10, 0), _at(10, 0))
-    assert _intervals(location) == [("on", _at(10, 0), None, None)]
-    warnings = [(r.levelno, r.getMessage()) for r in caplog.records if r.name == detection.__name__]
-    assert warnings == [
-        (logging.WARNING, "wall clock stepped back 3600 s; skipping this cycle's decisions")
+    assert _clamp_warnings(caplog) == [
+        "wall clock stepped back 3600 s; skipping this cycle's decisions",
+        "wall clock is 3595 s behind the detection cursor: 1 location state(s) and "
+        "0 queued message(s) moved back to now",
     ]
 
-    # Later cycles decide again, and the stored anchors (now in the future) give no OFF.
-    for _ in range(3):
-        clock.advance(seconds=5)
-        assert detection.run_detection(clock, 1, tracker) == 0
-    assert len(decisions) == 3
-    assert _subscriber_rows() == []
-    assert LocationState.objects.get(pk=location.pk).status == "on"
-    assert len([r for r in caplog.records if r.name == detection.__name__]) == 1
+    # The OFF follows one timeout (period 60 + grace 30, strict) after the step: nothing
+    # through 09:01:35, one OFF at the 09:01:40 cycle.
+    off = _cycle_until_off(clock, tracker, location, _at(9, 1, 35))
+    assert clock.now() == _at(9, 1, 40)
+    assert off.event_at == step
+    assert off.payload["was_on_us"] == 3_605_000_000
+    assert texts.render_alert("power_off", "en", off.payload["was_on_us"])
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV10_restart_after_backward_step_clamps_without_gap_notice(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    location = location_factory()
+    transitions.record_heartbeat(location.pk, _at(8, 0))
+    transitions.record_heartbeat(location.pk, _at(10, 0))
+    _system(cursor=_at(10, 0), resumed=_at(8, 0))
+    clock = FakeClock(_at(9, 0))
+    # A worker started after the step: a fresh tracker cannot see it, and the new lease
+    # generation forces the carve path.
+    tracker = lapse.CycleTracker()
+
+    assert detection.run_detection(clock, 1, tracker) == 0
+
+    assert (_incidents(), _ops_rows()) == ([], [])
+    assert _anchors() == (_at(9, 0), _at(9, 0))
+    assert _heartbeat_at(location) == _at(9, 0)
+    assert _intervals(location) == [("on", _at(8, 0), None, None)]
+    # A fresh window: no OFF from the step itself, only after the timeout (INV-10).
+    off = _cycle_until_off(clock, tracker, location, _at(9, 1, 30))
+    assert clock.now() == _at(9, 1, 35)
+    assert off.event_at == _at(9, 0)
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("delta", "clamped"),
+    [(timedelta(seconds=5), False), (timedelta(seconds=5, microseconds=1), True)],
+    ids=["exactly-5s", "5s-and-1us"],
+)
+def test_MON05_cursor_exactly_5s_ahead_is_not_clamped(
+    location_factory: Callable[..., Any],
+    ops_settings: Any,
+    caplog: pytest.LogCaptureFixture,
+    delta: timedelta,
+    clamped: bool,
+) -> None:
+    caplog.set_level(logging.WARNING, logger=lapse.__name__)
+    now = _at(10, 0)
+    location = location_factory()
+    transitions.record_heartbeat(location.pk, now + delta)
+    _system(cursor=now + delta, resumed=_at(8, 0))
+
+    assert lapse.carve_if_needed(now, force=True) is None
+
+    if clamped:
+        assert _anchors() == (now, now)
+        assert _heartbeat_at(location) == now
+    else:
+        assert _anchors() == (now + delta, _at(8, 0))
+        assert _heartbeat_at(location) == now + delta
+        assert [r for r in caplog.records if r.name == lapse.__name__] == []
+    assert (_incidents(), _ops_rows()) == ([], [])
+
+
+@pytest.mark.django_db(transaction=True)
+def test_MON05_clamp_keeps_nulls_and_past_values(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    waiting = location_factory(name="Waiting")
+    off = location_factory(name="Off")
+    transitions.record_heartbeat(off.pk, _at(8, 0))
+    detection.run_cycle(_at(8, 2))
+    on = location_factory(name="On")
+    transitions.record_heartbeat(on.pk, _at(10, 0))
+    _system(cursor=_at(10, 0), resumed=_at(8, 0), web=None)
+    before = {row["location_id"]: row for row in LocationState.objects.values()}
+    assert before[off.pk]["status"] == "off"
+    assert before[waiting.pk]["last_heartbeat_at"] is None
+
+    assert lapse.carve_if_needed(_at(9, 0), force=False) is None
+
+    after = {row["location_id"]: row for row in LocationState.objects.values()}
+    # Waiting (all NULL) and off (all in the past): untouched, state_version included.
+    assert after[waiting.pk] == before[waiting.pk]
+    assert after[off.pk] == before[off.pk]
+    # The on row: only the future instants move back, NULLs stay NULL, one version bump.
+    expected = dict(before[on.pk])
+    for name in ("last_heartbeat_at", "window_start_at", "on_since"):
+        if expected[name] is not None and expected[name] > _at(9, 0):
+            expected[name] = _at(9, 0)
+    expected["state_version"] += 1
+    assert after[on.pk] == expected
+    assert after[on.pk]["last_heartbeat_at"] == _at(9, 0)
+    assert [name for name, value in before[on.pk].items() if value is None] == [
+        name for name, value in after[on.pk].items() if value is None
+    ]
+    assert SystemState.objects.get(pk=1).web_started_at is None
+
+
+@pytest.mark.django_db(transaction=True)
+def test_MON05_on_since_in_the_future_is_clamped_so_was_on_is_never_negative(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    location = location_factory()
+    assert transitions.record_heartbeat(location.pk, _at(10, 0)) == "started"
+    _system(cursor=_at(10, 0), resumed=_at(10, 0))
+    clock = FakeClock(_at(9, 0))
+    tracker = lapse.CycleTracker()
+
+    assert detection.run_detection(clock, 1, tracker) == 0
+
+    assert LocationState.objects.get(pk=location.pk).on_since == _at(9, 0)
+    off = _cycle_until_off(clock, tracker, location, _at(9, 1, 30))
+    assert clock.now() == _at(9, 1, 35)
+    assert off.payload["was_on_us"] == 0
+    assert texts.render_alert("power_off", "en", 0)
+    # mark_off clamps the OFF start to the open on piece's start (10:00), which lies after
+    # the step: the accepted residual of CONTEXT (e) item 7.
+    assert off.event_at == _at(10, 0)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_MON05_clamp_error_leaves_cursor_for_rerun(
+    location_factory: Callable[..., Any], ops_settings: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    location = location_factory()
+    transitions.record_heartbeat(location.pk, _at(10, 0))
+    _system(cursor=_at(10, 0), resumed=_at(8, 0))
+
+    def broken(now: datetime) -> int:
+        raise OperationalError("simulated")
+
+    monkeypatch.setattr(outbox, "release_held", broken)
+    with pytest.raises(OperationalError):
+        lapse.carve_if_needed(_at(9, 0), force=False)
+
+    # The state clamp committed; the cursor did not move, so the next cycle re-runs it.
+    assert _anchors() == (_at(10, 0), _at(8, 0))
+    assert _heartbeat_at(location) == _at(9, 0)
+
+    monkeypatch.undo()
+    assert lapse.carve_if_needed(_at(9, 0), force=False) is None
+    assert _anchors() == (_at(9, 0), _at(9, 0))
+    assert _heartbeat_at(location) == _at(9, 0)
+
+    # A clamp with a stale cursor value matches no row and moves nothing.
+    assert lapse.clamp_future(_at(10, 0), _at(9, 0)) is False
+    assert _anchors() == (_at(9, 0), _at(9, 0))
+    assert (_incidents(), _ops_rows()) == ([], [])
+
+
+@pytest.mark.django_db(transaction=True)
+def test_MON05_heartbeat_after_clamp_is_recorded_normally(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    location = location_factory()
+    transitions.record_heartbeat(location.pk, _at(10, 0))
+    _system(cursor=_at(10, 0), resumed=_at(8, 0))
+    assert lapse.carve_if_needed(_at(9, 0), force=False) is None
+    assert _heartbeat_at(location) == _at(9, 0)
+
+    assert transitions.record_heartbeat(location.pk, _at(9, 0, 10)) == "plain"
+
+    assert _heartbeat_at(location) == _at(9, 0, 10)
 
 
 # Pitfall 5: a heartbeat that waited on the carve's row lock
