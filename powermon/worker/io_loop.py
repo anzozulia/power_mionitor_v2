@@ -72,7 +72,9 @@ The result decides the row's next status, for both channels (D-14 policy):
   ``delivery_failing`` incident opens with one ``ops_delivery_failing`` notice to the
   admin (D-10). A refusal while the incident is open opens no incident and sends no
   notice (INV-20 #1), but updates the open incident's details to that latest refusal
-  (its status and any ``migrate_to_chat_id``, W2-A2).
+  (its status and any ``migrate_to_chat_id``, W2-A2). A refusal answered by a channel the
+  admin has replaced since the send (another chat or bot, D-08) holds nothing: the row is
+  due at once and nothing is marked failing (quick task 261008-vdk).
 
 Only those two outcomes of a subscriber send touch the incident: a 429, a 5xx, a refused
 connection, an ambiguous send, an ops row and every chart call leave it alone (D-10).
@@ -190,7 +192,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
 from django.conf import settings
-from django.db import Error, close_old_connections, transaction
+from django.db import Error, close_old_connections, connection, transaction
 
 from powermon.alerts import delivery, ops, ops_texts, outbox
 from powermon.alerts.models import OpsIncident, OutboxMessage
@@ -215,6 +217,12 @@ LATE_AFTER = timedelta(seconds=120)
 # longer than this, in monotonic seconds since the lease was lost (D-11 #2). The lease's
 # HELD_MARKER_MAX_AGE_S is the same value (WR-02).
 DB_DOWN_NOTICE_AFTER_S = 300
+# The location's current channel, read FOR SHARE in the transaction that writes a refused
+# row's outcome (delivery.LIVE_LOCATION_SQL's lock): an admin save (update_config, FOR NO
+# KEY UPDATE) either committed before, or waits and then sees the row pending (make_due).
+CURRENT_CHANNEL_SQL = (
+    "SELECT bot_token, chat_id FROM location WHERE id = %s AND deleted_at IS NULL FOR SHARE"
+)
 # Which payload value holds the previous state's duration for each alert kind.
 _DURATION_KEYS = {outbox.KIND_POWER_OFF: "was_on_us", outbox.KIND_POWER_ON: "was_off_us"}
 # Outcomes of a subscriber send that concern the whole bot, not the one chat (D1): Telegram
@@ -868,7 +876,10 @@ def _apply(
     ``delivery_failing`` incident, in the transaction that writes the row (D-10). This is
     also the WR-04 flush path, so every write here is idempotent: the reset is fenced by
     the claim's attempt count, a second open gets no incident id and a second close
-    changes no row, so no notice is ever repeated.
+    changes no row, so no notice is ever repeated. The permanent branch reads the
+    location's current channel FOR SHARE in that same transaction: when the admin has
+    replaced the chat or bot since the send (D-08), the row is due at once and nothing is
+    marked failing (quick task 261008-vdk, F-11).
     """
     # The location of a subscriber alert; None for an ops row, which never touches it.
     location_id = row.location_id if row.channel == outbox.CHANNEL_SUBSCRIBER else None
@@ -915,10 +926,19 @@ def _apply(
         state.not_before[bot_wide] = next_attempt_at
     code = result.code or result.kind
     if result.kind == "permanent" and location_id is not None:
+        replaced = False
         # The row's reset and the failing incident (with its one notice) commit together.
         with transaction.atomic():
+            with connection.cursor() as cur:
+                cur.execute(CURRENT_CHANNEL_SQL, [location_id])
+                current = cur.fetchone()
+            if current is not None and chat_key(current[0], current[1]) != key:
+                # Refused by a channel the admin replaced since the send (D-08): the new
+                # one is untried, so the row is due now and nothing is marked failing.
+                replaced = True
+                outbox.mark_retry(row.pk, now, code, attempts=attempts)
             # Only this claim's attempt (WR-01): a later claim's row is not this outcome's.
-            if outbox.mark_retry(row.pk, next_attempt_at, code, attempts=attempts):
+            elif outbox.mark_retry(row.pk, next_attempt_at, code, attempts=attempts):
                 delivery.open_failing(
                     location_id,
                     now,
@@ -926,6 +946,9 @@ def _apply(
                     # Reported to the admin only: the location's chat stays (PITFALLS 6e).
                     result.migrate_to_chat_id,
                 )
+        if replaced:
+            log.info("relay: alert %s was refused by a replaced channel; it is due now", row.pk)
+            return
         # After the commit: the channel is held until the incident closes (D-12).
         state.failing[location_id] = key
         return
