@@ -1542,7 +1542,10 @@ script, which:
 4. builds the images first, with `--pull`, so a newer build of a pinned base image (Debian
    security fixes, time-zone data) is picked up. A failed build changes nothing: the old
    commit stays checked out and the old containers keep running. A Docker Hub or ghcr.io
-   outage or rate limit fails the build this way; re-run the deploy job later;
+   outage or rate limit fails the build this way; re-run the deploy job later. Then the new
+   image checks the configuration (`manage.py check` with the env file, no database): a
+   bad value ends with `FAILED <commit>: the configuration check failed …; nothing
+   restarted`, again with the old commit and containers left as they were;
 5. takes a dump (section 14) when `powermon/migrations` or `uv.lock` changed (Django's own
    migrations come with `uv.lock`);
 6. runs `up -d --wait`, which runs `migrate` once and then starts `web` and `worker`;
@@ -1652,7 +1655,9 @@ Ops alerts are off on this server: `OPS_BOT_TOKEN` and `OPS_CHAT_ID` are empty, 
 notices go to the worker log at WARNING. To turn them on, set both in the env file on the
 server (section 4 says where the values come from), with the same rules for values as in
 17.5, then run the manual redeploy (17.7). `docker compose restart` does not re-read the
-env file (section 7). Check the file with `python3 deploy/make-secrets.py --check` in
+env file (section 7). The redeploy checks every value with the new image before it
+restarts anything; a bad value ends with `FAILED …: the configuration check failed …;
+nothing restarted`. Check the file with `python3 deploy/make-secrets.py --check` in
 `/root/powermonitor`, then the worker log
 (`docker compose -f docker-compose.prod.yml -f docker-compose.vps.yml logs worker`).
 
@@ -1673,6 +1678,10 @@ nothing but `deploy <commit>`, and the script refuses anything else.
 
 While `.maintenance` exists (a restore, section 14), it refuses like a CI deploy:
 `FAILED <commit>: maintenance in progress …`.
+
+Before it restarts anything, the new image checks the configuration (17.2, step 4). A bad
+env value ends with `FAILED <commit>: the configuration check failed …; nothing
+restarted`, and the old containers keep running.
 
 ### 17.8 Rollback
 

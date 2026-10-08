@@ -186,6 +186,14 @@ if ! timeout 1800 "${COMPOSE[@]}" build --pull; then
   exit 1
 fi
 
+# The new image checks the env file while the old containers keep running: `up` would
+# remove them first and then fail in migrate, leaving nothing running.
+if ! timeout 120 "${COMPOSE[@]}" run --rm --no-deps -T migrate python manage.py check; then
+  if [[ $SHA != "$PREV" ]]; then checkout "$PREV"; fi
+  log "FAILED $SHA: the configuration check failed (env file or settings; see $OUT); still running $PREV, nothing restarted"
+  exit 1
+fi
+
 migrated=no
 if [[ $SHA != "$PREV" ]] && ! git diff --quiet "$PREV" "$SHA" -- "${SCHEMA_PATHS[@]}"; then
   migrated=yes
