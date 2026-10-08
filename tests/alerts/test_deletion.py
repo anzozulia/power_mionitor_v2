@@ -46,6 +46,7 @@ from powermon.chart import lifecycle
 from powermon.chart.models import ChartMessage
 from powermon.engine import history, transitions
 from powermon.engine.models import LocationState, PowerInterval, SystemState
+from powermon.locations import actions
 from powermon.locations.models import Location
 from powermon.worker import detection, io_loop
 
@@ -675,6 +676,216 @@ def test_DATA02_refused_off_delete_sends_the_dropped_on(
         ("A", "sendMessage"),
         ("A", "deleteMessage"),
         ("A", "sendMessage"),
+    ]
+
+
+# A refused or too-old OFF delete never sends a stale ON (quick task 261008-vdk, F-01)
+
+
+def _dropped_on(location: Any, *, expires_at: datetime = RESTORE + timedelta(hours=6)) -> Any:
+    """The outage's ON as ``history.remove_outage`` leaves a queued one: dropped, no ids."""
+    return OutboxMessage.objects.create(
+        channel=outbox.CHANNEL_SUBSCRIBER,
+        location=location,
+        kind=outbox.KIND_POWER_ON,
+        event_at=RESTORE,
+        recorded_at=RESTORE,
+        payload={"was_off_us": (RESTORE - OUTAGE) // US},
+        status="dropped",
+        last_error=outbox.OUTAGE_REMOVED,
+        attempts=1,
+        next_attempt_at=RESTORE,
+        expires_at=expires_at,
+    )
+
+
+def _removed_off(location: Any) -> OutboxMessage:
+    """The removed outage's sent OFF (message 1), its delete requested at REMOVED."""
+    return _alert(location, outbox.KIND_POWER_OFF, message_id=1, sent_at=OFF_SENT)
+
+
+def _on_state(on: OutboxMessage) -> tuple[str, str]:
+    stored = OutboxMessage.objects.get(pk=on.pk)
+    return stored.status, stored.last_error
+
+
+def _stale_lines(caplog: pytest.LogCaptureFixture) -> list[tuple[int, str]]:
+    return [(r.levelno, r.getMessage()) for r in caplog.records if r.name == outbox.__name__]
+
+
+@DB
+@pytest.mark.parametrize("later_status", ["sent", "uncertain", "sending", "pending"])
+def test_DATA02_refused_off_delete_keeps_the_on_dropped_after_a_later_alert_went_out(
+    location_factory: Callable[..., Any],
+    caplog: pytest.LogCaptureFixture,
+    later_status: str,
+) -> None:
+    location = location_factory()
+    off = _removed_off(location)
+    on = _dropped_on(location)
+    sent = later_status == "sent"
+    # A later outage's OFF, created after the ON, so its id is greater.
+    OutboxMessage.objects.create(
+        channel=outbox.CHANNEL_SUBSCRIBER,
+        location=location,
+        kind=outbox.KIND_POWER_OFF,
+        event_at=_at(9, 30),
+        recorded_at=_at(9, 31, 31),
+        payload={"was_on_us": 1},
+        status=later_status,
+        attempts=1,
+        next_attempt_at=_at(9, 31, 31),
+        expires_at=_at(9, 31, 31) + timedelta(hours=6),
+        sent_at=_at(9, 31, 32) if sent else None,
+        tg_chat_id=DEFAULT_CHAT_ID if sent else None,
+        tg_message_id=3 if sent else None,
+    )
+    caplog.set_level(logging.INFO, logger=outbox.__name__)
+    now = REMOVED + timedelta(minutes=5)
+
+    outbox.fail_delete(off, "http_403", now)
+
+    assert _result(off) == "http_403"
+    if later_status == "pending":
+        # A later row still queued is fine: the ON has the lower id and goes first.
+        stored = OutboxMessage.objects.get(pk=on.pk)
+        assert (stored.status, stored.next_attempt_at, stored.last_error) == ("pending", now, "")
+        assert _stale_lines(caplog) == []
+    else:
+        assert _on_state(on) == ("dropped", outbox.OUTAGE_REMOVED)
+        assert _stale_lines(caplog) == [
+            (
+                logging.INFO,
+                f"removed outage's ON alert {on.pk} for location {location.pk} "
+                "stays dropped (later_alert)",
+            )
+        ]
+
+
+@DB
+@pytest.mark.parametrize("change", ["chat", "token"])
+def test_DATA02_refused_off_delete_keeps_the_on_dropped_when_the_location_moved_chat(
+    location_factory: Callable[..., Any],
+    caplog: pytest.LogCaptureFixture,
+    change: str,
+) -> None:
+    location = location_factory()
+    off = _removed_off(location)
+    on = _dropped_on(location)
+    if change == "chat":
+        Location.objects.filter(pk=location.pk).update(chat_id=CHAT_B)
+    else:
+        # A new bot in the same chat: the ON still belongs there.
+        Location.objects.filter(pk=location.pk).update(bot_token=TOKEN_B)
+    caplog.set_level(logging.INFO, logger=outbox.__name__)
+    now = REMOVED + timedelta(minutes=5)
+
+    outbox.fail_delete(off, "http_403", now)
+
+    if change == "chat":
+        assert _on_state(on) == ("dropped", outbox.OUTAGE_REMOVED)
+        assert _stale_lines(caplog) == [
+            (
+                logging.INFO,
+                f"removed outage's ON alert {on.pk} for location {location.pk} "
+                "stays dropped (chat_changed)",
+            )
+        ]
+    else:
+        stored = OutboxMessage.objects.get(pk=on.pk)
+        assert (stored.status, stored.next_attempt_at, stored.last_error) == ("pending", now, "")
+        assert _stale_lines(caplog) == []
+
+
+@DB
+@pytest.mark.parametrize("expired", [True, False], ids=["at_now", "one_us_later"])
+def test_DATA02_too_old_delete_keeps_an_expired_on_dropped_and_sends_no_ops_notice(
+    location_factory: Callable[..., Any],
+    fake_telegram: FakeTelegram,
+    ops_settings: Any,
+    caplog: pytest.LogCaptureFixture,
+    expired: bool,
+) -> None:
+    location = location_factory()
+    off = _removed_off(location)
+    expires_at = RESTORE + timedelta(hours=6)
+    on = _dropped_on(location, expires_at=expires_at)
+    # Expired at exactly expires_at (expire_due's rule); one microsecond earlier it is not.
+    now = expires_at if expired else expires_at - US
+    caplog.set_level(logging.INFO, logger=outbox.__name__)
+
+    outbox.fail_delete(off, outbox.DELETE_TOO_OLD, now)
+
+    if not expired:
+        stored = OutboxMessage.objects.get(pk=on.pk)
+        assert (stored.status, stored.next_attempt_at, stored.last_error) == ("pending", now, "")
+        assert _stale_lines(caplog) == []
+        return
+    assert _on_state(on) == ("dropped", outbox.OUTAGE_REMOVED)
+    assert _stale_lines(caplog) == [
+        (
+            logging.INFO,
+            f"removed outage's ON alert {on.pk} for location {location.pk} stays dropped (expired)",
+        )
+    ]
+    # Nothing expires into an ops notice, and nothing is sent.
+    io_loop.run_iteration(FakeClock(now), io_loop.RelayState())
+    assert not OutboxMessage.objects.filter(kind=outbox.KIND_OPS_EXPIRED).exists()
+    assert _on_state(on) == ("dropped", outbox.OUTAGE_REMOVED)
+    assert len(fake_telegram.calls) == 0
+
+
+@DB
+def test_DATA02_refused_off_delete_after_a_chat_move_sends_no_stale_on(
+    location_factory: Callable[..., Any], fake_telegram: FakeTelegram
+) -> None:
+    _no_anchors()
+    location = location_factory()
+    forbidden = {"ok": False, "error_code": 403, "description": "Forbidden: kicked"}
+    # sendMessage: OFF A accepted, ON A refused, OFF B (to chat B) accepted; delete refused.
+    fake_telegram.accept(TOKEN_A)
+    fake_telegram.fail(TOKEN_A, status=403, json_body=forbidden)
+    fake_telegram.accept(TOKEN_A)
+    fake_telegram.fail_method(TOKEN_A, "deleteMessage", status=403, json_body=forbidden)
+    state = io_loop.RelayState()
+    clock = FakeClock(_at(8, 0))
+    assert transitions.record_heartbeat(location.pk, _at(8, 0)) == "started"
+    assert transitions.record_heartbeat(location.pk, OUTAGE) == "plain"
+    assert detection.run_cycle(_at(9, 1, 31)) == 1
+    clock.set(OFF_SENT)
+    assert io_loop.run_iteration(clock, state) is True
+    assert transitions.record_heartbeat(location.pk, RESTORE) == "restored"
+    clock.set(ON_SENT)
+    assert io_loop.run_iteration(clock, state) is True
+    off_a = OutboxMessage.objects.get(kind="power_off")
+    on_a = OutboxMessage.objects.get(kind="power_on")
+    assert (on_a.status, on_a.last_error) == ("pending", "http_403")
+
+    assert history.remove_outage(location.pk, OUTAGE, now=REMOVED, tz=KYIV) == "removed"
+    assert _on_state(on_a) == ("dropped", outbox.OUTAGE_REMOVED)
+
+    # The admin moves the location to chat B.
+    data = {name: getattr(location, name) for name in actions.CONFIG_FIELDS}
+    saved = actions.update_config(location.pk, data | {"chat_id": CHAT_B, "bot_token": ""}, REMOVED)
+    assert saved.channel_changed
+    # A new outage: OFF B is queued (the last heartbeat was the restore).
+    assert detection.run_cycle(_at(9, 21)) == 1
+
+    # After the old chat's hold: OFF B goes to chat B, then the OFF A delete is refused.
+    clock.set(_at(9, 30))
+    assert io_loop.run_iteration(clock, state) is True
+    assert fake_telegram.sent[-1]["chat_id"] == CHAT_B
+    assert _result(off_a) == "http_403"
+    assert _on_state(on_a) == ("dropped", outbox.OUTAGE_REMOVED)
+
+    # ON A never reaches chat B.
+    clock.set(_at(9, 30, 1))
+    assert io_loop.run_iteration(clock, state) is False
+    assert _requests(fake_telegram) == [
+        ("A", "sendMessage"),
+        ("A", "sendMessage"),
+        ("A", "sendMessage"),
+        ("A", "deleteMessage"),
     ]
 
 
