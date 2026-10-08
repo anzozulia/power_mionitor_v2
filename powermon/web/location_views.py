@@ -486,31 +486,44 @@ def delivery_row(location_id: int) -> DeliveryRow:
 
 # The Weekly chart card's warning while the channel's chart fails (F-04). Fixed copy: never
 # the location name or Telegram's description, only the short status code and the time.
+# The *_NO_STATUS bodies serve incidents with no stored status (details {} from before
+# quick task 261008-vdk): no code is made up for them (R-3).
 CHART_FAILING_TITLE = "The channel's chart is not being updated"
 CHART_FAILING_BODY = (
     "Telegram refused to post or update it (http_{status}) since {since}. It is retried "
     "every 15 min. Check that the bot is an admin of the channel and may post photos."
+)
+CHART_FAILING_BODY_NO_STATUS = (
+    "Telegram refused to post or update it since {since}. It is retried every 15 min. "
+    "Check that the bot is an admin of the channel and may post photos."
 )
 CHART_PIN_TITLE = "Today's chart is not pinned"
 CHART_PIN_BODY = (
     "Telegram refused the pin (http_{status}) since {since}. "
     "Check that the bot may pin messages in the channel."
 )
+CHART_PIN_BODY_NO_STATUS = (
+    "Telegram refused the pin since {since}. Check that the bot may pin messages in the channel."
+)
 
 
 def chart_trouble_alert(location_id: int, now: datetime, tz: str) -> tuple[str, str] | None:
     """The Weekly chart card's warning (title, body), or None while the chart is fine (F-04).
 
-    The time is ``failing_since_text``'s: ``HH:MM`` today, else the date too.
+    The time is ``failing_since_text``'s: ``HH:MM`` today, else the date too. The status
+    code shows only when one was stored (R-3).
     """
     trouble = delivery.chart_trouble(location_id)
     if trouble is None:
         return None
     since = failing_since_text(trouble.started_at, now, tz)
-    if trouble.kind == delivery.KIND_CHART_FAILING:
-        body = CHART_FAILING_BODY.format(status=trouble.http_status, since=since)
-        return CHART_FAILING_TITLE, body
-    return CHART_PIN_TITLE, CHART_PIN_BODY.format(status=trouble.http_status, since=since)
+    failing = trouble.kind == delivery.KIND_CHART_FAILING
+    title = CHART_FAILING_TITLE if failing else CHART_PIN_TITLE
+    if trouble.http_status is None:
+        body = CHART_FAILING_BODY_NO_STATUS if failing else CHART_PIN_BODY_NO_STATUS
+        return title, body.format(since=since)
+    body = CHART_FAILING_BODY if failing else CHART_PIN_BODY
+    return title, body.format(status=trouble.http_status, since=since)
 
 
 def local_minute(dt: datetime, tz: str) -> tuple[str, str]:

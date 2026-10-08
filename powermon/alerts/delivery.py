@@ -98,7 +98,9 @@ class ChartTrouble:
 
     kind: str
     started_at: datetime
-    http_status: int
+    # None when the incident stored no valid status (details {} from before quick task
+    # 261008-vdk): the true status cannot be recovered, so none is shown (R-3).
+    http_status: int | None
 
 
 def http_status(code: str) -> int:
@@ -227,7 +229,9 @@ def chart_trouble(location_id: int) -> ChartTrouble | None:
     """The location's open chart incident, ``chart_failing`` before ``chart_pin_failed``.
 
     One query. For the location page, which must never fail on a stored value: details
-    without an integer status from 100 to 599 read as 400, as in ``failing_incidents``.
+    without an integer status from 100 to 599 give ``http_status`` None. Details from
+    before this release hold {} and the true status cannot be recovered, so none is shown,
+    never a made-up 400 (quick task 261008-vdk R-3).
     """
     rows = OpsIncident.objects.filter(
         kind__in=_CHART_KINDS, location_id=location_id, ended_at__isnull=True
@@ -239,8 +243,7 @@ def chart_trouble(location_id: int) -> ChartTrouble | None:
         if kind in found:
             started_at, details = found[kind]
             values = details if isinstance(details, dict) else {}
-            status = _int_in(values.get("http_status"), 100, 599)
-            return ChartTrouble(kind, started_at, _DEFAULT_STATUS if status is None else status)
+            return ChartTrouble(kind, started_at, _int_in(values.get("http_status"), 100, 599))
     return None
 
 
