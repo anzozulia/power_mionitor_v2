@@ -168,6 +168,24 @@ def test_short_secret_key_refused_in_production() -> None:
     assert load(_env(SECRET_KEY="s" * 50)).secret_key == "s" * 50
 
 
+def test_INV21_production_refuses_a_short_admin_password() -> None:
+    # Imported here, not at module level: on the old code only this test is red (F-14).
+    from powermon import config
+
+    short = r"^ADMIN_PASSWORD must be at least 12 characters in production$"
+    # Failure: 11 characters, and 11 padded with spaces (surrounding spaces do not count).
+    with pytest.raises(ConfigError, match=short):
+        load(_env(ADMIN_PASSWORD="p" * 11))
+    with pytest.raises(ConfigError, match=short):
+        load(_env(ADMIN_PASSWORD="  " + "p" * 11 + "  "))
+
+    # Edge: exactly 12 characters load.
+    assert load(_env(ADMIN_PASSWORD="p" * 12)).admin_password == "p" * 12
+    # Expected: local mode has no floor.
+    assert load(_env(APP_ENV="local", ADMIN_PASSWORD="p" * 11)).admin_password == "p" * 11
+    assert config.MIN_ADMIN_PASSWORD_LENGTH == 12
+
+
 @pytest.mark.parametrize("value", ["1", "true", "YES", " on "])
 def test_debug_refused_in_production(value: str) -> None:
     with pytest.raises(ConfigError, match=r"^DEBUG must be off in production$"):

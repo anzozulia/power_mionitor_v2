@@ -71,6 +71,8 @@ def test_lookback_and_retry_after_match_the_window_and_cool_down() -> None:
     assert rules.THROTTLE_MESSAGE == "Too many failed sign-ins. Try again in 5 minutes."
     # The fail-closed bucket for a request with no parseable address.
     assert rules.UNKNOWN_IP == "0.0.0.0"  # noqa: S104
+    # F-14: an IPv6 client counts by its /64.
+    assert rules.IPV6_BUCKET_PREFIX == 64
 
 
 @pytest.mark.parametrize(
@@ -84,9 +86,15 @@ def test_lookback_and_retry_after_match_the_window_and_cool_down() -> None:
         ({"HTTP_X_FORWARDED_FOR": "203.0.113.9", "REMOTE_ADDR": "172.18.0.5"}, "203.0.113.9"),
         # Edge: surrounding spaces are stripped.
         ({"HTTP_X_FORWARDED_FOR": " 203.0.113.9 ", "REMOTE_ADDR": "172.18.0.5"}, "203.0.113.9"),
-        # Edge: IPv6 is kept, in its normal form.
-        ({"HTTP_X_FORWARDED_FOR": "2001:db8::1"}, "2001:db8::1"),
-        ({"HTTP_X_FORWARDED_FOR": "2001:DB8:0:0:0:0:0:1"}, "2001:db8::1"),
+        # Edge: IPv6 counts by its /64, as the network address in its normal form (F-14).
+        ({"HTTP_X_FORWARDED_FOR": "2001:db8::1"}, "2001:db8::"),
+        ({"HTTP_X_FORWARDED_FOR": "2001:DB8:0:0:0:0:0:1"}, "2001:db8::"),
+        # Expected: another address in the same /64 shares the bucket.
+        ({"HTTP_X_FORWARDED_FOR": "2001:db8::ffff:1"}, "2001:db8::"),
+        # Failure: a different /64 is a different bucket.
+        ({"HTTP_X_FORWARDED_FOR": "2001:db8:0:1::1"}, "2001:db8:0:1::"),
+        # Edge: the network address itself.
+        ({"REMOTE_ADDR": "2001:db8::"}, "2001:db8::"),
         # Edge: an IPv4-mapped IPv6 address counts as its IPv4 address.
         ({"HTTP_X_FORWARDED_FOR": "::ffff:203.0.113.9"}, "203.0.113.9"),
         ({"REMOTE_ADDR": "::ffff:10.0.0.1"}, "10.0.0.1"),
@@ -111,6 +119,9 @@ def test_lookback_and_retry_after_match_the_window_and_cool_down() -> None:
         "stripped",
         "ipv6",
         "ipv6-normalised",
+        "ipv6-same-64",
+        "ipv6-other-64",
+        "ipv6-network-address",
         "ipv4-mapped-forwarded",
         "ipv4-mapped-remote",
         "no-header",
