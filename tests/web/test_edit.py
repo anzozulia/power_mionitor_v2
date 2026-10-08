@@ -114,7 +114,9 @@ EDIT_INTRO = "Maintenance, alerts and router grace are switched on the location 
 EDIT_NOTE_MONITORING = (
     "New period and grace values apply from the next check and never change past history. "
     "Lower values can report OFF at the next check if the device has already been silent "
-    "that long."
+    "that long. If you lower the period, update the device first (Open device setup on the "
+    "location page): a device that reports less often than the new period plus grace is "
+    "reported OFF at every gap."
 )
 EDIT_NOTE_TELEGRAM = (
     "A new chat ID or bot token moves the weekly chart: a new one is posted and pinned, and "
