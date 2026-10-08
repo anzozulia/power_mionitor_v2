@@ -37,7 +37,7 @@ from io import StringIO
 from typing import Any
 
 import pytest
-from conftest import DEFAULT_BOT_TOKEN, OPS_BOT_TOKEN, OPS_CHAT_ID, FakeClock
+from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, OPS_BOT_TOKEN, OPS_CHAT_ID, FakeClock
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.db import DatabaseError, connection, transaction
@@ -50,7 +50,7 @@ from powermon.alerts.delivery import KIND_DELIVERY_FAILING
 from powermon.alerts.models import OpsIncident, OutboxMessage
 from powermon.chart.lifecycle import KIND_CHART_PIN_FAILED
 from powermon.chart.models import ChartMessage
-from powermon.engine import all_silent, lapse, maintenance, restore, transitions
+from powermon.engine import all_silent, history, lapse, maintenance, restore, transitions
 from powermon.engine.models import LocationState, PowerInterval, SystemState
 from powermon.locations.models import Location
 from powermon.web.management.commands import post_restore as post_restore_command
@@ -485,6 +485,119 @@ def test_post_restore_twice_changes_nothing_the_second_time(
     assert restore.restart_after_restore(_at(10, 25)) == restore.RestoreCounts(0, 0, 0)
 
     assert _snapshot() == after_first
+
+
+# A removed outage's dropped ON stays dropped after a restore (quick task 261008-vdk, F-13)
+
+
+def _removed_with_unsettled_delete(
+    location_factory: Callable[..., Any],
+) -> tuple[Any, OutboxMessage, OutboxMessage]:
+    """The dump: the 09:00-09:10 outage removed at 09:20, its OFF's delete not settled yet.
+
+    The OFF was sent (with its ids), the ON was still queued, so the removal dropped it
+    ("outage_removed") and requested the OFF's delete.
+    """
+    _system(cursor=_at(10, 0), resumed=_at(7, 0))
+    location = _off_since_9(location_factory)
+    off = OutboxMessage.objects.get(location=location, kind=outbox.KIND_POWER_OFF)
+    assert outbox.claim(off.pk) is True
+    assert outbox.mark_sent(off.pk, _at(9, 1, 32), tg_chat_id=DEFAULT_CHAT_ID, tg_message_id=1)
+    assert transitions.record_heartbeat(location.pk, _at(9, 10)) == "restored"
+    on = OutboxMessage.objects.get(location=location, kind=outbox.KIND_POWER_ON)
+    removed = history.remove_outage(location.pk, _at(9, 0), now=_at(9, 20), tz="Europe/Kyiv")
+    assert removed == "removed"
+    on.refresh_from_db()
+    off.refresh_from_db()
+    assert (on.status, on.last_error) == ("dropped", outbox.OUTAGE_REMOVED)
+    assert (off.delete_requested_at, off.delete_result) == (_at(9, 20), None)
+    return location, off, on
+
+
+def _tag(row: OutboxMessage) -> tuple[str, str]:
+    stored = OutboxMessage.objects.get(pk=row.pk)
+    return stored.status, stored.last_error
+
+
+def test_D14_SC4_removed_outage_on_stays_dropped_after_restore(
+    location_factory: Callable[..., Any],
+) -> None:
+    _, off, on = _removed_with_unsettled_delete(location_factory)
+
+    # Counted as before: the re-tagged ON is not a queued row.
+    assert restore.restart_after_restore(NOW) == restore.RestoreCounts(1, 0, 0)
+
+    assert _tag(on) == ("dropped", restore.RESTORED)
+    off.refresh_from_db()
+    # The delete request is kept: the false OFF is still removed from the channel.
+    assert (off.delete_requested_at, off.delete_result) == (_at(9, 20), None)
+    # A delete refused (or too old) after the restore puts nothing back.
+    outbox.fail_delete(off, outbox.DELETE_TOO_OLD, NOW)
+    assert _tag(on) == ("dropped", restore.RESTORED)
+
+
+@pytest.mark.parametrize("delete", ["refused", "ok"])
+def test_D14_SC4_refused_delete_after_restore_sends_no_on(
+    location_factory: Callable[..., Any], fake_telegram: Any, delete: str
+) -> None:
+    _, off, on = _removed_with_unsettled_delete(location_factory)
+    assert restore.restart_after_restore(NOW) == restore.RestoreCounts(1, 0, 0)
+    if delete == "refused":
+        kicked = {"ok": False, "error_code": 403, "description": "Forbidden: kicked"}
+        fake_telegram.fail_method(DEFAULT_BOT_TOKEN, "deleteMessage", status=403, json_body=kicked)
+    else:
+        fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    fake_telegram.accept(DEFAULT_BOT_TOKEN)
+    clock = FakeClock(_at(10, 21))
+    state = io_loop.RelayState()
+
+    io_loop.run_iteration(clock, state)
+    clock.advance(seconds=1)
+    io_loop.run_iteration(clock, state)
+
+    expected = "http_403" if delete == "refused" else "deleted"
+    assert OutboxMessage.objects.get(pk=off.pk).delete_result == expected
+    assert _tag(on) == ("dropped", restore.RESTORED)
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "sendMessage") == 0
+
+
+def test_D14_removed_on_keeps_outage_removed_when_its_delete_was_settled(
+    location_factory: Callable[..., Any],
+) -> None:
+    _, off, on = _removed_with_unsettled_delete(location_factory)
+    assert outbox.settle_delete(off.pk, "deleted") is True
+
+    assert restore.restart_after_restore(NOW) == restore.RestoreCounts(1, 0, 0)
+
+    assert _tag(on) == ("dropped", outbox.OUTAGE_REMOVED)
+
+
+def test_D14_only_the_removed_on_with_an_unsettled_delete_is_retagged(
+    location_factory: Callable[..., Any],
+) -> None:
+    _, _, on = _removed_with_unsettled_delete(location_factory)
+    # Another location's removed ON whose OFF has no unsettled delete request.
+    other = location_factory(name="Other")
+    other_on = _queue(other, outbox.KIND_POWER_ON, "dropped", _at(9, 10))
+    OutboxMessage.objects.filter(pk=other_on.pk).update(last_error=outbox.OUTAGE_REMOVED)
+
+    restore.restart_after_restore(NOW)
+
+    assert _tag(on) == ("dropped", restore.RESTORED)
+    assert _tag(other_on) == ("dropped", outbox.OUTAGE_REMOVED)
+
+
+def test_D14_post_restore_twice_keeps_the_removed_on_tag(
+    location_factory: Callable[..., Any],
+) -> None:
+    _, _, on = _removed_with_unsettled_delete(location_factory)
+    assert restore.restart_after_restore(NOW) == restore.RestoreCounts(1, 0, 0)
+    after_first = _snapshot()
+
+    assert restore.restart_after_restore(_at(10, 25)) == restore.RestoreCounts(0, 0, 0)
+
+    assert _snapshot() == after_first
+    assert _tag(on) == ("dropped", restore.RESTORED)
 
 
 def test_post_restore_refuses_while_a_worker_holds_the_lock(
