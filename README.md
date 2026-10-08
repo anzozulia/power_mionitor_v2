@@ -1111,9 +1111,15 @@ Rules:
 - An outage that was still in progress when the server was lost never gets its ON alert.
   A location whose power is off after the restore is detected only after its device has
   sent a heartbeat again.
+- The chart of the day the dump was taken is redrawn as a finished day once its location
+  is On again: the hours from the dump on are hatched, even if the lost server had already
+  finished that day's chart with real data. (Added 2026-10-08, quick task 261008-vdk.)
 - After a location's first heartbeat its weekly chart carries on as usual. A chart posted
   after the dump is unknown to the restored database: if it stays pinned, unpin it by hand
-  in Telegram.
+  in Telegram. While a location waits for its first heartbeat its chart is not updated:
+  the chart pinned at dump time keeps showing (as 'Today') until the device reports again;
+  then the older chart gets its final edit and unpin and today's chart is posted and
+  pinned.
 
 ## 15. History and backup checks (Phase 5 verification)
 
