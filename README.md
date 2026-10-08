@@ -1435,8 +1435,9 @@ Record the results in the Phase 6 UAT (`06-UAT.md`).
     - On the Locations page, a Fleet health filter press announces "Showing N of M
       locations" once. A poll with no change announces nothing.
 13. **Chart preview:** the location page's chart is the channel's pinned chart; the two
-    can differ by up to one chart update period (about 2 min at a 1-min period, since the
-    preview is cached for 60 s). (Amended 2026-10-06, quick task 261006-of9.) On the VPS, `docker stats` during a preview stays within the memory
+    can differ by up to one chart update period (the preview is drawn fresh on every
+    view). (Amended 2026-10-06, quick task 261006-of9; 2026-10-08, quick task
+    261008-vdk.) On the VPS, `docker stats` during a preview stays within the memory
     budget (about 25 MB more, for a moment).
 14. **Favicon on amd64:** `favicon.ico` was generated on arm64. On an amd64 host,
     `tests/web/test_icons.py` must pass in the dev image (it regenerates the file and
