@@ -1529,10 +1529,11 @@ script, which:
    on `origin/master`;
 2. skips a commit that is not newer than the deployed one (a re-run of an old build). The
    commit that is already checked out comes again when GitHub starts two runs for one push
-   or a deploy job is re-run. While the site is healthy, it restarts nothing and logs
-   `ok <commit>: already deployed and healthy; nothing restarted`. While the site is not
-   healthy, it rebuilds and restarts that commit (steps 4, 6 and 7, with no rollback), so
-   re-running a failed deploy job retries it;
+   or a deploy job is re-run. While web and worker are healthy (`/healthz` through the
+   host nginx, and the worker's own healthcheck, waited for up to a minute), it restarts
+   nothing and logs `ok <commit>: already deployed and healthy; nothing restarted`. While
+   either is not healthy, it rebuilds and restarts that commit (steps 4, 6 and 7, with no
+   rollback), so re-running a failed deploy job retries it;
 3. checks the commit out and restarts nothing when only `docs/`, `tests/`, `.github/`,
    `deploy/`, `README.md`, `LICENSE`, `PROJECT-BRIEF.md`, `.gitignore` or the local and CI
    Compose files (`docker-compose.local.yml`, `docker-compose.ci.yml`,
@@ -1672,9 +1673,9 @@ ssh hetzner /usr/local/sbin/powermon-deploy --redeploy
 
 It rebuilds the checked-out commit, runs `up --wait`, checks `/healthz` through nginx and
 prints its log lines. Exit code 0 means deployed. A CI re-run of the deployed commit does
-nothing while the site is healthy (17.2, step 2), so after an env change use this command,
-not a re-run. `--redeploy` works only as root on the server: the CI deploy key can send
-nothing but `deploy <commit>`, and the script refuses anything else.
+nothing while web and worker are healthy (17.2, step 2), so after an env change use this
+command, not a re-run. `--redeploy` works only as root on the server: the CI deploy key
+can send nothing but `deploy <commit>`, and the script refuses anything else.
 
 While `.maintenance` exists (a restore, section 14), it refuses like a CI deploy:
 `FAILED <commit>: maintenance in progress …`.
@@ -1689,9 +1690,9 @@ restarted`, and the old containers keep running.
   and CD deploys it.
 - **Emergency:** on the server, `git -C /root/powermonitor checkout --detach <good commit>`,
   then `/usr/local/sbin/powermon-deploy --redeploy` (17.7). Run both: a CI run of the commit
-  that is checked out restarts nothing while the site is healthy, so after a checkout alone
-  the old images keep running. CD skips commits older than the deployed one, so the next
-  push to `master` moves the server forward again.
+  that is checked out restarts nothing while web and worker are healthy, so after a
+  checkout alone the old images keep running. CD skips commits older than the deployed one,
+  so the next push to `master` moves the server forward again.
 - **After a migration:** section 8, and the restore in section 14.
 
 ### 17.9 Changing the deploy tooling

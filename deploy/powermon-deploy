@@ -9,8 +9,8 @@
 #     of the CI deploy key in /root/.ssh/authorized_keys, so it gets no arguments and the
 #     client's command arrives in SSH_ORIGINAL_COMMAND: exactly "deploy <40-hex commit>".
 #     GitHub can start two runs for one push, and a deploy job can be re-run: the commit
-#     that is already checked out restarts nothing while the site is healthy, and is rebuilt
-#     and restarted while it is not.
+#     that is already checked out restarts nothing while web and worker are healthy, and is
+#     rebuilt and restarted while they are not.
 #   - The owner, as root on the server: exactly one argument, --redeploy, and no
 #     SSH_ORIGINAL_COMMAND. It rebuilds and restarts the checked-out commit, e.g. after an
 #     env file change:
@@ -77,6 +77,26 @@ healthy() {
   for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
     body=$(curl -fsS --max-time 10 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/healthz" 2> /dev/null) || body=""
     if [[ $body == ok ]]; then return 0; fi
+    sleep 5
+  done
+  return 1
+}
+
+service_health() {
+  # Compose health of service $1: healthy | unhealthy | starting; empty when no running container.
+  local id
+  id=$("${COMPOSE[@]}" ps -q "$1") || id=""
+  if [[ -n $id ]]; then
+    docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$id" || true
+  fi
+}
+
+stack_healthy() {
+  # /healthz knows nothing about the worker: also its own healthcheck (health file < 30 s old).
+  local i
+  healthy || return 1
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    if [[ $(service_health worker) == healthy ]]; then return 0; fi
     sleep 5
   done
   return 1
@@ -159,8 +179,8 @@ if [[ $SHA != "$PREV" ]]; then
     exit 1
   fi
   if [[ $runtime == 0 ]]; then
-    if ! healthy; then
-      log "FAILED $SHA: no runtime change since $PREV and nothing restarted, but the site is not healthy"
+    if ! stack_healthy; then
+      log "FAILED $SHA: no runtime change since $PREV and nothing restarted, but web or worker is not healthy"
       exit 1
     fi
     log "ok $SHA: no runtime change since $PREV; checked out, nothing restarted"
@@ -168,13 +188,13 @@ if [[ $SHA != "$PREV" ]]; then
   fi
 elif [[ $mode == deploy ]]; then
   # The deployed commit again: GitHub can start two runs for one push, and a deploy job can
-  # be re-run. Nothing to do while the site is healthy. Otherwise the build and start below
-  # retry it, with no earlier commit to roll back to.
-  if healthy; then
+  # be re-run. Nothing to do while web and worker are healthy. Otherwise the build and start
+  # below retry it, with no earlier commit to roll back to.
+  if stack_healthy; then
     log "ok $SHA: already deployed and healthy; nothing restarted"
     exit 0
   fi
-  log "redeploying $SHA: it is checked out but the site is not healthy"
+  log "redeploying $SHA: it is checked out but web or worker is not healthy"
 fi
 
 # Build first: a failed build restarts nothing. --pull refreshes the base images (time-zone
