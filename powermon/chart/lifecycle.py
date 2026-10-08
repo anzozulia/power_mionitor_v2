@@ -578,7 +578,9 @@ def plan(
     (``refresh_slot``, CHRT-02), or that an outage removal marked (261006-qv7). A marked
     record with no slot due is a redraw as of ``min(last_rendered_at, now)``
     (``Action.as_of``); with a slot due it is a regular refresh at now. Redraws go first,
-    then the oldest render, ties to the lower location id. ``tz`` is the display zone the
+    then the oldest render, ties to the lower location id. A today record that is already
+    finalized (the display date moved back) gets no pin, refresh or redraw; it stays
+    today's record, so nothing is posted either (F-21). ``tz`` is the display zone the
     slots are aligned in. A step whose own key
     in ``not_before`` is in the future is skipped, so the next due step goes instead: a
     failing post never blocks the older charts' cleanup (D-02, INV-19). The alert relay's
@@ -613,6 +615,8 @@ def plan(
             return action
         if (
             today_row is None
+            # A finished day that is today again keeps its final image (D-14, F-21).
+            or today_row.finalized_at is not None
             or waiting(chart_key(location.location_id, "refresh"))
             or waiting(io_loop.chat_key(location.bot_token, today_row.chat_id))
         ):
@@ -690,8 +694,12 @@ def _free(
 
 
 def _pin_due(row: ChartRow) -> bool:
-    """Not pinned, and no permanent pin failure since the last render (D-07)."""
-    if row.pinned:
+    """Not pinned, and no permanent pin failure since the last render (D-07).
+
+    A finalized record that is today again (the local date moved back, e.g. a westward
+    ``DISPLAY_TZ`` change) is never pinned again: its day is finished (D-14, INV-19, F-21).
+    """
+    if row.pinned or row.finalized_at is not None:
         return False
     return row.pin_failed_at is None or row.pin_failed_at < row.last_rendered_at
 

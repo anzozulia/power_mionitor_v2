@@ -116,6 +116,9 @@ Generate the passwords with the same command as the secret key: its output uses 
 letters, digits, `-` and `_`, so the env file needs no quoting. Keep `APP_ENV=production`,
 `DEBUG=0` and `DISPLAY_TZ=Europe/Kyiv` (the canonical name; the old alias `Europe/Kiev` is
 rejected). `PUBLIC_BASE_URL` is ignored in production, which uses `https://DOMAIN`.
+Changing `DISPLAY_TZ` moves every day's boundaries. Change it well away from local
+midnight; a finished day's chart is then kept as it is, and today's chart resumes once
+the new zone's date reaches it. (Added 2026-10-08, quick task 261008-vdk.)
 
 The app refuses to start, and names the variable, when a secret is missing or still has
 its example value from `.env.example`.
