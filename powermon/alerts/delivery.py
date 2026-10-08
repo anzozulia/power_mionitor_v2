@@ -42,6 +42,10 @@ outcome, so the incident and its notice commit with that outcome or not at all. 
 here does network I/O, and the incident's details and the notices' payloads hold integers
 only (OPS-08). ``failing_incidents`` reads them back for the admin pages and never raises
 on a malformed value.
+
+``chart_trouble`` reads a location's open ``chart_failing`` (preferred) or
+``chart_pin_failed`` incident for the location page's Weekly chart card (F-04); only the
+chart lifecycle opens and closes those.
 """
 
 import json
@@ -86,6 +90,15 @@ class Failing:
     started_at: datetime
     http_status: int
     migrate_to_chat_id: int | None
+
+
+@dataclass(frozen=True)
+class ChartTrouble:
+    """An open chart incident of a location, as its page shows it (F-04)."""
+
+    kind: str
+    started_at: datetime
+    http_status: int
 
 
 def http_status(code: str) -> int:
@@ -208,6 +221,27 @@ def failing_incidents(location_ids: Iterable[int]) -> dict[int, Failing]:
             started_at, _DEFAULT_STATUS if status is None else status, migrate_to
         )
     return found
+
+
+def chart_trouble(location_id: int) -> ChartTrouble | None:
+    """The location's open chart incident, ``chart_failing`` before ``chart_pin_failed``.
+
+    One query. For the location page, which must never fail on a stored value: details
+    without an integer status from 100 to 599 read as 400, as in ``failing_incidents``.
+    """
+    rows = OpsIncident.objects.filter(
+        kind__in=_CHART_KINDS, location_id=location_id, ended_at__isnull=True
+    ).values_list("kind", "started_at", "details")
+    found: dict[str, tuple[datetime, object]] = {
+        kind: (started_at, details) for kind, started_at, details in rows
+    }
+    for kind in _CHART_KINDS:
+        if kind in found:
+            started_at, details = found[kind]
+            values = details if isinstance(details, dict) else {}
+            status = _int_in(values.get("http_status"), 100, 599)
+            return ChartTrouble(kind, started_at, _DEFAULT_STATUS if status is None else status)
+    return None
 
 
 def _int_in(value: object, low: int, high: int) -> int | None:

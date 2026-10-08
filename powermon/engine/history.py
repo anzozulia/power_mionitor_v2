@@ -79,9 +79,9 @@ deleted check:
    being unpinned (INV-19).
 
 The reset keeps the configuration, the device key, the three switches, an open
-``delivery_failing`` or ``chart_pin_failed`` incident and every alert already queued: they
-report real events (D-05, D-07). It queues nothing, deletes no message (owner default 2,
-261006-qv7) and logs one INFO line.
+``delivery_failing``, ``chart_failing`` or ``chart_pin_failed`` incident and every alert
+already queued: they report real events (D-05, D-07). It queues nothing, deletes no message
+(owner default 2, 261006-qv7) and logs one INFO line.
 
 Nothing here does network I/O (KD2), and time always comes from the caller (``now``, and
 for the removal also the display zone ``tz`` that names today's chart), never from SQL

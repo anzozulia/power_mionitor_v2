@@ -377,6 +377,13 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
     once when pinning starts failing and once when it works again:
     `📌 Can't pin today's chart for Office (Telegram: http_400). The chart is still posted and refreshed; pinning is retried every 15 min, or at each chart update if it updates less often. Check that the bot may pin messages in the chat.` (Amended 2026-10-06, quick task 261006-of9.)
     and `📌 Pinning works again for Office.`
+  - The bot may not post or update the weekly chart at all (no right to post photos, bot
+    removed from the channel), once when it starts and once when a chart post or update
+    works again:
+    `🖼 Can't post or update the weekly chart for Office (Telegram: http_403). Subscribers see no chart, or an old one. It is retried every 15 min. Check that the bot is an admin of the channel and may post photos.`
+    and `🖼 The weekly chart for Office is posted and updated again.` The location page's
+    Weekly chart card shows a warning while it lasts, and also while today's chart cannot
+    be pinned. (Added 2026-10-08, quick task 261008-vdk.)
   - Telegram refuses a location's alerts for good (bot removed from the channel, wrong
     chat ID, bad token), once when it starts and once when an alert or a test message
     goes through again, however many alerts are queued ("Location page" below):
@@ -1096,7 +1103,8 @@ Rules:
   quick task 261008-vdk.)
 - The admin gets one monitoring-gap notice (`⏸ Monitoring gap …`, section 5) for the lost
   hours. The problems the dump had open (all-silent, failing delivery, a chart that cannot
-  be pinned) are closed without a notice; a problem that persists is reported again.
+  be posted, updated or pinned) are closed without a notice; a problem that persists is
+  reported again.
 - An outage that was still in progress when the server was lost never gets its ON alert.
   A location whose power is off after the restore is detected only after its device has
   sent a heartbeat again.

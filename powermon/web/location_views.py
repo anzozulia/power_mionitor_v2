@@ -55,7 +55,7 @@ from powermon.telegram.client import DEFAULT_RETRY_AFTER_S, SendResult, Telegram
 from powermon.web import views
 from powermon.web.forms import LocationEditForm
 from powermon.web.fragments import confirm_response
-from powermon.web.status import location_status
+from powermon.web.status import failing_since_text, location_status
 
 log = logging.getLogger(__name__)
 
@@ -457,6 +457,35 @@ def delivery_row(location_id: int) -> DeliveryRow:
     )
 
 
+# The Weekly chart card's warning while the channel's chart fails (F-04). Fixed copy: never
+# the location name or Telegram's description, only the short status code and the time.
+CHART_FAILING_TITLE = "The channel's chart is not being updated"
+CHART_FAILING_BODY = (
+    "Telegram refused to post or update it (http_{status}) since {since}. It is retried "
+    "every 15 min. Check that the bot is an admin of the channel and may post photos."
+)
+CHART_PIN_TITLE = "Today's chart is not pinned"
+CHART_PIN_BODY = (
+    "Telegram refused the pin (http_{status}) since {since}. "
+    "Check that the bot may pin messages in the channel."
+)
+
+
+def chart_trouble_alert(location_id: int, now: datetime, tz: str) -> tuple[str, str] | None:
+    """The Weekly chart card's warning (title, body), or None while the chart is fine (F-04).
+
+    The time is ``failing_since_text``'s: ``HH:MM`` today, else the date too.
+    """
+    trouble = delivery.chart_trouble(location_id)
+    if trouble is None:
+        return None
+    since = failing_since_text(trouble.started_at, now, tz)
+    if trouble.kind == delivery.KIND_CHART_FAILING:
+        body = CHART_FAILING_BODY.format(status=trouble.http_status, since=since)
+        return CHART_FAILING_TITLE, body
+    return CHART_PIN_TITLE, CHART_PIN_BODY.format(status=trouble.http_status, since=since)
+
+
 def local_minute(dt: datetime, tz: str) -> tuple[str, str]:
     """``("YYYY-MM-DD", "HH:MM")`` of the instant ``dt`` in the display TZ ``tz`` (UI5-D4).
 
@@ -544,6 +573,8 @@ class LocationDetailView(View):
             "location": location,
             "status": location_status(location),
             "delivery": delivery_row(location.pk),
+            # The Weekly chart card's warning while the chart fails (F-04).
+            "chart_trouble": chart_trouble_alert(location.pk, now, tz),
             "switch_rows": switch_rows(location),
             "outage_rows": rows,
             "outages_total_text": outages_total_text(recent.outages),
