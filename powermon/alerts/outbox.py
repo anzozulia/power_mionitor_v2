@@ -434,6 +434,23 @@ def make_due(location_id: int, now: datetime) -> int:
     ).update(next_attempt_at=now)
 
 
+def release_held(now: datetime) -> int:
+    """After a backward wall-clock step: make every held pending row due at ``now``.
+
+    Pending rows of both channels (subscriber alerts and ops notices) whose
+    ``next_attempt_at`` is later than ``now`` move to ``now``; a row already due keeps its
+    time, and rows in flight or finished are never touched. Retry and 429 holds are
+    wall-clock times, so after the clock steps back they would otherwise wait the size of
+    the step on top (F-12; F-03 calls it after a restart). Runs on the caller's
+    connection. A naive ``now`` raises ValueError before any write. Returns how many moved.
+    """
+    if now.utcoffset() is None:
+        raise ValueError("a naive datetime has no defined instant")
+    return OutboxMessage.objects.filter(status="pending", next_attempt_at__gt=now).update(
+        next_attempt_at=now
+    )
+
+
 def lease_holds(pid: int | None) -> bool:
     """True when ``pid`` (the lease session) holds the worker lock; no pid is unfenced (C1).
 

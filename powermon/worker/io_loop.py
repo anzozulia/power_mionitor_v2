@@ -195,6 +195,7 @@ from powermon.alerts import delivery, ops, ops_texts, outbox
 from powermon.alerts.models import OpsIncident, OutboxMessage
 from powermon.alerts.texts import render_alert
 from powermon.clock import Clock
+from powermon.engine import lapse
 from powermon.i18n import times
 from powermon.telegram.client import DEFAULT_RETRY_AFTER_S, SendResult, TelegramClient
 from powermon.worker.lease import LeaseState, LeaseStatus
@@ -269,6 +270,10 @@ class RelayState:
     ``failing``: the ``chat_key`` the relay holds for each location whose subscriber alert
     was refused permanently, by location id; that channel's 15-minute hold lasts while the
     location's ``delivery_failing`` incident is open, and goes once it closes (D-12).
+    ``last_wall``/``last_mono``: the wall-clock and monotonic times of the previous pass,
+    rebased on every pass. A pass whose wall clock moved back more than
+    ``lapse.CLOCK_STEP_LIMIT_S`` against the monotonic clock releases every hold once
+    (``_after_clock_step``, F-12).
     """
 
     not_before: dict[str, datetime] = field(default_factory=dict)
@@ -280,6 +285,8 @@ class RelayState:
         default_factory=dict
     )
     failing: dict[int, str] = field(default_factory=dict)
+    last_wall: datetime | None = None
+    last_mono: float | None = None
 
 
 def bot_key(token: str) -> str:
@@ -368,10 +375,15 @@ def run_iteration(
     makes at most one delete call (``_delete_one``, always on); only a pass that made none
     goes on, with ``charts``, to at most one chart call
     (``powermon.chart.lifecycle.run_step``), which is off unless the worker enables it.
+    A backward wall-clock step first releases every hold once (``_after_clock_step``,
+    F-12).
     """
     close_old_connections()
     # Outcomes kept after a DB error are written before any new claim (WR-04).
     _flush_unapplied(state)
+    # After a backward wall-clock step every hold is released once (F-12). After the flush,
+    # so outcomes written with pre-step future times are released too.
+    _after_clock_step(clock, state)
     # Nothing past its maximum age may go out, so expiry runs before any head (ALRT-03).
     _expire(clock.now())
     # A channel held for a delivery failure that has since recovered goes at once (D-12).
@@ -421,6 +433,39 @@ def run_iteration(
         if tick is not None:
             tick()
     return attempted
+
+
+def _after_clock_step(clock: Clock, state: RelayState) -> None:
+    """Release every hold once after a backward wall-clock step (F-12).
+
+    Holds (``not_before``) and the outbox's ``next_attempt_at`` are wall-clock times. When
+    the wall clock moved back more than ``lapse.CLOCK_STEP_LIMIT_S`` against the monotonic
+    clock since the previous pass, every in-memory hold (chat, ops, bot-wide, delete and
+    chart keys) is cleared and the held pending rows are made due now
+    (``outbox.release_held``): at most one extra attempt per held chat, after which a new
+    429 or failure sets a new hold. The baseline is rebased on every pass, never kept at a
+    maximum, so one step releases once. If the release raises, the baseline stays where it
+    was and the next pass sees the step again and retries. A worker restart starts with no
+    holds; its held rows are released by the lapse clamp (``lapse.clamp_future``).
+    """
+    now, mono = clock.now(), clock.monotonic()
+    last_wall, last_mono = state.last_wall, state.last_mono
+    if last_wall is None or last_mono is None:
+        state.last_wall, state.last_mono = now, mono
+        return
+    step = (now - last_wall).total_seconds() - (mono - last_mono)
+    if step >= -lapse.CLOCK_STEP_LIMIT_S:
+        state.last_wall, state.last_mono = now, mono
+        return
+    state.not_before.clear()
+    released = outbox.release_held(now)
+    # Rebased only after the release committed: never max(), and a failed release retries.
+    state.last_wall, state.last_mono = now, mono
+    log.warning(
+        "wall clock stepped back %d s: relay holds cleared, %d queued message(s) due now",
+        round(-step),
+        released,
+    )
 
 
 def notify_db_down(status: LeaseStatus, clock: Clock, state: RelayState) -> bool:
