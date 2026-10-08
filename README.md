@@ -543,7 +543,9 @@ changes the rules for `Europe/Kyiv`, bump the Python and postgres image tags.
     refuses the OFF's delete, or it is too old by then, its ON alert stays too (a queued ON
     that the removal dropped is sent after all, unless a later alert has gone out since,
     the location has moved to another chat, or the ON is past its maximum age), with one
-    WARNING in the worker log, no ops notice and no "delivery failing". Delete such alerts
+    WARNING in the worker log, no ops notice and no "delivery failing". A later alert that
+    is itself being deleted, or already is, does not count, unless its outage was removed
+    only after the OFF's delete was refused. Delete such alerts
     by hand in Telegram. An alert already deleted by hand counts as deleted. History reset
     deletes no message. If one of the outage's alerts (its OFF, or the ON that ended it) is
     being sent at that moment, the page says so ("An alert about this outage is being sent

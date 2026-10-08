@@ -576,8 +576,15 @@ def _stale_on(on: OutboxMessage, off: OutboxMessage, now: datetime) -> str | Non
     than the one that got the OFF (a token change alone keeps the same chat); "later_alert"
     when a later subscriber alert of the location is sending, sent or uncertain, so the ON
     would be stale. A later row still pending is fine: the ON has the lower id and goes
-    first. The chat is read with a plain query: an admin chat save that commits in the
-    same instant as the refusal is not covered (quick task 261008-vdk, F-01).
+    first. A later row that will not stay visible is ignored too: its delete is requested
+    and not yet settled, or it settled as deleted or not found (another removal took that
+    outage away, quick task 261008-vdk R-2). The chat is read with a plain query: an admin
+    chat save that commits in the same instant as the refusal is not covered (quick task
+    261008-vdk, F-01).
+
+    Known limitation: a first OFF delete refused BEFORE the later outage is removed keeps
+    its ON dropped, because at that moment the later alert is still visible. That needs a
+    channel hold during the first removal, a per-message refusal and a second removal.
     """
     if on.expires_at <= now:
         return "expired"
@@ -593,6 +600,10 @@ def _stale_on(on: OutboxMessage, off: OutboxMessage, now: datetime) -> str | Non
         location_id=location_id,
         id__gt=on.pk,
         status__in=("sending", "sent", "uncertain"),
+    )
+    # Only rows that stay visible count (R-2).
+    later = later.exclude(delete_requested_at__isnull=False, delete_result__isnull=True).exclude(
+        delete_result__in=(DELETE_DELETED, DELETE_NOT_FOUND)
     )
     if later.exists():
         return "later_alert"
