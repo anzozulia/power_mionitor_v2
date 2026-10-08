@@ -303,6 +303,70 @@ def test_make_due_refuses_a_naive_time(location_factory: Callable[..., Any]) -> 
     assert _due_at(row) == later
 
 
+# F-12: after a backward wall-clock step every held pending row is released once
+
+
+@pytest.mark.django_db
+def test_release_held_moves_held_pending_rows_of_both_channels(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = location_factory()
+    other = location_factory()
+    now = RECORDED_AT + timedelta(minutes=5)
+    later = now + timedelta(minutes=10)
+    held = [_held(location, later), _held(other, later)]
+    with transaction.atomic():
+        notice = outbox.enqueue_ops(
+            outbox.KIND_OPS_GAP,
+            payload={"start_us": 1, "end_us": 2},
+            recorded_at=later,
+            location_id=location.pk,
+        )
+    assert _due_at(notice) == later
+
+    assert outbox.release_held(now) == 3
+
+    assert [_due_at(row) for row in (*held, notice)] == [now, now, now]
+
+
+@pytest.mark.django_db
+def test_release_held_keeps_due_and_non_pending_rows(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = location_factory()
+    now = RECORDED_AT + timedelta(minutes=5)
+    later = now + timedelta(minutes=10)
+    held = _held(location, later)
+    already_due = _held(location, now - timedelta(seconds=1))
+    at_now = _held(location, now)
+    finished = [
+        _held(location, later, status=status)
+        for status in ("sending", "sent", "uncertain", "dropped")
+    ]
+
+    assert outbox.release_held(now) == 1
+
+    assert _due_at(held) == now
+    assert _due_at(already_due) == now - timedelta(seconds=1)
+    assert _due_at(at_now) == now
+    # Rows in flight or finished keep their future time.
+    assert [_due_at(row) for row in finished] == [later] * 4
+    # Nothing left to move: a second call changes no row.
+    assert outbox.release_held(now) == 0
+
+
+@pytest.mark.django_db
+def test_release_held_refuses_a_naive_time(location_factory: Callable[..., Any]) -> None:
+    location = location_factory()
+    later = RECORDED_AT + timedelta(minutes=15)
+    row = _held(location, later)
+
+    with pytest.raises(ValueError, match="naive"):
+        outbox.release_held(datetime(2026, 10, 1, 10, 10))  # noqa: DTZ001
+
+    assert _due_at(row) == later
+
+
 # D-09, INV-19 #2: a deleted location's queued alerts are never sent
 
 
