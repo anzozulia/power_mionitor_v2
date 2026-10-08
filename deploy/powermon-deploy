@@ -169,8 +169,10 @@ elif [[ $mode == deploy ]]; then
   log "redeploying $SHA: it is checked out but the site is not healthy"
 fi
 
-# Build first: a failed build restarts nothing.
-if ! timeout 1800 "${COMPOSE[@]}" build; then
+# Build first: a failed build restarts nothing. --pull refreshes the base images (time-zone
+# rules, security fixes); a registry outage fails here, before any restart. The rollback
+# build below does without it.
+if ! timeout 1800 "${COMPOSE[@]}" build --pull; then
   if [[ $SHA != "$PREV" ]]; then checkout "$PREV"; fi
   log "FAILED $SHA: build failed; still running $PREV, nothing restarted"
   exit 1
