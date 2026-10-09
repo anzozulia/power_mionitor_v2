@@ -39,7 +39,8 @@ retried after 30 s; INV-16's at-most-once rule is about sends. Its outcomes neve
 ("not found" included) settles it, a 429 holds the delete key and the bot, a 5xx or an
 unsent request holds both for 30 s, and a refusal settles it with one WARNING; a refused
 or too-old OFF also cancels the rest of its removal and sends the ON alert the removal
-dropped (``outbox.fail_delete``), so the channel never shows only "power off".
+dropped unless a later alert went out, the chat changed or it expired
+(``outbox.fail_delete``), so the channel never shows only "power off".
 
 The chart step (``powermon.chart.lifecycle.run_step``, D-05) is the last step of the pass
 and makes at most one Telegram call; a pass that made a delete call skips it. It runs only
@@ -71,7 +72,9 @@ The result decides the row's next status, for both channels (D-14 policy):
   ``delivery_failing`` incident opens with one ``ops_delivery_failing`` notice to the
   admin (D-10). A refusal while the incident is open opens no incident and sends no
   notice (INV-20 #1), but updates the open incident's details to that latest refusal
-  (its status and any ``migrate_to_chat_id``, W2-A2).
+  (its status and any ``migrate_to_chat_id``, W2-A2). A refusal answered by a channel the
+  admin has replaced since the send (another chat or bot, D-08) holds nothing: the row is
+  due at once and nothing is marked failing (quick task 261008-vdk).
 
 Only those two outcomes of a subscriber send touch the incident: a 429, a 5xx, a refused
 connection, an ambiguous send, an ops row and every chart call leave it alone (D-10).
@@ -189,12 +192,13 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
 from django.conf import settings
-from django.db import Error, close_old_connections, transaction
+from django.db import Error, close_old_connections, connection, transaction
 
 from powermon.alerts import delivery, ops, ops_texts, outbox
 from powermon.alerts.models import OpsIncident, OutboxMessage
 from powermon.alerts.texts import render_alert
 from powermon.clock import Clock
+from powermon.engine import lapse
 from powermon.i18n import times
 from powermon.telegram.client import DEFAULT_RETRY_AFTER_S, SendResult, TelegramClient
 from powermon.worker.lease import LeaseState, LeaseStatus
@@ -213,6 +217,12 @@ LATE_AFTER = timedelta(seconds=120)
 # longer than this, in monotonic seconds since the lease was lost (D-11 #2). The lease's
 # HELD_MARKER_MAX_AGE_S is the same value (WR-02).
 DB_DOWN_NOTICE_AFTER_S = 300
+# The location's current channel, read FOR SHARE in the transaction that writes a refused
+# row's outcome (delivery.LIVE_LOCATION_SQL's lock): an admin save (update_config, FOR NO
+# KEY UPDATE) either committed before, or waits and then sees the row pending (make_due).
+CURRENT_CHANNEL_SQL = (
+    "SELECT bot_token, chat_id FROM location WHERE id = %s AND deleted_at IS NULL FOR SHARE"
+)
 # Which payload value holds the previous state's duration for each alert kind.
 _DURATION_KEYS = {outbox.KIND_POWER_OFF: "was_on_us", outbox.KIND_POWER_ON: "was_off_us"}
 # Outcomes of a subscriber send that concern the whole bot, not the one chat (D1): Telegram
@@ -269,6 +279,10 @@ class RelayState:
     ``failing``: the ``chat_key`` the relay holds for each location whose subscriber alert
     was refused permanently, by location id; that channel's 15-minute hold lasts while the
     location's ``delivery_failing`` incident is open, and goes once it closes (D-12).
+    ``last_wall``/``last_mono``: the wall-clock and monotonic times of the previous pass,
+    rebased on every pass. A pass whose wall clock moved back more than
+    ``lapse.CLOCK_STEP_LIMIT_S`` against the monotonic clock releases every hold once
+    (``_after_clock_step``, F-12).
     """
 
     not_before: dict[str, datetime] = field(default_factory=dict)
@@ -280,6 +294,8 @@ class RelayState:
         default_factory=dict
     )
     failing: dict[int, str] = field(default_factory=dict)
+    last_wall: datetime | None = None
+    last_mono: float | None = None
 
 
 def bot_key(token: str) -> str:
@@ -368,10 +384,15 @@ def run_iteration(
     makes at most one delete call (``_delete_one``, always on); only a pass that made none
     goes on, with ``charts``, to at most one chart call
     (``powermon.chart.lifecycle.run_step``), which is off unless the worker enables it.
+    A backward wall-clock step first releases every hold once (``_after_clock_step``,
+    F-12).
     """
     close_old_connections()
     # Outcomes kept after a DB error are written before any new claim (WR-04).
     _flush_unapplied(state)
+    # After a backward wall-clock step every hold is released once (F-12). After the flush,
+    # so outcomes written with pre-step future times are released too.
+    _after_clock_step(clock, state)
     # Nothing past its maximum age may go out, so expiry runs before any head (ALRT-03).
     _expire(clock.now())
     # A channel held for a delivery failure that has since recovered goes at once (D-12).
@@ -421,6 +442,39 @@ def run_iteration(
         if tick is not None:
             tick()
     return attempted
+
+
+def _after_clock_step(clock: Clock, state: RelayState) -> None:
+    """Release every hold once after a backward wall-clock step (F-12).
+
+    Holds (``not_before``) and the outbox's ``next_attempt_at`` are wall-clock times. When
+    the wall clock moved back more than ``lapse.CLOCK_STEP_LIMIT_S`` against the monotonic
+    clock since the previous pass, every in-memory hold (chat, ops, bot-wide, delete and
+    chart keys) is cleared and the held pending rows are made due now
+    (``outbox.release_held``): at most one extra attempt per held chat, after which a new
+    429 or failure sets a new hold. The baseline is rebased on every pass, never kept at a
+    maximum, so one step releases once. If the release raises, the baseline stays where it
+    was and the next pass sees the step again and retries. A worker restart starts with no
+    holds; its held rows are released by the lapse clamp (``lapse.clamp_future``).
+    """
+    now, mono = clock.now(), clock.monotonic()
+    last_wall, last_mono = state.last_wall, state.last_mono
+    if last_wall is None or last_mono is None:
+        state.last_wall, state.last_mono = now, mono
+        return
+    step = (now - last_wall).total_seconds() - (mono - last_mono)
+    if step >= -lapse.CLOCK_STEP_LIMIT_S:
+        state.last_wall, state.last_mono = now, mono
+        return
+    state.not_before.clear()
+    released = outbox.release_held(now)
+    # Rebased only after the release committed: never max(), and a failed release retries.
+    state.last_wall, state.last_mono = now, mono
+    log.warning(
+        "wall clock stepped back %d s: relay holds cleared, %d queued message(s) due now",
+        round(-step),
+        released,
+    )
 
 
 def notify_db_down(status: LeaseStatus, clock: Clock, state: RelayState) -> bool:
@@ -822,7 +876,10 @@ def _apply(
     ``delivery_failing`` incident, in the transaction that writes the row (D-10). This is
     also the WR-04 flush path, so every write here is idempotent: the reset is fenced by
     the claim's attempt count, a second open gets no incident id and a second close
-    changes no row, so no notice is ever repeated.
+    changes no row, so no notice is ever repeated. The permanent branch reads the
+    location's current channel FOR SHARE in that same transaction: when the admin has
+    replaced the chat or bot since the send (D-08), the row is due at once and nothing is
+    marked failing (quick task 261008-vdk, F-11).
     """
     # The location of a subscriber alert; None for an ops row, which never touches it.
     location_id = row.location_id if row.channel == outbox.CHANNEL_SUBSCRIBER else None
@@ -869,10 +926,19 @@ def _apply(
         state.not_before[bot_wide] = next_attempt_at
     code = result.code or result.kind
     if result.kind == "permanent" and location_id is not None:
+        replaced = False
         # The row's reset and the failing incident (with its one notice) commit together.
         with transaction.atomic():
+            with connection.cursor() as cur:
+                cur.execute(CURRENT_CHANNEL_SQL, [location_id])
+                current = cur.fetchone()
+            if current is not None and chat_key(current[0], current[1]) != key:
+                # Refused by a channel the admin replaced since the send (D-08): the new
+                # one is untried, so the row is due now and nothing is marked failing.
+                replaced = True
+                outbox.mark_retry(row.pk, now, code, attempts=attempts)
             # Only this claim's attempt (WR-01): a later claim's row is not this outcome's.
-            if outbox.mark_retry(row.pk, next_attempt_at, code, attempts=attempts):
+            elif outbox.mark_retry(row.pk, next_attempt_at, code, attempts=attempts):
                 delivery.open_failing(
                     location_id,
                     now,
@@ -880,6 +946,9 @@ def _apply(
                     # Reported to the admin only: the location's chat stays (PITFALLS 6e).
                     result.migrate_to_chat_id,
                 )
+        if replaced:
+            log.info("relay: alert %s was refused by a replaced channel; it is due now", row.pk)
+            return
         # After the commit: the channel is held until the incident closes (D-12).
         state.failing[location_id] = key
         return

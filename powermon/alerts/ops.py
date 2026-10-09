@@ -186,6 +186,12 @@ def render_text(
         )
     if kind == outbox.KIND_OPS_PIN_RESTORED:
         return ops_texts.pin_restored(_location_name(location_id), escape=escape)
+    if kind == outbox.KIND_OPS_CHART_FAILING:
+        return ops_texts.chart_failing(
+            _int(payload, "http_status"), _location_name(location_id), escape=escape
+        )
+    if kind == outbox.KIND_OPS_CHART_RESTORED:
+        return ops_texts.chart_restored(_location_name(location_id), escape=escape)
     if kind == outbox.KIND_OPS_DELIVERY_FAILING:
         return ops_texts.delivery_failing(
             _int(payload, "http_status"),

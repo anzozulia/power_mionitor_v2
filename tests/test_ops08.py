@@ -479,6 +479,9 @@ def test_INV23_ops_notice_texts_secret_free(location_factory: Callable[..., Any]
             location.pk,
         ),
         outbox.KIND_OPS_DELIVERY_RESTORED: ({}, location.pk),
+        # The chart failure notices (F-04, quick task 261008-vdk): a status, or nothing.
+        outbox.KIND_OPS_CHART_FAILING: ({"http_status": 403}, location.pk),
+        outbox.KIND_OPS_CHART_RESTORED: ({}, location.pk),
     }
     assert set(notices) == set(outbox.OPS_KINDS)
     texts = [

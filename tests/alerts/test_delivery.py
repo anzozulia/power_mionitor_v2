@@ -24,6 +24,9 @@
   even one in flight at delete time that came back to pending; they are dropped before
   expiry, so no expiry notice names the deleted location. A deleted location never gets a
   new failing incident or notice, even from a refusal answered while it was being deleted.
+- D-08 (F-11, quick task 261008-vdk): a refusal answered by a channel the admin replaced
+  while the send was in flight holds nothing: the row is due at once, no incident opens,
+  and the next pass sends to the new channel.
 
 The relay runs ``close_old_connections()``, so every test that runs ``run_iteration`` is
 ``django_db(transaction=True)``, as is the race with a concurrent delete (``Actor``, real
@@ -33,6 +36,7 @@ whose bot is accepted wherever ops rows must be delivered.
 """
 
 import dataclasses
+import logging
 import threading
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -60,11 +64,14 @@ from powermon.alerts import delivery, outbox
 from powermon.alerts.models import OpsIncident, OutboxMessage
 from powermon.chart import lifecycle
 from powermon.engine.models import LocationState, PowerInterval, SystemState
+from powermon.locations import actions
 from powermon.locations.models import Location
 from powermon.telegram.client import SendResult
 from powermon.worker import io_loop
 
 TOKEN_A = DEFAULT_BOT_TOKEN
+TOKEN_B = "987654321:" + "B" * 35
+CHAT_B = -1009876543210
 # The OFF alert is recorded (and so due) at 10:06:31 UTC, 13:06:31 in Kyiv.
 T0 = datetime(2026, 10, 1, 10, 6, 31, tzinfo=UTC)
 # An admin-typed name with HTML in it: every notice escapes it (Telegram HTML).
@@ -889,3 +896,250 @@ def test_open_failing_waits_for_a_concurrent_delete_and_writes_nothing(
     assert relay.result is False
     assert not OpsIncident.objects.exists()
     assert _ops_rows(outbox.KIND_OPS_DELIVERY_FAILING) == []
+
+
+# D-08 (F-11, quick task 261008-vdk): a refusal from a replaced channel holds nothing
+
+
+def _config(location: Any, **changes: Any) -> dict[str, Any]:
+    """The edit form's data for ``location`` with ``changes`` (an empty token keeps it)."""
+    data = {name: getattr(location, name) for name in actions.CONFIG_FIELDS}
+    return data | {"bot_token": ""} | changes
+
+
+def _relay_lines(caplog: pytest.LogCaptureFixture) -> list[tuple[int, str]]:
+    return [(r.levelno, r.getMessage()) for r in caplog.records if r.name == io_loop.__name__]
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("change", ["chat", "token"])
+def test_D08_refusal_from_a_channel_replaced_mid_send_is_due_now_and_opens_no_failing(
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    ops_settings: Any,
+    caplog: pytest.LogCaptureFixture,
+    change: str,
+) -> None:
+    location = location_factory(name=NAME)
+    off = _queue(location)
+    changes = {"chat_id": CHAT_B} if change == "chat" else {"bot_token": TOKEN_B}
+
+    def during() -> None:
+        # The admin replaces the channel while the send is in flight.
+        assert actions.update_config(location.pk, _config(location, **changes), T0).channel_changed
+
+    fake_telegram.answer(TOKEN_A, during, status=403, json_body=KICKED)
+    fake_telegram.accept(TOKEN_A if change == "chat" else TOKEN_B)
+    fake_telegram.accept(OPS_BOT_TOKEN)
+    caplog.set_level(logging.INFO, logger=io_loop.__name__)
+    clock = FakeClock(T0)
+    state = io_loop.RelayState()
+
+    assert io_loop.run_iteration(clock, state) is True
+
+    row = _row(off)
+    assert (row.status, row.attempts, row.last_error, row.next_attempt_at) == (
+        "pending",
+        1,
+        "http_403",
+        T0,
+    )
+    assert _incidents(location) == []
+    assert _ops_rows(outbox.KIND_OPS_DELIVERY_FAILING) == []
+    assert state.failing == {}
+    assert _relay_lines(caplog) == [
+        (
+            logging.WARNING,
+            f"relay: permanent error http_403 for location {location.pk}; "
+            "its channel backs off for 15 min",
+        ),
+        (logging.INFO, f"relay: alert {off.pk} was refused by a replaced channel; it is due now"),
+    ]
+
+    # The next pass sends it to the new channel.
+    clock.advance(seconds=1)
+    assert io_loop.run_iteration(clock, state) is True
+    assert _row(off).status == "sent"
+    if change == "chat":
+        assert fake_telegram.sent[-1]["chat_id"] == CHAT_B
+    else:
+        assert _calls_to(fake_telegram, TOKEN_B) == 1
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("change", ["chat", "deleted"])
+def test_D08_flushed_refusal_after_a_channel_change_is_due_now(
+    location_factory: Callable[..., Any], ops_settings: Any, change: str
+) -> None:
+    # The WR-04 flush path writes the refusal after the admin's save committed.
+    location = location_factory()
+    off = _queue(location)
+    assert outbox.claim(off.pk) is True
+    old = io_loop.chat_key(TOKEN_A, DEFAULT_CHAT_ID)
+    if change == "chat":
+        Location.objects.filter(pk=location.pk).update(chat_id=CHAT_B)
+    else:
+        Location.objects.filter(pk=location.pk).update(deleted_at=T0)
+    state = io_loop.RelayState()
+
+    io_loop._apply(_row(off), 1, SendResult("permanent", code="http_403"), T0, state, old)
+
+    row = _row(off)
+    assert (row.status, row.last_error) == ("pending", "http_403")
+    assert _incidents(location) == []
+    if change == "chat":
+        assert row.next_attempt_at == T0
+        assert state.failing == {}
+    else:
+        # A deleted location falls through: the usual hold, and open_failing writes nothing.
+        assert row.next_attempt_at == T0 + _min(15)
+        assert _ops_rows(outbox.KIND_OPS_DELIVERY_FAILING) == []
+
+
+@pytest.mark.django_db(transaction=True)
+def test_D08_name_only_save_mid_send_keeps_the_15_min_hold_and_opens_failing(
+    location_factory: Callable[..., Any], fake_telegram: Any, ops_settings: Any
+) -> None:
+    location = location_factory(name=NAME)
+    off = _queue(location)
+
+    def during() -> None:
+        saved = actions.update_config(location.pk, _config(location, name="Renamed"), T0)
+        assert saved.found and not saved.channel_changed
+
+    fake_telegram.answer(TOKEN_A, during, status=403, json_body=KICKED)
+    fake_telegram.accept(TOKEN_A)
+    fake_telegram.accept(OPS_BOT_TOKEN)
+    state = io_loop.RelayState()
+
+    assert io_loop.run_iteration(FakeClock(T0), state) is True
+
+    assert _row(off).next_attempt_at == T0 + _min(15)
+    assert _incidents(location) == [(T0, None, {"http_status": 403})]
+    assert len(_ops_rows(outbox.KIND_OPS_DELIVERY_FAILING)) == 1
+    assert state.failing == {location.pk: io_loop.chat_key(TOKEN_A, DEFAULT_CHAT_ID)}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_D08_refusal_waits_for_an_uncommitted_chat_save_and_is_due_now(
+    location_factory: Callable[..., Any],
+) -> None:
+    # The admin's chat save has written chat B but not committed when the relay writes the
+    # refusal: FOR SHARE waits for it, then reads chat B, so nothing is held or failing.
+    location = location_factory()
+    off = _queue(location)
+    assert outbox.claim(off.pk) is True
+    old = io_loop.chat_key(TOKEN_A, DEFAULT_CHAT_ID)
+    state = io_loop.RelayState()
+    locked, release = threading.Event(), threading.Event()
+
+    def save_holding_the_row() -> None:
+        with transaction.atomic(), connection.cursor() as cur:
+            cur.execute("UPDATE location SET chat_id = %s WHERE id = %s", [CHAT_B, location.pk])
+            locked.set()
+            if not release.wait(5):
+                raise AssertionError("the race hook was never released")
+
+    def refused() -> None:
+        io_loop._apply(_row(off), 1, SendResult("permanent", code="http_403"), T0, state, old)
+
+    save, relay = Actor(save_holding_the_row), Actor(refused)
+    try:
+        save.start()
+        assert locked.wait(5)
+        relay.start()
+        assert wait_for(lambda: relay.pid is not None and blocked_on_lock(relay.pid))
+        release.set()
+        save.join(5)
+        relay.join(5)
+    finally:
+        _finish(save, relay, release=release)
+
+    assert save.exc is None, save.exc
+    assert relay.exc is None, relay.exc
+    row = _row(off)
+    assert (row.status, row.next_attempt_at, row.last_error) == ("pending", T0, "http_403")
+    assert _incidents(location) == []
+    assert state.failing == {}
+
+
+# F-04 (quick task 261008-vdk): the location page's chart warning reads the chart incidents
+
+
+@pytest.mark.django_db
+def test_chart_trouble_prefers_chart_failing_and_reads_its_status(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = location_factory()
+    OpsIncident.objects.create(
+        kind="chart_pin_failed", location=location, started_at=T0, details={"http_status": 400}
+    )
+    started = T0 + _min(5)
+    OpsIncident.objects.create(
+        kind="chart_failing", location=location, started_at=started, details={"http_status": 403}
+    )
+
+    assert delivery.chart_trouble(location.pk) == delivery.ChartTrouble(
+        "chart_failing", started, 403
+    )
+    assert (delivery.KIND_CHART_FAILING, delivery.KIND_CHART_PIN_FAILED) == (
+        "chart_failing",
+        "chart_pin_failed",
+    )
+    assert lifecycle.KIND_CHART_FAILING == delivery.KIND_CHART_FAILING
+    assert lifecycle.KIND_CHART_PIN_FAILED == delivery.KIND_CHART_PIN_FAILED
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "details",
+    [
+        {"http_status": "403"},
+        {},
+        {"http_status": True},
+        [],
+        {"http_status": 99},
+        {"http_status": 600},
+    ],
+)
+def test_chart_trouble_reads_a_missing_or_malformed_status_as_none(
+    location_factory: Callable[..., Any], details: Any
+) -> None:
+    # Details from before this release hold {}: the true status cannot be recovered, so
+    # none is shown, never a made-up 400 (quick task 261008-vdk R-3).
+    location = location_factory()
+    OpsIncident.objects.create(
+        kind="chart_failing", location=location, started_at=T0, details=details
+    )
+    other = location_factory()
+    OpsIncident.objects.create(
+        kind="chart_pin_failed", location=other, started_at=T0, details=details
+    )
+
+    assert delivery.chart_trouble(location.pk) == delivery.ChartTrouble("chart_failing", T0, None)
+    assert delivery.chart_trouble(other.pk) == delivery.ChartTrouble("chart_pin_failed", T0, None)
+
+
+@pytest.mark.django_db
+def test_chart_trouble_is_none_without_an_open_chart_incident(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = location_factory()
+    other = location_factory()
+    for kind in ("chart_failing", "chart_pin_failed"):
+        OpsIncident.objects.create(
+            kind=kind,
+            location=location,
+            started_at=T0,
+            ended_at=T0 + _min(1),
+            details={"http_status": 403},
+        )
+    OpsIncident.objects.create(
+        kind="delivery_failing", location=location, started_at=T0, details={"http_status": 403}
+    )
+    OpsIncident.objects.create(
+        kind="chart_failing", location=other, started_at=T0, details={"http_status": 403}
+    )
+
+    assert delivery.chart_trouble(location.pk) is None
+    assert delivery.chart_trouble(other.pk + 1000) is None

@@ -107,7 +107,10 @@ Edit `.env.docker_production`:
 
 - `SECRET_KEY`: at least 50 random characters. Generate one with
   `python3 -c 'import secrets; print(secrets.token_urlsafe(50))'`.
-- `ADMIN_USERNAME`, `ADMIN_PASSWORD`: the single admin account of the web panel.
+- `ADMIN_USERNAME`, `ADMIN_PASSWORD`: the single admin account of the web panel. In
+  production `ADMIN_PASSWORD` must be at least 12 characters (surrounding spaces do not
+  count), or the app refuses to start. `deploy/make-secrets.py` generates about 67.
+  (Amended 2026-10-08, quick task 261008-vdk.)
 - `POSTGRES_PASSWORD`: the database password.
 - `DOMAIN`: the bare host name, e.g. `power.example.org` (no `https://`, no path).
 - `ACME_EMAIL`: your email for the Let's Encrypt account.
@@ -116,6 +119,9 @@ Generate the passwords with the same command as the secret key: its output uses 
 letters, digits, `-` and `_`, so the env file needs no quoting. Keep `APP_ENV=production`,
 `DEBUG=0` and `DISPLAY_TZ=Europe/Kyiv` (the canonical name; the old alias `Europe/Kiev` is
 rejected). `PUBLIC_BASE_URL` is ignored in production, which uses `https://DOMAIN`.
+Changing `DISPLAY_TZ` moves every day's boundaries. Change it well away from local
+midnight; a finished day's chart is then kept as it is, and today's chart resumes once
+the new zone's date reaches it. (Added 2026-10-08, quick task 261008-vdk.)
 
 The app refuses to start, and names the variable, when a secret is missing or still has
 its example value from `.env.example`.
@@ -140,7 +146,8 @@ Optional settings:
 - `BACKUP_TIME_UTC`: the time of the nightly database dump, in UTC, as `HH:MM` (default
   `03:00`, which is 05:00 or 06:00 in Kyiv). The default is clear of local midnight, when
   the charts are posted, and of the DST change (section 14).
-- `BACKUP_KEEP`: how many nightly dumps are kept, 1 to 365 (default 14).
+- `BACKUP_KEEP`: nightly dumps are kept for this many days, and at least this many dumps
+  are kept, 1 to 365 (default 14).
 
 A `BACKUP_TIME_UTC` or `BACKUP_KEEP` of the wrong shape makes no dump and keeps the
 `backup` service restarting (`docker compose -f docker-compose.prod.yml ps` shows
@@ -300,6 +307,11 @@ docker run --rm --user "$(id -u):$(id -g)" -e UV_CACHE_DIR=/tmp/uv-cache -v "$PW
 After changing dependencies in `pyproject.toml`, run `uv lock` the same way instead of
 `uv lock --check`, and review every new package name before building.
 
+Time-zone rules come from the Debian `tzdata` in the Python base image
+(`python:3.14.7-slim-trixie`, see the `Dockerfile`). The deploy builds with `--pull` (17.2,
+step 4), but a pinned patch tag stops being rebuilt once the next patch is out. When IANA
+changes the rules for `Europe/Kyiv`, bump the Python and postgres image tags.
+
 ## 10. Operations notes
 
 - **Logs:** `docker compose -f docker-compose.prod.yml logs <service>` (`db`, `migrate`,
@@ -377,6 +389,13 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
     once when pinning starts failing and once when it works again:
     `📌 Can't pin today's chart for Office (Telegram: http_400). The chart is still posted and refreshed; pinning is retried every 15 min, or at each chart update if it updates less often. Check that the bot may pin messages in the chat.` (Amended 2026-10-06, quick task 261006-of9.)
     and `📌 Pinning works again for Office.`
+  - The bot may not post or update the weekly chart at all (no right to post photos, bot
+    removed from the channel), once when it starts and once when a chart post or update
+    works again:
+    `🖼 Can't post or update the weekly chart for Office (Telegram: http_403). Subscribers see no chart, or an old one. It is retried every 15 min. Check that the bot is an admin of the channel and may post photos.`
+    and `🖼 The weekly chart for Office is posted and updated again.` The location page's
+    Weekly chart card shows a warning while it lasts, and also while today's chart cannot
+    be pinned. (Added 2026-10-08, quick task 261008-vdk.)
   - Telegram refuses a location's alerts for good (bot removed from the channel, wrong
     chat ID, bad token), once when it starts and once when an alert or a test message
     goes through again, however many alerts are queued ("Location page" below):
@@ -522,13 +541,17 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
     hours ago, sent before this update, or its delivery is uncertain), both alerts stay and
     a queued ON alert is still sent, so the channel is not left at power off. If Telegram
     refuses the OFF's delete, or it is too old by then, its ON alert stays too (a queued ON
-    that the removal dropped is sent after all), with one WARNING in the worker log, no ops
-    notice and no "delivery failing". Delete such alerts by hand in Telegram. An alert
-    already deleted by hand counts as deleted. History reset deletes no message. If one of
-    the outage's alerts (its OFF, or the ON that ended it) is being sent at that moment, the
-    page says so ("An alert about this outage is being sent to the channel right now.
-    Nothing changed. Try again in a minute.") and nothing changes: try again a minute later.
-    (Amended 2026-10-06, quick task 261006-qv7.)
+    that the removal dropped is sent after all, unless a later alert has gone out since,
+    the location has moved to another chat, or the ON is past its maximum age), with one
+    WARNING in the worker log, no ops notice and no "delivery failing". A later alert that
+    is itself being deleted, or already is, does not count, unless its outage was removed
+    only after the OFF's delete was refused. Delete such alerts
+    by hand in Telegram. An alert already deleted by hand counts as deleted. History reset
+    deletes no message. If one of the outage's alerts (its OFF, or the ON that ended it) is
+    being sent at that moment, the page says so ("An alert about this outage is being sent
+    to the channel right now. Nothing changed. Try again in a minute.") and nothing
+    changes: try again a minute later. (Amended 2026-10-06, quick task 261006-qv7.)
+    (Amended 2026-10-08, quick task 261008-vdk.)
   - **Reset history:** deletes the location's whole recorded power history. It is refused
     while an outage is in progress (reset after power returns, or delete the location).
     The location then shows **Waiting for first heartbeat**; its next heartbeat restarts
@@ -547,7 +570,10 @@ After changing dependencies in `pyproject.toml`, run `uv lock` the same way inst
 - **Sign-in throttle:** 5 failed sign-ins within a minute from one IP lock sign-in for
   that IP for 5 minutes: every sign-in from it then gets HTTP 429 and "Too many failed
   sign-ins. Try again in 5 minutes.", even with the right password. The IP is the one
-  Caddy reports in `X-Forwarded-For` (locally, the direct client address).
+  the reverse proxy (Caddy, or the host nginx on a shared VPS) reports in
+  `X-Forwarded-For` (locally, the direct client address). An IPv6 client counts by its
+  /64, so rotating addresses inside one /64 does not escape the lock, and a successful
+  sign-in from that /64 clears its failures. (Amended 2026-10-08, quick task 261008-vdk.)
 - **All-silent and maintenance (Pitfall 7):** an all-silent incident starts only when at
   least 2 active locations (monitored, not in maintenance) are all silent, and its start
   is the moment the last of them fell quiet. It ends at the first heartbeat after that
@@ -956,8 +982,10 @@ same `postgres:18.6-trixie` image as `db`, so `pg_dump` has the server's version
   server was down over night. It checks once a minute. A failed dump is retried after 5
   minutes, then at growing intervals of up to 1 hour.
 - **How:** `pg_dump` in PostgreSQL's custom format. Each dump is checked with
-  `pg_restore --list` before it replaces anything; only then are the dumps beyond the
-  newest `BACKUP_KEEP` (default 14) deleted. A failed dump deletes nothing.
+  `pg_restore --list` before it replaces anything; only then are old dumps deleted: a dump
+  goes only when it is beyond the newest `BACKUP_KEEP` (default 14) and older than the last
+  `BACKUP_KEEP` nightly slots. So the nightly dump of each of the last `BACKUP_KEEP` nights
+  stays, however many dumps on demand were taken. A failed dump deletes nothing.
 - **Where:** `docker_data/prod/backups/` (locally `docker_data/local/backups/`), outside
   the PostgreSQL data directory. Each file is named by its UTC start time, for example
   `powermon-20261003T030000Z.dump`. The directory is 0700 and every dump 0600, owned by
@@ -965,10 +993,17 @@ same `postgres:18.6-trixie` image as `db`, so `pg_dump` has the server's version
   hold every bot token and device key, so reading them needs `sudo`. There is no automated
   off-site copy: copy dumps off the VPS by hand (below).
 - **Health:** `docker compose -f docker-compose.prod.yml ps backup` shows `healthy` while
-  the newest dump is under 26 hours old. A failing backup shows only there and in
+  the newest dump is under 26 hours old. It also shows `unhealthy` while a dump is dated
+  more than 5 minutes in the future (taken while the server clock was ahead): the nightly
+  dumps go on, and it turns healthy once that file is moved out of the backup directory.
+  A failing backup shows only there and in
   `docker compose -f docker-compose.prod.yml logs backup`: each dump logs
   `backup: dump powermon-….dump ok`, each failure one `backup: error: …` line. There is no
-  ops notice for it, so look at it after each deploy and now and then.
+  ops notice for it, so look at it after each deploy and now and then. A deploy (17.2,
+  step 6) runs the same check (`backup.sh --health`) after starting backup, for about 2
+  minutes when each check answers at once and at most about 6 minutes when the check
+  hangs, logs one `warning <commit>: backup is unhealthy …` line when it still fails, and
+  still completes. Compose shows `starting` for up to 5 minutes after a recreate.
 
 ### A dump on demand
 
@@ -978,8 +1013,9 @@ Before a risky change (a large update, a manual database edit), take a dump at o
 docker compose -f docker-compose.prod.yml exec backup bash /backup/backup.sh --dump-now
 ```
 
-It logs `backup: dump powermon-….dump ok`. As after a nightly dump, only the newest
-`BACKUP_KEEP` dumps are kept.
+It logs `backup: dump powermon-….dump ok`. It never pushes a nightly dump out: the
+nightly dumps of the last `BACKUP_KEEP` nights stay, so each dump on demand adds one file
+until it is older than that window.
 
 ### Copying a dump off the VPS
 
@@ -1009,6 +1045,7 @@ database that already has tables, and it never drops or cleans one.
 (for example `cd ~/power-monitor`), choose the dump, then run:
 
 ```sh
+sudo flock /run/lock/powermon-deploy.lock touch .maintenance
 sudo ls -l docker_data/prod/backups/
 F=powermon-20261003T030000Z.dump
 docker compose -f docker-compose.prod.yml stop web worker backup
@@ -1019,7 +1056,12 @@ docker compose -f docker-compose.prod.yml run --rm --no-deps backup bash /backup
 docker compose -f docker-compose.prod.yml run --rm --build migrate
 docker compose -f docker-compose.prod.yml run --rm --no-deps migrate python manage.py post_restore
 docker compose -f docker-compose.prod.yml up -d --build --wait
+sudo rm .maintenance
 ```
+
+The first line takes the maintenance marker `.maintenance` in the clone: `flock` waits
+until a deploy that is running has finished (17.2), and while the marker exists every new
+deploy and `--redeploy` refuses. The last line removes it.
 
 What each step does:
 
@@ -1049,7 +1091,11 @@ Rules:
   `db`, move the new `docker_data/prod/postgres` aside as well, and start again from
   `up -d --wait db`. To go back to the old database, stop `db`, move the new directory
   aside and the `postgres.before-restore-…` directory back to `docker_data/prod/postgres`,
-  then run the deploy command.
+  then `sudo rm .maintenance` and run the deploy command.
+- While `.maintenance` exists, every CI deploy and `--redeploy` refuses
+  (`FAILED <commit>: maintenance in progress …`). If a step fails, the marker stays until
+  you remove it with `sudo rm .maintenance`: only once `post_restore` and the last `up`
+  have run, or once the old database is back.
 - Once the restored stack has run correctly for a day, delete the moved-aside data
   directory by hand: `sudo rm -rf docker_data/prod/postgres.before-restore-…`.
 
@@ -1067,15 +1113,18 @@ Rules:
 
 3. From your computer, copy the dump into it (here the clone is `~/power-monitor`):
    `scp <file> <user>@<new-vps>:power-monitor/docker_data/prod/backups/`
-4. In the clone, run the same commands as above from `up -d --wait db` on:
+4. In the clone, run the same commands as above from `up -d --wait db` on, inside the
+   maintenance marker:
 
    ```sh
+   sudo flock /run/lock/powermon-deploy.lock touch .maintenance
    F=powermon-20261003T030000Z.dump
    docker compose -f docker-compose.prod.yml up -d --wait db
    docker compose -f docker-compose.prod.yml run --rm --no-deps backup bash /backup/backup.sh --restore "$F"
    docker compose -f docker-compose.prod.yml run --rm --build migrate
    docker compose -f docker-compose.prod.yml run --rm --no-deps migrate python manage.py post_restore
    docker compose -f docker-compose.prod.yml up -d --build --wait
+   sudo rm .maintenance
    ```
 
    The domain's DNS records must point at the new VPS before the last command: Caddy
@@ -1089,15 +1138,25 @@ Rules:
   section 6). Its history up to the dump is kept. The hours from the dump to that
   heartbeat are drawn as not monitored (hatched), never as an outage.
 - Subscribers get no message: the alerts the dump had queued are dropped, never sent.
+  A removed outage's alerts that the dump still had to delete are still deleted, and its
+  dropped ON alert is never sent, even if that delete is refused. (Amended 2026-10-08,
+  quick task 261008-vdk.)
 - The admin gets one monitoring-gap notice (`⏸ Monitoring gap …`, section 5) for the lost
   hours. The problems the dump had open (all-silent, failing delivery, a chart that cannot
-  be pinned) are closed without a notice; a problem that persists is reported again.
+  be posted, updated or pinned) are closed without a notice; a problem that persists is
+  reported again.
 - An outage that was still in progress when the server was lost never gets its ON alert.
   A location whose power is off after the restore is detected only after its device has
   sent a heartbeat again.
+- The chart of the day the dump was taken is redrawn as a finished day once its location
+  is On again: the hours from the dump on are hatched, even if the lost server had already
+  finished that day's chart with real data. (Added 2026-10-08, quick task 261008-vdk.)
 - After a location's first heartbeat its weekly chart carries on as usual. A chart posted
   after the dump is unknown to the restored database: if it stays pinned, unpin it by hand
-  in Telegram.
+  in Telegram. While a location waits for its first heartbeat its chart is not updated:
+  the chart pinned at dump time keeps showing (as 'Today') until the device reports again;
+  then the older chart gets its final edit and unpin and today's chart is posted and
+  pinned.
 
 ## 15. History and backup checks (Phase 5 verification)
 
@@ -1203,8 +1262,8 @@ WARNING) and the grep result. Record the result in the phase verification file.
    ```
 
    Expected: `backup` is `healthy`. Its log has
-   `backup: started: a dump every night at 03:00 UTC, the newest 14 kept` and one
-   `backup: dump powermon-<deploy time>.dump ok`. The listing shows the directory (`.`) as
+   `backup: started: a dump every night at 03:00 UTC, kept for 14 nights (at least the newest 14)`
+   and one `backup: dump powermon-<deploy time>.dump ok`. The listing shows the directory (`.`) as
    `drwx------` and one `-rw-------` dump named with the deploy time (UTC).
 2. The next day, after `BACKUP_TIME_UTC`, run the same three commands.
 
@@ -1413,8 +1472,9 @@ Record the results in the Phase 6 UAT (`06-UAT.md`).
     - On the Locations page, a Fleet health filter press announces "Showing N of M
       locations" once. A poll with no change announces nothing.
 13. **Chart preview:** the location page's chart is the channel's pinned chart; the two
-    can differ by up to one chart update period (about 2 min at a 1-min period, since the
-    preview is cached for 60 s). (Amended 2026-10-06, quick task 261006-of9.) On the VPS, `docker stats` during a preview stays within the memory
+    can differ by up to one chart update period (the preview is drawn fresh on every
+    view). (Amended 2026-10-06, quick task 261006-of9; 2026-10-08, quick task
+    261008-vdk.) On the VPS, `docker stats` during a preview stays within the memory
     budget (about 25 MB more, for a moment).
 14. **Favicon on amd64:** `favicon.ico` was generated on arm64. On an amd64 host,
     `tests/web/test_icons.py` must pass in the dev image (it regenerates the file and
@@ -1468,24 +1528,47 @@ line in `/root/.ssh/authorized_keys` starts with
 `restrict,command="/usr/local/sbin/powermon-deploy"`, so the key can run nothing but that
 script, which:
 
-1. accepts only `deploy <40-hex commit>` and takes a lock (one deploy at a time). For a
-   commit other than the checked-out one, it fetches `origin/master` and refuses a commit
-   that is not on `origin/master`;
+1. accepts only `deploy <40-hex commit>` and takes a lock (one deploy at a time). While
+   `/root/powermonitor/.maintenance` exists (a restore, section 14), it logs
+   `FAILED <commit>: maintenance in progress …` and does nothing else. For a commit other
+   than the checked-out one, it fetches `origin/master` and refuses a commit that is not
+   on `origin/master`;
 2. skips a commit that is not newer than the deployed one (a re-run of an old build). The
    commit that is already checked out comes again when GitHub starts two runs for one push
-   or a deploy job is re-run. While the site is healthy, it restarts nothing and logs
-   `ok <commit>: already deployed and healthy; nothing restarted`. While the site is not
-   healthy, it rebuilds and restarts that commit (steps 4, 6 and 7, with no rollback), so
-   re-running a failed deploy job retries it;
+   or a deploy job is re-run. While web and worker are healthy (`/healthz` through the
+   host nginx, and the worker's own healthcheck, waited for up to a minute), it restarts
+   nothing and logs `ok <commit>: already deployed and healthy; nothing restarted`. While
+   either is not healthy, it rebuilds and restarts that commit (steps 4, 6 and 7, with no
+   rollback), so re-running a failed deploy job retries it;
 3. checks the commit out and restarts nothing when only `docs/`, `tests/`, `.github/`,
-   `deploy/`, `README.md`, `LICENSE` or `PROJECT-BRIEF.md` changed;
-4. builds the images first. A failed build changes nothing: the old commit stays checked
-   out and the old containers keep running;
-5. takes a dump (section 14) when `powermon/migrations` changed;
-6. runs `up -d --wait`, which runs `migrate` once and then starts `web` and `worker`;
+   `deploy/`, `README.md`, `LICENSE`, `PROJECT-BRIEF.md`, `.gitignore` or the local and CI
+   Compose files (`docker-compose.local.yml`, `docker-compose.ci.yml`,
+   `docker-compose.dev-ui.yml`) changed. A change under `docker/backup/` among them
+   recreates only `backup`, whose running loop keeps the old script until then; web and
+   worker do not restart. `docker-compose.prod.yml`,
+   `docker-compose.vps.yml`, the `Dockerfile`, `.dockerignore`, `.env.example` and
+   `docker/Caddyfile` always count as a runtime change;
+4. builds the images first, with `--pull`, so a newer build of a pinned base image (Debian
+   security fixes, time-zone data) is picked up. A failed build changes nothing: the old
+   commit stays checked out and the old containers keep running. A Docker Hub or ghcr.io
+   outage or rate limit fails the build this way; re-run the deploy job later. Then the new
+   image checks the configuration (`manage.py check` with the env file, no database): a
+   bad value ends with `FAILED <commit>: the configuration check failed …; nothing
+   restarted`, again with the old commit and containers left as they were;
+5. takes a dump (section 14) when `powermon/migrations` or `uv.lock` changed (Django's own
+   migrations come with `uv.lock`);
+6. runs `up -d --wait web worker`, which runs `migrate` once and then starts `web` and
+   `worker`. Then it starts `backup` apart, recreated when `docker/backup/` changed or the
+   commit was already checked out (a retry or `--redeploy`), and runs its own check
+   (`backup.sh --health`, up to 8 tries 15 s apart). A backup that does not start, or whose
+   check still fails, is one `warning <commit>: …` line, not a failed deploy. When only
+   `docker/backup/` changed and backup does not start, the `ok` line says it was not
+   recreated;
 7. checks `https://powermonitor.anzozulia.com/healthz` through the host nginx;
-8. if that fails, rolls back to the previous commit and starts it again, except after a
-   migration: then it stops and leaves the recovery to you (section 8, and the dump);
+8. if that fails, rolls back to the previous commit and starts the images it ran before
+   (it rebuilds them only when one is missing), except after a change to
+   `powermon/migrations` or `uv.lock`: then it stops and leaves the recovery to you
+   (section 8, and the dump);
 9. removes this project's dangling images, never anything else on the host.
 
 Each outcome is one line in `/var/log/powermon-deploy.log` (rotated weekly, 8 kept,
@@ -1526,6 +1609,9 @@ host run, from `/root/powermonitor`:
 ```sh
 docker compose -f docker-compose.prod.yml -f docker-compose.vps.yml <command>
 ```
+
+A restore (section 14) on this host runs in `/root/powermonitor`, so its marker is
+`/root/powermonitor/.maintenance`, the file the deploy script checks (17.2, step 1).
 
 ### 17.4 First bring-up
 
@@ -1585,7 +1671,9 @@ Ops alerts are off on this server: `OPS_BOT_TOKEN` and `OPS_CHAT_ID` are empty, 
 notices go to the worker log at WARNING. To turn them on, set both in the env file on the
 server (section 4 says where the values come from), with the same rules for values as in
 17.5, then run the manual redeploy (17.7). `docker compose restart` does not re-read the
-env file (section 7). Check the file with `python3 deploy/make-secrets.py --check` in
+env file (section 7). The redeploy checks every value with the new image before it
+restarts anything; a bad value ends with `FAILED …: the configuration check failed …;
+nothing restarted`. Check the file with `python3 deploy/make-secrets.py --check` in
 `/root/powermonitor`, then the worker log
 (`docker compose -f docker-compose.prod.yml -f docker-compose.vps.yml logs worker`).
 
@@ -1598,11 +1686,19 @@ from your machine:
 ssh hetzner /usr/local/sbin/powermon-deploy --redeploy
 ```
 
-It rebuilds the checked-out commit, runs `up --wait`, checks `/healthz` through nginx and
+It rebuilds the checked-out commit, checks the configuration (17.2, step 4), runs
+`up --wait web worker`, checks `/healthz` through nginx, starts `backup` (17.2, step 6) and
 prints its log lines. Exit code 0 means deployed. A CI re-run of the deployed commit does
-nothing while the site is healthy (17.2, step 2), so after an env change use this command,
-not a re-run. `--redeploy` works only as root on the server: the CI deploy key can send
-nothing but `deploy <commit>`, and the script refuses anything else.
+nothing while web and worker are healthy (17.2, step 2), so after an env change use this
+command, not a re-run. `--redeploy` works only as root on the server: the CI deploy key
+can send nothing but `deploy <commit>`, and the script refuses anything else.
+
+While `.maintenance` exists (a restore, section 14), it refuses like a CI deploy:
+`FAILED <commit>: maintenance in progress …`.
+
+Before it restarts anything, the new image checks the configuration (17.2, step 4). A bad
+env value ends with `FAILED <commit>: the configuration check failed …; nothing
+restarted`, and the old containers keep running.
 
 ### 17.8 Rollback
 
@@ -1610,9 +1706,9 @@ nothing but `deploy <commit>`, and the script refuses anything else.
   and CD deploys it.
 - **Emergency:** on the server, `git -C /root/powermonitor checkout --detach <good commit>`,
   then `/usr/local/sbin/powermon-deploy --redeploy` (17.7). Run both: a CI run of the commit
-  that is checked out restarts nothing while the site is healthy, so after a checkout alone
-  the old images keep running. CD skips commits older than the deployed one, so the next
-  push to `master` moves the server forward again.
+  that is checked out restarts nothing while web and worker are healthy, so after a
+  checkout alone the old images keep running. CD skips commits older than the deployed one,
+  so the next push to `master` moves the server forward again.
 - **After a migration:** section 8, and the restore in section 14.
 
 ### 17.9 Changing the deploy tooling

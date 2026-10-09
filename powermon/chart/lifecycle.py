@@ -30,11 +30,21 @@ worker was down is simply due on the next pass.
   record, never the location's current chat (D-01, D-04). A permanent pin failure (the
   bot may post but not pin, INV-17 #1) is stored as ``pin_failed_at``; the pin is tried
   again only after the next successful render (D-07). The first such failure opens the
-  location's ``chart_pin_failed`` incident and queues one ``ops_pin_failed`` notice; the
+  location's ``chart_pin_failed`` incident (its details carry the refusal's HTTP status)
+  and queues one ``ops_pin_failed`` notice; the
   pin that works again closes it and queues one ``ops_pin_restored`` notice. Each goes
   in the same transaction as the record's UPDATE, and only the opener (or closer) whose
   write changed the database notifies, so a pin refused again after every refresh never
   repeats a notice (INV-20 shape).
+- Refused post or update (F-04, INV-20): a permanent refusal of today's chart post,
+  refresh or redraw (no right to post photos, the bot removed) opens the location's
+  ``chart_failing`` incident and queues one ``ops_chart_failing`` notice, in one
+  transaction with the location row read FOR SHARE, so a deleted location gets nothing
+  (D-09). The next post or refresh that works closes it and queues one
+  ``ops_chart_restored`` notice. Only the opener (or closer) whose write changed the
+  database notifies, so a refusal repeated every 15 min never repeats a notice. The
+  step's 15-min backoff is unchanged, and a transient or rate-limited outcome or "message
+  to edit not found" opens nothing.
 - Today's chart deleted in the channel ("message to edit / pin not found" on a refresh
   or a pin): the record is retired (``retired_at``, unpinned) and never called again, and
   the next pass posts exactly one replacement, records it and pins it (INV-17 #3, D-06).
@@ -212,7 +222,7 @@ from django.db import (
     transaction,
 )
 
-from powermon.alerts import ops, outbox
+from powermon.alerts import delivery, ops, outbox
 from powermon.alerts.models import OpsIncident
 from powermon.chart import model, source
 from powermon.chart.models import ChartMessage
@@ -228,8 +238,10 @@ log = logging.getLogger(__name__)
 
 Step = Literal["post", "pin", "finalize", "unpin", "refresh", "release"]
 
-# The ops_incident kind of a location whose bot may post but not pin (D-07, INV-17 #1).
-KIND_CHART_PIN_FAILED = "chart_pin_failed"
+# The ops_incident kinds of the chart (defined in ``delivery``, which the web reads): a bot
+# that may post but not pin (D-07, INV-17 #1), and today's chart refused for good (F-04).
+KIND_CHART_PIN_FAILED = delivery.KIND_CHART_PIN_FAILED
+KIND_CHART_FAILING = delivery.KIND_CHART_FAILING
 # Every chart step key starts with this (``chart_key``); no other key does.
 _KEY_PREFIX = "chart:"
 # The HTTP status a pin-failure notice names when the result code carries none.
@@ -252,6 +264,8 @@ _PERMANENT_KINDS = ("permanent", "edit_target_missing")
 _CLEANUP: tuple[Step, ...] = ("finalize", "unpin")
 # The steps on today's record: its message gone means today's chart is posted again.
 _TODAYS: tuple[Step, ...] = ("pin", "refresh")
+# The steps whose permanent refusal leaves subscribers with no chart or an old one (F-04).
+_REFUSABLE: tuple[Step, ...] = ("post", "refresh")
 
 # The monitored locations (status on or off, not deleted), and the ones that still have an
 # active record (ROWS_SQL's predicate) to release: a deleted location's (D-09), or a
@@ -564,7 +578,9 @@ def plan(
     (``refresh_slot``, CHRT-02), or that an outage removal marked (261006-qv7). A marked
     record with no slot due is a redraw as of ``min(last_rendered_at, now)``
     (``Action.as_of``); with a slot due it is a regular refresh at now. Redraws go first,
-    then the oldest render, ties to the lower location id. ``tz`` is the display zone the
+    then the oldest render, ties to the lower location id. A today record that is already
+    finalized (the display date moved back) gets no pin, refresh or redraw; it stays
+    today's record, so nothing is posted either (F-21). ``tz`` is the display zone the
     slots are aligned in. A step whose own key
     in ``not_before`` is in the future is skipped, so the next due step goes instead: a
     failing post never blocks the older charts' cleanup (D-02, INV-19). The alert relay's
@@ -599,6 +615,8 @@ def plan(
             return action
         if (
             today_row is None
+            # A finished day that is today again keeps its final image (D-14, F-21).
+            or today_row.finalized_at is not None
             or waiting(chart_key(location.location_id, "refresh"))
             or waiting(io_loop.chat_key(location.bot_token, today_row.chat_id))
         ):
@@ -676,8 +694,12 @@ def _free(
 
 
 def _pin_due(row: ChartRow) -> bool:
-    """Not pinned, and no permanent pin failure since the last render (D-07)."""
-    if row.pinned:
+    """Not pinned, and no permanent pin failure since the last render (D-07).
+
+    A finalized record that is today again (the local date moved back, e.g. a westward
+    ``DISPLAY_TZ`` change) is never pinned again: its day is finished (D-14, INV-19, F-21).
+    """
+    if row.pinned or row.finalized_at is not None:
         return False
     return row.pin_failed_at is None or row.pin_failed_at < row.last_rendered_at
 
@@ -866,6 +888,8 @@ def _apply(
     if result.kind == "ok":
         if action.step == "post" and result.message_id is not None:
             _record_or_keep(action.location, today, result.message_id, answered, state)
+            # Recorded or kept first: a close that raises never posts the chart again.
+            _chart_working(action.location.location_id, answered)
         elif action.step == "pin" and row is not None:
             _pinned(action.location, row, answered)
         elif action.step == "refresh" and row is not None:
@@ -877,6 +901,7 @@ def _apply(
             # A redraw keeps last_rendered_at, so the next slot comes on schedule.
             if row.redraw_requested_at is not None:
                 _clear_redraw(row)
+            _chart_working(action.location.location_id, answered)
         elif action.step == "finalize" and row is not None:
             # Conditional: a repeated or concurrent final edit changes nothing twice.
             ChartMessage.objects.filter(pk=row.id, finalized_at__isnull=True).update(
@@ -906,6 +931,9 @@ def _apply(
     if result.kind == "permanent" and action.step == "pin" and row is not None:
         # The bot may not pin here: tried again after the next render, not before (D-07).
         _pin_refused(action.location, row, result, answered)
+    if result.kind == "permanent" and action.step in _REFUSABLE:
+        # Subscribers see no chart, or an old one: one notice when it starts (INV-20).
+        _chart_refused(action.location, result, answered)
     _fail(action, key, result, answered, state)
 
 
@@ -991,12 +1019,73 @@ def _pin_refused(
     refresh never repeats the notice (D-07). The channel's alerts are never held.
     """
     location_id = location.location_id
+    status = _http_status(result.code)
     with transaction.atomic():
         ChartMessage.objects.filter(pk=row.id, pinned=False).update(pin_failed_at=answered)
-        if ops.open_incident(KIND_CHART_PIN_FAILED, answered, location_id=location_id) is not None:
+        if (
+            ops.open_incident(
+                KIND_CHART_PIN_FAILED,
+                answered,
+                location_id=location_id,
+                details={"http_status": status},
+            )
+            is not None
+        ):
             ops.notify(
                 outbox.KIND_OPS_PIN_FAILED,
-                payload={"http_status": _http_status(result.code)},
+                payload={"http_status": status},
+                recorded_at=answered,
+                location_id=location_id,
+            )
+
+
+def _chart_refused(location: ChartLocation, result: SendResult, answered: datetime) -> None:
+    """Telegram refused today's chart post or update for good: one notice when it starts.
+
+    One transaction: the location row read ``FOR SHARE`` (a deleted location, or one being
+    deleted, gets nothing, D-09), the ``chart_failing`` incident's open and the start notice.
+    Only the opener that got an incident id back notifies, so a refusal repeated every
+    15 min never repeats the notice (INV-20, F-04). The step's backoff (``_fail``) and the
+    channel's alerts are unchanged.
+    """
+    location_id = location.location_id
+    status = _http_status(result.code)
+    with transaction.atomic():
+        with connection.cursor() as cur:
+            cur.execute(delivery.LIVE_LOCATION_SQL, [location_id])
+            if cur.fetchone() is None:
+                return
+        opened = ops.open_incident(
+            KIND_CHART_FAILING, answered, location_id=location_id, details={"http_status": status}
+        )
+        if opened is not None:
+            ops.notify(
+                outbox.KIND_OPS_CHART_FAILING,
+                payload={"http_status": status},
+                recorded_at=answered,
+                location_id=location_id,
+            )
+
+
+def _chart_working(location_id: int, answered: datetime) -> None:
+    """Today's chart was posted or updated: an open ``chart_failing`` ends with one notice.
+
+    One transaction: the incident's conditional close and the ``ops_chart_restored`` notice;
+    only the closer whose UPDATE closed it notifies (INV-20, F-04). With no open incident it
+    writes nothing. A database error propagates to ``_unwritten``.
+    """
+    with transaction.atomic():
+        incident = (
+            OpsIncident.objects.filter(
+                kind=KIND_CHART_FAILING, location_id=location_id, ended_at__isnull=True
+            )
+            .values_list("id", flat=True)
+            .first()
+        )
+        if incident is not None and ops.close_incident(incident, answered):
+            ops.notify(
+                outbox.KIND_OPS_CHART_RESTORED,
+                payload={},
                 recorded_at=answered,
                 location_id=location_id,
             )
@@ -1338,7 +1427,12 @@ def _unwritten(
 
     For a refresh, pin, final edit, unpin or release, all idempotent: the call is made again
     after ``step_delay``, so an UPDATE that keeps failing never turns into a call per pass.
-    A post never gets here: its record is kept and written first (``_record_or_keep``).
+    A post gets here only when writing its ``chart_failing`` incident raised (F-04). After an
+    accepted post, closing it raised: its record was already written or kept
+    (``_record_or_keep``), so it is never posted again, and its key is dropped once today's
+    record exists. After a permanent refusal, opening it raised: nothing was recorded, and
+    the post (like a refused refresh) is tried again after ``step_delay``, not the 15-min
+    permanent wait.
     """
     failures = state.chart_failures.get(key, 0) + 1
     state.chart_failures[key] = failures

@@ -1,7 +1,8 @@
 {% load icons %}{% comment %}
 The location page's Weekly chart card (06-UI-SPEC Page Contracts > S5 Weekly chart; UI-06,
 D6-04): the header strip and the body of section#weekly-chart, which the page renders
-around this include. Context: the detail view's (location, has_history, language_label).
+around this include. Context: the detail view's (location, has_history, language_label,
+chart_trouble).
 
 - With stored history: the header action "Open full size" (chart-full-size) and
   figure[data-testid=weekly-chart] bound to the chartImage component. A link (new tab,
@@ -16,6 +17,9 @@ around this include. Context: the detail view's (location, has_history, language
 - Without stored history (has_history false): the empty state weekly-chart-empty, no image
   (so no PNG request) and no header action. A waiting location with history, for example
   after a restore, shows the image.
+- While the channel's chart fails (an open chart_failing or chart_pin_failed incident),
+  the warning [data-testid=weekly-chart-trouble] with fixed copy heads the body, with or
+  without history; it never names the location (F-04).
 - The poll never touches this card, so the image is never requested again by it.
 {% endcomment %}<div class="flex items-center justify-between gap-4 rounded-t-[5px] border-b border-border bg-surface-muted px-4 py-2">
 <div class="flex min-w-0 flex-wrap items-baseline gap-x-2"><h2 id="weekly-chart-title" class="text-label font-semibold tracking-label text-fg-muted uppercase">Weekly chart</h2>
@@ -23,6 +27,7 @@ around this include. Context: the detail view's (location, has_history, language
 {% if has_history %}<div class="-my-1 flex shrink-0 items-center"><a href="{% url 'location-chart' location.pk %}" target="_blank" rel="noopener" data-testid="chart-full-size" data-variant="ghost" class="-mr-2 inline-flex min-h-11 items-center justify-center gap-2 rounded-control border border-transparent bg-transparent px-2 text-body font-semibold whitespace-nowrap text-fg no-underline hover:bg-surface-sunken md:min-h-(--control-h-sm) motion-safe:transition-colors motion-safe:duration-150">{% icon "maximize-2" class="size-3.5 shrink-0 text-icon" %}Open full size<span class="sr-only"> (opens in a new tab)</span></a></div>{% endif %}
 </div>
 <div class="p-4">
+{% if chart_trouble %}<div class="pb-4">{% include "partials/_alert.html" with tone="warning" title=chart_trouble.0 body=chart_trouble.1 testid="weekly-chart-trouble" only %}</div>{% endif %}
 {% if has_history %}<figure data-testid="weekly-chart" x-data="chartImage" class="flex min-w-0 flex-col gap-2">
 <a href="{% url 'location-chart' location.pk %}" target="_blank" rel="noopener" aria-label="Open the weekly chart at full size (opens in a new tab)" class="group/chart block cursor-zoom-in rounded-control">
 <span class="relative block aspect-[32/25] overflow-hidden rounded-control border border-border bg-surface-muted group-hover/chart:border-border-strong motion-safe:transition-colors motion-safe:duration-150"><span aria-hidden="true" class="absolute top-1/2 left-1/2 size-6 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-border-strong border-t-fg-subtle motion-safe:animate-spin"></span><img src="{% url 'location-chart' location.pk %}" width="1280" height="1000" class="relative block h-auto w-full" loading="lazy" decoding="async" alt="Weekly power chart for {{ location.name }}, the same image as the chart pinned in the Telegram channel" aria-describedby="chart-caption"></span>

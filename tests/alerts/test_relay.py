@@ -1796,3 +1796,171 @@ def test_DATA02_mark_sent_stores_ids_only_when_both_are_given(
         ("sent", None, None),
         ("sent", None, None),
     ]
+
+
+# INV-16 / F-12: relay holds are wall-clock times. After a backward wall-clock step every
+# hold is released once; a new 429 or failure then sets a new hold (no hammering).
+
+CLOCK_STEP_WARNING = (
+    "wall clock stepped back {} s: relay holds cleared, {} queued message(s) due now"
+)
+
+
+def _cleared_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == RELAY_LOGGER and r.levelno >= logging.WARNING
+    ]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV16_backward_clock_step_releases_a_backed_off_alert(
+    location_factory: Callable[..., Any], fake_telegram: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger=RELAY_LOGGER)
+    off = _queue(location_factory())
+    fake_telegram.fail(TOKEN_A, status=502)
+    fake_telegram.accept(TOKEN_A)
+    state = io_loop.RelayState()
+    clock = FakeClock(T0)
+
+    assert io_loop.run_iteration(clock, state) is True
+    row = _row(off)
+    assert row.status == "pending"
+    assert row.next_attempt_at > clock.now()
+
+    clock.set(clock.now() - timedelta(minutes=10))
+    assert io_loop.run_iteration(clock, state) is True
+
+    assert _row(off).status == "sent"
+    assert _cleared_lines(caplog) == [CLOCK_STEP_WARNING.format(600, 1)]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV16_backward_clock_step_releases_a_429_hold_once_then_respects_the_new_429(
+    location_factory: Callable[..., Any], fake_telegram: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger=RELAY_LOGGER)
+    off = _queue(location_factory())
+    fake_telegram.fail(TOKEN_A, status=429, json_body=_too_many_requests(3600))
+    fake_telegram.fail(TOKEN_A, status=429, json_body=_too_many_requests(3600))
+    fake_telegram.accept(TOKEN_A)
+    state = io_loop.RelayState()
+    clock = FakeClock(T0)
+
+    assert io_loop.run_iteration(clock, state) is True
+    assert _row(off).next_attempt_at >= T0 + _seconds(3600)
+
+    clock.advance(seconds=5)
+    clock.set(clock.now() - timedelta(minutes=10))
+    # One release, one retry: Telegram answers 429 again and the new hold stands.
+    assert io_loop.run_iteration(clock, state) is True
+    assert _calls_to(fake_telegram, TOKEN_A) == 2
+    row = _row(off)
+    assert (row.status, row.last_error) == ("pending", "429")
+    assert row.next_attempt_at >= clock.now() + _seconds(3600)
+
+    # The baseline was rebased: later passes see no step and make no call.
+    for _ in range(3):
+        clock.advance(seconds=5)
+        assert io_loop.run_iteration(clock, state) is False
+    assert _calls_to(fake_telegram, TOKEN_A) == 2
+    assert len([line for line in _cleared_lines(caplog) if "relay holds cleared" in line]) == 1
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("delta", "released"),
+    [(timedelta(seconds=5), False), (timedelta(seconds=5, microseconds=1), True)],
+    ids=["exactly-5s", "5s-and-1us"],
+)
+def test_INV16_step_back_of_5s_or_less_keeps_holds(
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    caplog: pytest.LogCaptureFixture,
+    delta: timedelta,
+    released: bool,
+) -> None:
+    caplog.set_level(logging.WARNING, logger=RELAY_LOGGER)
+    off = _queue(location_factory())
+    fake_telegram.fail(TOKEN_A, status=429, json_body=_too_many_requests(30))
+    fake_telegram.accept(TOKEN_A)
+    state = io_loop.RelayState()
+    clock = FakeClock(T0)
+    assert io_loop.run_iteration(clock, state) is True
+    held_until = _row(off).next_attempt_at
+    assert held_until == T0 + _seconds(30)
+
+    clock.set(clock.now() - delta)
+
+    assert io_loop.run_iteration(clock, state) is released
+    if released:
+        assert _calls_to(fake_telegram, TOKEN_A) == 2
+        assert _row(off).status == "sent"
+        assert len(_cleared_lines(caplog)) == 1
+    else:
+        assert _calls_to(fake_telegram, TOKEN_A) == 1
+        assert _row(off).next_attempt_at == held_until
+        assert _cleared_lines(caplog) == []
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV16_first_pass_has_no_baseline(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    off = _queue(location_factory(), at=T0 + _seconds(60))
+    fake_telegram.accept(TOKEN_A)
+    state = io_loop.RelayState()
+
+    assert io_loop.run_iteration(FakeClock(T0), state) is False
+
+    assert _calls_to(fake_telegram, TOKEN_A) == 0
+    assert _row(off).next_attempt_at == T0 + _seconds(60)
+    assert state.last_wall == T0
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV16_forward_clock_step_does_not_release_holds(
+    location_factory: Callable[..., Any], fake_telegram: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger=RELAY_LOGGER)
+    off = _queue(location_factory())
+    fake_telegram.fail(TOKEN_A, status=429, json_body=_too_many_requests(30))
+    fake_telegram.accept(TOKEN_A)
+    state = io_loop.RelayState()
+    clock = FakeClock(T0)
+    assert io_loop.run_iteration(clock, state) is True
+
+    clock.set(clock.now() + timedelta(seconds=10))
+
+    assert io_loop.run_iteration(clock, state) is False
+    assert _calls_to(fake_telegram, TOKEN_A) == 1
+    assert _row(off).next_attempt_at == T0 + _seconds(30)
+    assert _cleared_lines(caplog) == []
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV16_a_failed_release_is_retried_on_the_next_pass(
+    location_factory: Callable[..., Any], fake_telegram: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    off = _queue(location_factory())
+    fake_telegram.fail(TOKEN_A, status=502)
+    fake_telegram.accept(TOKEN_A)
+    state = io_loop.RelayState()
+    clock = FakeClock(T0)
+    assert io_loop.run_iteration(clock, state) is True
+    clock.set(clock.now() - timedelta(minutes=10))
+
+    def broken(now: datetime) -> int:
+        raise OperationalError("simulated")
+
+    monkeypatch.setattr(outbox, "release_held", broken)
+    with pytest.raises(OperationalError):
+        io_loop.run_iteration(clock, state)
+    # Not rebased: the next pass sees the step again.
+    assert state.last_wall == T0
+
+    monkeypatch.undo()
+    assert io_loop.run_iteration(clock, state) is True
+    assert _row(off).status == "sent"

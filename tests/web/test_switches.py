@@ -8,8 +8,9 @@ column changes, with no ``location_state`` lock and no ``state_version`` bump (D
 switch makes a Telegram call (KD2).
 
 Edges (UI-SPEC screen H, E3 error): the same state again writes nothing and gets the
-"already" info flash; GET and other methods answer 405; a missing or unknown value answers
-400 with an empty body; a POST without a CSRF token is refused; an unknown location is 404.
+"already" info flash; a GET changes nothing and redirects to the page with a warning
+(F-24); other methods answer 405; a missing or unknown value answers 400 with an empty
+body; a POST without a CSRF token is refused; an unknown location is 404.
 
 The location page is read through tests/web/pages.py and the 06-UI-SPEC switch hooks
 (UI-10): each switch is ``form[data-testid=switch][data-switch][data-state]`` posting the
@@ -37,6 +38,7 @@ from powermon.engine.models import LocationState, PowerInterval
 from powermon.locations import actions
 from powermon.locations.models import Location
 from powermon.web.location_views import (
+    ACTION_NOT_DONE_MESSAGE,
     ALERTS_COPY,
     MAINTENANCE_COPY,
     ROUTER_GRACE_COPY,
@@ -279,11 +281,22 @@ def test_switch_already_on_shows_the_info_flash(
 
 
 @pytest.mark.django_db
-def test_switch_get_is_405(admin: Client, location_factory: Callable[..., Any]) -> None:
+def test_switch_get_changes_nothing_and_redirects(
+    admin: Client, location_factory: Callable[..., Any]
+) -> None:
     location = _on_since_8(location_factory)
+    gone = location_factory(name="Gone", deleted_at=_at(9, 0))
 
-    for method in (admin.get, admin.put, admin.delete):
+    # Expected (F-24): a GET never acts; it lands on the page with a warning.
+    response = admin.get(_switch(location))
+    assert (response.status_code, response.url) == (302, _page(location))
+    followed = admin.get(response.url)
+    assert [(m.level, m.text) for m in messages(followed)] == [("warning", ACTION_NOT_DONE_MESSAGE)]
+    # Failure: every other method still answers 405.
+    for method in (admin.put, admin.delete):
         assert method(_switch(location)).status_code == 405
+    # Edge: a deleted location answers 404.
+    assert admin.get(_switch(gone)).status_code == 404
 
     assert Location.objects.get(pk=location.pk).maintenance is False
 
@@ -422,7 +435,8 @@ def test_alerts_switch_refuses_a_bad_value_a_get_and_an_unknown_location(
     for data in ({}, {"value": "toggle"}, {"value": "OFF"}, {"value": ""}):
         response = admin.post(_alerts(location), data)
         assert (response.status_code, response.content) == (400, b"")
-    assert admin.get(_alerts(location)).status_code == 405
+    response = admin.get(_alerts(location))
+    assert (response.status_code, response.url) == (302, _page(location))
     for pk in (gone.pk, gone.pk + 1000):
         assert admin.post(f"/locations/{pk}/alerts/", {"value": "off"}).status_code == 404
 
@@ -549,7 +563,8 @@ def test_router_grace_switch_refuses_a_bad_value_a_get_and_an_unknown_location(
     for data in ({}, {"value": "1"}, {"value": "On"}):
         response = admin.post(_router_grace(location), data)
         assert (response.status_code, response.content) == (400, b"")
-    assert admin.get(_router_grace(location)).status_code == 405
+    response = admin.get(_router_grace(location))
+    assert (response.status_code, response.url) == (302, _page(location))
     for pk in (gone.pk, gone.pk + 1000):
         assert admin.post(f"/locations/{pk}/router-grace/", {"value": "on"}).status_code == 404
 
@@ -637,8 +652,10 @@ def test_UI10_switch_flip_and_repeat(
     assert toasts(second) == [("info", flash(f"already_{state}"))]
     assert form_on(parse(second))["data-state"] == state
 
-    # Failure: GET is 405, a bad value 400 with an empty body, a missing CSRF token 403.
-    assert admin.get(url).status_code == 405
+    # Failure: GET changes nothing (F-24), a bad value 400 with an empty body, a missing
+    # CSRF token 403.
+    got = admin.get(url)
+    assert (got.status_code, got.url) == (302, _page(location))
     bad = admin.post(url, {"value": "toggle"})
     assert (bad.status_code, bad.content) == (400, b"")
     browser = Client(enforce_csrf_checks=True)

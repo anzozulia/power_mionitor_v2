@@ -237,6 +237,25 @@ def test_forwarded_ip_is_the_key(client: Client) -> None:
 
 
 @pytest.mark.django_db
+def test_INV21_ipv6_rotation_inside_a_64_is_throttled(client: Client) -> None:
+    # F-14: rotating addresses inside one /64 does not escape the lock.
+    sync_admin("admin", "pw-one")
+    for i in range(1, 6):
+        _fail(client, 1, HTTP_X_FORWARDED_FOR=f"2001:db8::{i}")
+    assert LoginFailure.objects.filter(client_ip="2001:db8::").count() == 5
+
+    # Failure: a sixth address in the same /64 is throttled, even with the right password.
+    blocked = _sign_in(client, "admin", "pw-one", HTTP_X_FORWARDED_FOR="2001:db8::ffff:6")
+    assert blocked.status_code == 429
+    assert not _signed_in(client)
+
+    # Edge: another /64 is another client.
+    response = _sign_in(client, "admin", "pw-one", HTTP_X_FORWARDED_FOR="2001:db8:0:1::1")
+    assert response.status_code == 302
+    assert _signed_in(client)
+
+
+@pytest.mark.django_db
 def test_throttled_page_checks_no_credentials(
     client: Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:

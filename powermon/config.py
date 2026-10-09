@@ -36,6 +36,8 @@ EXAMPLE_VALUES: Mapping[str, str] = {
 DEFAULT_DISPLAY_TZ = "Europe/Kyiv"
 DEFAULT_LOCAL_BASE_URL = "http://localhost:8000"
 MIN_SECRET_KEY_LENGTH = 50
+# The production floor for the admin password; surrounding spaces do not count (F-14).
+MIN_ADMIN_PASSWORD_LENGTH = 12
 # Undelivered alerts expire this long after recorded_at (D-07, ALRT-03).
 DEFAULT_ALERT_MAX_AGE_HOURS = 6
 MAX_ALERT_MAX_AGE_HOURS = 48
@@ -147,6 +149,11 @@ def load(env: Mapping[str, str]) -> Config:
         if len(required["SECRET_KEY"].strip()) < MIN_SECRET_KEY_LENGTH:
             raise ConfigError(
                 f"SECRET_KEY must be at least {MIN_SECRET_KEY_LENGTH} characters in production"
+            )
+        if len(required["ADMIN_PASSWORD"].strip()) < MIN_ADMIN_PASSWORD_LENGTH:
+            raise ConfigError(
+                f"ADMIN_PASSWORD must be at least {MIN_ADMIN_PASSWORD_LENGTH} characters "
+                "in production"
             )
         allowed_hosts: tuple[str, ...] = (domain, "127.0.0.1")
         public_base_url = f"https://{domain}"

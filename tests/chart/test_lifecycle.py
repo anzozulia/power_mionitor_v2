@@ -1097,6 +1097,63 @@ def test_INV19_plan_unpins_an_older_record_not_known_to_be_pinned() -> None:
         ) is (None)
 
 
+def _finalized_today(redraw: datetime | None = None) -> lifecycle.ChartRow:
+    """Today's record already finalized and unpinned: the display date moved back (F-21).
+
+    Rendered at 11:50, so the 12:00 slot is due at NOON_05.
+    """
+    return dataclasses.replace(
+        _row(11, 1, rendered=kyiv("2026-10-01 11:50"), pinned=False),
+        finalized_at=kyiv("2026-10-01 11:55"),
+        unpinned_at=kyiv("2026-10-01 11:56"),
+        redraw_requested_at=redraw,
+    )
+
+
+@pytest.mark.parametrize("redraw", [None, kyiv("2026-10-01 11:58")], ids=["slot", "redraw"])
+def test_INV19_plan_never_pins_or_refreshes_a_finalized_record_that_is_today_again(
+    redraw: datetime | None,
+) -> None:
+    # F-21 (quick task 261008-vdk): a finished day keeps its final image (D-14).
+    row = _finalized_today(redraw)
+
+    assert (
+        lifecycle.plan([_location(1)], [row], today=TODAY, now=NOON_05, not_before={}, tz=KYIV)
+        is None
+    )
+
+
+def test_INV19_finalized_today_record_still_lets_an_older_record_unpin() -> None:
+    a = _location(1)
+    yesterday = TODAY - timedelta(days=1)
+    older = dataclasses.replace(
+        _row(10, 1, rendered=NOON_05 - timedelta(days=1), day=yesterday, pinned=True),
+        finalized_at=NOON_05 - timedelta(hours=12),
+    )
+
+    assert lifecycle.plan(
+        [a], [older, _finalized_today()], today=TODAY, now=NOON_05, not_before={}, tz=KYIV
+    ) == lifecycle.Action("unpin", a, older)
+
+
+def test_INV19_unfinalized_today_record_is_still_pinned() -> None:
+    a = _location(1)
+    row = dataclasses.replace(_finalized_today(), finalized_at=None, unpinned_at=None)
+
+    assert lifecycle.plan([a], [row], today=TODAY, now=NOON_05, not_before={}, tz=KYIV) == (
+        lifecycle.Action("pin", a, row)
+    )
+
+
+def test_pin_due_is_false_for_a_finalized_record() -> None:
+    finalized = _finalized_today()
+
+    assert lifecycle._pin_due(finalized) is False
+    assert lifecycle._pin_due(dataclasses.replace(finalized, finalized_at=None)) is True
+    pinned = dataclasses.replace(finalized, finalized_at=None, pinned=True)
+    assert lifecycle._pin_due(pinned) is False
+
+
 def test_plan_final_edit_waits_for_its_day_and_never_holds_the_unpin() -> None:
     a = _location(1)
     older = _row(10, 1, rendered=NOON_05 - timedelta(days=1), day=TODAY - timedelta(days=1))

@@ -76,6 +76,12 @@ PIN_FAILED = (
     "Check that the bot may pin messages in the chat."
 )
 PIN_RESTORED = "📌 Pinning works again for Test location."
+# F-04 (quick task 261008-vdk): Telegram refused today's chart post or update for good.
+CHART_FAILING = (
+    "🖼 Can't post or update the weekly chart for Test location (Telegram: http_403). "
+    "Subscribers see no chart, or an old one. It is retried every 15 min. "
+    "Check that the bot is an admin of the channel and may post photos."
+)
 
 
 @pytest.fixture(autouse=True)
@@ -515,6 +521,36 @@ def test_pin_failed_notice_reaches_the_ops_chat(
     assert (_row(notice).status, _row(notice).sent_at) == ("sent", T0)
 
 
+@pytest.mark.django_db(transaction=True)
+def test_chart_failing_notice_reaches_the_ops_chat(
+    location_factory: Callable[..., Any], fake_telegram: Any, ops_settings: Any
+) -> None:
+    location = location_factory()
+    with transaction.atomic():
+        ops.notify(
+            outbox.KIND_OPS_CHART_FAILING,
+            payload={"http_status": 403},
+            recorded_at=T0,
+            location_id=location.pk,
+        )
+
+    [notice] = _ops_rows()
+    assert (notice.kind, notice.payload, notice.location_id, notice.status) == (
+        "ops_chart_failing",
+        {"http_status": 403},
+        location.pk,
+        "pending",
+    )
+    fake_telegram.accept(OPS_BOT_TOKEN)
+
+    assert io_loop.run_iteration(FakeClock(T0), io_loop.RelayState()) is True
+
+    # One message, with the ops bot, to the env-configured ops chat only.
+    assert _bots(fake_telegram) == ["ops"]
+    assert fake_telegram.sent == [_body(CHART_FAILING, OPS_CHAT_ID)]
+    assert (_row(notice).status, _row(notice).sent_at) == ("sent", T0)
+
+
 @pytest.mark.django_db
 def test_enqueue_ops_refuses_a_pin_status_that_is_not_an_integer(
     location_factory: Callable[..., Any],
@@ -657,6 +693,8 @@ def test_enqueue_ops_queues_a_due_ops_row() -> None:
         "ops_pin_restored",
         "ops_delivery_failing",
         "ops_delivery_restored",
+        "ops_chart_failing",
+        "ops_chart_restored",
     }
 
 

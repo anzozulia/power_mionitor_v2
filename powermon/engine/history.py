@@ -79,9 +79,9 @@ deleted check:
    being unpinned (INV-19).
 
 The reset keeps the configuration, the device key, the three switches, an open
-``delivery_failing`` or ``chart_pin_failed`` incident and every alert already queued: they
-report real events (D-05, D-07). It queues nothing, deletes no message (owner default 2,
-261006-qv7) and logs one INFO line.
+``delivery_failing``, ``chart_failing`` or ``chart_pin_failed`` incident and every alert
+already queued: they report real events (D-05, D-07). It queues nothing, deletes no message
+(owner default 2, 261006-qv7) and logs one INFO line.
 
 Nothing here does network I/O (KD2), and time always comes from the caller (``now``, and
 for the removal also the display zone ``tz`` that names today's chart), never from SQL
@@ -322,9 +322,11 @@ def remove_outage(
       write. The next removal decides from the settled rows.
 
     "gone", "in_progress" and "sending" write nothing at all: no request and no mark.
-    ``location_state`` is written only by that rewind. A restore needs no change for the
-    delete requests (``restore.DROP_QUEUED_SQL``): the requests in a dump match that dump's
-    timeline. ValueError for a naive ``outage_start`` or ``now``.
+    ``location_state`` is written only by that rewind. A restore keeps the delete requests
+    (the requests in a dump match that dump's timeline) and re-tags a removed outage's
+    dropped ON "restored" while its OFF's delete is unsettled
+    (``restore.KEEP_REMOVED_ON_DROPPED_SQL``), so a refused delete after the restore never
+    sends it. ValueError for a naive ``outage_start`` or ``now``.
     """
     _aware(outage_start)
     _aware(now)

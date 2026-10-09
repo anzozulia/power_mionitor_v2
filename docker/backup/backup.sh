@@ -11,8 +11,9 @@
 #                           on SIGTERM or SIGINT (the image's stop signal).
 #   --once [--now EPOCH]    one schedule check: dump, verify and rotate when a dump is due
 #   --health [--now EPOCH]  the container healthcheck: exit 0 only while the newest dump, by
-#                           the time in its name, is less than 26 h old (D-11). It reads file
-#                           names only, needs no database setting and runs as root, read-only.
+#                           the time in its name, is less than 26 h old (D-11) and no dump is
+#                           dated more than 5 min in the future (F-15). It reads file names
+#                           only, needs no database setting and runs as root, read-only.
 #   --dump-now              dump, verify and rotate now, whatever the schedule (D-16: the
 #                           restore drill, or a dump before a risky deploy)
 #   --restore NAME          pg_restore the dump NAME from the backup directory into the
@@ -25,14 +26,18 @@
 # by the UTC time in its name, is older than the most recent BACKUP_TIME_UTC slot. That slot
 # is always less than 24 h ago, so a newest dump older than 24 h gives a dump at once, at
 # start and at any later check (INV-25 #1). Nothing is kept between runs. The age comes from
-# the name, not the mtime, so a dump copied to a new server keeps its real age.
+# the name, not the mtime, so a dump copied to a new server keeps its real age. A dump dated
+# more than FUTURE_SLACK_S (5 min) after the clock is ignored by the schedule and the health
+# age, so it never stops the nightly dumps; --health is unhealthy until it is moved out (F-15).
 #
 # Dump, verify, rotate (D-10): pg_dump -Fc writes a dot-prefixed .partial file in the backup
 # directory. Only a non-empty file that passes pg_restore --list is renamed to
-# powermon-YYYYMMDDTHHMMSSZ.dump (UTC), and only after that rename are the dumps beyond the
-# newest BACKUP_KEEP deleted, by name. A failed dump removes its own temp file, deletes no
-# dump and logs one error line. No ops notice is sent: the healthcheck and the log show a
-# failing backup (D-12).
+# powermon-YYYYMMDDTHHMMSSZ.dump (UTC), and only after that rename does the rotation run, by
+# name: a dump is deleted only when it is beyond the newest BACKUP_KEEP and dated before the
+# last BACKUP_KEEP nightly slots (or its name holds an impossible time). So every nightly dump
+# of the last BACKUP_KEEP nights stays, and a dump on demand never pushes one out (F-16). A
+# failed dump removes its own temp file, deletes no dump and logs one error line. No ops
+# notice is sent: the healthcheck and the log show a failing backup (D-12).
 #
 # Permissions (D-11): dumps hold every bot token and device key. umask 077 makes a new
 # directory 0700 and every dump 0600. The container starts as root (the image has no USER):
@@ -65,6 +70,9 @@ BACKUP_RETRY_MAX_S=${BACKUP_RETRY_MAX_S:-3600}
 DUMP_NAME_RE='^powermon-[0-9]{8}T[0-9]{6}Z\.dump$'
 # Healthy while the newest dump is younger than this: a night's slot plus two hours.
 HEALTH_MAX_AGE_S=$(( 26 * 3600 ))
+# A dump dated more than this after the clock is from a clock that was ahead: the schedule and
+# the health age ignore it, and --health reports it until it is moved out (F-15).
+FUTURE_SLACK_S=300
 # --restore restores only while this is 0 (D-15).
 TABLE_COUNT_SQL="SELECT count(*) FROM pg_tables WHERE schemaname = 'public'"
 ARGS=("$@")
@@ -124,15 +132,28 @@ name_epoch() {
 }
 
 newest() {
-  # "EPOCH NAME" of the newest dump; fails when there is none.
+  # "EPOCH NAME" of the newest dump at epoch $1, skipping dumps dated more than FUTURE_SLACK_S
+  # after it (F-15); fails when there is none.
   local all=() i epoch
   mapfile -t all < <(dumps)
   for (( i = ${#all[@]} - 1; i >= 0; i-- )); do
-    if epoch=$(name_epoch "${all[i]}"); then
+    if epoch=$(name_epoch "${all[i]}") && (( epoch <= $1 + FUTURE_SLACK_S )); then
       printf '%s %s\n' "$epoch" "${all[i]##*/}"
       return 0
     fi
   done
+  return 1
+}
+
+future_dump() {
+  # The name of a dump dated more than FUTURE_SLACK_S after epoch $1 (a clock that was ahead).
+  local path epoch
+  while IFS= read -r path; do
+    if epoch=$(name_epoch "$path") && (( epoch > $1 + FUTURE_SLACK_S )); then
+      printf '%s\n' "${path##*/}"
+      return 0
+    fi
+  done < <(dumps)
   return 1
 }
 
@@ -147,7 +168,7 @@ last_slot() {
 is_due() {
   # A dump is due at epoch $1 when there is none, or the newest is older than the last slot.
   local newest_epoch _name
-  if ! read -r newest_epoch _name < <(newest); then return 0; fi
+  if ! read -r newest_epoch _name < <(newest "$1"); then return 0; fi
   (( newest_epoch < $(last_slot "$1") ))
 }
 
@@ -159,10 +180,15 @@ discard() {
 }
 
 rotate() {
-  # Keep the newest BACKUP_KEEP dumps by name; runs only after a verified rename (D-10).
-  local all=() i
+  # Delete a dump only when it is beyond the newest BACKUP_KEEP AND from before the last
+  # BACKUP_KEEP nightly slots at epoch $1, or its name holds an impossible time: a dump on
+  # demand never pushes a nightly one out early (INV-25, F-16). Runs only after a verified
+  # rename (D-10).
+  local all=() i epoch cutoff
+  cutoff=$(( $(last_slot "$1") - (BACKUP_KEEP - 1) * 86400 ))
   mapfile -t all < <(dumps)
   for (( i = 0; i < ${#all[@]} - BACKUP_KEEP; i++ )); do
+    if epoch=$(name_epoch "${all[i]}") && (( epoch >= cutoff )); then continue; fi
     if rm -f -- "${all[i]}"; then
       log "removed ${all[i]##*/}"
     else
@@ -194,14 +220,19 @@ dump() {
     return 1
   fi
   CURRENT_TMP=""
-  rotate
+  rotate "$1"
   log "dump $name ok"
 }
 
 health() {
-  # Healthy while the newest dump, by the time in its name, is under 26 h old at epoch $1.
+  # Healthy while the newest dump, by the time in its name, is under 26 h old at epoch $1, and
+  # no dump is dated in the future (F-15: dumps go on; the file must be moved out by hand).
   local epoch name age
-  if ! read -r epoch name < <(newest); then
+  if name=$(future_dump "$1"); then
+    log "unhealthy: dump $name is dated in the future; move it out of the backup directory"
+    return 1
+  fi
+  if ! read -r epoch name < <(newest "$1"); then
     log "unhealthy: no dump yet"
     return 1
   fi
@@ -226,7 +257,7 @@ run_loop() {
   # The container's command (D-09): check every BACKUP_CHECK_EVERY_S, dump when due.
   local failures=0 retry_at=0 wait_s=0 now path
   trap stop_loop TERM INT
-  log "started: a dump every night at $BACKUP_TIME_UTC UTC, the newest $BACKUP_KEEP kept"
+  log "started: a dump every night at $BACKUP_TIME_UTC UTC, kept for $BACKUP_KEEP nights (at least the newest $BACKUP_KEEP)"
   # A dump cut off by a stop or a crash leaves its temp file behind.
   for path in "$BACKUP_DIR"/.powermon-*.dump.partial; do
     if rm -f -- "$path"; then log "removed leftover ${path##*/}"; fi

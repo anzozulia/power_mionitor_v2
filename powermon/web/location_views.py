@@ -7,6 +7,9 @@ the edit form, the delete and the key rotation (D-13, D-05, D-11, D-07, D-09, D-
   so a reload never repeats it. The edit save is too. Delete and Regenerate key are a GET
   confirmation, then a POST (D-17): the delete redirects to the list, the regenerate
   answers with the revealed setup page itself (D-14), guarded against a resubmit (UI-D7).
+- A GET of a switch or the test-message URL never acts (F-24): it redirects to the
+  location page with a warning, so a stale tab's POST that went through sign-in does not
+  end on a blank 405.
 - The edit save writes only the configuration columns, through ``actions.update_config``,
   never ``form.save()`` or ``Location.save()``: a form loaded earlier can never revert the
   status, a switch or the device key (D-07, INV-02 #3).
@@ -55,7 +58,7 @@ from powermon.telegram.client import DEFAULT_RETRY_AFTER_S, SendResult, Telegram
 from powermon.web import views
 from powermon.web.forms import LocationEditForm
 from powermon.web.fragments import confirm_response
-from powermon.web.status import location_status
+from powermon.web.status import failing_since_text, location_status
 
 log = logging.getLogger(__name__)
 
@@ -116,6 +119,9 @@ TEST_SERVER_ERROR_MESSAGE = (
 )
 # {wait} is "1 second" or "{N} seconds", N an integer.
 TEST_RATE_LIMITED_MESSAGE = "Telegram asks to wait before the next message. Try again in {wait}."
+# F-24: a GET of an action URL (the sign-in redirect after an ended session, a stale tab)
+# never acts; the location page says so.
+ACTION_NOT_DONE_MESSAGE = "Nothing was changed. If you were signed out, use the button again."
 # The permanent codes with their own cause (the other permanent codes get the refused copy).
 NOT_IN_CHAT_CODES = ("http_400", "http_403")
 BAD_TOKEN_CODES = ("http_401", "http_404")
@@ -210,6 +216,18 @@ def location_or_404(pk: int) -> Location:
     )
 
 
+def action_not_done(request: HttpRequest, pk: int) -> HttpResponse:
+    """A GET of a switch or test-message URL: change nothing, warn, back to the page (F-24).
+
+    After a session ends, the sign-in form sends the admin back to the action URL with a
+    GET (its ``next``). That GET never acts: no switch changes and no Telegram message is
+    sent. An unknown or deleted location answers 404, like the POST.
+    """
+    location_or_404(pk)
+    messages.warning(request, ACTION_NOT_DONE_MESSAGE)
+    return redirect("location-detail", pk=pk)
+
+
 def settings_context(location: Location) -> dict[str, Any]:
     """The values of the shared settings list (``partials/_settings_dl.html``) on S5 and S8.
 
@@ -278,10 +296,11 @@ class SwitchView(View):
     """POST ``value=on|off``: set one switch of the location, then back to its page.
 
     A missing or unknown value answers 400 with an empty body and changes nothing (only a
-    hand-made request can send one). GET and every other method answer 405.
+    hand-made request can send one). A GET changes nothing and redirects to the location
+    page with the ACTION_NOT_DONE_MESSAGE warning (F-24). Every other method answers 405.
     """
 
-    http_method_names = ["post"]
+    http_method_names = ["get", "post"]
     # Tests inject a FakeClock with SomeSwitchView.as_view(clock=...).
     clock: Clock = SystemClock()
     # The flashes: "on" / "off" after a change, "already_on" / "already_off" when not.
@@ -294,6 +313,9 @@ class SwitchView(View):
     def flash(self, location: Location, key: str) -> str:
         """The flash for ``key`` ("on", "off", "already_on", "already_off")."""
         return self.copy[key]
+
+    def get(self, request: HttpRequest, pk: int) -> HttpResponse:
+        return action_not_done(request, pk)
 
     def post(self, request: HttpRequest, pk: int) -> HttpResponse:
         value = request.POST.get("value")
@@ -389,12 +411,14 @@ def flash_for_test_message(result: SendResult, recovered: bool) -> tuple[int, st
 class SendTestMessageView(View):
     """``/locations/<pk>/test-message/``: send the admin's test message (LOC-07, D-11, D-12).
 
-    POST only (CSRF); GET and every other method answer 405, and an unknown or deleted
-    location 404. The view makes exactly one ``sendMessage`` with the location's current
-    token and chat: the fixed D-11 text in the location's language, sent silently
-    (``disable_notification``), whatever the switches say. It is not an alert: it never
-    goes through the outbox and is never retried; the client's (5 s, 10 s) timeouts bound
-    the wait. Views run in autocommit, so no transaction is open during the call.
+    Only a POST (CSRF) sends. A GET sends nothing and redirects to the location page with
+    the ACTION_NOT_DONE_MESSAGE warning (F-24). Every other method answers 405, and an
+    unknown or deleted location 404. The view makes exactly one ``sendMessage`` with the
+    location's current token and chat: the fixed D-11 text in the location's language,
+    sent silently (``disable_notification``), whatever the switches say. It is not an
+    alert: it never goes through the outbox and is never retried; the client's (5 s,
+    10 s) timeouts bound the wait. Views run in autocommit, so no transaction is open
+    during the call.
 
     After an ``ok`` only, one transaction records the success at the clock's time
     (``delivery.record_test_success``): the location's queued alerts become due, and an
@@ -404,9 +428,12 @@ class SendTestMessageView(View):
     redirect to the location page (UI-D4), so a reload never sends a second message.
     """
 
-    http_method_names = ["post"]
+    http_method_names = ["get", "post"]
     # Tests inject a FakeClock with SendTestMessageView.as_view(clock=...).
     clock: Clock = SystemClock()
+
+    def get(self, request: HttpRequest, pk: int) -> HttpResponse:
+        return action_not_done(request, pk)
 
     def post(self, request: HttpRequest, pk: int) -> HttpResponse:
         location = location_or_404(pk)
@@ -455,6 +482,48 @@ def delivery_row(location_id: int) -> DeliveryRow:
         code=f"http_{failing.http_status}",
         lines=(cause, DELIVERY_RETRY_LINE),
     )
+
+
+# The Weekly chart card's warning while the channel's chart fails (F-04). Fixed copy: never
+# the location name or Telegram's description, only the short status code and the time.
+# The *_NO_STATUS bodies serve incidents with no stored status (details {} from before
+# quick task 261008-vdk): no code is made up for them (R-3).
+CHART_FAILING_TITLE = "The channel's chart is not being updated"
+CHART_FAILING_BODY = (
+    "Telegram refused to post or update it (http_{status}) since {since}. It is retried "
+    "every 15 min. Check that the bot is an admin of the channel and may post photos."
+)
+CHART_FAILING_BODY_NO_STATUS = (
+    "Telegram refused to post or update it since {since}. It is retried every 15 min. "
+    "Check that the bot is an admin of the channel and may post photos."
+)
+CHART_PIN_TITLE = "Today's chart is not pinned"
+CHART_PIN_BODY = (
+    "Telegram refused the pin (http_{status}) since {since}. "
+    "Check that the bot may pin messages in the channel."
+)
+CHART_PIN_BODY_NO_STATUS = (
+    "Telegram refused the pin since {since}. Check that the bot may pin messages in the channel."
+)
+
+
+def chart_trouble_alert(location_id: int, now: datetime, tz: str) -> tuple[str, str] | None:
+    """The Weekly chart card's warning (title, body), or None while the chart is fine (F-04).
+
+    The time is ``failing_since_text``'s: ``HH:MM`` today, else the date too. The status
+    code shows only when one was stored (R-3).
+    """
+    trouble = delivery.chart_trouble(location_id)
+    if trouble is None:
+        return None
+    since = failing_since_text(trouble.started_at, now, tz)
+    failing = trouble.kind == delivery.KIND_CHART_FAILING
+    title = CHART_FAILING_TITLE if failing else CHART_PIN_TITLE
+    if trouble.http_status is None:
+        body = CHART_FAILING_BODY_NO_STATUS if failing else CHART_PIN_BODY_NO_STATUS
+        return title, body.format(since=since)
+    body = CHART_FAILING_BODY if failing else CHART_PIN_BODY
+    return title, body.format(status=trouble.http_status, since=since)
 
 
 def local_minute(dt: datetime, tz: str) -> tuple[str, str]:
@@ -544,6 +613,8 @@ class LocationDetailView(View):
             "location": location,
             "status": location_status(location),
             "delivery": delivery_row(location.pk),
+            # The Weekly chart card's warning while the chart fails (F-04).
+            "chart_trouble": chart_trouble_alert(location.pk, now, tz),
             "switch_rows": switch_rows(location),
             "outage_rows": rows,
             "outages_total_text": outages_total_text(recent.outages),

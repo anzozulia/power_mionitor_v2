@@ -9,20 +9,25 @@
 #     of the CI deploy key in /root/.ssh/authorized_keys, so it gets no arguments and the
 #     client's command arrives in SSH_ORIGINAL_COMMAND: exactly "deploy <40-hex commit>".
 #     GitHub can start two runs for one push, and a deploy job can be re-run: the commit
-#     that is already checked out restarts nothing while the site is healthy, and is rebuilt
-#     and restarted while it is not.
+#     that is already checked out restarts nothing while web and worker are healthy, and is
+#     rebuilt and restarted while they are not.
 #   - The owner, as root on the server: exactly one argument, --redeploy, and no
 #     SSH_ORIGINAL_COMMAND. It rebuilds and restarts the checked-out commit, e.g. after an
 #     env file change:
 #       ssh hetzner /usr/local/sbin/powermon-deploy --redeploy
 #   Anything else is refused.
 #
-# A new commit must be on origin/master. A commit that is not newer than the deployed one
-# is skipped. When only non-runtime paths changed, the commit is checked out and nothing
-# restarts. Otherwise the images are built before anything restarts (a failed build changes
-# nothing). When powermon/migrations changed, a dump is taken first. Then the stack is
-# started and checked through the host nginx. A failed start rolls back to the previous
-# commit, except after a migration (README section 8).
+# While $REPO_DIR/.maintenance exists (a restore, README section 14), every deploy is
+# refused. A new commit must be on origin/master. A commit that is not newer than the
+# deployed one is skipped. When only non-runtime paths changed, the commit is checked out
+# and web and worker do not restart; a change under docker/backup recreates only backup.
+# Otherwise the images are built with --pull and the new image checks the configuration
+# before anything restarts (a failed build or check changes nothing). When
+# powermon/migrations or uv.lock changed, a dump is taken first. Then web and worker are
+# started and checked through the host nginx, and backup is started apart: a backup whose
+# own --health check keeps failing is a warning line, never a failed deploy. A failed start rolls back to the previous
+# commit and starts the images that ran before (rebuilt only when one is missing), except
+# after a schema change (README section 8).
 #
 # Prints no env value. Exit codes: 0 deployed or nothing to do (an already deployed, healthy
 # commit included); 1 failed; 2 refused.
@@ -40,10 +45,17 @@ OUT=/var/log/powermon-deploy.out
 LOCK=/run/lock/powermon-deploy.lock
 PROJECT=powermon-prod
 COMPOSE=(docker compose -f docker-compose.prod.yml -f docker-compose.vps.yml)
-# A change only under these paths needs no build and no restart.
-NON_RUNTIME_RE='^(docs/|tests/|\.github/|deploy/|README\.md$|LICENSE$|PROJECT-BRIEF\.md$)'
-MIGRATIONS=powermon/migrations
+# A change only under these paths needs no build and no restart of web and worker
+# (docker/backup/ recreates only backup).
+NON_RUNTIME_RE='^(docs/|tests/|\.github/|deploy/|docker/backup/|README\.md$|LICENSE$|PROJECT-BRIEF\.md$|docker-compose\.(local|ci|dev-ui)\.yml$|\.gitignore$)'
+# A change here can change the schema: Django's own migrations come with uv.lock.
+SCHEMA_PATHS=(powermon/migrations uv.lock)
+# Present while a restore runs (README section 14): every deploy refuses.
+MAINTENANCE=$REPO_DIR/.maintenance
 SHA=""
+# The app services whose images a rollback starts again (images $PROJECT-<service>).
+APP_IMAGES=(web worker migrate)
+declare -A PREV_IMAGE=()
 
 log() {
   # The log file first: a dropped SSH client must not keep the deploy from being recorded.
@@ -79,8 +91,92 @@ healthy() {
   return 1
 }
 
+service_health() {
+  # Compose health of service $1: healthy | unhealthy | starting; empty when no running container.
+  local id
+  id=$("${COMPOSE[@]}" ps -q "$1") || id=""
+  if [[ -n $id ]]; then
+    docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$id" || true
+  fi
+}
+
+stack_healthy() {
+  # /healthz knows nothing about the worker: also its own healthcheck (health file < 30 s old).
+  local i
+  healthy || return 1
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    if [[ $(service_health worker) == healthy ]]; then return 0; fi
+    sleep 5
+  done
+  return 1
+}
+
 start() {
-  timeout 900 "${COMPOSE[@]}" up -d --wait --wait-timeout 300 && healthy
+  # The app only; db and migrate come in through depends_on. A stale backup must not fail
+  # or roll back a release: refresh_backup handles backup after a successful start.
+  timeout 900 "${COMPOSE[@]}" up -d --wait --wait-timeout 300 web worker && healthy
+}
+
+backup_probe() {
+  # backup.sh --health in the running container, up to 8 tries 15 s apart: about 2 min when
+  # each check answers at once, at most about 6 min (8 x 30 s + 7 x 15 s) when it hangs. Not
+  # Compose's health status: it shows "starting" for up to 5 min after a recreate.
+  local i
+  for i in 1 2 3 4 5 6 7 8; do
+    if timeout 30 "${COMPOSE[@]}" exec -T backup bash /backup/backup.sh --health; then
+      return 0
+    fi
+    if ((i < 8)); then sleep 15; fi
+  done
+  return 1
+}
+
+refresh_backup() {
+  # "$@": --force-recreate or nothing. --no-deps: db is already up to date (and must never be
+  # recreated from the non-runtime path). 1 only when backup did not start; the callers never
+  # fail the deploy on it.
+  if ! timeout 300 "${COMPOSE[@]}" up -d --no-deps "$@" backup; then
+    log "warning $SHA: the backup service did not start; see $OUT and README section 14"
+    return 1
+  fi
+  if ! backup_probe; then
+    log "warning $SHA: backup is unhealthy (no dump in the last 26 h, or one dated in the future); README section 14"
+  fi
+  return 0
+}
+
+keep_images() {
+  # The image ID of each app service's existing container, for a rollback. Read from the
+  # containers, never from the $PROJECT-<service> tags: a build whose configuration check or
+  # pre-migration dump failed (nothing restarted), or one that failed half way, has already
+  # moved a tag to an image that never ran. prune never removes an image a container uses.
+  local s cid id
+  for s in "${APP_IMAGES[@]}"; do
+    cid=$("${COMPOSE[@]}" ps -a -q "$s") || cid=""
+    cid=${cid%%$'\n'*}
+    id=""
+    if [[ -n $cid ]]; then
+      id=$(docker inspect -f '{{.Image}}' "$cid" 2> /dev/null) || id=""
+    fi
+    PREV_IMAGE[$s]=$id
+  done
+}
+
+reuse_images() {
+  # Point every app image tag back at the image kept by keep_images; 1 when one is missing
+  # or a tag fails (the caller then rebuilds).
+  local s
+  for s in "${APP_IMAGES[@]}"; do
+    [[ -n ${PREV_IMAGE[$s]:-} ]] || return 1
+  done
+  for s in "${APP_IMAGES[@]}"; do
+    docker tag "${PREV_IMAGE[$s]}" "$PROJECT-$s" || return 1
+  done
+}
+
+backup_changed() {
+  # The running backup loop keeps the old backup.sh until its container is recreated.
+  [[ $SHA != "$PREV" ]] && ! git diff --quiet "$PREV" "$SHA" -- docker/backup
 }
 
 prune() {
@@ -124,6 +220,12 @@ started=$SECONDS
 if [[ $mode == redeploy ]]; then
   SHA=$PREV
 fi
+# A restore holds the marker from before its first step until after its last (README
+# section 14). Checked under the lock, before any fetch, build or restart.
+if [[ -e $MAINTENANCE ]]; then
+  log "FAILED $SHA: maintenance in progress ($MAINTENANCE exists; README section 14); nothing done"
+  exit 1
+fi
 
 if [[ $SHA != "$PREV" ]]; then
   timeout 120 git fetch --quiet origin +refs/heads/master:refs/remotes/origin/master
@@ -150,33 +252,56 @@ if [[ $SHA != "$PREV" ]]; then
     exit 1
   fi
   if [[ $runtime == 0 ]]; then
-    if ! healthy; then
-      log "FAILED $SHA: no runtime change since $PREV and nothing restarted, but the site is not healthy"
+    # backup runs apart from web and worker, and a FAILED below leaves this commit checked
+    # out: its backup.sh must reach the loop either way.
+    # A flag, not a bare call: a failed recreate must not trip set -e.
+    backup_ok=yes
+    if backup_changed; then refresh_backup --force-recreate || backup_ok=no; fi
+    if ! stack_healthy; then
+      log "FAILED $SHA: no runtime change since $PREV and nothing restarted, but web or worker is not healthy"
       exit 1
     fi
-    log "ok $SHA: no runtime change since $PREV; checked out, nothing restarted"
+    if backup_changed && [[ $backup_ok == yes ]]; then
+      log "ok $SHA: no app change since $PREV; checked out, backup recreated for its script change, web and worker not restarted"
+    elif [[ $backup_ok == no ]]; then
+      log "ok $SHA: no app change since $PREV; checked out, but backup was not recreated (see the warning above); web and worker not restarted"
+    else
+      log "ok $SHA: no runtime change since $PREV; checked out, nothing restarted"
+    fi
     exit 0
   fi
 elif [[ $mode == deploy ]]; then
   # The deployed commit again: GitHub can start two runs for one push, and a deploy job can
-  # be re-run. Nothing to do while the site is healthy. Otherwise the build and start below
-  # retry it, with no earlier commit to roll back to.
-  if healthy; then
+  # be re-run. Nothing to do while web and worker are healthy. Otherwise the build and start
+  # below retry it, with no earlier commit to roll back to.
+  if stack_healthy; then
     log "ok $SHA: already deployed and healthy; nothing restarted"
     exit 0
   fi
-  log "redeploying $SHA: it is checked out but the site is not healthy"
+  log "redeploying $SHA: it is checked out but web or worker is not healthy"
 fi
 
-# Build first: a failed build restarts nothing.
-if ! timeout 1800 "${COMPOSE[@]}" build; then
+# Build first: a failed build restarts nothing. --pull refreshes the base images (time-zone
+# rules, security fixes); a registry outage fails here, before any restart. The images that
+# run now are kept first: a rollback starts them again instead of rebuilding the previous
+# commit on a freshly pulled base (only a commit change can roll back).
+if [[ $SHA != "$PREV" ]]; then keep_images; fi
+if ! timeout 1800 "${COMPOSE[@]}" build --pull; then
   if [[ $SHA != "$PREV" ]]; then checkout "$PREV"; fi
   log "FAILED $SHA: build failed; still running $PREV, nothing restarted"
   exit 1
 fi
 
+# The new image checks the env file while the old containers keep running: `up` would
+# remove them first and then fail in migrate, leaving nothing running.
+if ! timeout 120 "${COMPOSE[@]}" run --rm --no-deps -T migrate python manage.py check; then
+  if [[ $SHA != "$PREV" ]]; then checkout "$PREV"; fi
+  log "FAILED $SHA: the configuration check failed (env file or settings; see $OUT); still running $PREV, nothing restarted"
+  exit 1
+fi
+
 migrated=no
-if [[ $SHA != "$PREV" ]] && ! git diff --quiet "$PREV" "$SHA" -- "$MIGRATIONS"; then
+if [[ $SHA != "$PREV" ]] && ! git diff --quiet "$PREV" "$SHA" -- "${SCHEMA_PATHS[@]}"; then
   migrated=yes
   if ! timeout 600 "${COMPOSE[@]}" exec -T backup bash /backup/backup.sh --dump-now; then
     checkout "$PREV"
@@ -187,6 +312,14 @@ if [[ $SHA != "$PREV" ]] && ! git diff --quiet "$PREV" "$SHA" -- "$MIGRATIONS"; 
 fi
 
 if start; then
+  # The same commit again (a retry, --redeploy, a checkout by hand): the running loop may
+  # still hold another commit's backup.sh.
+  # backup never decides the deploy's result (F-06).
+  if [[ $SHA == "$PREV" ]] || backup_changed; then
+    refresh_backup --force-recreate || true
+  else
+    refresh_backup || true
+  fi
   prune
   log "ok $SHA (was $PREV) in $((SECONDS - started)) s"
   exit 0
@@ -201,7 +334,14 @@ if [[ $SHA == "$PREV" ]]; then
   exit 1
 fi
 checkout "$PREV"
-if timeout 1800 "${COMPOSE[@]}" build && start; then
+# The previous images when all of them are known and re-tagged; otherwise rebuild them.
+rolled_back=no
+if reuse_images; then
+  if start; then rolled_back=yes; fi
+elif timeout 1800 "${COMPOSE[@]}" build && start; then
+  rolled_back=yes
+fi
+if [[ $rolled_back == yes ]]; then
   log "FAILED $SHA: not healthy; rolled back to $PREV, which is healthy"
 else
   log "FAILED $SHA: not healthy; the rollback to $PREV is not healthy either"

@@ -8,8 +8,9 @@
   view may answer 405 to GET instead), so no new endpoint slips past sign-in.
 - The Phase 6 server surfaces are in the route table, so they are part of the walk.
 - Matrix completeness: every named admin route is rendered by the render matrix
-  (``test_render_matrix.MATRIX_ROUTES``) or is in the explicit POST-only list, whose
-  routes answer a signed-in GET with 405; the status JSON and the chart PNG are the two
+  (``test_render_matrix.MATRIX_ROUTES``) or is in the explicit POST-only list: routes
+  that act only on a POST; a signed-in GET answers 405 (logout) or redirects without
+  acting (F-24, quick task 261008-vdk); the status JSON and the chart PNG are the two
   admin surfaces that are not HTML pages. Every admin route is also in the INV-23
   secret-scan matrix (``test_inv23_pages.INV23_ROUTES``, from its TEST-STRATEGY §9 rows).
   The device endpoint and the health check are not admin routes. A new route missing from
@@ -37,7 +38,8 @@ NOT_ADMIN = frozenset({"heartbeat", "healthz"})
 # The admin surfaces that are not HTML pages (the poll's JSON and the chart preview PNG):
 # their own suites and the INV-23 matrix cover them, the render matrix cannot.
 NOT_HTML = frozenset({"location-status-json", "location-chart"})
-# The admin routes that take only a POST and answer with a redirect; the matrix renders the
+# The admin routes that act only on a POST and answer with a redirect; a signed-in GET
+# answers 405 (logout) or redirects without acting (F-24). The matrix renders the
 # page each redirects to (the switch and test-message flashes on S5, sign-in after sign-out,
 # the list after the theme switch). The POSTs of create, edit, delete, reveal, regenerate,
 # remove and reset share a route with a page the matrix renders.
@@ -157,7 +159,7 @@ def test_R14_matrix_completeness() -> None:
 
 
 @pytest.mark.django_db
-def test_R14_post_only_routes_refuse_get(
+def test_R14_post_only_routes_never_act_on_get(
     client: Client, location_factory: Callable[..., Any], fixed_now: datetime
 ) -> None:
     client.force_login(get_user_model().objects.create_user("admin", password="not-used-here"))
@@ -165,9 +167,21 @@ def test_R14_post_only_routes_refuse_get(
     values = {"pk": location.pk, "start_us": ops.instant_us(fixed_now)}
     routes = {str(pattern.name): pattern for pattern in _named_routes()}
 
-    # Expected: a signed-in GET of every POST-only route answers 405 (no page to render).
+    page = reverse("location-detail", kwargs={"pk": location.pk})
+    # Expected: a signed-in GET of a POST-only route never acts. Logout answers 405; the
+    # theme and the location actions redirect to their page (F-24).
+    expected = {
+        "logout": (405, None),
+        "theme": (302, "/"),
+        "location-maintenance": (302, page),
+        "location-alerts": (302, page),
+        "location-router-grace": (302, page),
+        "location-test-message": (302, page),
+    }
+    assert set(expected) == POST_ONLY
     for name in sorted(POST_ONLY):
         url = reverse(name, kwargs=_kwargs(routes[name], values))
-        assert client.get(url).status_code == 405, name
+        response = client.get(url)
+        assert (response.status_code, response.get("Location")) == expected[name], name
     # Failure: a route with a page is not POST-only: the same client gets the list.
     assert client.get(reverse("location-list")).status_code == 200

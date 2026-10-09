@@ -54,18 +54,29 @@ SELECT status, outage_started_at
 
 # off -> on: the first heartbeat after an outage (MON-03). outage_started_at is left as
 # it is; "was OFF for" is computed from the value LOCK_SQL read under the lock.
+# ``at`` is the clamped gate time (IN-01) and ``now`` the receive time. The state keeps the
+# receive time, so detection anchors are never stamped in the future (F-03 follow-up,
+# quick task 261008-vdk R-1); only the timeline and the ON alert's event_at use ``at``.
+# Without a clamp ``at == now`` and nothing changes. LEAST is safe here: both operands are
+# bound, non-NULL parameters. Accepted residual: after a clamped restore on_since lies
+# before the off piece's end, so removing exactly that outage later does not rewind
+# on_since (REWIND_ON_SINCE_SQL needs on_since >= the outage end). That needs a clamped
+# restore (a backward clock step, or a heartbeat that waited on a lapse carve) plus that
+# removal.
 RESTORE_SQL = """
 UPDATE location_state
-   SET status = 'on', on_since = %(now)s,
+   SET status = 'on', on_since = LEAST(%(at)s, %(now)s),
        last_heartbeat_at = GREATEST(last_heartbeat_at, %(now)s),
        state_version = state_version + 1
  WHERE location_id = %(id)s AND status = 'off'
 """
 
-# waiting -> on: the first heartbeat starts monitoring, silently (MON-01).
+# waiting -> on: the first heartbeat starts monitoring, silently (MON-01). As in
+# RESTORE_SQL, the state keeps the receive time ``now`` and only the timeline uses the
+# clamped ``at`` (R-1).
 FIRST_SQL = """
 UPDATE location_state
-   SET status = 'on', on_since = %(now)s, last_heartbeat_at = %(now)s,
+   SET status = 'on', on_since = LEAST(%(at)s, %(now)s), last_heartbeat_at = %(now)s,
        state_version = state_version + 1
  WHERE location_id = %(id)s AND status = 'waiting'
 """
@@ -237,14 +248,19 @@ def record_heartbeat(location_id: int, now: datetime) -> str:
     on every heartbeat; the clamp keeps the CHECK true and "was OFF for" never negative.
     The ON alert is dated at ``at`` but recorded at ``now``: the outbox makes a row due at
     its recorded_at, so after a backward clock step the alert goes out at once instead of
-    waiting until the wall clock reaches ``at`` again. Without a clamp ``at == now``.
+    waiting until the wall clock reaches ``at`` again. The state keeps the receive time:
+    ``on_since = min(at, now)`` and ``last_heartbeat_at = max(old, now)``, so detection
+    anchors are never stamped in the future and the next OFF is decided one timeout after
+    the last real heartbeat (F-03 follow-up, quick task 261008-vdk R-1). Only the timeline
+    and the ON alert's event_at use the clamped ``at``. Without a clamp ``at == now``.
 
     The FIRST gate clamps the same way. Before Phase 5 a waiting location had no interval,
     but after a database restore (``powermon.engine.restore``, D-13) it holds an open
     ``not_monitored`` piece from the dump's last known moment. Its first heartbeat closes
     that piece and opens "on" at ``max(now, open interval start)``; a server whose clock
     is behind the dump would otherwise close the piece before its start and answer 500
-    on every heartbeat (RESEARCH Pitfall 3). The start is still silent.
+    on every heartbeat (RESEARCH Pitfall 3). The state again keeps the receive time
+    (R-1). The start is still silent.
     """
     params: dict[str, int | datetime] = {"id": location_id, "now": now}
     with transaction.atomic(), connection.cursor() as cur:
@@ -258,7 +274,7 @@ def record_heartbeat(location_id: int, now: datetime) -> str:
             at = max(t for t in (now, outage_started_at, open_start) if t is not None)
             if at > now:
                 _warn_restore_clamped(location_id, at)
-            _run_gate(cur, RESTORE_SQL, {"id": location_id, "now": at})
+            _run_gate(cur, RESTORE_SQL, {"id": location_id, "at": at, "now": now})
             maintenance, alerts_enabled = _config_row(cur, location_id)
             # Closes the off interval at ``at``, never before its start (the clamp above):
             # an off piece that starts at ``at`` is deleted instead.
@@ -276,13 +292,14 @@ def record_heartbeat(location_id: int, now: datetime) -> str:
             return "restored"
         if status == "waiting":
             # After a restore the location may hold an open not_monitored piece (D-13):
-            # the gate is stamped at max(now, its start), never closing it before its
-            # start (RESEARCH Pitfall 3). Without an open piece ``first == now``.
+            # the timeline is stamped at max(now, its start), never closing it before its
+            # start (RESEARCH Pitfall 3); the state keeps ``now`` (R-1). Without an open
+            # piece ``first == now``.
             open_start = timeline.open_start(cur, location_id)
             first = now if open_start is None else max(now, open_start)
             if first > now:
                 _warn_restore_clamped(location_id, first)
-            _run_gate(cur, FIRST_SQL, {"id": location_id, "now": first})
+            _run_gate(cur, FIRST_SQL, {"id": location_id, "at": first, "now": now})
             # MON-01 stays silent: the timeline opens, no outbox row is written.
             maintenance, _alerts_enabled = _config_row(cur, location_id)
             timeline.set_open_state(

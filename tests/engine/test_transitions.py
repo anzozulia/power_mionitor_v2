@@ -333,7 +333,7 @@ def test_IN01_backward_clock_step_heartbeat_restores_at_outage_start(
     assert transitions.record_heartbeat(location.pk, _at(10, 4)) == "restored"
 
     state = LocationState.objects.get(pk=location.pk)
-    assert (state.status, state.on_since, state.last_heartbeat_at) == ("on", _at(10, 5), _at(10, 5))
+    assert (state.status, state.on_since, state.last_heartbeat_at) == ("on", _at(10, 4), _at(10, 5))
     # The off piece would end where it starts: it is deleted, never closed before its start.
     assert _intervals(location) == [
         ("on", _at(10, 0), _at(10, 5), None),
@@ -376,8 +376,8 @@ def test_IN01_restore_never_closes_before_the_open_interval_start(
     state = LocationState.objects.get(pk=location.pk)
     assert (state.status, state.on_since, state.last_heartbeat_at) == (
         "on",
-        _at(10, 10),
-        _at(10, 10),
+        _at(10, 9, 59),
+        _at(10, 9, 59),
     )
     assert _intervals(location) == [
         ("off", _at(9, 0), _at(10, 0), _at(9, 0)),
@@ -413,7 +413,7 @@ def test_IN01_restore_without_an_open_interval_clamps_to_the_outage_start(
     assert transitions.record_heartbeat(location.pk, _at(10, 4)) == "restored"
 
     state = LocationState.objects.get(pk=location.pk)
-    assert (state.status, state.on_since, state.last_heartbeat_at) == ("on", _at(10, 5), _at(10, 5))
+    assert (state.status, state.on_since, state.last_heartbeat_at) == ("on", _at(10, 4), _at(10, 5))
     assert _intervals(location) == [("on", _at(10, 5), None, None)]
     [on] = OutboxMessage.objects.filter(location=location)
     assert (on.event_at, on.payload) == (_at(10, 5), {"was_off_us": 0})

@@ -10,29 +10,36 @@ Weekly chart; TEST-STRATEGY §8.2, §7.5 UI-06).
   image anywhere on the page, so the browser requests no PNG, and no header action.
 - A waiting location with history (after a restore) and a location in maintenance show the
   image too: what decides is the stored history, not the status.
+- While the channel's chart fails (an open ``chart_failing`` or ``chart_pin_failed``
+  incident) the card shows one ``weekly-chart-trouble`` warning with fixed copy, the
+  short ``http_NNN`` code only when one was stored, and the start time, never the
+  location name (F-04, R-3, quick task 261008-vdk).
 - Rendering the page never renders the chart: the browser requests the PNG lazily, and the
-  route renders and caches it (T-06-48). Polling never touches the card.
+  route renders it per request (T-06-48; F-25, quick task 261008-vdk). Polling never
+  touches the card.
 
-Pages are read through tests/web/pages.py and the 06-UI-SPEC hooks only. Tests that
-request the PNG start and end with an empty per-process chart cache.
+Pages are read through tests/web/pages.py and the 06-UI-SPEC hooks only.
 """
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 from bs4 import Tag
+from conftest import FakeClock
+from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.core.cache import cache
 from django.test import Client
 from django.urls import reverse
 from pages import all_by_testid, assert_page, by_testid, main, parse, section, text
 
+from powermon.alerts.models import OpsIncident
 from powermon.chart import render
 from powermon.engine.models import LocationState, PowerInterval
 from powermon.locations.models import Location
-from powermon.web.chart_preview import cache_key
+from powermon.web.location_views import LocationDetailView
+from powermon.web.status import failing_since_text
 
 User = get_user_model()
 
@@ -47,14 +54,6 @@ CHART_EMPTY = (
 CHART_ERROR = "The chart could not be drawn right now. Reload the page to try again."
 LANGUAGE_LABELS = {"uk": "Ukrainian", "en": "English", "ru": "Russian"}
 NAME = 'Office <b>"main"</b> & Co'
-
-
-@pytest.fixture(autouse=True)
-def empty_cache() -> Iterator[None]:
-    """Every test starts and ends with an empty per-process chart cache."""
-    cache.clear()
-    yield
-    cache.clear()
 
 
 @pytest.fixture
@@ -215,19 +214,130 @@ def test_UI06_page_render_does_not_render_the_chart(
 
     response = admin.get(_page(location))
 
-    # The page only points at the PNG (lazily); it never renders or caches the chart (T-06-48).
+    # The page only points at the PNG (lazily); it never renders the chart (T-06-48).
     assert response.status_code == 200
     assert by_testid(main(parse(response)), "weekly-chart").find("img") is not None
     assert calls == []
-    assert cache.get(cache_key(location.pk)) is None
-    # The browser's request for the image renders it once, and the cache serves the next.
+    # Every request for the image renders it (F-25). No byte equality: the live chart's
+    # "now" moves under the real clock.
     first = admin.get(_chart(location))
     second = admin.get(_chart(location))
     assert (first.status_code, second.status_code) == (200, 200)
-    assert first.content == second.content
-    assert calls == ["Office"]
+    assert first.content.startswith(PNG_SIGNATURE)
+    assert second.content.startswith(PNG_SIGNATURE)
+    assert calls == ["Office", "Office"]
     # A deleted location's page and chart answer 404, the chart without a render.
     Location.objects.filter(pk=location.pk).update(deleted_at=_at(16))
     assert admin.get(_page(location)).status_code == 404
     assert admin.get(_chart(location)).status_code == 404
-    assert calls == ["Office"]
+    assert calls == ["Office", "Office"]
+
+
+# F-04 (quick task 261008-vdk): the card warns while the channel's chart fails
+
+CHART_FAILING_TITLE = "The channel's chart is not being updated"
+CHART_PIN_TITLE = "Today's chart is not pinned"
+
+
+def _incident(location: Any, kind: str, details: dict[str, Any], **kw: Any) -> OpsIncident:
+    return OpsIncident.objects.create(
+        kind=kind, location=location, started_at=_at(9, 5), details=details, **kw
+    )
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("case", ["failing", "pin_only", "both", "closed", "delivery_only"])
+def test_weekly_chart_card_warns_while_the_chart_fails(
+    admin: Client,
+    location_factory: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    monkeypatch.setattr(LocationDetailView, "clock", FakeClock(_at(15)))
+    location = location_factory(name=NAME)
+    _history(location)
+    _on(location)
+    if case in ("failing", "both"):
+        _incident(location, "chart_failing", {"http_status": 403})
+    if case in ("pin_only", "both"):
+        _incident(location, "chart_pin_failed", {})
+    if case == "closed":
+        _incident(location, "chart_failing", {"http_status": 403}, ended_at=_at(10))
+        _incident(location, "chart_pin_failed", {}, ended_at=_at(10))
+    if case == "delivery_only":
+        _incident(location, "delivery_failing", {"http_status": 403})
+    since = failing_since_text(_at(9, 5), _at(15), settings.TIME_ZONE)
+
+    response = admin.get(_page(location))
+    soup = assert_page(response, title=NAME, app=True)
+
+    card = _card(soup)
+    found = all_by_testid(card, "weekly-chart-trouble")
+    assert all_by_testid(soup, "weekly-chart-trouble") == found
+    if case in ("closed", "delivery_only"):
+        assert found == []
+    else:
+        [warning] = found
+        assert warning["data-tone"] == "warning"
+        body = text(warning)
+        if case == "pin_only":
+            assert CHART_PIN_TITLE in body
+            assert f"Telegram refused the pin since {since}." in body
+            assert "(http_" not in body
+            assert CHART_FAILING_TITLE not in body
+        else:
+            assert CHART_FAILING_TITLE in body
+            assert f"Telegram refused to post or update it (http_403) since {since}." in body
+            assert CHART_PIN_TITLE not in body
+        # Fixed copy: never the location name, raw or escaped.
+        assert NAME not in body
+        assert "Office" not in body
+        assert "Office" not in str(warning)
+    # INV-23: the page shows no secret.
+    html = response.content.decode()
+    assert location.device_key not in html
+    assert location.bot_token not in html
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("kind", "details", "expected"),
+    [
+        ("chart_pin_failed", {}, "Telegram refused the pin since {since}."),
+        ("chart_failing", {}, "Telegram refused to post or update it since {since}."),
+        ("chart_pin_failed", {"http_status": 403}, "Telegram refused the pin (http_403) since"),
+        (
+            "chart_failing",
+            {"http_status": 403},
+            "Telegram refused to post or update it (http_403) since",
+        ),
+    ],
+    ids=["pin-no-status", "failing-no-status", "pin-403", "failing-403"],
+)
+def test_weekly_chart_card_shows_the_status_code_only_when_one_was_stored(
+    admin: Client,
+    location_factory: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    details: dict[str, Any],
+    expected: str,
+) -> None:
+    # R-3 (quick task 261008-vdk): incidents from before this release hold details {}.
+    monkeypatch.setattr(LocationDetailView, "clock", FakeClock(_at(15)))
+    location = location_factory(name=NAME)
+    _history(location)
+    _on(location)
+    _incident(location, kind, details)
+    since = failing_since_text(_at(9, 5), _at(15), settings.TIME_ZONE)
+
+    soup = assert_page(admin.get(_page(location)), title=NAME, app=True)
+
+    [warning] = all_by_testid(_card(soup), "weekly-chart-trouble")
+    body = text(warning)
+    assert expected.format(since=since) in body
+    if details:
+        assert f"(http_403) since {since}." in body
+    else:
+        assert "(http_" not in body
+    title = CHART_PIN_TITLE if kind == "chart_pin_failed" else CHART_FAILING_TITLE
+    assert title in body

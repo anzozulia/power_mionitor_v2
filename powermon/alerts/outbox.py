@@ -24,7 +24,9 @@ during it:
     pending --drop_deleted_pending (its location was deleted)--> dropped (never sent, D-09)
     pending --make_due (a recorded success or a channel change)--> pending, due now
     pending --remove_outage (its outage was removed)--> dropped (outage_removed)
-    dropped (outage_removed) --fail_delete of its OFF--> pending (sent after all)
+    dropped (outage_removed) --fail_delete of its OFF--> pending (sent after all, unless a
+        later alert went out, the chat changed or it expired)
+    dropped (outage_removed) --post_restore, its OFF's delete unsettled--> dropped (restored)
 
 Delete requests (261006-qv7, DATA-02 amended) live on "sent" subscriber rows and never
 change a row's status, attempts or ``next_attempt_at``:
@@ -38,9 +40,10 @@ when the relay has both (``tg_chat_id``, ``tg_message_id``); an ops row stores n
 lower id) is always deleted before its ON. ``settle_delete`` and ``fail_delete`` are
 conditional on ``delete_result IS NULL``. When the OFF's delete is refused or too old,
 ``fail_delete`` cancels the rest of that removal and puts back to "pending" the ON alert
-the removal dropped, in one transaction: the channel never ends up showing only "power
-off". Requests leave the relay's head-of-line, expiry, recovery and ``make_due`` paths
-alone: they select open rows only.
+the removal dropped, unless a later alert went out, the chat changed or it expired, in one
+transaction: the channel never ends up showing only "power off". Requests leave the
+relay's head-of-line, expiry, recovery and ``make_due`` paths alone: they select open rows
+only.
 
 A deleted location's subscriber alerts are never sent (D-09, INV-19 #2): its rows are not
 heads (``subscriber_heads``), and the relay drops its pending rows on every pass, before
@@ -84,6 +87,7 @@ in flight (or to activation's recovery).
 ``last_error`` is always a short code (at most 64 characters), never a URL or a token.
 """
 
+import logging
 from datetime import datetime, timedelta
 from typing import NamedTuple
 
@@ -92,7 +96,10 @@ from django.db import connection, transaction
 from django.db.models import F
 
 from powermon.alerts.models import OPEN_STATUSES, OutboxMessage
+from powermon.locations.models import Location
 from powermon.worker.lease import LOCK_KEY
+
+log = logging.getLogger(__name__)
 
 KIND_POWER_OFF = "power_off"
 KIND_POWER_ON = "power_on"
@@ -110,6 +117,9 @@ KIND_OPS_PIN_RESTORED = "ops_pin_restored"  # {}; location = the chart's
 # A location's subscriber alerts are refused / delivered again (D-10); location = the alert's.
 KIND_OPS_DELIVERY_FAILING = "ops_delivery_failing"  # {http_status[, migrate_to_chat_id]}
 KIND_OPS_DELIVERY_RESTORED = "ops_delivery_restored"  # {}
+# Today's chart is refused for good / posted or updated again (F-04); location = the chart's.
+KIND_OPS_CHART_FAILING = "ops_chart_failing"  # {http_status}
+KIND_OPS_CHART_RESTORED = "ops_chart_restored"  # {}
 OPS_KINDS = (
     KIND_OPS_GAP,
     KIND_OPS_ALL_SILENT_START,
@@ -120,6 +130,8 @@ OPS_KINDS = (
     KIND_OPS_PIN_RESTORED,
     KIND_OPS_DELIVERY_FAILING,
     KIND_OPS_DELIVERY_RESTORED,
+    KIND_OPS_CHART_FAILING,
+    KIND_OPS_CHART_RESTORED,
 )
 # The database column is varchar(64).
 MAX_ERROR_LENGTH = 64
@@ -434,6 +446,23 @@ def make_due(location_id: int, now: datetime) -> int:
     ).update(next_attempt_at=now)
 
 
+def release_held(now: datetime) -> int:
+    """After a backward wall-clock step: make every held pending row due at ``now``.
+
+    Pending rows of both channels (subscriber alerts and ops notices) whose
+    ``next_attempt_at`` is later than ``now`` move to ``now``; a row already due keeps its
+    time, and rows in flight or finished are never touched. Retry and 429 holds are
+    wall-clock times, so after the clock steps back they would otherwise wait the size of
+    the step on top (F-12; F-03 calls it after a restart). Runs on the caller's
+    connection. A naive ``now`` raises ValueError before any write. Returns how many moved.
+    """
+    if now.utcoffset() is None:
+        raise ValueError("a naive datetime has no defined instant")
+    return OutboxMessage.objects.filter(status="pending", next_attempt_at__gt=now).update(
+        next_attempt_at=now
+    )
+
+
 def lease_holds(pid: int | None) -> bool:
     """True when ``pid`` (the lease session) holds the worker lock; no pid is unfenced (C1).
 
@@ -493,8 +522,10 @@ def fail_delete(row: OutboxMessage, code: str, now: datetime) -> int:
     "cancelled" and is never called, and the ON alert that removal dropped while it was
     still queued goes back to "pending", due at ``now``, so it is sent after all: the
     channel keeps both alerts and never ends up showing only "power off" (owner default 3,
-    261006-qv7 D6). Expiry still applies to it. Nothing else changes when the row was
-    settled already.
+    261006-qv7 D6). Expiry still applies to it. The ON stays dropped instead, with one INFO
+    line (ids only), when ``_stale_on`` names a reason: it expired, the location moved to
+    another chat, or a later alert already went out. An admin chat save that commits in
+    the same instant is not covered. Nothing else changes when the row was settled already.
     """
     with transaction.atomic():
         if not settle_delete(row.pk, code):
@@ -514,12 +545,69 @@ def fail_delete(row: OutboxMessage, code: str, now: datetime) -> int:
             last_error=OUTAGE_REMOVED,
             event_at__gte=row.event_at,
         )
-        kept = [on.pk for on in dropped if restores(on, row.event_at)]
+        kept = []
+        for on in dropped:
+            if not restores(on, row.event_at):
+                continue
+            reason = _stale_on(on, row, now)
+            if reason is None:
+                kept.append(on.pk)
+            else:
+                # Ids only (OPS-08).
+                log.info(
+                    "removed outage's ON alert %s for location %s stays dropped (%s)",
+                    on.pk,
+                    row.location_id,
+                    reason,
+                )
         if kept:
             OutboxMessage.objects.filter(pk__in=kept, status="dropped").update(
                 status="pending", next_attempt_at=now, last_error=""
             )
     return cancelled
+
+
+def _stale_on(on: OutboxMessage, off: OutboxMessage, now: datetime) -> str | None:
+    """Why the removal's dropped ON ``on`` must stay dropped after all; None to send it.
+
+    ``off`` is the removed outage's OFF, whose delete was refused or too old. In order:
+    "expired" when the ON is past its maximum age (``expire_due``'s rule: expired at
+    exactly ``expires_at``); "chat_changed" when the location now posts to another chat
+    than the one that got the OFF (a token change alone keeps the same chat); "later_alert"
+    when a later subscriber alert of the location is sending, sent or uncertain, so the ON
+    would be stale. A later row still pending is fine: the ON has the lower id and goes
+    first. A later row that will not stay visible is ignored too: its delete is requested
+    and not yet settled, or it settled as deleted or not found (another removal took that
+    outage away, quick task 261008-vdk R-2). The chat is read with a plain query: an admin
+    chat save that commits in the same instant as the refusal is not covered (quick task
+    261008-vdk, F-01).
+
+    Known limitation: a first OFF delete refused BEFORE the later outage is removed keeps
+    its ON dropped, because at that moment the later alert is still visible. That needs a
+    channel hold during the first removal, a per-message refusal and a second removal.
+    """
+    if on.expires_at <= now:
+        return "expired"
+    location_id = off.location_id
+    # fail_delete only passes a location's OFF; a row with no location has no chat to match.
+    if location_id is None:
+        return "chat_changed"
+    chat = Location.objects.filter(pk=location_id).values_list("chat_id", flat=True).first()
+    if chat != off.tg_chat_id:
+        return "chat_changed"
+    later = OutboxMessage.objects.filter(
+        channel=CHANNEL_SUBSCRIBER,
+        location_id=location_id,
+        id__gt=on.pk,
+        status__in=("sending", "sent", "uncertain"),
+    )
+    # Only rows that stay visible count (R-2).
+    later = later.exclude(delete_requested_at__isnull=False, delete_result__isnull=True).exclude(
+        delete_result__in=(DELETE_DELETED, DELETE_NOT_FOUND)
+    )
+    if later.exists():
+        return "later_alert"
+    return None
 
 
 def recover_interrupted() -> list[RowRef]:

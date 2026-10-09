@@ -5,8 +5,8 @@ the admin panel's failing badge (LOC-03). It is opened only by a permanent outco
 (400/401/403/404) of a subscriber alert send, and closed by a successful subscriber alert
 send or by a recorded success of the admin's test message. A transient error (5xx, a
 refused connection), a 429, an ambiguous send and every chart call never open or close it:
-long Telegram outages are covered by the expiry notices, and a refused pin has its own
-incident (D-10).
+long Telegram outages are covered by the expiry notices, and a refused chart pin, post or
+update has its own incident (``chart_pin_failed``, ``chart_failing``; D-10, F-04).
 
 Exactly one failing notice and one restored notice per incident is the database's job,
 not a code convention: the partial unique index ``ops_incident_one_open`` lets a single
@@ -42,6 +42,10 @@ outcome, so the incident and its notice commit with that outcome or not at all. 
 here does network I/O, and the incident's details and the notices' payloads hold integers
 only (OPS-08). ``failing_incidents`` reads them back for the admin pages and never raises
 on a malformed value.
+
+``chart_trouble`` reads a location's open ``chart_failing`` (preferred) or
+``chart_pin_failed`` incident for the location page's Weekly chart card (F-04); only the
+chart lifecycle opens and closes those.
 """
 
 import json
@@ -55,6 +59,13 @@ from powermon.alerts import ops, outbox
 from powermon.alerts.models import OpsIncident
 
 KIND_DELIVERY_FAILING = "delivery_failing"
+# The chart's ops_incident kinds (D-07, INV-20, F-04). Only the chart lifecycle
+# (``powermon.chart.lifecycle``) opens and closes them. They live here because the web reads
+# them for the location page and must never import the lifecycle.
+KIND_CHART_FAILING = "chart_failing"
+KIND_CHART_PIN_FAILED = "chart_pin_failed"
+# chart_failing first: a chart that is not posted or updated at all is the bigger problem.
+_CHART_KINDS = (KIND_CHART_FAILING, KIND_CHART_PIN_FAILED)
 # A live location's row, held against a concurrent delete until the caller commits (D-09).
 LIVE_LOCATION_SQL = "SELECT 1 FROM location WHERE id = %s AND deleted_at IS NULL FOR SHARE"
 # The open failing incident's details, replaced by the latest refusal's (status and
@@ -79,6 +90,17 @@ class Failing:
     started_at: datetime
     http_status: int
     migrate_to_chat_id: int | None
+
+
+@dataclass(frozen=True)
+class ChartTrouble:
+    """An open chart incident of a location, as its page shows it (F-04)."""
+
+    kind: str
+    started_at: datetime
+    # None when the incident stored no valid status (details {} from before quick task
+    # 261008-vdk): the true status cannot be recovered, so none is shown (R-3).
+    http_status: int | None
 
 
 def http_status(code: str) -> int:
@@ -201,6 +223,28 @@ def failing_incidents(location_ids: Iterable[int]) -> dict[int, Failing]:
             started_at, _DEFAULT_STATUS if status is None else status, migrate_to
         )
     return found
+
+
+def chart_trouble(location_id: int) -> ChartTrouble | None:
+    """The location's open chart incident, ``chart_failing`` before ``chart_pin_failed``.
+
+    One query. For the location page, which must never fail on a stored value: details
+    without an integer status from 100 to 599 give ``http_status`` None. Details from
+    before this release hold {} and the true status cannot be recovered, so none is shown,
+    never a made-up 400 (quick task 261008-vdk R-3).
+    """
+    rows = OpsIncident.objects.filter(
+        kind__in=_CHART_KINDS, location_id=location_id, ended_at__isnull=True
+    ).values_list("kind", "started_at", "details")
+    found: dict[str, tuple[datetime, object]] = {
+        kind: (started_at, details) for kind, started_at, details in rows
+    }
+    for kind in _CHART_KINDS:
+        if kind in found:
+            started_at, details = found[kind]
+            values = details if isinstance(details, dict) else {}
+            return ChartTrouble(kind, started_at, _int_in(values.get("http_status"), 100, 599))
+    return None
 
 
 def _int_in(value: object, low: int, high: int) -> int | None:

@@ -3,12 +3,13 @@
 Pure: no database, no clock, no Django. Every time is an argument, and the store
 (``powermon.throttle.store``) feeds in the failures it read.
 
-The rule: five failed sign-ins within 60 s from one client IP start a 5-minute cool-down,
-counted from the fifth failure. During it every sign-in POST from that IP answers 429,
-even one with the right password. The window is inclusive (the fifth failure exactly 60 s
-after the first still counts) and the cool-down end is strict (at exactly 5 minutes after
-the fifth failure the next POST is checked normally). Throttled POSTs are never recorded
-as failures, so an attacker cannot extend a cool-down by trying again during it.
+The rule: five failed sign-ins within 60 s from one client IP (an IPv6 client: its /64)
+start a 5-minute cool-down, counted from the fifth failure. During it every sign-in POST
+from that IP answers 429, even one with the right password. The window is inclusive (the
+fifth failure exactly 60 s after the first still counts) and the cool-down end is strict
+(at exactly 5 minutes after the fifth failure the next POST is checked normally).
+Throttled POSTs are never recorded as failures, so an attacker cannot extend a cool-down
+by trying again during it.
 """
 
 import ipaddress
@@ -34,6 +35,9 @@ RETRY_AFTER = "300"
 # Every source that cannot be parsed shares this one bucket: fail closed. A bucket name,
 # not a bind address (S104).
 UNKNOWN_IP = "0.0.0.0"  # noqa: S104
+# An IPv6 client counts by its /64, the usual allocation of one subscriber line, so a
+# client rotating addresses inside its /64 stays in one bucket (F-14).
+IPV6_BUCKET_PREFIX = 64
 
 
 def cool_down_end(failures: Sequence[datetime]) -> datetime | None:
@@ -64,7 +68,9 @@ def _parse(value: object) -> str | None:
     An IPv4-mapped IPv6 address (``::ffff:203.0.113.9``) becomes its IPv4 form, so one
     client gets one bucket whichever way its address is written. A scoped IPv6 address
     (``fe80::1%eth0``) is refused: no client reaches the app with one, and the database's
-    inet type does not take the scope.
+    inet type does not take the scope. Any other IPv6 address becomes the network address
+    of its /64 (``2001:db8::1`` and ``2001:db8::ffff:1`` both give ``2001:db8::``), which
+    is still a valid inet value.
     """
     if not isinstance(value, str):
         return None
@@ -77,18 +83,21 @@ def _parse(value: object) -> str | None:
             return None
         if address.ipv4_mapped is not None:
             return str(address.ipv4_mapped)
+        network = ipaddress.IPv6Network(f"{address}/{IPV6_BUCKET_PREFIX}", strict=False)
+        return str(network.network_address)
     return str(address)
 
 
 def client_ip(meta: Mapping[str, object]) -> str:
     """The client IP the throttle counts by: the rightmost ``X-Forwarded-For`` value.
 
-    In production the web app is reachable only through Caddy (``expose`` only, SEC-02).
-    Caddy ignores the ``X-Forwarded-*`` headers a client sends and sets its own, with the
-    address it saw as the last value, so the rightmost value is the one a client cannot
-    choose. Without the header (local compose, tests) the socket's ``REMOTE_ADDR`` is used.
-    A value that is not an IP address falls through to the next source; if nothing
-    parses, the request counts under UNKNOWN_IP.
+    In production the web app is reachable only through the reverse proxy (Caddy, or the
+    host nginx on a shared VPS; README section 17). The proxy ignores the
+    ``X-Forwarded-For`` a client sends and sets the address it saw as the last value, so
+    the rightmost value is the one a client cannot choose. An IPv6 address counts by its
+    /64 (``_parse``). Without the header (local compose, tests) the socket's
+    ``REMOTE_ADDR`` is used. A value that is not an IP address falls through to the next
+    source; if nothing parses, the request counts under UNKNOWN_IP.
     """
     forwarded = meta.get("HTTP_X_FORWARDED_FOR")
     if isinstance(forwarded, str) and forwarded.strip():

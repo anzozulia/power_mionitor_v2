@@ -5,6 +5,8 @@ itself; this form POST is the fallback. It sets the ``theme`` cookie (``light``,
 or ``system``) with the attributes the JS writes too, and always redirects to the fixed
 ``/``: it reads neither a ``next`` value nor the Referer, so it can never redirect off the
 site (R8). The allowlist is the context processor's (``context_processors.THEMES``).
+A GET sets no cookie and redirects to ``/`` (F-24: the sign-in redirect after an ended
+session).
 """
 
 from django.conf import settings
@@ -26,12 +28,18 @@ class ThemeView(View):
     """POST ``theme=light|dark|system``: set the theme cookie, then 302 to ``/``.
 
     A missing or unknown value answers 400 with an empty body and sets no cookie (only a
-    hand-made request can send one). GET and every other method answer 405. CSRF-protected
+    hand-made request can send one). A GET sets no cookie and redirects to ``/`` (F-24: the
+    sign-in redirect after an ended session). Every other method answers 405. CSRF-protected
     and login-required like every admin POST. Writes nothing to the database and adds no
     flash. Every response is never cached.
     """
 
-    http_method_names = ["post"]
+    http_method_names = ["get", "post"]
+
+    def get(self, request: HttpRequest) -> HttpResponse:
+        # The sign-in redirect after an ended session GETs /theme/ (F-24): no cookie, no
+        # flash, only the fixed target.
+        return HttpResponseRedirect(THEME_REDIRECT)
 
     def post(self, request: HttpRequest) -> HttpResponse:
         value = request.POST.get("theme")

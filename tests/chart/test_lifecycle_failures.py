@@ -14,6 +14,11 @@
   incident; the channel's alerts are never held.
 - The chart's backoff maps stay bounded: a row's step keys are dropped once that record
   no longer needs the step (Wave 3 audit, fix B).
+- INV-20, F-04 (quick task 261008-vdk): a chart post, refresh or redraw Telegram refuses
+  for good opens the location's ``chart_failing`` incident with exactly one
+  ``ops_chart_failing`` notice, and the next one that works closes it with exactly one
+  ``ops_chart_restored`` notice; transient, rate-limited, ambiguous and "message to edit
+  not found" outcomes, and a deleted location, open nothing.
 - INV-19: a pin that may have taken effect while the record says "not pinned" (an
   ambiguous answer, an unwritten outcome) never leaves an orphaned pin: every older record
   gets exactly one unpin by its stored message id before it leaves the lifecycle (Wave 4
@@ -46,7 +51,9 @@ from powermon.alerts.models import OpsIncident, OutboxMessage
 from powermon.chart import lifecycle, model
 from powermon.chart.models import ChartMessage
 from powermon.engine.models import SystemState
+from powermon.locations import actions
 from powermon.locations.models import Location
+from powermon.telegram.client import SendResult
 from powermon.worker import io_loop
 
 pytestmark = pytest.mark.django_db(transaction=True)
@@ -58,6 +65,8 @@ NOON_05 = kyiv("2026-10-02 12:05")
 SINCE = kyiv("2026-10-01 08:00")
 # The ops_incident kind of a refused pin (lifecycle.KIND_CHART_PIN_FAILED).
 PIN_INCIDENT = "chart_pin_failed"
+# The ops_incident kind of a refused chart post or update (lifecycle.KIND_CHART_FAILING, F-04).
+CHART_INCIDENT = "chart_failing"
 LIFECYCLE_LOGGER = lifecycle.__name__
 TOKEN_B = "987654321:" + "B" * 35
 CHAT_B = -1009876543210
@@ -74,6 +83,24 @@ NO_PIN_RIGHTS = {
     "description": "Bad Request: not enough rights to manage pinned messages in the chat",
 }
 BAD_GATEWAY = {"ok": False, "error_code": 502, "description": "Bad Gateway"}
+NO_PHOTO_RIGHTS = {
+    "ok": False,
+    "error_code": 400,
+    "description": "Bad Request: not enough rights to send photos to the chat",
+}
+KICKED = {
+    "ok": False,
+    "error_code": 403,
+    "description": "Forbidden: bot was kicked from the channel chat",
+}
+TOO_MANY = {
+    "ok": False,
+    "error_code": 429,
+    "description": "Too Many Requests: retry after 7",
+    "parameters": {"retry_after": 7},
+}
+# The ops notices of a refused chart post or update (F-04).
+CHART_NOTICES = ("ops_chart_failing", "ops_chart_restored")
 DISK_FULL = "could not extend file: No space left on device"
 # The key of the bot that posted a kept chart photo (D-08): the default location's bot.
 BOT_A = io_loop.bot_key(DEFAULT_BOT_TOKEN)
@@ -177,8 +204,8 @@ def _ops_rows(kind: str) -> list[OutboxMessage]:
     return list(rows.order_by("id"))
 
 
-def _incidents(location: Any) -> list[tuple[datetime, datetime | None]]:
-    rows = OpsIncident.objects.filter(kind=PIN_INCIDENT, location=location).order_by("id")
+def _incidents(location: Any, kind: str = PIN_INCIDENT) -> list[tuple[datetime, datetime | None]]:
+    rows = OpsIncident.objects.filter(kind=kind, location=location).order_by("id")
     return [(row.started_at, row.ended_at) for row in rows]
 
 
@@ -603,6 +630,216 @@ def test_pin_transient_error_does_not_open_an_incident(
     assert (today_row.pinned, today_row.pin_failed_at) == (False, None)
     assert _incidents(location) == []
     assert _ops_rows(outbox.KIND_OPS_PIN_FAILED) == []
+
+
+# INV-20, F-04: a chart post or update refused for good gives one notice, and one on recovery
+
+
+def _today_record(location: Any, rendered: datetime, **kw: Any) -> ChartMessage:
+    """Today's pinned record, rendered at ``rendered``, as an earlier pass left it."""
+    return ChartMessage.objects.create(
+        location=location,
+        local_date=TODAY,
+        chat_id=DEFAULT_CHAT_ID,
+        bot_key=io_loop.bot_key(location.bot_token),
+        message_id=900,
+        pinned=True,
+        last_rendered_at=rendered,
+        created_at=rendered,
+        **kw,
+    )
+
+
+def _chart_notices() -> list[OutboxMessage]:
+    rows = OutboxMessage.objects.filter(channel=outbox.CHANNEL_OPS, kind__in=CHART_NOTICES)
+    return list(rows.order_by("id"))
+
+
+def test_INV20_chart_post_refused_gives_one_failing_and_one_restored(
+    location_factory: Callable[..., Any], fake_telegram: Any, ops_settings: Any
+) -> None:
+    location = _monitored(location_factory)
+    # The bot may not post photos for the first three tries; then the admin grants it.
+    for _ in range(3):
+        fake_telegram.fail_method(
+            DEFAULT_BOT_TOKEN, "sendPhoto", status=400, json_body=NO_PHOTO_RIGHTS
+        )
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    fake_telegram.accept(OPS_BOT_TOKEN)
+    start = kyiv("2026-10-02 09:00")
+    clock = FakeClock(start)
+    state = io_loop.RelayState()
+    channel = io_loop.chat_key(DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID)
+
+    # 09:00, 09:15, 09:30: the post is refused each time; one incident, one notice.
+    for minutes in (0, 15, 30):
+        clock.set(start + _min(minutes))
+        _run_until_idle(clock, state)
+        assert _incidents(location, CHART_INCIDENT) == [(start, None)]
+        [failing] = _ops_rows(outbox.KIND_OPS_CHART_FAILING)
+        assert (failing.payload, failing.location_id, failing.recorded_at) == (
+            {"http_status": 400},
+            location.pk,
+            start,
+        )
+        assert _ops_rows(outbox.KIND_OPS_CHART_RESTORED) == []
+        assert ChartMessage.objects.filter(location=location).count() == 0
+        assert channel not in state.not_before
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "sendPhoto") == 3
+
+    # 09:45: the right was granted; the post is accepted, recorded and pinned.
+    restored_at = start + _min(45)
+    clock.set(restored_at)
+    _run_until_idle(clock, state)
+    today_row = _active_today()
+    assert (today_row.message_id, today_row.pinned) == (1001, True)
+    assert _incidents(location, CHART_INCIDENT) == [(start, restored_at)]
+    [restored] = _ops_rows(outbox.KIND_OPS_CHART_RESTORED)
+    assert (restored.payload, restored.location_id, restored.recorded_at) == (
+        {},
+        location.pk,
+        restored_at,
+    )
+    assert len(_ops_rows(outbox.KIND_OPS_CHART_FAILING)) == 1
+    assert OutboxMessage.objects.get(pk=restored.pk).status == "sent"
+    assert channel not in state.not_before
+    assert lifecycle.KIND_CHART_FAILING == CHART_INCIDENT
+    # The pin incident is a different one: never opened here.
+    assert _incidents(location) == []
+
+
+@pytest.mark.parametrize("step", ["refresh", "redraw"])
+def test_INV20_chart_refresh_refused_opens_once_and_closes_on_the_next_refresh(
+    step: str, location_factory: Callable[..., Any], fake_telegram: Any, ops_settings: Any
+) -> None:
+    if step == "refresh":
+        location = _monitored(location_factory)
+        # Rendered before the 12:00 slot: a regular refresh is due at 12:05.
+        record = _today_record(location, kyiv("2026-10-02 11:50"))
+    else:
+        # Hourly updates: no slot is due before 13:00, so only the removal's redraw is.
+        location = _monitored(location_factory, chart_refresh_min=60)
+        record = _today_record(location, NOON_05, redraw_requested_at=NOON_05)
+    for _ in range(2):
+        fake_telegram.fail_method(
+            DEFAULT_BOT_TOKEN, "editMessageMedia", status=403, json_body=KICKED
+        )
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    fake_telegram.accept(OPS_BOT_TOKEN)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+
+    for minutes in (0, 15):
+        clock.set(NOON_05 + _min(minutes))
+        _run_until_idle(clock, state)
+        assert _incidents(location, CHART_INCIDENT) == [(NOON_05, None)]
+        [failing] = _ops_rows(outbox.KIND_OPS_CHART_FAILING)
+        assert (failing.payload, failing.location_id) == ({"http_status": 403}, location.pk)
+        assert _ops_rows(outbox.KIND_OPS_CHART_RESTORED) == []
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "editMessageMedia") == 2
+
+    restored_at = NOON_05 + _min(30)
+    clock.set(restored_at)
+    _run_until_idle(clock, state)
+    assert _incidents(location, CHART_INCIDENT) == [(NOON_05, restored_at)]
+    [restored] = _ops_rows(outbox.KIND_OPS_CHART_RESTORED)
+    assert (restored.payload, restored.location_id) == ({}, location.pk)
+    assert len(_ops_rows(outbox.KIND_OPS_CHART_FAILING)) == 1
+    assert _chart(fake_telegram) == [("editMessageMedia", 900)]
+    record.refresh_from_db()
+    assert record.redraw_requested_at is None
+    assert record.retired_at is None
+
+
+@pytest.mark.parametrize("case", ["post_502", "post_429", "refresh_timeout", "refresh_target_gone"])
+def test_chart_transient_or_missing_target_opens_no_chart_incident(
+    case: str, location_factory: Callable[..., Any], fake_telegram: Any, ops_settings: Any
+) -> None:
+    location = _monitored(location_factory)
+    record = None
+    if case == "post_502":
+        fake_telegram.fail_method(DEFAULT_BOT_TOKEN, "sendPhoto", status=502, json_body=BAD_GATEWAY)
+    elif case == "post_429":
+        fake_telegram.fail_method(DEFAULT_BOT_TOKEN, "sendPhoto", status=429, json_body=TOO_MANY)
+    else:
+        record = _today_record(location, kyiv("2026-10-02 11:50"))
+        if case == "refresh_timeout":
+            fake_telegram.fail_method(
+                DEFAULT_BOT_TOKEN, "editMessageMedia", exc=requests.ReadTimeout()
+            )
+        else:
+            fake_telegram.fail_method(
+                DEFAULT_BOT_TOKEN, "editMessageMedia", status=400, json_body=EDIT_GONE
+            )
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    fake_telegram.accept(OPS_BOT_TOKEN)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+
+    assert _pass(clock, state) is True
+
+    assert _incidents(location, CHART_INCIDENT) == []
+    assert _chart_notices() == []
+    if case == "refresh_target_gone":
+        # "message to edit not found" still retires the record (INV-17 #3).
+        assert record is not None
+        record.refresh_from_db()
+        assert record.retired_at == NOON_05
+
+
+def test_chart_refused_for_a_deleted_location_opens_nothing(
+    location_factory: Callable[..., Any], ops_settings: Any
+) -> None:
+    location = _monitored(location_factory)
+    at = NOON_05
+    assert actions.delete_location(location.pk, at) is True
+    chart_location = lifecycle.ChartLocation(
+        location.pk,
+        location.name,
+        location.language,
+        location.bot_token,
+        location.chat_id,
+        timedelta(0),
+    )
+
+    lifecycle._chart_refused(chart_location, SendResult("permanent", code="http_403"), at)
+
+    assert _incidents(location, CHART_INCIDENT) == []
+    assert _chart_notices() == []
+
+
+def test_chart_failing_close_error_does_not_repost(
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    location = _monitored(location_factory)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    real = lifecycle._chart_working
+    tries: list[int] = []
+
+    def refused_once(*args: Any, **kwargs: Any) -> Any:
+        tries.append(1)
+        if len(tries) == 1:
+            raise OperationalError(DISK_FULL)
+        return real(*args, **kwargs)
+
+    # The post is accepted and recorded, but closing the incident raises once.
+    monkeypatch.setattr(lifecycle, "_chart_working", refused_once)
+    caplog.set_level(logging.WARNING, logger=LIFECYCLE_LOGGER)
+    clock = FakeClock(NOON_05)
+    state = io_loop.RelayState()
+
+    _run_until_idle(clock, state)
+    clock.set(NOON_05 + _min(1))
+    _run_until_idle(clock, state)
+
+    assert tries
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "sendPhoto") == 1
+    [row] = ChartMessage.objects.filter(location=location, local_date=TODAY)
+    assert (row.message_id, row.pinned) == (1001, True)
+    assert state.chart_posted == {}
 
 
 # The chart's backoff maps stay bounded (Wave 3 audit, fix B)

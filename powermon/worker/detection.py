@@ -17,13 +17,16 @@ Cycle order (D-04, D-15, RESEARCH Pattern 3):
    5 s, otherwise run when the gap since the last completed cycle is over 15 s. It commits
    before any timeout decision, and a carve moves ``detection_resumed_at`` to now, so no
    OFF can follow from the gap itself;
-5. the cursor: ``last_cycle_completed_at`` moves to now with GREATEST (never backwards)
-   and the tracker remembers this cycle. Both happen once the lapse check committed and
+5. the cursor: ``last_cycle_completed_at`` moves to now with GREATEST (never backwards
+   here; only the lapse step's ``clamp_future`` moves it back after a backward wall-clock
+   step, F-03) and the tracker remembers this cycle. Both happen once the lapse check committed and
    before the decisions, so a decisions step that keeps failing neither keeps a forced
    trigger armed nor lets the cursor fall behind the threshold: it is logged by the loop,
    never a new gap notice on every cycle (plan-check advisory 1);
 6. the decisions (``run_cycle``), skipped on a cycle whose clock stepped by more than
-   5 s either way. A backward step records nothing, only one WARNING;
+   5 s either way. A backward step records no gap: the lapse step moves the
+   future-stamped anchors back to now (``lapse.clamp_future``), so the next OFF follows
+   the timeout from the step;
 7. the all-silent check (``all_silent.evaluate``, OPS-04, INV-12), after the decisions and
    skipped together with them on a clock step. It only informs the admin and never holds
    a subscriber alert (D-01), so it runs after the OFFs of the cycle are recorded. An
@@ -86,7 +89,7 @@ def run_detection(
         # The carve below records the gap (and logs it); the decisions wait a cycle.
         log.warning("wall clock stepped forward %d s; skipping this cycle's decisions", round(step))
     elif step is not None and step < -lapse.CLOCK_STEP_LIMIT_S:
-        # Nothing is recorded (the window before the cursor is history): one line only.
+        # The lapse step below rewinds the future-stamped anchors; nothing is carved.
         log.warning("wall clock stepped back %d s; skipping this cycle's decisions", round(-step))
     lapse.carve_if_needed(now, force=force, tick=tick)
     SystemState.objects.filter(pk=1).update(
