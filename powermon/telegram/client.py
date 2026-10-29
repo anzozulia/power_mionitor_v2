@@ -65,7 +65,9 @@ errors and of ``raise_for_status()`` (STACK G3, P-12). So this module never call
 method, kind and code. The adapter keeps requests' default of no retries, and nothing
 sleeps: all retry timing belongs to the caller (the outbox relay, INV-15/16, and the chart
 lifecycle). Every call passes explicit (connect, read) timeouts, because requests has no
-default timeout: (5 s, 10 s) by default, (5 s, 5 s) for the ``getMe`` probe (261030-11v).
+default timeout: (5 s, 10 s) by default, (5 s, 30 s) for the two photo uploads
+(``sendPhoto``, ``editMessageMedia``) and (5 s, 5 s) for the ``getMe`` probe
+(quick task 261030-11v).
 """
 
 import json
@@ -94,6 +96,9 @@ SendKind = Literal[
 
 DEFAULT_API_BASE = "https://api.telegram.org"
 DEFAULT_TIMEOUT: tuple[float, float] = (5.0, 10.0)
+# sendPhoto and editMessageMedia upload a chart PNG that Telegram processes before it
+# answers; under load that answer takes longer than 10 s (quick task 261030-11v, D-2).
+PHOTO_TIMEOUT: tuple[float, float] = (5.0, 30.0)
 # The getMe health probe made before a chart post while the bot is degraded (D-1).
 PROBE_TIMEOUT: tuple[float, float] = (5.0, 5.0)
 # The wait used when a 429 carries no usable retry_after (STACK G13).
@@ -200,10 +205,12 @@ class TelegramClient:
         *,
         api_base: str = DEFAULT_API_BASE,
         timeout: tuple[float, float] = DEFAULT_TIMEOUT,
+        photo_timeout: tuple[float, float] = PHOTO_TIMEOUT,
         probe_timeout: tuple[float, float] = PROBE_TIMEOUT,
     ) -> None:
         self._base = f"{api_base}/bot{token}"
         self._timeout = timeout
+        self._photo_timeout = photo_timeout
         self._probe_timeout = probe_timeout
 
     def __repr__(self) -> str:
@@ -237,6 +244,7 @@ class TelegramClient:
             data={"chat_id": str(chat_id), "caption": caption, "disable_notification": "true"},
             files={PHOTO_FIELD: (PHOTO_FILENAME, png, _PNG_TYPE)},
             want_message_id=True,
+            timeout=self._photo_timeout,
         )
         return _logged("sendPhoto", result)
 
@@ -258,6 +266,7 @@ class TelegramClient:
             },
             files={MEDIA_ATTACH: (PHOTO_FILENAME, png, _PNG_TYPE)},
             chart=True,
+            timeout=self._photo_timeout,
         )
         return _logged("editMessageMedia", result)
 
