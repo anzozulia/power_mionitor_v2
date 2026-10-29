@@ -14,7 +14,8 @@ multipart bodies are read back with ``parse_multipart``.
   message id is ``maybe_delivered``, since the photo cannot be recorded.
 - D-07: a missing pin right stays ``permanent`` (the lifecycle's pin-failure path).
 - D-08: a fresh session per call, the short (5 s, 10 s) timeouts, no redirects, no client
-  retries.
+  retries; the two photo uploads wait (5 s, 30 s) and the getMe probe (5 s, 5 s)
+  (quick task 261030-11v).
 - INV-23: result codes are short fixed strings, never the token or Telegram's text.
 - 261006-qv7 (DATA-02 amended): an ok sendMessage carries Telegram's message id when it is
   usable, and stays ok without one; deleteMessage names a stored message, and "message to
@@ -533,7 +534,23 @@ def test_chart_calls_use_the_short_timeouts_and_no_redirects(
 
     assert result == SendResult("permanent", code="http_302")
     assert len(fake_telegram.calls) == 1
-    assert fake_telegram.calls[0].request.req_kwargs["timeout"] == (5.0, 10.0)
+    # The two photo uploads wait 30 s for Telegram's answer (261030-11v, D-2).
+    expected = {"sendPhoto": (5.0, 30.0), "editMessageMedia": (5.0, 30.0)}.get(method, (5.0, 10.0))
+    assert fake_telegram.calls[0].request.req_kwargs["timeout"] == expected
+
+
+def test_photo_timeout_is_configurable(fake_telegram: Any) -> None:
+    fake_telegram.accept_chart(TOKEN)
+    fake_telegram.accept(TOKEN)
+    client = TelegramClient(TOKEN, photo_timeout=(1.0, 2.0))
+
+    client.send_photo(DEFAULT_CHAT_ID, PNG, CAPTION)
+    client.send_message(DEFAULT_CHAT_ID, "text")
+
+    sent_photo, sent_message = (call.request for call in fake_telegram.calls)
+    assert sent_photo.req_kwargs["timeout"] == (1.0, 2.0)
+    # Every other method keeps the default pair.
+    assert sent_message.req_kwargs["timeout"] == (5.0, 10.0)
 
 
 @pytest.mark.parametrize("method", METHODS)
