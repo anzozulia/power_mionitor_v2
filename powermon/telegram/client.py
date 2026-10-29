@@ -39,7 +39,8 @@ No method raises across its boundary. Every outcome comes back as a ``SendResult
 - ``maybe_delivered``: the request may have reached Telegram (read timeout after the
   request was written, connection dropped after sending, a TLS error after the handshake,
   any other transport error). The caller decides what that means: an alert is never resent
-  (INV-16), an ambiguous chart post is posted again (D-06). A ``sendPhoto`` that Telegram
+  (INV-16), an ambiguous chart post is posted again (D-06), but only after a ``getMe``
+  probe (``get_me``) answers ok (quick task 261030-11v). A ``sendPhoto`` that Telegram
   accepted without a usable ``message_id`` is ``maybe_delivered`` too (code
   ``no_message_id``): the photo may exist but cannot be recorded.
 - ``rate_limited``: HTTP 429; ``retry_after`` is the wait in whole seconds.
@@ -64,7 +65,7 @@ errors and of ``raise_for_status()`` (STACK G3, P-12). So this module never call
 method, kind and code. The adapter keeps requests' default of no retries, and nothing
 sleeps: all retry timing belongs to the caller (the outbox relay, INV-15/16, and the chart
 lifecycle). Every call passes explicit (connect, read) timeouts, because requests has no
-default timeout.
+default timeout: (5 s, 10 s) by default, (5 s, 5 s) for the ``getMe`` probe (261030-11v).
 """
 
 import json
@@ -93,6 +94,8 @@ SendKind = Literal[
 
 DEFAULT_API_BASE = "https://api.telegram.org"
 DEFAULT_TIMEOUT: tuple[float, float] = (5.0, 10.0)
+# The getMe health probe made before a chart post while the bot is degraded (D-1).
+PROBE_TIMEOUT: tuple[float, float] = (5.0, 5.0)
 # The wait used when a 429 carries no usable retry_after (STACK G13).
 DEFAULT_RETRY_AFTER_S = 30
 # The multipart file field of sendPhoto, the attach:// name of editMessageMedia's file
@@ -197,9 +200,11 @@ class TelegramClient:
         *,
         api_base: str = DEFAULT_API_BASE,
         timeout: tuple[float, float] = DEFAULT_TIMEOUT,
+        probe_timeout: tuple[float, float] = PROBE_TIMEOUT,
     ) -> None:
         self._base = f"{api_base}/bot{token}"
         self._timeout = timeout
+        self._probe_timeout = probe_timeout
 
     def __repr__(self) -> str:
         return "TelegramClient(<token hidden>)"
@@ -294,6 +299,16 @@ class TelegramClient:
         )
         return _logged("deleteMessage", result)
 
+    def get_me(self) -> SendResult:
+        """Ask Telegram for the bot itself (``getMe``): the health probe (261030-11v, D-1).
+
+        It changes nothing in any chat, so repeating it is harmless. It uses the short
+        ``probe_timeout`` (5 s, 5 s): it only asks whether Telegram answers this bot now,
+        and ``ok`` means it did.
+        """
+        result = self._call("getMe", timeout=self._probe_timeout)
+        return _logged("getMe", result)
+
     def _call(
         self,
         method: str,
@@ -305,8 +320,12 @@ class TelegramClient:
         keep_message_id: bool = False,
         chart: bool = False,
         delete: bool = False,
+        timeout: tuple[float, float] | None = None,
     ) -> SendResult:
-        """POST one Bot API ``method`` (a JSON body, or ``data`` + ``files`` as multipart)."""
+        """POST one Bot API ``method`` (a JSON body, or ``data`` + ``files`` as multipart).
+
+        ``timeout`` overrides the client's default (connect, read) pair for this call.
+        """
         try:
             # A fresh session per call, so no stale keep-alive connection fails mid-request
             # and every request starts with connect(). No redirects: a redirected POST
@@ -317,7 +336,7 @@ class TelegramClient:
                     json=json_body,
                     data=data,
                     files=files,
-                    timeout=self._timeout,
+                    timeout=self._timeout if timeout is None else timeout,
                     allow_redirects=False,
                 )
         except requests.ConnectTimeout:  # before ConnectionError, which it subclasses

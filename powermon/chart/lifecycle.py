@@ -179,7 +179,10 @@ doubling, at most 15 min. So a failed step's key always outlives its bot's hold,
 location's other due steps go first (D-02), except while it has a stale record: then a
 failed release holds every step of that location, and the location's next stale record,
 if any, goes first (Pitfall 1); and an ambiguous post, which is posted again
-(D-06), slows down to at most 4 untracked photos an hour. Permanent errors and render
+(D-06), slows down to at most 4 untracked photos an hour. While the bot is degraded (a
+call of it timed out or got a 5xx, ``io_loop.note_bot_health``), a post is made only after
+a ``getMe`` probe answers ok; otherwise it waits like a failed step and no photo is sent
+(quick task 261030-11v). Permanent errors and render
 errors wait a fixed 15 min. A step whose call was made but whose record UPDATE raised a
 database error (refresh, pin, finalize, unpin: all idempotent) waits ``step_delay(n)``
 too, so a write that keeps failing never turns into a call per pass. Any other
@@ -200,7 +203,8 @@ would turn into a call per pass. The alert relay's keys are never touched.
 Each call logs one INFO line, ``chart <step> for location <id>: <kind> (<code>)
 render_ms=<n> call_ms=<n>``, with no token and no Telegram description (OPS-08); a redraw
 after an outage removal says ``redraw`` in place of ``refresh`` (its key stays the
-refresh step's).
+refresh step's). A degraded bot's probe before a post logs ``chart probe for location
+<id>: <kind> (<code>) call_ms=<n>`` (261030-11v).
 """
 
 import logging
@@ -806,10 +810,18 @@ def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | No
         if _stopped(stop) or not outbox.lease_holds(state.lease_pid):
             return False
         client = TelegramClient(location.bot_token)
+        if action.step == "post" and io_loop.is_degraded(state, location.bot_token):
+            # The one chart call that is not idempotent: no blind post while the bot is
+            # degraded (261030-11v, D-1). The probe is a call, so the pass made one.
+            if not _probe_ok(client, action, key, clock, state):
+                return True
+            if _stopped(stop) or not outbox.lease_holds(state.lease_pid):
+                return True
         called = clock.monotonic()
         result = _call(client, action, content)
         call_ms = _ms(clock.monotonic() - called)
         answered = clock.now()
+        io_loop.note_bot_health(state, location.bot_token, result)
         log.info(
             "chart %s for location %s: %s (%s) render_ms=%d call_ms=%d",
             label,
@@ -867,6 +879,67 @@ def _call(client: TelegramClient, action: Action, content: tuple[bytes, str] | N
         # message that is not pinned answers "not modified" (ok) or "not found" (D-08).
         return client.unpin_chat_message(row.chat_id, row.message_id)
     raise ValueError(f"no call for the chart step {action.step!r}")
+
+
+def _probe_ok(
+    client: TelegramClient,
+    action: Action,
+    key: str,
+    clock: Clock,
+    state: io_loop.RelayState,
+) -> bool:
+    """While the bot is degraded, ask Telegram first whether it answers (261030-11v, D-1).
+
+    A post is the one chart call that is not idempotent: an ambiguous one may have put a
+    photo in the channel, and posting again then duplicates it. So while the bot's last
+    call timed out or got a 5xx (``io_loop.note_bot_health``), a post is made only after a
+    ``getMe`` probe answers ok. Any other probe outcome defers the post like a failed step
+    (``_probe_failed``) and sends no photo. Logs one INFO line,
+    ``chart probe for location <id>: <kind> (<code>) call_ms=<n>``.
+    """
+    called = clock.monotonic()
+    probe = client.get_me()
+    call_ms = _ms(clock.monotonic() - called)
+    answered = clock.now()
+    io_loop.note_bot_health(state, action.location.bot_token, probe)
+    log.info(
+        "chart probe for location %s: %s (%s) call_ms=%d",
+        action.location.location_id,
+        probe.kind,
+        probe.code,
+        call_ms,
+    )
+    if probe.kind == "ok":
+        return True
+    _probe_failed(action, key, probe, answered, state)
+    return False
+
+
+def _probe_failed(
+    action: Action, key: str, probe: SendResult, answered: datetime, state: io_loop.RelayState
+) -> None:
+    """The probe did not answer ok: the post waits like a failed step, and no photo is sent.
+
+    The step's consecutive failures grow and it waits ``step_delay(n)``; a bot-wide probe
+    outcome (429, 5xx, refused connection) also holds the bot as ``_fail`` would (D-1).
+    """
+    failures = state.chart_failures.get(key, 0) + 1
+    state.chart_failures[key] = failures
+    delay = step_delay(failures)
+    hold = _bot_hold(probe, failures)
+    if hold is not None:
+        state.not_before[io_loop.bot_wide_key(action.location.bot_token)] = answered + hold
+        delay = hold + delay
+    state.not_before[key] = answered + delay
+    log.warning(
+        "chart post for location %s: the bot failed its health probe (%s, %s); no photo is "
+        "sent and the post is tried again in %d s (attempt %d)",
+        action.location.location_id,
+        probe.kind,
+        probe.code,
+        delay // timedelta(seconds=1),
+        failures,
+    )
 
 
 def _apply(
@@ -1335,7 +1408,8 @@ def _fail(
       min(2**n, BACKOFF_CAP_S) s), and the step waits ``step_delay(n)`` longer, so the
       location's other steps go first once the hold ends;
     - maybe_delivered: ``step_delay(n)``. A post may exist but is never recorded, pinned
-      or edited, and is posted again after the wait (D-06); an edit or pin is idempotent.
+      or edited, and is posted again after the wait (D-06), and only after a getMe probe
+      answers ok while the bot is degraded; an edit or pin is idempotent.
 
     It never writes ``chat_key``: a chart failure must not hold the channel's alerts.
     """
