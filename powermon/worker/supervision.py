@@ -5,7 +5,8 @@ restarts nothing (INV-13). So a stalled loop must end the worker process, and th
 thread watches the loops (D-15, OPS-05):
 
 - Each loop stamps ``Progress`` at the top of every iteration, after every location of a
-  detection cycle and after every outbox row.
+  detection cycle and, in the I/O loop, after every subscriber head, the ops step, the
+  delete step and the chart step.
 - ``Watchdog.check()`` finds a loop whose last stamp is more than its limit old
   (detection 60 s, Telegram I/O 180 s), or whose thread has died while the worker is not
   stopping, and runs the stall action once. A loop thread that ended because of the stop
@@ -54,6 +55,9 @@ HEALTH_FILE = Path("/tmp/powermon-worker.health")  # noqa: S108 - container-priv
 # How long each loop may go without stamping (D-15). A detection cycle's worst bounded
 # chain (lease check, reconnect, one location's statements) and an I/O row's (claim,
 # send with connect and read timeouts, apply) fit well inside (RESEARCH timing budget).
+# The longest step between two telegram-io stamps is a chart post behind its getMe probe:
+# (5 + 5) + (5 + 30) s, or 55 s with a second address family's connect attempt each, well
+# inside 180 s (quick task 261030-11v; tests/worker/test_io_stall_budget.py).
 DETECTION_STALL_S = 60.0
 IO_STALL_S = 180.0
 STALL_LIMITS_S = {"detection": DETECTION_STALL_S, "telegram-io": IO_STALL_S}

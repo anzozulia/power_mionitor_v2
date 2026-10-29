@@ -231,6 +231,12 @@ _BOT_WIDE_KINDS = ("rate_limited", "transient", "not_sent")
 # The same kinds for the chart lifecycle, which holds a bot for them as an alert would.
 BOT_WIDE_KINDS = _BOT_WIDE_KINDS
 _BOT_WIDE_PREFIX = "bot:"
+# Outcomes after which Telegram may not be answering a bot normally: a read timeout or a
+# connection dropped after the request was written, or a 5xx (quick task 261030-11v, D-1).
+_DEGRADED_KINDS = ("maybe_delivered", "transient")
+# Outcomes that show Telegram answered the bot: an ok, or a definite refusal other than a
+# 429. A 429 and a request that never left the client (not_sent) change nothing (D-1).
+_ANSWERED_KINDS = ("ok", "permanent", "edit_target_missing")
 
 
 @dataclass(frozen=True)
@@ -276,6 +282,10 @@ class RelayState:
     yet, by (location id, local date) -> (chat id, message id, answer time, bot key); the
     bot key (``bot_key``) is that of the token that posted it (D-08). The next chart step
     writes it first, so it is never posted a second time (WR-04 analogue).
+    ``degraded``: the ``bot_key`` of each bot whose last Telegram call ended
+    ``maybe_delivered`` or ``transient`` (``note_bot_health``). While a bot is in it, the
+    chart lifecycle makes no post before a ``getMe`` probe answers ok (261030-11v, D-1). In
+    memory, so a restart starts with every bot healthy.
     ``failing``: the ``chat_key`` the relay holds for each location whose subscriber alert
     was refused permanently, by location id; that channel's 15-minute hold lasts while the
     location's ``delivery_failing`` incident is open, and goes once it closes (D-12).
@@ -294,6 +304,7 @@ class RelayState:
         default_factory=dict
     )
     failing: dict[int, str] = field(default_factory=dict)
+    degraded: set[str] = field(default_factory=set)
     last_wall: datetime | None = None
     last_mono: float | None = None
 
@@ -339,6 +350,25 @@ def bot_wide_key(token: str) -> str:
 def delete_key(location_id: int) -> str:
     """A location's delete step backoff key: by location id, never a token (261006-qv7)."""
     return f"delete:{location_id}"
+
+
+def note_bot_health(state: RelayState, token: str, result: SendResult) -> None:
+    """Update the bot's degraded mark from one Telegram outcome (261030-11v, D-1).
+
+    A ``maybe_delivered`` or ``transient`` outcome sets it; an ``ok``, a permanent refusal
+    or ``edit_target_missing`` (Telegram answered) clears it; a 429 or a request that never
+    left the client changes nothing. Memory only; nothing is logged (OPS-08).
+    """
+    key = bot_key(token)
+    if result.kind in _DEGRADED_KINDS:
+        state.degraded.add(key)
+    elif result.kind in _ANSWERED_KINDS:
+        state.degraded.discard(key)
+
+
+def is_degraded(state: RelayState, token: str) -> bool:
+    """True while the bot's last telling Telegram outcome was a timeout or a 5xx (D-1)."""
+    return bot_key(token) in state.degraded
 
 
 def activate(state: RelayState, clock: Clock) -> int:
@@ -508,6 +538,7 @@ def notify_db_down(status: LeaseStatus, clock: Clock, state: RelayState) -> bool
     if max(state.not_before.get(key, now), state.not_before.get(bot_wide_key(token), now)) > now:
         return False
     result = TelegramClient(token).send_message(chat_id, text)
+    note_bot_health(state, token, result)
     if result.kind in ("ok", "maybe_delivered"):
         # An ambiguous send may have reached the admin: never repeated (INV-16).
         state.db_down_notified = True
@@ -564,6 +595,7 @@ def _delete_one(clock: Clock, state: RelayState) -> bool:
         if not outbox.lease_holds(state.lease_pid):
             return False
         result = TelegramClient(token).delete_message(chat_id, message_id)
+        note_bot_health(state, token, result)
         # The call may have blocked for seconds: waits count from its answer.
         answered = clock.now()
         log.log(
@@ -780,6 +812,7 @@ def _send(
         _write(Unapplied(row, attempts, None, clock.now(), key, bot_wide), state)
         return False
     result = client.send_message(chat_id, text)
+    note_bot_health(state, token, result)
     # The send may have blocked for seconds: waits and sent_at count from its answer.
     _write(Unapplied(row, attempts, result, clock.now(), key, bot_wide, chat_id), state)
     return True

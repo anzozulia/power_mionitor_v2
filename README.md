@@ -442,6 +442,10 @@ changes the rules for `Europe/Kyiv`, bump the Python and postgres image tags.
   - The worker unpins only the charts it posted itself, by their message, in the chat
     they were posted to; pins the channel admin made stay. If today's chart is deleted in
     the channel, one replacement is posted and pinned.
+  - If Telegram stops answering a bot (a call times out or gets a 5xx), no new chart is
+    posted for it until a quick getMe check answers; then exactly one is posted. Chart
+    uploads wait up to 30 s for Telegram's answer. (Amended 2026-10-30, quick task
+    261030-11v.)
   - A channel pin may leave a "pinned a photo" service message in the channel each day
     (Telegram's behaviour; it is checked once in section 12).
   - Cost: a render takes about 0.1 to 0.3 s of CPU and about 35 MB of extra worker memory
@@ -453,6 +457,8 @@ changes the rules for `Europe/Kyiv`, bump the Python and postgres image tags.
     line, `chart <post|pin|finalize|unpin|refresh|redraw|release> for location <id>:
     <result> (<code>) render_ms=<n> call_ms=<n>` (`release` unpins a chart after a chat or
     token change or a delete; "Location page" below; `redraw` follows an outage removal).
+    While a bot is degraded, the getMe check before a post logs `chart probe for location
+    <id>: <kind> (<code>) call_ms=<n>` (quick task 261030-11v).
     Each delete of a removed outage's alert logs `alert delete for location <id>: <kind>
     (<code>) outbox <id>`, at WARNING when Telegram refused it or it was too old. A pass
     makes either one delete or one chart call, never both. (Amended 2026-10-06, quick task 261006-qv7.)

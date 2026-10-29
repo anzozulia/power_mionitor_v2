@@ -14,7 +14,8 @@ multipart bodies are read back with ``parse_multipart``.
   message id is ``maybe_delivered``, since the photo cannot be recorded.
 - D-07: a missing pin right stays ``permanent`` (the lifecycle's pin-failure path).
 - D-08: a fresh session per call, the short (5 s, 10 s) timeouts, no redirects, no client
-  retries.
+  retries; the two photo uploads wait (5 s, 30 s) and the getMe probe (5 s, 5 s)
+  (quick task 261030-11v).
 - INV-23: result codes are short fixed strings, never the token or Telegram's text.
 - 261006-qv7 (DATA-02 amended): an ok sendMessage carries Telegram's message id when it is
   usable, and stays ok without one; deleteMessage names a stored message, and "message to
@@ -533,7 +534,23 @@ def test_chart_calls_use_the_short_timeouts_and_no_redirects(
 
     assert result == SendResult("permanent", code="http_302")
     assert len(fake_telegram.calls) == 1
-    assert fake_telegram.calls[0].request.req_kwargs["timeout"] == (5.0, 10.0)
+    # The two photo uploads wait 30 s for Telegram's answer (261030-11v, D-2).
+    expected = {"sendPhoto": (5.0, 30.0), "editMessageMedia": (5.0, 30.0)}.get(method, (5.0, 10.0))
+    assert fake_telegram.calls[0].request.req_kwargs["timeout"] == expected
+
+
+def test_photo_timeout_is_configurable(fake_telegram: Any) -> None:
+    fake_telegram.accept_chart(TOKEN)
+    fake_telegram.accept(TOKEN)
+    client = TelegramClient(TOKEN, photo_timeout=(1.0, 2.0))
+
+    client.send_photo(DEFAULT_CHAT_ID, PNG, CAPTION)
+    client.send_message(DEFAULT_CHAT_ID, "text")
+
+    sent_photo, sent_message = (call.request for call in fake_telegram.calls)
+    assert sent_photo.req_kwargs["timeout"] == (1.0, 2.0)
+    # Every other method keeps the default pair.
+    assert sent_message.req_kwargs["timeout"] == (5.0, 10.0)
 
 
 @pytest.mark.parametrize("method", METHODS)
@@ -663,6 +680,44 @@ def test_chart_result_codes_never_contain_the_token(
     assert all(secret not in str(record.args) for record in caplog.records)
     # Every failure is logged, by method, kind and code only.
     assert f"telegram {method}: " in caplog.text
+
+
+# getMe: the health probe before a degraded bot's chart post (quick task 261030-11v, D-1)
+
+
+def test_get_me_ok_uses_the_short_probe_timeouts(fake_telegram: Any) -> None:
+    fake_telegram.accept_probe(TOKEN)
+
+    result = _client().get_me()
+
+    assert result == SendResult("ok")
+    assert len(fake_telegram.calls) == 1
+    request = fake_telegram.calls[0].request
+    assert request.url.endswith("/getMe")
+    assert request.req_kwargs["timeout"] == (5.0, 5.0)
+    assert fake_telegram.chart_calls == []
+
+
+def test_get_me_read_timeout_is_maybe_delivered(fake_telegram: Any) -> None:
+    fake_telegram.fail_method(TOKEN, "getMe", exc=requests.ReadTimeout())
+
+    assert _client().get_me() == SendResult("maybe_delivered", code="read_timeout")
+
+
+def test_get_me_refused_is_permanent(fake_telegram: Any) -> None:
+    body = {"ok": False, "error_code": 401, "description": "Unauthorized"}
+    fake_telegram.fail_method(TOKEN, "getMe", status=401, json_body=body)
+
+    result = _client().get_me()
+
+    assert (result.kind, result.code) == ("permanent", "http_401")
+
+
+def test_get_me_bad_gateway_is_transient(fake_telegram: Any) -> None:
+    body = {"ok": False, "error_code": 502, "description": "Bad Gateway"}
+    fake_telegram.fail_method(TOKEN, "getMe", status=502, json_body=body)
+
+    assert _client().get_me() == SendResult("transient", code="http_502")
 
 
 # The fake's per-method helpers, which the chart lifecycle tests build on
