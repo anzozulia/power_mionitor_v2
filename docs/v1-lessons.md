@@ -205,12 +205,13 @@ Source: a September 2026 investigation of the v1 codebase (Django, last changed 
 - **Covers:** ALRT-05, ALRT-06, OPS-03, LOC-03, LOC-07
 
 #### INV-17 Chart messages are recorded before pinning, and posting is idempotent
-- **Rule:** The chart record (location, local date, chat id, message id) is stored as soon as the send succeeds, before pinning. Whether the message is pinned is stored in a separate field. Before posting, check whether a record already exists for that location and date. If it does, edit that message instead of posting a new one. The refresh edits today's message whether or not it is pinned. If Telegram reports "message to edit not found", post one replacement.
+- **Rule:** The chart record (location, local date, chat id, message id) is stored as soon as the send succeeds, before pinning. Whether the message is pinned is stored in a separate field. Before posting, check whether a record already exists for that location and date. If it does, edit that message instead of posting a new one. The refresh edits today's message whether or not it is pinned. If Telegram reports "message to edit not found", post one replacement. An ambiguous chart post is not posted again while the bot is degraded (a call of it timed out or got a 5xx): a getMe probe must answer first. (Amended 2026-10-30, quick task 261030-11v.)
 - **v1 failure:** v1 sent and pinned first, then inserted the record, and swallowed the error when the record already existed. A bot that could post but not pin, or three quick pin errors, left no record. That day's chart was then never refreshed, every day, and the only trace was an ERROR log line. A restart at 00:00:40 or a manual command posted and pinned an extra chart that nothing tracked. A chart deleted by a channel admin made every 15-min edit fail for the rest of the day.
 - **Acceptance:**
   - Given a bot that can post but not pin, when the midnight job runs, then the chart is posted, recorded and refreshed every 15 min, and the admin is told that pinning failed.
   - Given today's chart already exists, when the daily job runs again (a restart at 00:00:40 or a manual trigger), then 0 new messages are posted.
   - Given today's chart was deleted in the channel, when the next refresh runs, then exactly 1 replacement is posted and pinned.
+  - Given Telegram times out every call of the bot from 23:33 to 00:36, when the midnight chart is due, then no photo is posted until a getMe probe answers ok, and then exactly 1 is posted and pinned. (Amended 2026-10-30, quick task 261030-11v.)
 - **Covers:** CHRT-05, CHRT-02
 
 #### INV-18 Scheduled jobs catch up after missed runs
