@@ -665,6 +665,44 @@ def test_chart_result_codes_never_contain_the_token(
     assert f"telegram {method}: " in caplog.text
 
 
+# getMe: the health probe before a degraded bot's chart post (quick task 261030-11v, D-1)
+
+
+def test_get_me_ok_uses_the_short_probe_timeouts(fake_telegram: Any) -> None:
+    fake_telegram.accept_probe(TOKEN)
+
+    result = _client().get_me()
+
+    assert result == SendResult("ok")
+    assert len(fake_telegram.calls) == 1
+    request = fake_telegram.calls[0].request
+    assert request.url.endswith("/getMe")
+    assert request.req_kwargs["timeout"] == (5.0, 5.0)
+    assert fake_telegram.chart_calls == []
+
+
+def test_get_me_read_timeout_is_maybe_delivered(fake_telegram: Any) -> None:
+    fake_telegram.fail_method(TOKEN, "getMe", exc=requests.ReadTimeout())
+
+    assert _client().get_me() == SendResult("maybe_delivered", code="read_timeout")
+
+
+def test_get_me_refused_is_permanent(fake_telegram: Any) -> None:
+    body = {"ok": False, "error_code": 401, "description": "Unauthorized"}
+    fake_telegram.fail_method(TOKEN, "getMe", status=401, json_body=body)
+
+    result = _client().get_me()
+
+    assert (result.kind, result.code) == ("permanent", "http_401")
+
+
+def test_get_me_bad_gateway_is_transient(fake_telegram: Any) -> None:
+    body = {"ok": False, "error_code": 502, "description": "Bad Gateway"}
+    fake_telegram.fail_method(TOKEN, "getMe", status=502, json_body=body)
+
+    assert _client().get_me() == SendResult("transient", code="http_502")
+
+
 # The fake's per-method helpers, which the chart lifecycle tests build on
 
 

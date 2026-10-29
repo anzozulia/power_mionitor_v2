@@ -185,11 +185,15 @@ class FakeTelegram:
     that bot's chart calls and its deleteMessage calls (the calls that name a stored
     message, ``CHART_METHODS``) with ok and records each one in ``chart_calls``: sendPhoto
     answers the message ids 1001, 1002, ..., editMessageMedia the edited message,
-    pinChatMessage, unpinChatMessage and deleteMessage ``true``.
+    pinChatMessage, unpinChatMessage and deleteMessage ``true``. It also answers the
+    bot's getMe health probe with ok (``accept_probe``, 261030-11v), not recorded in
+    ``chart_calls``.
     ``fail_method`` and ``answer_method`` are ``fail`` and ``answer`` for one method;
     ``count(token, method)`` counts every request, failed ones included. Several
     registrations for one URL answer in registration order and the last one repeats, so
-    ``fail_method`` before ``accept_chart`` fails the first call only. A call to any bot or
+    ``fail_method`` before ``accept_chart`` fails the first call only; likewise
+    ``fail_method(token, "getMe", ...)`` before ``accept_probe`` or ``accept_chart`` fails
+    the first probe only. A call to any bot or
     method that was not registered raises ``requests.ConnectionError``.
     """
 
@@ -288,6 +292,12 @@ class FakeTelegram:
                 callback=self._chart_callback(token, method),
                 content_type="application/json",
             )
+        self.accept_probe(token)
+
+    def accept_probe(self, token: str) -> None:
+        """Answer the bot's getMe health probe with ok (261030-11v); not in ``chart_calls``."""
+        body = {"ok": True, "result": {"id": 1, "is_bot": True, "first_name": "Fake bot"}}
+        self.rsps.add(responses.POST, self._url(token, "getMe"), json=body)
 
     def fail_method(
         self,
