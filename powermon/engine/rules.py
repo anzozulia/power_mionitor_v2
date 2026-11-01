@@ -84,7 +84,9 @@ def longest_timeout(period_s: int, grace_s: int, router_grace: bool) -> timedelt
     Period + grace, plus ``ROUTER_GRACE`` when router-reconnect grace is on.
     ``effective_timeout`` adds the router grace only while its window applies, so it is
     never longer: an outage that started before ``t`` is recorded by the first detection
-    cycle after ``t`` + this (the chart's final edit waits for it, INV-03).
+    cycle after ``t`` + this. The chart's final edit waits for max(this, the boot delay)
+    (``lifecycle.settle_time``, INV-03), since a restore can be dated up to the boot delay
+    before it was received.
     """
     timeout = timedelta(seconds=period_s + grace_s)
     return timeout + ROUTER_GRACE if router_grace else timeout

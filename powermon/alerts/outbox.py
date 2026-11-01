@@ -479,10 +479,15 @@ def lease_holds(pid: int | None) -> bool:
 def restores(row: OutboxMessage, outage_start: datetime) -> bool:
     """True when the power_on row ``row`` ends the outage that starts at ``outage_start``.
 
-    ``record_heartbeat`` queues the ON alert with ``event_at`` = the restore and
-    ``payload["was_off_us"]`` = restore - outage start, so the match is exact in integer
-    microseconds. It also holds when power returned while the location was not monitored,
-    where the timeline has no boundary at the restore (RESEARCH Pitfall 2).
+    ``record_heartbeat`` queues the ON alert with ``event_at`` = the restore, which is the
+    receive time backdated by the location's boot delay (no earlier than the outage start
+    or a not-monitored piece's end, MON-03 as amended by quick task 261101-g9v), and
+    ``payload["was_off_us"]`` = restore - outage start. One ``at`` feeds both, so
+    ``event_at - outage_start == was_off_us`` and ``event_at >= outage_start`` hold for every
+    ON row, and the match is exact in integer microseconds. ``history._on_alerts``,
+    ``fail_delete`` and ``restore.KEEP_REMOVED_ON_DROPPED_SQL`` rely on that. It also holds
+    when power returned while the location was not monitored, where the timeline has no
+    boundary at the restore (RESEARCH Pitfall 2).
     """
     was_off = row.payload.get("was_off_us") if isinstance(row.payload, dict) else None
     if not isinstance(was_off, int) or isinstance(was_off, bool):

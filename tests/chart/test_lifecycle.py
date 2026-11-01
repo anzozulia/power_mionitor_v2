@@ -1021,6 +1021,52 @@ def test_settle_time_is_the_longest_timeout_plus_the_lapse_threshold() -> None:
     assert lifecycle.settle_time(3600, 3600, False) == timedelta(hours=2, seconds=15)
 
 
+def test_settle_time_waits_for_the_boot_delay() -> None:
+    # A restore is dated up to the boot delay before it was received (261101-g9v): the wait
+    # is max(longest timeout, delay) + the lapse threshold, never their sum.
+    assert lifecycle.settle_time(60, 30, False, 300) == timedelta(seconds=315)
+    # Edge: a delay shorter than the timeout changes nothing (router grace 270 s > 60 s).
+    assert lifecycle.settle_time(60, 30, True, 60) == timedelta(seconds=285)
+    assert lifecycle.settle_time(60, 30, False, 0) == timedelta(seconds=105)
+    assert lifecycle.settle_time(60, 30, False, 90) == timedelta(seconds=105)
+    # The positional three-argument form keeps the old wait (no boot delay).
+    assert lifecycle.settle_time(60, 30, False) == lifecycle.settle_time(60, 30, False, 0)
+
+    # A location with that wait settles yesterday only once the cursor passed end + 315 s.
+    location = dataclasses.replace(_location(1), settle=lifecycle.settle_time(60, 30, False, 300))
+    yesterday = TODAY - timedelta(days=1)
+    rows = [_row(10, 1, rendered=NOON_05 - timedelta(days=1), day=yesterday)]
+    end = model.next_midnight(yesterday, KYIV)
+
+    def settled(cursor: datetime) -> frozenset[int]:
+        return lifecycle.settled_records(
+            [location], rows, today=TODAY, detected_until=cursor, tz=KYIV
+        )
+
+    assert settled(end + timedelta(seconds=105)) == frozenset()
+    assert settled(end + timedelta(seconds=315) - timedelta(microseconds=1)) == frozenset()
+    assert settled(end + timedelta(seconds=315)) == {10}
+
+
+def test_settle_time_rejects_a_non_numeric_boot_delay() -> None:
+    # Failure case: the delay is seconds as an int, as the DB column holds it.
+    with pytest.raises(TypeError):
+        lifecycle.settle_time(60, 30, False, "300")  # type: ignore[arg-type]
+
+
+def test_read_snapshot_settle_includes_the_location_boot_delay(
+    location_factory: Callable[..., Any],
+) -> None:
+    # LOCATIONS_SQL's last column (r[11]) is the boot delay; the snapshot's settle waits for it.
+    location = _monitored(location_factory, period_s=60, grace_s=30)
+    Location.objects.filter(pk=location.pk).update(boot_delay_s=300)
+    [snapshot], _ = lifecycle.read_snapshot(TODAY)
+    assert snapshot.settle == timedelta(seconds=315)
+    Location.objects.filter(pk=location.pk).update(boot_delay_s=0)
+    [snapshot], _ = lifecycle.read_snapshot(TODAY)
+    assert snapshot.settle == timedelta(seconds=105)
+
+
 def test_settled_records_wait_for_the_detection_cursor() -> None:
     a = _location(1)
     b = _location(2, TOKEN_B, router_grace=True)

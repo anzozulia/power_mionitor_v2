@@ -179,6 +179,75 @@ def test_ALRT04_late_on_prefix_dst_2027_03_28(
     ]
 
 
+# A restore backdated by the location's boot delay (261101-g9v): the ON row's event_at is
+# earlier than its recorded_at. Lateness still counts from recorded_at, and the prefix
+# shows the backdated event_at, the instant the chart shows. One row per test: a row
+# cannot be sent at two times.
+
+
+def _backdated_on(location: Any, *, event_at: datetime, recorded_at: datetime) -> OutboxMessage:
+    return _queue(location, "power_on", event_at=event_at, recorded_at=recorded_at)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_ALRT04_backdated_on_sent_within_120s_of_recorded_at_has_no_prefix(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    # Dated 10:20 local, received 10:22, sent 10:23:30: 210 s after event_at but only 90 s
+    # after recorded_at, so it is not late.
+    _backdated_on(
+        location_factory(),
+        event_at=datetime(2026, 10, 1, 7, 20, tzinfo=UTC),
+        recorded_at=datetime(2026, 10, 1, 7, 22, tzinfo=UTC),
+    )
+    fake_telegram.accept(TOKEN_A)
+
+    assert io_loop.run_iteration(
+        FakeClock(datetime(2026, 10, 1, 7, 23, 30, tzinfo=UTC)), io_loop.RelayState()
+    )
+
+    assert _texts(fake_telegram) == ["🟢 <b>POWER ON</b>" + WAS_OFF]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_ALRT04_late_backdated_on_shows_the_backdated_time(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    # Received 10:22, sent 10:30 (late): the prefix is the backdated 10:20, not 10:22.
+    _backdated_on(
+        location_factory(),
+        event_at=datetime(2026, 10, 1, 7, 20, tzinfo=UTC),
+        recorded_at=datetime(2026, 10, 1, 7, 22, tzinfo=UTC),
+    )
+    fake_telegram.accept(TOKEN_A)
+
+    assert io_loop.run_iteration(
+        FakeClock(datetime(2026, 10, 1, 7, 30, tzinfo=UTC)), io_loop.RelayState()
+    )
+
+    assert _texts(fake_telegram) == ["🟢 10:20 <b>POWER ON</b>" + WAS_OFF]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_ALRT04_late_backdated_on_across_local_midnight_shows_the_date(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    # Dated 23:59 local on 01.10, received 00:01 on 02.10, sent 00:10: the prefix carries
+    # the previous local date, as the chart draws the ON on 01.10.
+    _backdated_on(
+        location_factory(),
+        event_at=datetime(2026, 10, 1, 20, 59, tzinfo=UTC),
+        recorded_at=datetime(2026, 10, 1, 21, 1, tzinfo=UTC),
+    )
+    fake_telegram.accept(TOKEN_A)
+
+    assert io_loop.run_iteration(
+        FakeClock(datetime(2026, 10, 1, 21, 10, tzinfo=UTC)), io_loop.RelayState()
+    )
+
+    assert _texts(fake_telegram) == ["🟢 01.10 23:59 <b>POWER ON</b>" + WAS_OFF]
+
+
 @pytest.mark.django_db(transaction=True)
 def test_ALRT04_date_prefix_when_local_date_differs(
     location_factory: Callable[..., Any], fake_telegram: Any

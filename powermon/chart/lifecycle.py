@@ -56,6 +56,12 @@ worker was down is simply due on the next pass.
   settled (INV-03):
   OFF is recorded after the fact, backdated to the last heartbeat, so an outage that
   started in the day's last minutes is in the timeline only a timeout after midnight.
+  ON is dated up to the location's boot delay before the restoring heartbeat was received
+  (MON-03, amended by quick task 261101-g9v), so a heartbeat received up to that delay
+  after midnight can still add ON time to the finished day. The wait is the larger of the
+  two plus one lapse threshold (``settle_time``). Raising the boot delay after a day's
+  final edit was sent leaves that finished message stale by up to the increase (an
+  accepted residual: the finished chart is not redrawn).
   The record's day has settled once the detection cursor
   (``system_state.last_cycle_completed_at``) is the location's ``settle`` past the
   midnight that ends it (``settle_time``, ``settled_records``). The cursor, not the wall
@@ -275,11 +281,12 @@ _REFUSABLE: tuple[Step, ...] = ("post", "refresh")
 # active record (ROWS_SQL's predicate) to release: a deleted location's (D-09), or a
 # record a history reset marked (D-08), which brings in a location that waits for its
 # first heartbeat after the reset. Those only get their records released, and leave the
-# snapshot once every such record is retired. The last two columns flag a waiting
-# location and give its chart update period in minutes.
+# snapshot once every such record is retired. The last three columns flag a waiting
+# location, give its chart update period in minutes and its boot delay in seconds (r[11],
+# which ``settle_time`` waits for).
 LOCATIONS_SQL = """
 SELECT l.id, l.name, l.language, l.bot_token, l.chat_id, l.period_s, l.grace_s, l.router_grace,
-       l.deleted_at IS NOT NULL, s.status = 'waiting', l.chart_refresh_min
+       l.deleted_at IS NOT NULL, s.status = 'waiting', l.chart_refresh_min, l.boot_delay_s
   FROM location l
   JOIN location_state s ON s.location_id = l.id
  WHERE (s.status IN ('on', 'off') AND l.deleted_at IS NULL)
@@ -324,8 +331,9 @@ class ChartLocation:
     language: str
     bot_token: str = field(repr=False)
     chat_id: int
-    # How long after a day ends detection may still record an OFF that started in it
-    # (``settle_time``): the day's final edit waits until the detection cursor passed it.
+    # How long after a day ends detection may still record an OFF that started in it, or a
+    # restore backdated by the boot delay into it (``settle_time``): the day's final edit
+    # waits until the detection cursor passed it.
     settle: timedelta
     # A deleted location (D-09): every record it still has is released, nothing else.
     deleted: bool = False
@@ -436,8 +444,10 @@ def refresh_slot(now: datetime, every_min: int, tz: str) -> datetime:
     return minute - timedelta(minutes=local.minute % every_min)
 
 
-def settle_time(period_s: int, grace_s: int, router_grace: bool) -> timedelta:
-    """How long after an instant detection may still record an OFF that started before it.
+def settle_time(
+    period_s: int, grace_s: int, router_grace: bool, boot_delay_s: int = 0
+) -> timedelta:
+    """How long after an instant the timeline may still change before it.
 
     OFF is recorded after the fact (INV-03): the first detection cycle more than the
     effective timeout after the last heartbeat records it, backdated to that heartbeat. So
@@ -451,8 +461,18 @@ def settle_time(period_s: int, grace_s: int, router_grace: bool) -> timedelta:
     cursor back, so the final chart misses an OFF whose decisions failed in every cycle
     of that last lapse-threshold margin after ``t`` + the timeout (a few cycles; an
     accepted residual, code review WR-01).
+
+    A restore is dated up to the location's boot delay (``boot_delay_s``) before its
+    receive time (MON-03, amended by quick task 261101-g9v), so only heartbeats received
+    before ``t`` + the delay can add ON time before ``t``. The wait is the larger of the
+    timeout and the delay, never their sum: each bounds its own kind of late change. The
+    delay is read with the location at the start of the step, so raising it after a day's
+    final edit was sent leaves that finished message stale by up to the increase (an
+    accepted residual: the finished chart is not redrawn, D-14). The default 0 keeps the
+    wait as it was without a boot delay.
     """
-    return rules.longest_timeout(period_s, grace_s, router_grace) + lapse.LAPSE_THRESHOLD
+    timeout = rules.longest_timeout(period_s, grace_s, router_grace)
+    return max(timeout, timedelta(seconds=boot_delay_s)) + lapse.LAPSE_THRESHOLD
 
 
 def detection_cursor() -> datetime | None:
@@ -475,7 +495,8 @@ def settled_records(
     An older record's day has settled once the detection cursor (``detected_until``) is at
     least its location's ``settle`` past the local midnight that ends the day: every OFF
     that started in the day is then in the stored timeline (INV-03), including an outage
-    that crosses midnight, which counts on both days (chart-spec §8). The exception is an
+    that crosses midnight, which counts on both days (chart-spec §8), and every restore
+    backdated by the boot delay into the day (``settle_time``). The exception is an
     OFF whose decisions failed in every cycle of the short margin (one lapse threshold, a
     few cycles) just before the settle point: each failure is logged, and the finished
     chart is not redrawn (D-14), an accepted residual (code review WR-01).
@@ -520,7 +541,7 @@ def read_snapshot(today: date) -> tuple[list[ChartLocation], list[ChartRow]]:
                 language=r[2],
                 bot_token=r[3],
                 chat_id=r[4],
-                settle=settle_time(r[5], r[6], r[7]),
+                settle=settle_time(r[5], r[6], r[7], r[11]),
                 deleted=r[8],
                 awaiting_heartbeat=r[9],
                 refresh_min=r[10],

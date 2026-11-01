@@ -199,6 +199,40 @@ def test_INV03_1_off_span_and_total_match_the_on_alert(location_factory: Any) ->
     )
 
 
+@pytest.mark.django_db(transaction=True)
+def test_INV03_1_boot_delay_off_span_and_total_match_the_on_alert(location_factory: Any) -> None:
+    # Boot delay 120 s (261101-g9v): the restore received at 12:00 is dated 11:58, and one
+    # instant feeds the timeline and the ON alert, so the chart's off span is "was OFF for".
+    SystemState.objects.update_or_create(
+        pk=1,
+        defaults={
+            "detection_resumed_at": kyiv("2026-10-01 09:00"),
+            "web_started_at": None,
+            "last_cycle_completed_at": None,
+        },
+    )
+    location = location_factory(boot_delay_s=120)
+    assert transitions.record_heartbeat(location.pk, kyiv("2026-10-01 09:00")) == "started"
+    assert transitions.record_heartbeat(location.pk, kyiv("2026-10-01 10:00")) == "plain"
+    assert detection.run_cycle(kyiv("2026-10-01 10:01:31")) == 1
+    assert transitions.record_heartbeat(location.pk, kyiv("2026-10-01 12:00")) == "restored"
+
+    [alert] = OutboxMessage.objects.filter(kind="power_on")
+    was_off_us = alert.payload["was_off_us"]
+    today = _today(location, kyiv("2026-10-01 12:05"))
+
+    assert was_off_us == H + 58 * M
+    assert alert.event_at == kyiv("2026-10-01 11:58")
+    assert format_alert_duration(was_off_us, "en") == "1h 58m"
+    assert today.off_us == was_off_us
+    assert (format_total_duration(today.off_us, "en"), today.count) == ("1h 58m", 1)
+    assert today.segments == (
+        Segment("on", 9 * H, 10 * H),
+        Segment("off", 10 * H, 11 * H + 58 * M),
+        Segment("on", 11 * H + 58 * M, 12 * H + 5 * M),
+    )
+
+
 def test_week_query_includes_an_interval_that_started_before_the_week(
     location_factory: Any,
 ) -> None:
