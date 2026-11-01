@@ -67,7 +67,7 @@ Subscribers get a timely, correct OFF/ON alert for every real outage and never a
 
 ### How it works (domain rules)
 
-**Location settings:** name; heartbeat period (s, default 60, min 10); grace (s, default 30, min 10); Telegram bot token + chat/channel ID (per location); language (`uk` / `en` / `ru`); alerts on/off; maintenance mode; router-reconnect grace on/off. All times are stored in UTC and displayed in the instance timezone (default `Europe/Kyiv`).
+**Location settings:** name; heartbeat period (s, default 60, min 10); grace (s, default 30, min 10); Telegram bot token + chat/channel ID (per location); language (`uk` / `en` / `ru`); alerts on/off; maintenance mode; router-reconnect grace on/off; boot delay (s, default 0, 0-600: the time from mains power returning to the first heartbeat). (Amended 2026-11-01, quick task 261101-g9v.) All times are stored in UTC and displayed in the instance timezone (default `Europe/Kyiv`).
 
 **Location status** (shown to the admin, LOC-03): on, off, maintenance, or waiting for first heartbeat.
 
@@ -75,7 +75,7 @@ Subscribers get a timely, correct OFF/ON alert for every real outage and never a
 
 **OFF rule.** A location is OFF when no heartbeat has arrived for more than `period + grace` seconds. If router-reconnect grace is on and the last heartbeat came within 300 s after power returned, add 180 s, because routers without a UPS reboot and reconnect right after power comes back. The outage is **backdated to the last heartbeat**.
 
-**ON rule.** The location is ON at the first heartbeat after an outage.
+**ON rule.** The location is ON at the first heartbeat after an outage. With a boot delay, the ON time is that heartbeat minus the delay, so the boot time counts as power on; it is not backdated when the silence was no longer than the delay, and never to before the outage start or into not-monitored time. (Amended 2026-11-01, quick task 261101-g9v.)
 
 **Durations.**
 - "Was ON for" = last heartbeat − ON time.
@@ -101,7 +101,7 @@ Worked example (period 60 s, grace 30 s):
 | State | Meaning |
 |---|---|
 | on | Power present (heartbeats arriving) |
-| off | Outage, from the last heartbeat before detection to the first heartbeat after |
+| off | Outage, from the last heartbeat before detection to the first heartbeat after (minus the boot delay) (Amended 2026-11-01, quick task 261101-g9v.) |
 | not monitored | Maintenance mode, or the service itself was down |
 | no data | Before the location's first heartbeat, after a history reset, and the future |
 
@@ -168,7 +168,7 @@ Each requirement is user-visible or observable and testable. Section 3 defines t
 ### Locations & admin (LOC)
 
 - [ ] **LOC-01**: Admin can log in to the web admin panel with the single admin account defined in the environment; changing its username or password there and restarting changes the login and never leaves a second account.
-- [ ] **LOC-02**: Admin can create a location with name, heartbeat period, grace period, Telegram bot token, chat/channel ID and language (uk/en/ru).
+- [ ] **LOC-02**: Admin can create a location with name, heartbeat period, grace period, Telegram bot token, chat/channel ID and language (uk/en/ru), and optionally a boot delay. (Amended 2026-11-01, quick task 261101-g9v.)
 - [ ] **LOC-03**: Admin sees each location's current status (on / off / maintenance / waiting for first heartbeat), its last heartbeat time, and whether its alert delivery is healthy.
 - [ ] **LOC-04**: Admin can edit and delete a location; deleting stops its alerts and unpins its chart.
 - [ ] **LOC-05**: Admin sees device setup instructions for a location: heartbeat URL, device key, and copy-paste examples (curl, router cron line).
@@ -188,7 +188,7 @@ Each requirement is user-visible or observable and testable. Section 3 defines t
 
 - [ ] **MON-01**: A location's first heartbeat starts monitoring with status ON and sends no alert.
 - [ ] **MON-02**: A location is marked OFF when no heartbeat has arrived for period + grace (+ router-reconnect grace when it applies); the outage start is recorded as the last heartbeat time.
-- [ ] **MON-03**: A location is marked ON at the first heartbeat after an outage; outage duration = restore time − outage start.
+- [ ] **MON-03**: A location is marked ON at the first heartbeat after an outage; outage duration = restore time − outage start. The restore time is that heartbeat minus the location's boot delay (default 0), guarded and clamped as in the ON rule. (Amended 2026-11-01, quick task 261101-g9v.)
 - [ ] **MON-04**: Each outage produces exactly one OFF and one ON transition, even with concurrent heartbeats, overlapping checks, or a second worker process started by mistake.
 - [ ] **MON-05**: Server downtime is never reported as a power outage: after a restart every location gets a fresh detection window, the downtime is recorded as "not monitored", outages that begin during the downtime and continue after it are still alerted within one detection window, and an outage already in progress stays one outage.
 - [ ] **MON-06**: After a database restart or a transient error, outage detection resumes within 60 s of the database accepting connections, with no manual action; an error for one location does not stop detection for the others.

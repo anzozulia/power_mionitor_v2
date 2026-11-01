@@ -173,7 +173,10 @@ On a 400 px wide phone, the smallest text (27 px) shows at about 8.4 px, and the
   - A divider captioned "минулого тижня / last week / прошлой недели" separates them from the current week.
   - On Monday there are 6 dimmed rows. On Sunday there are none and no divider.
 - **Finished-day render:** at midnight, the previous day's message gets one final render with
-  now = end of that day. That render has no now line and no pill; the today band stays.
+  now = end of that day. That render has no now line and no pill; the today band stays. It waits
+  until detection has run past midnight by max(the location's longest heartbeat timeout, its boot
+  delay) + one lapse threshold (15 s), so an outage that began, or a restore backdated, across
+  midnight is already in the timeline. (Amended 2026-11-01, quick task 261101-g9v.)
 
 ## 8. Text formats per language
 
@@ -243,7 +246,9 @@ On a 400 px wide phone, the smallest text (27 px) shows at about 8.4 px, and the
   must produce the same image.
 - **States:**
   - `on` and `off` come from the engine's intervals. An OFF interval starts at the last heartbeat, the
-    same instant the alert uses.
+    same instant the alert uses. An ON interval after an outage starts at the first heartbeat minus
+    the location's boot delay (when one is set), the same instant the ON alert uses.
+    (Amended 2026-11-01, quick task 261101-g9v.)
   - `not monitored` means maintenance mode or server downtime.
   - Any time the timeline does not cover is **no data**: before the location's first heartbeat, after
     a history reset, and the future.
@@ -260,8 +265,9 @@ On a 400 px wide phone, the smallest text (27 px) shows at about 8.4 px, and the
     later occurrence, by dropping the first occurrence (fold = 0) before drawing.
   - Totals and captions always use real elapsed time, so the 23 h and 25 h days are counted correctly.
 - **Now marker** uses local wall-clock *now*. Nothing is drawn to the right of it in today's row.
-- **Changing a location's thresholds** never changes the chart for past days (DATA-04), because the
-  chart reads stored intervals only.
+- **Changing a location's thresholds** (period, grace, router grace, boot delay) never changes the
+  chart for past days (DATA-04), because the chart reads stored intervals only.
+  (Amended 2026-11-01, quick task 261101-g9v.)
 
 ## 10. Acceptance checklist
 
