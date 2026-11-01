@@ -15,7 +15,7 @@
   new chat ID) and the retry line are in the delivery-failing banner (D-10, D-13).
 - The settings list is the setup page's, shared through one partial, so both pages show
   identical values; with router grace on, "Reported OFF after" names the longer timeout
-  right after power returns.
+  right after the first heartbeat following an outage, and "Boot delay" follows it.
 - The page shows no device key, not even masked, and the bot token only masked (SEC-04).
 - The admin-typed name is escaped everywhere and never truncated (E2).
 - Every location URL answers 404 for an unknown or deleted location, and every page needs
@@ -470,9 +470,10 @@ def test_location_page_settings_and_setup_sections(
         ("Grace period", "20 s"),
         (
             "Reported OFF after",
-            f"65 s without a heartbeat ({65 + ROUTER_GRACE_S} s right after power returns, "
-            "router grace on)",
+            f"65 s without a heartbeat ({65 + ROUTER_GRACE_S} s right after the first "
+            "heartbeat following an outage, router grace on)",
         ),
+        ("Boot delay", "0 s"),
         ("Channel chat ID", "-1009876543210"),
         ("Bot token", "987654321, the rest is hidden"),
     ]

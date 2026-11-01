@@ -192,13 +192,14 @@ ALERTS_COPY = {
 }
 ROUTER_GRACE_HELP = (
     "While on, OFF waits 180 seconds longer when the last heartbeat came within 5 minutes "
-    "after power returned, so a router that restarts after a blackout is not reported as a "
-    "second outage. It changes only decisions made from now on."
+    "after the first heartbeat that followed an outage, so a router that restarts after a "
+    "blackout is not reported as a second outage. It changes only decisions made from now on."
 )
 # "off" names the location's plain timeout: {off_after_s} is period + grace, an integer.
 ROUTER_GRACE_COPY = {
     "on": (
-        "Router grace is on. From now on, OFF waits 180 seconds longer right after power returns."
+        "Router grace is on. From now on, OFF waits 180 seconds longer right after the first "
+        "heartbeat following an outage."
     ),
     "off": (
         "Router grace is off. From now on, OFF is reported after {off_after_s} seconds "
@@ -636,6 +637,8 @@ def stored_settings(location: Location) -> dict[str, Any]:
         "name": location.name,
         "period_s": location.period_s,
         "grace_s": location.grace_s,
+        # Without it an untouched edit save would reset the boot delay to 0 (261101-g9v).
+        "boot_delay_s": location.boot_delay_s,
         "chat_id": location.chat_id,
         "language": location.language,
         "chart_refresh_min": location.chart_refresh_min,

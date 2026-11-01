@@ -201,6 +201,7 @@ def _create_location(data: dict[str, Any], now: datetime) -> Location:
             name=data["name"],
             period_s=data["period_s"],
             grace_s=data["grace_s"],
+            boot_delay_s=data["boot_delay_s"],
             bot_token=data["bot_token"],
             chat_id=data["chat_id"],
             language=data["language"],
@@ -415,7 +416,9 @@ class HeartbeatView(View):
         return self._beat(request)
 
     def _beat(self, request: HttpRequest) -> HttpResponse:
-        # The server receive time is the only timestamp; device clocks never matter.
+        # The server receive time is the only timestamp; device clocks never matter. A
+        # restore is dated at the receive time minus the location's configured boot delay
+        # (261101-g9v): server config read under the row lock, not a device timestamp.
         now = self.clock.now()
         key = _extract_key(request)
         try:

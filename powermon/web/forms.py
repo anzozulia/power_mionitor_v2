@@ -12,7 +12,9 @@ from powermon.locations.models import (
     CHART_REFRESH_CHOICES,
     DEFAULT_CHART_REFRESH_MIN,
     LANGUAGE_CHOICES,
+    MAX_BOOT_DELAY_S,
     MAX_SECONDS,
+    MIN_BOOT_DELAY_S,
     MIN_SECONDS,
 )
 
@@ -29,6 +31,10 @@ SECONDS_NOT_WHOLE = "Enter a whole number of seconds."
 PERIOD_TOO_SHORT = "The heartbeat period must be at least 10 seconds."
 GRACE_TOO_SHORT = "The grace period must be at least 10 seconds."
 SECONDS_TOO_LONG = "Use at most 3600 seconds (1 hour)."
+# The boot delay (quick task 261101-g9v): 0-600 seconds, 0 turns it off. Like the other
+# seconds messages, these never echo the posted value.
+BOOT_DELAY_BELOW_MIN = "The boot delay cannot be negative. Enter 0 to turn it off."
+BOOT_DELAY_TOO_LONG = "Use at most 600 seconds (10 minutes)."
 # Not in the UI-SPEC: the select offers only valid choices, so only a hand-made request
 # gets this. It replaces Django's text, which would echo the posted value.
 LANGUAGE_INVALID = "Choose Ukrainian, English or Russian."
@@ -43,6 +49,12 @@ HELP_GRACE = (
     "seconds with no heartbeat (90 seconds with the defaults). 10 to 3600 seconds."
 )
 # The *_TOKEN_* names hold UI copy, not secrets (S105); ruff reports at the first line.
+HELP_BOOT_DELAY = (
+    "Time from mains power returning to this location's first heartbeat (router, optical "
+    "terminal and board boot). After an outage the ON time is dated this much earlier, so "
+    "the chart and the alerts count it as power on. Enter the shortest boot time you "
+    "measured; 0 turns it off. 120 = 2 minutes."
+)
 HELP_BOT_TOKEN = (
     "The token from @BotFather, like 123456789:AAH…. Each location uses its own bot. "  # noqa: S105
     "The token is saved but never shown again."
@@ -106,13 +118,25 @@ class SignInForm(AuthenticationForm):
         return super().clean()
 
 
-def _seconds_field(label: str, initial: int, too_short: str, help_text: str) -> forms.IntegerField:
-    """A whole number of seconds, 10-3600 (D-10, K-6), with the UI-SPEC messages only."""
+def _seconds_field(
+    label: str,
+    initial: int,
+    too_short: str,
+    help_text: str,
+    *,
+    min_value: int = MIN_SECONDS,
+    max_value: int = MAX_SECONDS,
+    too_long: str = SECONDS_TOO_LONG,
+) -> forms.IntegerField:
+    """A whole number of seconds, 10-3600 by default (D-10, K-6), with the UI-SPEC messages only.
+
+    The boot delay passes its own bounds (0-600) and above-max copy (quick task 261101-g9v).
+    """
     return forms.IntegerField(
         label=label,
         initial=initial,
-        min_value=MIN_SECONDS,
-        max_value=MAX_SECONDS,
+        min_value=min_value,
+        max_value=max_value,
         # Django adds min and max to the number input; step keeps browsers on whole numbers.
         widget=forms.NumberInput(attrs={"step": "1"}),
         help_text=help_text,
@@ -122,7 +146,7 @@ def _seconds_field(label: str, initial: int, too_short: str, help_text: str) -> 
             "required": SECONDS_NOT_WHOLE,
             "invalid": SECONDS_NOT_WHOLE,
             "min_value": too_short,
-            "max_value": SECONDS_TOO_LONG,
+            "max_value": too_long,
         },
     )
 
@@ -166,6 +190,15 @@ class LocationForm(forms.Form):
     )
     period_s = _seconds_field("Heartbeat period (seconds)", 60, PERIOD_TOO_SHORT, HELP_PERIOD)
     grace_s = _seconds_field("Grace period (seconds)", 30, GRACE_TOO_SHORT, HELP_GRACE)
+    boot_delay_s = _seconds_field(
+        "Boot delay (seconds)",
+        0,
+        BOOT_DELAY_BELOW_MIN,
+        HELP_BOOT_DELAY,
+        min_value=MIN_BOOT_DELAY_S,
+        max_value=MAX_BOOT_DELAY_S,
+        too_long=BOOT_DELAY_TOO_LONG,
+    )
     # CharField refuses a NUL before clean_<field> runs. Its code maps to the copy the
     # 01-09 validator gives any value with a NUL, so Django's text never shows.
     bot_token = forms.CharField(
@@ -244,7 +277,7 @@ class LocationEditForm(LocationForm):
 
     form_error = EDIT_FORM_ERROR
 
-    # Redefined in place: the field keeps its position between the grace period and the
+    # Redefined in place: the field keeps its position between the boot delay and the
     # chat ID. A NUL keeps the format copy, as on the add form.
     bot_token = forms.CharField(
         label=NEW_TOKEN_LABEL,

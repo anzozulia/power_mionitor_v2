@@ -37,6 +37,7 @@ from pages import (
     assert_page,
     breadcrumbs,
     by_testid,
+    definitions,
     field,
     field_error,
     form_values,
@@ -59,8 +60,11 @@ from powermon.locations.validators import (
 )
 from powermon.logging_setup import RedactingFormatter
 from powermon.web.forms import (
+    BOOT_DELAY_BELOW_MIN,
+    BOOT_DELAY_TOO_LONG,
     CHART_REFRESH_INVALID,
     GRACE_TOO_SHORT,
+    HELP_BOOT_DELAY,
     HELP_BOT_TOKEN,
     HELP_CHAT_ID,
     LANGUAGE_INVALID,
@@ -115,6 +119,8 @@ def test_location_defaults_match_D10(fixed_now: datetime) -> None:
     assert location.alerts_enabled is True
     assert location.language == "uk"
     assert location.chart_refresh_min == 15
+    # 261101-g9v: the boot delay is off unless the admin enters one.
+    assert location.boot_delay_s == 0
     assert location.deleted_at is None
     assert location.created_at == fixed_now
     assert location.chat_id == DEFAULT_CHAT_ID
@@ -189,6 +195,43 @@ def test_D2_raw_insert_without_the_column_gets_15(fixed_now: datetime) -> None:
             "WHERE table_name = 'location' AND column_name = 'chart_refresh_min'"
         )
         assert cur.fetchone()[0] == "15"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("delay", [-1, 601])
+def test_K6_boot_delay_check_rejects_out_of_range(fixed_now: datetime, delay: int) -> None:
+    # 261101-g9v: the database refuses a boot delay outside 0-600 seconds.
+    _assert_rejected("location_boot_delay_0_600", fixed_now, boot_delay_s=delay)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("delay", [0, 600])
+def test_boot_delay_check_accepts_both_bounds(fixed_now: datetime, delay: int) -> None:
+    location = _new_location(fixed_now, boot_delay_s=delay)
+    location.refresh_from_db()
+
+    assert location.boot_delay_s == delay
+
+
+@pytest.mark.django_db
+def test_D1_raw_insert_without_boot_delay_gets_0(fixed_now: datetime) -> None:
+    # 261101-g9v: db_default keeps DEFAULT 0 in the database, so code from before the
+    # boot delay (a rollback, README section 8) can still add a location.
+    with connection.cursor() as cur:
+        cur.execute(
+            "INSERT INTO location (name, period_s, grace_s, router_grace, maintenance, "
+            "alerts_enabled, language, bot_token, chat_id, device_key, created_at, "
+            "chart_refresh_min) "
+            "VALUES (%s, 60, 30, false, false, true, 'uk', %s, %s, %s, %s, 15) "
+            "RETURNING boot_delay_s",
+            ["Old code", DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, generate_device_key(), fixed_now],
+        )
+        assert cur.fetchone()[0] == 0
+        cur.execute(
+            "SELECT column_default FROM information_schema.columns "
+            "WHERE table_name = 'location' AND column_name = 'boot_delay_s'"
+        )
+        assert cur.fetchone()[0] == "0"
 
 
 @pytest.mark.django_db
@@ -488,7 +531,7 @@ SECTION_DESCRIPTIONS = [
 ]
 SECTION_FIELDS = {
     "basics": ["name"],
-    "monitoring": ["period_s", "grace_s"],
+    "monitoring": ["period_s", "grace_s", "boot_delay_s"],
     "telegram": ["bot_token", "chat_id", "language", "chart_refresh_min"],
 }
 SUFFIX = "s"
@@ -516,6 +559,7 @@ def _form(**overrides: str) -> dict[str, str]:
         "name": "Office",
         "period_s": "60",
         "grace_s": "30",
+        "boot_delay_s": "0",
         "bot_token": GOOD_TOKEN,
         "chat_id": "-1001234567890",
         "language": "uk",
@@ -608,6 +652,7 @@ def test_UI01_add_form_renders(admin: Client) -> None:
         "name": "",
         "period_s": "60",
         "grace_s": "30",
+        "boot_delay_s": "0",
         "bot_token": "",
         "chat_id": "",
         "language": "uk",
@@ -618,14 +663,14 @@ def test_UI01_add_form_renders(admin: Client) -> None:
     # Monitoring: the seconds inputs with their "s" add-on, and the hint bound to them.
     monitoring = sections[1]
     assert monitoring.get("x-data") == "offAfterHint"
-    for name in ("period_s", "grace_s"):
+    for name in ("period_s", "grace_s", "boot_delay_s"):
         assert field(page, name).get("inputmode") == "numeric"
     add_ons = [
         found
         for found in monitoring.find_all(attrs={"aria-hidden": "true"})
         if found.get_text(strip=True) == SUFFIX
     ]
-    assert len(add_ons) == 2
+    assert len(add_ons) == 3
     hint = by_testid(monitoring, "off-after-hint")
     assert _shown(hint) == OFF_AFTER.format(90)
     assert _icon_names(hint) == ["clock"]
@@ -711,6 +756,75 @@ def test_period_empty_or_not_a_whole_number(admin: Client, field_name: str, valu
 
     assert field_error(page, field_name) == SECONDS_NOT_WHOLE
     assert "Exceeds the limit" not in text(page)
+
+
+# The boot delay (quick task 261101-g9v): 0-600 whole seconds, 0 turns it off.
+BOOT_DELAY_LABEL = "Boot delay (seconds)"
+
+
+def test_add_form_boot_delay_field_follows_the_grace_period(admin: Client) -> None:
+    page = assert_page(admin.get(NEW_URL), app=True, title=ADD_TITLE)
+    monitoring = all_by_testid(page, "form-section")[1]
+
+    names = [control.get("name") for control in monitoring.find_all("input")]
+    assert names.index("boot_delay_s") == names.index("grace_s") + 1
+    delay = field(page, "boot_delay_s")
+    assert (delay.get("type"), delay.get("step"), delay.get("value")) == ("number", "1", "0")
+    assert (delay.get("min"), delay.get("max")) == ("0", "600")
+    label = monitoring.find("label", attrs={"for": "id_boot_delay_s"})
+    assert isinstance(label, Tag)
+    assert text(label) == BOOT_DELAY_LABEL
+    assert text(section(page, "id_boot_delay_s_helptext")) == HELP_BOOT_DELAY
+    assert delay.get("aria-describedby") == "id_boot_delay_s_helptext"
+
+
+def test_add_stores_the_boot_delay_and_the_setup_page_shows_it(admin: Client) -> None:
+    response = admin.post(NEW_URL, _form(boot_delay_s="120"))
+
+    assert response.status_code == 302
+    location = Location.objects.get()
+    assert location.boot_delay_s == 120
+    rows = dict(definitions(parse(admin.get(response.url)), "settings-panel"))
+    assert rows["Boot delay"] == "120 s"
+
+
+@pytest.mark.parametrize("value", ["0", "600"], ids=["min", "max"])
+def test_add_accepts_the_boot_delay_bounds(admin: Client, value: str) -> None:
+    response = admin.post(NEW_URL, _form(boot_delay_s=value))
+
+    assert response.status_code == 302
+    assert Location.objects.get().boot_delay_s == int(value)
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [("-1", BOOT_DELAY_BELOW_MIN), ("601", BOOT_DELAY_TOO_LONG)],
+    ids=["below-0", "above-600"],
+)
+def test_add_refuses_a_boot_delay_out_of_range(admin: Client, value: str, message: str) -> None:
+    page = _rejected(admin, boot_delay_s=value)
+
+    assert field_error(page, "boot_delay_s") == message
+    # The message never echoes the posted value; the bound input keeps it, as Django does.
+    assert value not in message
+    assert field(page, "boot_delay_s").get("value") == value
+    assert field_error(page, "grace_s") is None
+
+
+@pytest.mark.parametrize(
+    "value", ["", "   ", "abc", "1.5", "60s", "9" * 5000], ids=lambda v: repr(v)[:12]
+)
+def test_add_refuses_a_boot_delay_that_is_not_a_whole_number(admin: Client, value: str) -> None:
+    page = _rejected(admin, boot_delay_s=value)
+
+    assert field_error(page, "boot_delay_s") == SECONDS_NOT_WHOLE
+    assert "Exceeds the limit" not in text(page)
+
+
+def test_boot_delay_messages_never_contain_a_number_from_the_post() -> None:
+    # The copy is fixed text: only the bounds it names (0 and 600) appear in it.
+    assert BOOT_DELAY_BELOW_MIN == "The boot delay cannot be negative. Enter 0 to turn it off."
+    assert BOOT_DELAY_TOO_LONG == "Use at most 600 seconds (10 minutes)."
 
 
 @pytest.mark.parametrize(

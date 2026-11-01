@@ -33,7 +33,15 @@ FLAG_FIELDS: tuple[str, ...] = get_args(FlagField)
 # The columns the edit form writes on every save (D-07). The bot token is written only
 # when a new one was typed. The switches, the device key and the live state are never
 # among them, so a form loaded earlier can never revert what changed since (INV-02 #3).
-CONFIG_FIELDS = ("name", "period_s", "grace_s", "chat_id", "language", "chart_refresh_min")
+CONFIG_FIELDS = (
+    "name",
+    "period_s",
+    "grace_s",
+    "boot_delay_s",
+    "chat_id",
+    "language",
+    "chart_refresh_min",
+)
 
 
 @dataclass(frozen=True)
@@ -61,6 +69,13 @@ def update_config(location_id: int, data: Mapping[str, Any], now: datetime) -> C
     stored timeline is never recomputed: raising grace changes no past row or total, and
     lowering it below the current silence makes the next cycle record OFF from the last
     heartbeat (DATA-04, INV-06).
+
+    The boot delay (quick task 261101-g9v) applies from the next restoring heartbeat, which
+    reads it under the ``location_state`` row lock. It is not a channel change, and it never
+    recomputes past outages: an ON time already recorded keeps its date (INV-06, DATA-04).
+    With router grace on, the reconnect window of the current on period reads it every
+    detection cycle, so a change moves that window at once (``rules.effective_timeout``).
+    As for period and grace, the last save wins.
 
     A new chat ID or a new token (one that differs from the stored one) is a channel
     change (D-08): in the same transaction the location's pending subscriber alerts become

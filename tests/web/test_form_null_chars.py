@@ -72,6 +72,7 @@ def _form(**overrides: str) -> dict[str, str]:
         "name": "Office",
         "period_s": "60",
         "grace_s": "30",
+        "boot_delay_s": "0",
         "bot_token": DEFAULT_BOT_TOKEN,
         "chat_id": GOOD_CHAT_ID,
         "language": "uk",

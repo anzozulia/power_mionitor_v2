@@ -84,8 +84,9 @@ WARNING_BLOCK = (
 )
 OFF_BLOCK = (
     "This location is off now. Until the device has the new key, the return of power is not "
-    "seen: the outage is recorded until the first heartbeat with the new key, so the chart, "
-    "the day totals and the ON alert (if alerts are on) count that time as off. Turn "
+    "seen: the outage is recorded until the first heartbeat with the new key (less the boot "
+    "delay, if one is set), so the chart, the day totals and the ON alert (if alerts are on) "
+    "count that time as off. Turn "
     "maintenance on first to have that time shown as not monitored instead."
 )
 WAITING_BLOCK = (
