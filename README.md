@@ -545,7 +545,9 @@ changes the rules for `Europe/Kyiv`, bump the Python and postgres image tags.
     pause a location instead, turn maintenance on or alerts off.
 - **History corrections:** two sections of the location page fix a wrong power history.
   Each is a confirmation page, then the change. Neither sends a new message to the
-  channel, and there is no undo. (Amended 2026-10-06, quick task 261006-qv7.)
+  channel, and there is no undo in the admin panel. (Amended 2026-10-06, quick task
+  261006-qv7.) The rows a removal or a reset takes off the timeline are first copied to
+  the append-only `power_interval_archive` table. (Amended 2026-11-01, quick task 261101-mm9.)
   - **Recent outages:** every outage of the last 14 local days, newest first, with its
     start, end and off time (the chart's daily-total format). The outage in progress reads
     "in progress" and has no Remove link. **Remove** turns a false outage that has ended
@@ -576,8 +578,12 @@ changes the rules for `Europe/Kyiv`, bump the Python and postgres image tags.
     being sent at that moment, the page says so ("An alert about this outage is being sent
     to the channel right now. Nothing changed. Try again in a minute.") and nothing
     changes: try again a minute later. (Amended 2026-10-06, quick task 261006-qv7.)
-    (Amended 2026-10-08, quick task 261008-vdk.)
-  - **Reset history:** deletes the location's whole recorded power history. It is refused
+    (Amended 2026-10-08, quick task 261008-vdk.) The removed outage's off pieces are
+    copied to `power_interval_archive` (reason `outage_removed`) before they become on.
+    (Amended 2026-11-01, quick task 261101-mm9.)
+  - **Reset history:** removes the location's whole recorded power history from the chart,
+    the daily totals and Recent outages; a copy is kept in `power_interval_archive`
+    (reason `history_reset`). (Amended 2026-11-01, quick task 261101-mm9.) It is refused
     while an outage is in progress (reset after power returns, or delete the location).
     The location then shows **Waiting for first heartbeat**; its next heartbeat restarts
     monitoring as On without an alert, and a new chart is posted and pinned that shows no
@@ -616,7 +622,24 @@ changes the rules for `Europe/Kyiv`, bump the Python and postgres image tags.
 - **Data:** everything lives in `docker_data/prod/`: PostgreSQL data, Caddy certificates
   and the nightly database dumps in `docker_data/prod/backups/` (section 14). The power
   history is kept indefinitely; heartbeats themselves are never stored (only each
-  location's last heartbeat time), so there is nothing to prune.
+  location's last heartbeat time), so there is nothing to prune. Even a reset or an
+  outage removal does not lose history: it first copies the rows it takes off the timeline to
+  `power_interval_archive`, in the same transaction, and nothing ever deletes or updates
+  archive rows. (Amended 2026-11-01, quick task 261101-mm9.) For a future export:
+  - an outage is the `off` pieces of `power_interval` that share `outage_start_at`;
+  - `not_monitored` is not off;
+  - a deleted location's open piece (no `end_at`) never closes, so cap it at
+    `location.deleted_at`;
+  - an archived row with no `end_at` ran until its `archived_at`;
+  - all times are UTC `timestamptz`;
+  - run exports through `psql`, or through a management command that first runs
+    `SET statement_timeout = 0` as `manage.py release` does, never through a web request:
+    the 5 s `statement_timeout` in the shared database settings caps every Django
+    connection (web requests and management commands; only the worker overrides it).
+
+  Keeping the history "forever" also needs an off-host copy of the dumps (section 14,
+  Copying a dump off the VPS). The dumps are as secret as the server (they hold the bot
+  tokens and device keys), so never put them in the repo. (Amended 2026-11-01, quick task 261101-mm9.)
 
 ## 11. Failure drills (Phase 2 verification)
 

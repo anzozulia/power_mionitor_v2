@@ -8,6 +8,11 @@
   totals read. Only ``powermon.engine.timeline.set_open_state`` writes it, in the same
   transaction as the state change. PostgreSQL itself rejects overlapping, zero-length and
   second open intervals (PITFALLS 15), so no code path can corrupt it.
+- ``PowerIntervalArchive`` (DATA-01, quick task 261101-mm9): an append-only copy of the
+  ``power_interval`` rows a history reset (DATA-03) or an outage removal (DATA-02) took off
+  the timeline, so no real outage history is ever lost. Only ``powermon.engine.history``
+  writes it, with one INSERT...SELECT in the destroying transaction; no code deletes or
+  updates archive rows (``tests/engine/test_inv09.py``). Nothing in the app reads it.
 - ``SystemState``: one row (id 1) with the process-level anchors of the detection window.
 
 No timestamp column has a database default: every time comes from the caller's Clock
@@ -26,6 +31,8 @@ STATUSES = ("waiting", "on", "off")
 # "no data" is never stored: it is the absence of an interval (before the first
 # heartbeat, after a history reset, the future).
 INTERVAL_STATES = ("on", "off", "not_monitored")
+# Why a row was archived: the reset (DATA-03) or the removal of a false outage (DATA-02).
+ARCHIVE_REASONS = ("history_reset", "outage_removed")
 
 # CHECK conditions, enforced by PostgreSQL.
 STATUS_KNOWN = Q(status__in=STATUSES)
@@ -37,6 +44,7 @@ OUTAGE_START_IFF_OFF = Q(state="off", outage_start_at__isnull=False) | (
 )
 IS_OPEN = Q(end_at__isnull=True)
 SINGLETON_ID = Q(id=1)
+ARCHIVE_REASON_KNOWN = Q(reason__in=ARCHIVE_REASONS)
 
 
 class LocationState(models.Model):
@@ -119,6 +127,61 @@ class PowerInterval(models.Model):
 
     def __str__(self) -> str:
         return f"location {self.location_id}: {self.state} [{self.start_at}, {self.end_at})"
+
+
+class PowerIntervalArchive(models.Model):
+    """An append-only copy of a ``power_interval`` row that a reset or a removal destroyed.
+
+    DATA-01 (amended by quick task 261101-mm9): the history is kept forever, also through
+    the two admin actions that take rows off the timeline. ``history.reset_history``
+    (DATA-03, reason ``history_reset``) copies every row of the location and
+    ``history.remove_outage`` (DATA-02, reason ``outage_removed``) copies the outage's off
+    pieces, each with one INSERT...SELECT in the destroying transaction, under the row lock
+    and after every refusal. Those two statements are the only writes: no code deletes or
+    updates archive rows (enforced by ``tests/engine/test_inv09.py``).
+
+    The columns are a faithful copy of the source row. ``end_at`` NULL means the piece was
+    still open when it was archived, so it ran until ``archived_at``, which is the caller's
+    Clock time (never a database default). Archived rows may overlap (a reset after earlier
+    removals), so there is no exclusion, one-open or end-after-start constraint. Nothing in
+    the app reads this table; a future export does.
+    """
+
+    # CASCADE like every child of a location; never used: a location is only tombstoned.
+    location = models.ForeignKey(
+        Location,
+        on_delete=models.CASCADE,
+        db_column="location_id",
+        related_name="archived_intervals",
+    )
+    state = models.CharField(max_length=16)
+    start_at = models.DateTimeField()
+    end_at = models.DateTimeField(null=True)
+    outage_start_at = models.DateTimeField(null=True)
+    archived_at = models.DateTimeField()
+    reason = models.CharField(
+        max_length=16,
+        choices=[("history_reset", "history reset"), ("outage_removed", "outage removed")],
+    )
+
+    class Meta:
+        db_table = "power_interval_archive"
+        constraints = [
+            models.CheckConstraint(
+                condition=INTERVAL_STATE_KNOWN, name="power_interval_archive_state_valid"
+            ),
+            models.CheckConstraint(
+                condition=ARCHIVE_REASON_KNOWN, name="power_interval_archive_reason_valid"
+            ),
+        ]
+        # Django limits an index name to 30 characters.
+        indexes = [models.Index(fields=["location", "start_at"], name="interval_archive_loc_start")]
+
+    def __str__(self) -> str:
+        return (
+            f"location {self.location_id}: archived {self.state} "
+            f"[{self.start_at}, {self.end_at}) ({self.reason})"
+        )
 
 
 class SystemState(models.Model):

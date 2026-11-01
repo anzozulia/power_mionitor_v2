@@ -24,8 +24,11 @@ timeline writer:
    amendment, W1-A1) or its ON alert matched by ``outbox.restores`` (wave-2 audit, W2-A1:
    when the OFF alert expired or was never queued, the ON alert is its location's head and
    can be sending itself). The attempt settles within seconds, and the next removal decides;
-4. each off piece of the outage becomes ``on`` through ``timeline.overwrite``, one piece at
-   a time: not-monitored time inside the outage stays not monitored (D-02);
+4. the outage's off pieces are first copied to the append-only ``power_interval_archive``
+   with reason ``outage_removed`` (``ARCHIVE_REMOVED_SQL``, DATA-01 as amended by quick
+   task 261101-mm9), then each of them becomes ``on`` through ``timeline.overwrite``, one
+   piece at a time: not-monitored time inside the outage stays not monitored (D-02) and
+   is not copied, because it is not rewritten;
 5. if the outage is the one that last turned the location on (status on, no later off
    piece, and no on piece starting between its end and ``on_since``, which rules out a
    FIRST after a DB restore unless the outage was still in progress at the dump; that
@@ -55,8 +58,9 @@ is already queued keeps the value it was recorded with (261007-llg D-7). It queu
 message (no subscriber message, no ops notice): it only asks the worker, through rows
 written in its transaction, to delete the outage's alerts and to redraw today's chart
 (KD2, KD3), and logs one INFO line. The lock order is location_state, outbox_message,
-power_interval, chart_message. Adjacent ``on`` pieces left by a removal are not merged:
-the chart sums pieces by state, so they read as one span.
+power_interval, chart_message; the archive copy reads power_interval and only inserts
+new archive rows. Adjacent ``on`` pieces left by a removal are not merged: the chart sums
+pieces by state, so they read as one span.
 
 The reset (``reset_history``, DATA-03) is one transaction under the same row lock, then the
 deleted check:
@@ -66,8 +70,10 @@ deleted check:
    silently, so its ON alert would never be sent;
 2. a location with no stored interval has nothing to reset: nothing is written, not even
    a ``state_version`` bump (UI5-D9), so a double submit changes nothing;
-3. otherwise every ``power_interval`` row of the location is deleted, a real delete with
-   no undo, and ``transitions.WAITING_SQL`` (imported, never copied; the post-restore
+3. otherwise every ``power_interval`` row of the location is first copied to
+   ``power_interval_archive`` with reason ``history_reset`` (``ARCHIVE_RESET_SQL``, DATA-01
+   as amended by quick task 261101-mm9), then deleted; there is no undo in the admin
+   panel. ``transitions.WAITING_SQL`` (imported, never copied; the post-restore
    restart shares it) sets the location back to "waiting for first heartbeat" with the
    four times NULL and ``state_version`` bumped, so a detector snapshot read before the
    reset loses its OFF CAS (D-05). The next heartbeat takes the FIRST gate: on, no alert
@@ -125,6 +131,27 @@ HAS_HISTORY_SQL = "SELECT EXISTS (SELECT 1 FROM power_interval WHERE location_id
 
 # The reset's real delete of the location's whole timeline (D-05).
 DELETE_HISTORY_SQL = "DELETE FROM power_interval WHERE location_id = %(id)s"
+
+# DATA-01 (amended by quick task 261101-mm9): the reset and the removal never lose history.
+# Each copies the rows it destroys into the append-only archive first, in the destroying
+# transaction, under the location's row lock and after every refusal, so a refused or
+# failed action archives nothing. ``archived_at`` is the caller's ``now``, never SQL now().
+# The reset copies every row of the location, the open piece included (end_at NULL).
+ARCHIVE_RESET_SQL = """
+INSERT INTO power_interval_archive
+       (location_id, state, start_at, end_at, outage_start_at, archived_at, reason)
+SELECT location_id, state, start_at, end_at, outage_start_at, %(now)s, 'history_reset'
+  FROM power_interval
+ WHERE location_id = %(id)s
+"""
+# The removal copies exactly the pieces its overwrite loop rewrites: OUTAGE_SQL's predicate.
+ARCHIVE_REMOVED_SQL = """
+INSERT INTO power_interval_archive
+       (location_id, state, start_at, end_at, outage_start_at, archived_at, reason)
+SELECT location_id, state, start_at, end_at, outage_start_at, %(now)s, 'outage_removed'
+  FROM power_interval
+ WHERE location_id = %(id)s AND state = 'off' AND outage_start_at = %(start)s
+"""
 
 # The reset marker on the location's active records that are not marked yet (D-08). The
 # worker unpins each marked record in its stored chat and only then retires it.
@@ -306,8 +333,9 @@ def remove_outage(
     One transaction under the location's row lock (see the module docstring), at ``now``
     (the caller's clock); ``tz`` is the display zone, which names today's chart. Returns:
 
-    - "removed": every off piece of the outage is ``on`` now, not-monitored pieces inside
-      it are kept, its alerts are settled (``_settle_alerts``: queued ones dropped and sent
+    - "removed": every off piece of the outage was copied to the archive (reason
+      ``outage_removed``) and is ``on`` now, not-monitored pieces inside it are kept, its
+      alerts are settled (``_settle_alerts``: queued ones dropped and sent
       ones requested for deletion, unless its OFF alert cannot be deleted), today's chart
       record is marked for a redraw and, when it is the outage that last turned the
       location on, ``on_since`` is rewound (``REWIND_ON_SINCE_SQL``);
@@ -321,7 +349,8 @@ def remove_outage(
       (W2-A1). Checked under the lock, after the checks above and before any timeline
       write. The next removal decides from the settled rows.
 
-    "gone", "in_progress" and "sending" write nothing at all: no request and no mark.
+    "gone", "in_progress" and "sending" write nothing at all: no request, no mark and no
+    archive row.
     ``location_state`` is written only by that rewind. A restore keeps the delete requests
     (the requests in a dump match that dump's timeline) and re-tags a removed outage's
     dropped ON "restored" while its OFF's delete is unsettled
@@ -357,6 +386,8 @@ def remove_outage(
             # Before any write: a failed attempt would put the row back to pending. The OFF
             # (W1-A1), or the ON, the head when the OFF expired or was never queued (W2-A1).
             return "sending"
+        # DATA-01: the off pieces the loop below rewrites are archived first (261101-mm9).
+        cur.execute(ARCHIVE_REMOVED_SQL, {"id": location_id, "start": outage_start, "now": now})
         # One piece at a time: a single overwrite across the whole outage would also turn
         # its not-monitored pieces into on (D-02).
         for start, end in pieces:
@@ -479,7 +510,8 @@ def reset_history(location_id: int, now: datetime) -> ResetResult:
 
     One transaction under the location's row lock (see the module docstring). Returns:
 
-    - "reset": every interval of the location is deleted, it waits for its first heartbeat
+    - "reset": every interval of the location is copied to the archive (reason
+      ``history_reset``) and then deleted, it waits for its first heartbeat
       (``WAITING_SQL``, ``state_version`` bumped) and its active chart records are marked
       for the worker's release;
     - "in_progress", with nothing written: the locked status is off, in maintenance or not
@@ -488,8 +520,8 @@ def reset_history(location_id: int, now: datetime) -> ResetResult:
       the second click of a double submit);
     - "gone", with nothing written: the location is unknown or deleted.
 
-    Queued alerts, the configuration, the switches and open incidents are kept (D-05,
-    D-07). ValueError for a naive ``now``.
+    The refusals write nothing, the archive included. Queued alerts, the configuration,
+    the switches and open incidents are kept (D-05, D-07). ValueError for a naive ``now``.
     """
     _aware(now)
     with transaction.atomic(), connection.cursor() as cur:
@@ -509,6 +541,8 @@ def reset_history(location_id: int, now: datetime) -> ResetResult:
         exists = cur.fetchone()
         if not (exists and exists[0]):
             return "nothing"
+        # DATA-01: every row is archived first, then deleted (261101-mm9).
+        cur.execute(ARCHIVE_RESET_SQL, {"id": location_id, "now": now})
         cur.execute(DELETE_HISTORY_SQL, {"id": location_id})
         cur.execute(WAITING_SQL, {"id": location_id})
         cur.execute(MARK_CHARTS_SQL, {"id": location_id, "now": now})

@@ -169,11 +169,12 @@ REMOVE_CHART = (
 )
 # A key whose tail has upper-case letters, so no page text or hex marker holds it by chance.
 KEY = "abcdefghijklmnopqrstuvwx0123QZXK"
-# 06-UI-SPEC copy rows reset.*, verbatim.
-RESET_LEAD = "This cannot be undone. Resetting the history:"
+# 06-UI-SPEC copy rows reset.*, verbatim; amended by 261101-mm9.
+RESET_LEAD = "This cannot be undone in the admin panel. Resetting the history:"
 RESET_CONSEQUENCES = [
-    "deletes all recorded power history of this location: the chart and the daily totals "
-    "show no data for the time before the reset, and Recent outages is empty;",
+    "removes all recorded power history of this location from the chart, the daily totals "
+    "and Recent outages, which show no data for the time before the reset (a copy is kept "
+    "in the database archive);",
     "unpins its weekly chart in the channel if the bot can still pin there; otherwise unpin "
     "it by hand in Telegram (the posted messages stay in the channel);",
     "sets it to Waiting for first heartbeat: nothing is detected until the next heartbeat, "
