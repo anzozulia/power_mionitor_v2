@@ -163,7 +163,7 @@ Every class is spelled out: no class name is built from data.
 <div id="reset-history" tabindex="-1" class="flex scroll-mt-16 flex-col items-start gap-4 py-3 md:flex-row md:items-center md:justify-between md:gap-6">
 <div class="flex min-w-0 max-w-190 flex-col gap-1">
 <h3 class="text-body font-semibold text-fg">Reset history</h3>
-<p class="text-body text-fg-muted">Deletes all recorded power history of this location and unpins its weekly chart where the bot still can. The location then waits for its next heartbeat, which restarts monitoring without an alert. Settings, the device key and the switches are kept. There is no undo.</p>
+<p class="text-body text-fg-muted">Removes all recorded power history of this location from the chart, the daily totals and Recent outages (a copy is kept in the database archive) and unpins its weekly chart where the bot still can. The location then waits for its next heartbeat, which restarts monitoring without an alert. Settings, the device key and the switches are kept. There is no undo in the admin panel.</p>
 {% if outage_in_progress or status.power_key == "off" %}<p id="reset-unavailable" data-testid="reset-unavailable" data-reason="in-progress" class="flex items-start gap-1 text-body text-fg-muted">{% icon "info" class="mt-0.5 size-3.5 shrink-0 text-icon" %}<span>An outage is in progress. Reset the history after power returns, or delete the location.</span></p>
 {% elif not has_history %}<p id="reset-unavailable" data-testid="reset-unavailable" data-reason="no-history" class="flex items-start gap-1 text-body text-fg-muted">{% icon "info" class="mt-0.5 size-3.5 shrink-0 text-icon" %}<span>There is no power history to reset.</span></p>
 {% endif %}</div>

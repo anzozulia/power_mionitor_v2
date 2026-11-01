@@ -73,11 +73,12 @@ RESET_REFUSED_FLASH = (
     "An outage is in progress. Reset the history after power returns, or delete the location."
 )
 NOTHING_TO_RESET_FLASH = "There is no power history to reset. Nothing changed."
-# 05-UI-SPEC Copywriting › Reset-history confirmation, verbatim.
-RESET_LEAD = "This cannot be undone. Resetting the history:"
+# 05-UI-SPEC Copywriting › Reset-history confirmation, verbatim; amended by 261101-mm9.
+RESET_LEAD = "This cannot be undone in the admin panel. Resetting the history:"
 RESET_CONSEQUENCES = [
-    "deletes all recorded power history of this location: the chart and the daily totals "
-    "show no data for the time before the reset, and Recent outages is empty;",
+    "removes all recorded power history of this location from the chart, the daily totals "
+    "and Recent outages, which show no data for the time before the reset (a copy is kept "
+    "in the database archive);",
     "unpins its weekly chart in the channel if the bot can still pin there; otherwise unpin "
     "it by hand in Telegram (the posted messages stay in the channel);",
     "sets it to Waiting for first heartbeat: nothing is detected until the next heartbeat, "

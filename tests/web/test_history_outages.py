@@ -75,12 +75,13 @@ RESET_FLASH = (
     "without an alert. The old weekly chart is unpinned when the bot can do so; if the pin "
     "stays, unpin it by hand in Telegram."
 )
-# 06-UI-SPEC copy table, loc.reset_desc, loc.reset_refused, verbatim.
+# 06-UI-SPEC copy table, loc.reset_desc, loc.reset_refused, verbatim; amended by 261101-mm9.
 RESET_SENTENCE = (
-    "Deletes all recorded power history of this location and unpins its weekly chart where "
-    "the bot still can. The location then waits for its next heartbeat, which restarts "
+    "Removes all recorded power history of this location from the chart, the daily totals "
+    "and Recent outages (a copy is kept in the database archive) and unpins its weekly chart "
+    "where the bot still can. The location then waits for its next heartbeat, which restarts "
     "monitoring without an alert. Settings, the device key and the switches are kept. There "
-    "is no undo."
+    "is no undo in the admin panel."
 )
 RESET_IN_PROGRESS_LINE = (
     "An outage is in progress. Reset the history after power returns, or delete the location."

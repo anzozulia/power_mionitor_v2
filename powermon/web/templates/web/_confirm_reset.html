@@ -22,9 +22,9 @@ keeps room for the dialog's own close button at its top-right).
 <h1 id="confirm-title" data-testid="confirm-title" class="min-w-0 flex-1 font-semibold break-words text-fg {% if fragment %}text-lead{% else %}text-title tracking-title{% endif %}">Reset the history of {{ location.name }}?</h1>
 </div>
 <div class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-6 py-4 text-body text-fg">
-<p class="text-fg-muted">This cannot be undone. Resetting the history:</p>
+<p class="text-fg-muted">This cannot be undone in the admin panel. Resetting the history:</p>
 <ul data-testid="consequences" class="flex flex-col gap-2">
-<li class="relative pl-4 before:absolute before:top-2 before:left-0.5 before:size-1 before:rounded-full before:bg-fg-subtle">deletes all recorded power history of this location: the chart and the daily totals show no data for the time before the reset, and Recent outages is empty;</li>
+<li class="relative pl-4 before:absolute before:top-2 before:left-0.5 before:size-1 before:rounded-full before:bg-fg-subtle">removes all recorded power history of this location from the chart, the daily totals and Recent outages, which show no data for the time before the reset (a copy is kept in the database archive);</li>
 <li class="relative pl-4 before:absolute before:top-2 before:left-0.5 before:size-1 before:rounded-full before:bg-fg-subtle">unpins its weekly chart in the channel if the bot can still pin there; otherwise unpin it by hand in Telegram (the posted messages stay in the channel);</li>
 <li class="relative pl-4 before:absolute before:top-2 before:left-0.5 before:size-1 before:rounded-full before:bg-fg-subtle">sets it to Waiting for first heartbeat: nothing is detected until the next heartbeat, which restarts monitoring as On without an alert and posts and pins a new chart;</li>
 <li class="relative pl-4 before:absolute before:top-2 before:left-0.5 before:size-1 before:rounded-full before:bg-fg-subtle">still sends the alerts already queued, because they report real events;</li>
