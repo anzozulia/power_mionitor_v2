@@ -586,6 +586,7 @@ def test_settings_partial() -> None:
         ("Heartbeat period", "60 s"),
         ("Grace period", "30 s"),
         ("Reported OFF after", "90 s without a heartbeat"),
+        ("Boot delay", "0 s"),
         ("Channel chat ID", "-1001234567890"),
         ("Bot token", "987654321, the rest is hidden"),
     ]
@@ -612,12 +613,37 @@ def test_settings_partial_router_grace(period: int, grace: int) -> None:
 
     assert rows[False]["Heartbeat period"] == f"{period} s"
     assert rows[False]["Grace period"] == f"{grace} s"
-    # Router grace off: no extension; on: the 180 s extension right after power returns.
+    # Router grace off: no extension; on: the 180 s extension right after the first
+    # heartbeat that follows an outage (the window counts from it, 261101-g9v).
     assert rows[False]["Reported OFF after"] == f"{total} s without a heartbeat"
     assert rows[True]["Reported OFF after"] == (
         f"{total} s without a heartbeat "
-        f"({total + ROUTER_GRACE_S} s right after power returns, router grace on)"
+        f"({total + ROUTER_GRACE_S} s right after the first heartbeat following an outage, "
+        "router grace on)"
     )
+
+
+@pytest.mark.parametrize("delay", [0, 120, 600])
+def test_settings_partial_boot_delay_row(delay: int) -> None:
+    # 261101-g9v: "Boot delay" right after "Reported OFF after", its value with the unit.
+    rows = definitions(_settings_html(_location(boot_delay_s=delay)), "settings-panel")
+    labels = [label for label, _ in rows]
+
+    assert labels.index("Boot delay") == labels.index("Reported OFF after") + 1
+    assert dict(rows)["Boot delay"] == f"{delay} s"
+    assert rows[-1][0] == "Bot token"
+
+
+def test_settings_partial_boot_delay_row_with_router_grace() -> None:
+    # Edge: the router-grace extension does not move or change the boot delay row.
+    rows = dict(
+        definitions(
+            _settings_html(_location(boot_delay_s=120, router_grace=True)), "settings-panel"
+        )
+    )
+
+    assert rows["Boot delay"] == "120 s"
+    assert rows["Reported OFF after"].endswith("router grace on)")
 
 
 @pytest.mark.parametrize("language", sorted(LANGUAGE_LABELS))

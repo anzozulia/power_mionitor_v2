@@ -14,7 +14,9 @@ never given a final edit (D-08).
 
 A day's final edit waits until detection has settled past the end of that day (INV-03):
 OFF is recorded after the fact, backdated to the last heartbeat, so an outage that started
-in the day's last minutes is only in the timeline a timeout after midnight. The unpin does
+in the day's last minutes is only in the timeline a timeout after midnight. A restore is
+dated up to the location's boot delay before it was received (261101-g9v), so the wait is
+the larger of the timeout and the boot delay, plus one lapse threshold. The unpin does
 not wait for it, so two charts are pinned for seconds only (D-02).
 
 Every test runs ``io_loop.run_iteration(..., charts=True)``, which calls
@@ -46,7 +48,7 @@ from PIL import Image
 from powermon.alerts.models import OpsIncident
 from powermon.chart import lifecycle, model
 from powermon.chart.models import ChartMessage
-from powermon.engine import lapse
+from powermon.engine import lapse, transitions
 from powermon.engine.models import LocationState, PowerInterval, SystemState
 from powermon.locations.models import Location
 from powermon.worker import detection, io_loop
@@ -390,6 +392,91 @@ def test_INV03_INV08_final_edit_waits_for_an_outage_detected_after_midnight(
     assert (yesterday.finalized_at, yesterday.pinned) == (kyiv("2026-10-02 00:01:46"), False)
     pinned = ChartMessage.objects.filter(pinned=True).values_list("message_id", flat=True)
     assert list(pinned) == [1001]
+
+
+def test_INV03_final_edit_waits_for_a_restore_backdated_across_midnight(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    # Boot delay 300 s (261101-g9v): the restoring heartbeat received at Fri 00:03:00 is
+    # dated 23:58:00 Thu, so Thu's last 2 minutes are ON. Thu's final edit must wait for
+    # max(90 s timeout, 300 s delay) + 15 s = midnight + 315 s, not the old 105 s.
+    location = location_factory(boot_delay_s=300)
+    insert_pieces(
+        location,
+        local_pieces(
+            [
+                ("on", "2026-09-30 00:00", "2026-10-01 20:00"),
+                ("off", "2026-10-01 20:00", None),
+            ]
+        ),
+    )
+    set_status(location, "off", at=kyiv("2026-10-01 20:00"))
+    yesterday = _seed(
+        location, YESTERDAY, message_id=501, pinned=True, rendered=kyiv("2026-10-01 23:45")
+    )
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    # The ON alert.
+    fake_telegram.accept(DEFAULT_BOT_TOKEN)
+    start = kyiv("2026-10-02 00:00:01")
+    restore_received = kyiv("2026-10-02 00:03:00")
+    clock = FakeClock(start)
+    state = io_loop.RelayState()
+    edits_at: list[datetime] = []
+    off_recorded: list[datetime] = []
+    next_heartbeat = restore_received
+    outcomes: list[str] = []
+
+    # Detection runs a cycle every 5 s and the I/O thread a pass after each, to 00:06:01.
+    # Heartbeats: the restore at 00:03:00, then every 30 s (no Fri OFF with a 90 s timeout).
+    for step in range(73):
+        at = start + _sec(5 * step)
+        clock.set(at)
+        while next_heartbeat <= at:
+            outcomes.append(transitions.record_heartbeat(location.pk, next_heartbeat))
+            next_heartbeat += _sec(30)
+        if _detection_cycle(at):
+            off_recorded.append(at)
+        before = len(fake_telegram.chart_calls)
+        io_loop.run_iteration(clock, state, charts=True)
+        edits_at.extend(
+            at
+            for call in fake_telegram.chart_calls[before:]
+            if call.method == "editMessageMedia" and call.fields["message_id"] == "501"
+        )
+
+    assert outcomes[0] == "restored"
+    assert off_recorded == []
+    # Thu's off piece ends at the backdated restore, 23:58:00 Thu.
+    off = PowerInterval.objects.get(location=location, state="off")
+    assert off.end_at == kyiv("2026-10-01 23:58:00")
+    # No final edit at the old settle point (00:01:46) or any pass before midnight + 315 s;
+    # it is made by the first pass at or after it (00:05:16 at this 5 s cadence).
+    settle_point = model.next_midnight(YESTERDAY, KYIV) + _sec(315)
+    assert len(edits_at) == 1
+    assert edits_at[0] >= settle_point
+    assert edits_at[0] - settle_point < _sec(5)
+    final = next(
+        call
+        for call in fake_telegram.chart_calls
+        if call.method == "editMessageMedia" and call.fields["message_id"] == "501"
+    )
+    assert _caption(final) == "Thu 01.10 off: 3h 58m · 1 outage"
+    [snapshot], _ = lifecycle.read_snapshot(TODAY)
+    end_of_day = model.next_midnight(YESTERDAY, KYIV)
+    settled, _ = lifecycle.chart_content(snapshot, YESTERDAY, end_of_day, live=False, tz=KYIV)
+    assert final.files["chart"] == settled
+    yesterday.refresh_from_db()
+    assert yesterday.finalized_at == edits_at[0]
+
+
+def test_INV03_final_edit_without_a_boot_delay_keeps_the_old_settle_point(
+    location_factory: Callable[..., Any],
+) -> None:
+    # Edge: boot delay 0 keeps the snapshot's settle at 90 s + 15 s (the INV-03 test above).
+    location = _monitored(location_factory)
+    [snapshot], _ = lifecycle.read_snapshot(TODAY)
+    assert snapshot.location_id == location.pk
+    assert snapshot.settle == _sec(105)
 
 
 # INV-18 #2, INV-19 #1: catch-up after missed midnights (D-02, D-03, D-04)

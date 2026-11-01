@@ -26,12 +26,16 @@ CHART_REFRESH_CHOICES = [
 ]
 CHART_REFRESH_MINUTES = tuple(minutes for minutes, _ in CHART_REFRESH_CHOICES)
 DEFAULT_CHART_REFRESH_MIN = 15
+# Boot delay bounds in seconds (MON-03 amended by quick task 261101-g9v). 0 turns it off.
+MIN_BOOT_DELAY_S = 0
+MAX_BOOT_DELAY_S = 600
 
 # CHECK conditions, enforced by PostgreSQL.
 PERIOD_IN_RANGE = Q(period_s__gte=MIN_SECONDS, period_s__lte=MAX_SECONDS)
 GRACE_IN_RANGE = Q(grace_s__gte=MIN_SECONDS, grace_s__lte=MAX_SECONDS)
 LANGUAGE_KNOWN = Q(language__in=LANGUAGES)
 CHART_REFRESH_KNOWN = Q(chart_refresh_min__in=CHART_REFRESH_MINUTES)
+BOOT_DELAY_IN_RANGE = Q(boot_delay_s__gte=MIN_BOOT_DELAY_S, boot_delay_s__lte=MAX_BOOT_DELAY_S)
 
 
 class Location(models.Model):
@@ -43,6 +47,14 @@ class Location(models.Model):
     grace_s = models.IntegerField(default=30)
     # Router-reconnect grace: engine rules use it now; its UI arrives with LOC-09 (D-10).
     router_grace = models.BooleanField(default=False)
+    # Boot delay (quick task 261101-g9v): the seconds from mains power returning to the
+    # location's first heartbeat (router, optical terminal and board boot). Only the
+    # restore gate (the ON is dated this much earlier), the router window and the chart's
+    # final-edit settle read it. db_default keeps DEFAULT 0 in the database, so old code
+    # on this schema can still insert a location (a rollback, README section 8).
+    # IntegerField, not PositiveSmallIntegerField, for the same reason as
+    # chart_refresh_min: the latter's own CHECK would sort before location_boot_delay_0_600.
+    boot_delay_s = models.IntegerField(default=0, db_default=0)
     maintenance = models.BooleanField(default=False)
     alerts_enabled = models.BooleanField(default=True)
     language = models.CharField(max_length=2, choices=LANGUAGE_CHOICES, default="uk")
@@ -74,6 +86,7 @@ class Location(models.Model):
             models.CheckConstraint(
                 condition=CHART_REFRESH_KNOWN, name="location_chart_refresh_valid"
             ),
+            models.CheckConstraint(condition=BOOT_DELAY_IN_RANGE, name="location_boot_delay_0_600"),
         ]
 
     def __str__(self) -> str:

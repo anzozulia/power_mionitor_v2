@@ -125,7 +125,9 @@ subscriber row is claimed, ``_deliver`` reads the clock and, when the row goes o
 than ``LATE_AFTER`` (120 s) after its ``recorded_at``, renders the event's local time
 (``times.event_prefix`` in ``settings.CFG.display_tz``: ``HH:MM``, or ``DD.MM HH:MM`` on
 another local date) before the bold status. Lateness counts from ``recorded_at``, never
-from the backdated outage start (INV-15). Ops notices carry their own times and never get
+from the backdated outage start or the restore backdated by the boot delay (INV-15). The
+prefix shows ``event_at``, so for ON it is the backdated restore time, the same instant
+the chart shows. Ops notices carry their own times and never get
 this prefix.
 
 Expiry (ALRT-03, D-07, D-08) is the first work step of every pass, before any head is
@@ -876,8 +878,9 @@ def _record(outcome: Unapplied, state: RelayState) -> None:
 def _late_prefix(row: OutboxMessage, now: datetime) -> str | None:
     """The event's local time if the alert goes out more than LATE_AFTER after it was recorded.
 
-    The event time is the outage start for OFF and the restore time for ON (``event_at``);
-    lateness counts from ``recorded_at`` (D-05 to D-07, INV-15).
+    The event time is the outage start for OFF and the restore time for ON (``event_at``,
+    backdated by the location's boot delay, so it matches the chart); lateness counts from
+    ``recorded_at`` (the receive time), never from ``event_at`` (D-05 to D-07, INV-15).
     """
     if now - row.recorded_at <= LATE_AFTER:
         return None

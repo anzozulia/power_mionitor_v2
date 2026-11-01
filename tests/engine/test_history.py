@@ -1678,6 +1678,45 @@ def test_INV07_4_K2_removing_the_latest_outage_rewinds_on_since(
 
 
 @pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("alerts", ["queued", "sent"])
+def test_INV07_4_removing_a_backdated_restore_outage_rewinds_on_since(
+    location_factory: Callable[..., Any], alerts: str
+) -> None:
+    # Quick task 261101-g9v: a 120 s boot delay dates the restore received at 12:05 at
+    # 12:03, so on_since equals the off piece's end and the removal still rewinds it.
+    _no_anchors()
+    location = location_factory(boot_delay_s=120)
+    assert transitions.record_heartbeat(location.pk, _at(8, 0)) == "started"
+    assert transitions.record_heartbeat(location.pk, _at(12, 0)) == "plain"
+    assert detection.run_cycle(_at(12, 1, 31)) == 1
+    assert transitions.record_heartbeat(location.pk, _at(12, 5)) == "restored"
+    assert _intervals(location)[-2:] == [
+        ("off", _at(12, 0), _at(12, 3), _at(12, 0)),
+        ("on", _at(12, 3), None, None),
+    ]
+    off = _row_of(location, "power_off", _at(12, 0))
+    # outbox.restores matches the ON by its backdated event_at and was_off_us.
+    on = _row_of(location, "power_on", _at(12, 3))
+    assert on.payload == {"was_off_us": _us(minutes=3)}
+    if alerts == "sent":
+        _send(off, _at(12, 1, 32), 1)
+        _send(on, _at(12, 5, 1), 2)
+    version = _live(location)[5]
+
+    assert _remove(location, _at(12, 0), _at(12, 10)) == "removed"
+
+    assert _rewound(location) == (_at(8, 0), version + 1)
+    if alerts == "queued":
+        assert _status(on) == ("dropped", history.OUTAGE_REMOVED)
+        assert _requests() == []
+    else:
+        assert _requests() == [
+            ("power_off", _at(12, 0), _at(12, 10), None),
+            ("power_on", _at(12, 3), _at(12, 10), None),
+        ]
+
+
+@pytest.mark.django_db(transaction=True)
 @pytest.mark.parametrize("off_alert", ["queued", "sent_without_id"])
 def test_INV07_4_acceptance_off_alert_says_power_was_on_for_6h(
     location_factory: Callable[..., Any], off_alert: str

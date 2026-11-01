@@ -84,6 +84,7 @@ from powermon.locations.models import Location
 from powermon.locations.validators import CHAT_ID_EMPTY, TOKEN_FORMAT
 from powermon.web import location_views
 from powermon.web.forms import (
+    BOOT_DELAY_TOO_LONG,
     CHART_REFRESH_INVALID,
     EDIT_FORM_ERROR,
     GRACE_TOO_SHORT,
@@ -113,6 +114,7 @@ EDIT_H1 = "Edit location"
 EDIT_INTRO = "Maintenance, alerts and router grace are switched on the location page."
 EDIT_NOTE_MONITORING = (
     "New period and grace values apply from the next check and never change past history. "
+    "A new boot delay applies from the next return of power. "
     "Lower values can report OFF at the next check if the device has already been silent "
     "that long. If you lower the period, update the device first (Open device setup on the "
     "location page): a device that reports less often than the new period plus grace is "
@@ -190,6 +192,7 @@ def _form(location: Any, **overrides: str) -> dict[str, str]:
         "name": location.name,
         "period_s": str(location.period_s),
         "grace_s": str(location.grace_s),
+        "boot_delay_s": str(location.boot_delay_s),
         "bot_token": "",
         "chat_id": str(location.chat_id),
         "language": location.language,
@@ -319,6 +322,7 @@ def test_INV02_3_stale_edit_never_reverts_the_status(
         "name": "Office",
         "period_s": "60",
         "grace_s": "30",
+        "boot_delay_s": "0",
         "bot_token": "",
         "chat_id": str(DEFAULT_CHAT_ID),
         "language": "en",
@@ -413,6 +417,7 @@ def test_edit_unknown_or_deleted_location_is_404(
         "name": "Back again",
         "period_s": "60",
         "grace_s": "30",
+        "boot_delay_s": "0",
         "bot_token": "",
         "chat_id": str(DEFAULT_CHAT_ID),
         "language": "en",
@@ -537,6 +542,89 @@ def test_update_config_writes_the_chart_update_period(
 
     assert saved == actions.ConfigSaved(found=True, channel_changed=False)
     assert Location.objects.get(pk=location.pk).chart_refresh_min == 30
+
+
+@pytest.mark.django_db
+def test_edit_shows_and_keeps_the_stored_boot_delay(
+    rf: RequestFactory,
+    admin: Client,
+    location_factory: Callable[..., Any],
+    fake_telegram: FakeTelegram,
+) -> None:
+    # 261101-g9v: the stored 120 is the initial value, and a name-only save keeps it
+    # (stored_settings carries it; without it an untouched edit would reset it to 0).
+    location = location_factory(name="Office", boot_delay_s=120)
+    clock = FakeClock(_at(9, 0))
+
+    page = parse(admin.get(_edit(location)).content.decode())
+    assert _loaded_form(page)["boot_delay_s"] == "120"
+    assert location_views.stored_settings(location)["boot_delay_s"] == 120
+    response, flashes = _save(rf, location, clock, name="Office 2")
+
+    assert (response.status_code, flashes) == (302, [CHANGES_SAVED])
+    saved = Location.objects.get(pk=location.pk)
+    assert (saved.name, saved.boot_delay_s) == ("Office 2", 120)
+    assert len(fake_telegram.calls) == 0
+
+
+@pytest.mark.django_db
+def test_edit_boot_delay_only_save_is_not_a_channel_change(
+    rf: RequestFactory, location_factory: Callable[..., Any], fake_telegram: FakeTelegram
+) -> None:
+    location = location_factory(name="Office", bot_token=TOKEN)
+    other = location_factory(name="Other")
+    clock = FakeClock(_at(9, 0))
+    held = _held_alert(location, _at(8, 55), held_until=_at(9, 10))
+    rows_before = list(OutboxMessage.objects.order_by("pk").values())
+
+    response, flashes = _save(rf, location, clock, boot_delay_s="180")
+
+    assert (response.status_code, flashes) == (302, [CHANGES_SAVED])
+    assert Location.objects.get(pk=location.pk).boot_delay_s == 180
+    assert Location.objects.get(pk=other.pk).boot_delay_s == 0
+    # Not a channel change: the outbox is untouched, the held alert stays held.
+    assert list(OutboxMessage.objects.order_by("pk").values()) == rows_before
+    held.refresh_from_db()
+    assert held.next_attempt_at == _at(9, 10)
+    assert len(fake_telegram.calls) == 0
+
+
+@pytest.mark.django_db
+def test_edit_refuses_a_boot_delay_above_600(
+    admin: Client, location_factory: Callable[..., Any]
+) -> None:
+    location = location_factory(name="Office", boot_delay_s=120)
+    before = Location.objects.filter(pk=location.pk).values().get()
+
+    response = admin.post(_edit(location), _form(location, boot_delay_s="601", name="X"))
+
+    page = _refused(response)
+    assert field(page, "boot_delay_s").get("value") == "601"
+    assert field_error(page, "boot_delay_s") == BOOT_DELAY_TOO_LONG
+    assert "601" not in BOOT_DELAY_TOO_LONG
+    assert Location.objects.filter(pk=location.pk).values().get() == before
+
+
+@pytest.mark.django_db
+def test_update_config_writes_the_boot_delay(location_factory: Callable[..., Any]) -> None:
+    location = location_factory(name="Office")
+    data = {name: getattr(location, name) for name in actions.CONFIG_FIELDS}
+    assert "boot_delay_s" in actions.CONFIG_FIELDS
+
+    saved = actions.update_config(
+        location.pk, {**data, "boot_delay_s": 600, "bot_token": ""}, _at(9, 0)
+    )
+
+    assert saved == actions.ConfigSaved(found=True, channel_changed=False)
+    assert Location.objects.get(pk=location.pk).boot_delay_s == 600
+    # Failure: data without the boot delay is a KeyError, never a silent reset to 0.
+    with pytest.raises(KeyError):
+        actions.update_config(
+            location.pk,
+            {name: value for name, value in data.items() if name != "boot_delay_s"},
+            _at(9, 1),
+        )
+    assert Location.objects.get(pk=location.pk).boot_delay_s == 600
 
 
 @pytest.mark.django_db
@@ -1026,6 +1114,7 @@ def test_edit_page_layout(admin: Client, location_factory: Callable[..., Any]) -
         "name": name,
         "period_s": "60",
         "grace_s": "30",
+        "boot_delay_s": "0",
         "bot_token": "",
         "chat_id": str(DEFAULT_CHAT_ID),
         "language": "ru",
@@ -1075,6 +1164,7 @@ def test_UI01_edit_form_renders(admin: Client, location_factory: Callable[..., A
         "name": "Office",
         "period_s": "120",
         "grace_s": "45",
+        "boot_delay_s": "0",
         "bot_token": "",
         "chat_id": str(DEFAULT_CHAT_ID),
         "language": "ru",

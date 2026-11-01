@@ -8,8 +8,10 @@ The OFF rule (PROJECT.md, docs/v1-lessons.md section 2):
 - A location that is on is OFF when ``now - anchor > effective timeout`` (strict ``>``,
   K-2: "after 10:06:30, not at it").
 - The effective timeout is period + grace, plus ``ROUTER_GRACE`` when router-reconnect
-  grace is on and the last heartbeat came at most ``ROUTER_WINDOW`` after the location
-  turned on (inclusive, K-4).
+  grace is on and the last heartbeat came at most ``ROUTER_WINDOW`` after the first
+  heartbeat that turned the location on (inclusive, K-4). A restore is dated the
+  location's boot delay before that heartbeat (quick task 261101-g9v), so the window is
+  ``on_since + ROUTER_WINDOW + boot delay``; with a boot delay of 0 that is K-4 literally.
 - The anchor is the latest of the last heartbeat, the location's window start and the
   system anchors (worker start, web start): after a restart every location gets a fresh
   detection window (D-14), and the outage then starts at that anchor (INV-04/INV-11).
@@ -39,6 +41,9 @@ class Snapshot:
     period_s: int
     grace_s: int
     router_grace: bool
+    # Seconds the ON is dated before the first heartbeat (quick task 261101-g9v). Last,
+    # with a default, so existing positional and keyword callers keep working.
+    boot_delay_s: int = 0
 
 
 @dataclass(frozen=True)
@@ -61,8 +66,15 @@ class Decision:
 
 
 def effective_timeout(snap: Snapshot) -> timedelta:
-    """Period + grace, plus the router-reconnect grace when it applies."""
-    applies = snap.router_grace and snap.last_heartbeat_at - snap.on_since <= ROUTER_WINDOW
+    """Period + grace, plus the router-reconnect grace when it applies.
+
+    The window counts ``ROUTER_WINDOW`` from the first heartbeat after on, which lies the
+    boot delay after ``on_since`` (D-3, quick task 261101-g9v). The delay is the one read
+    this cycle, not the one the restore used. Accepted residual: lowering it within minutes
+    of a backdated restore shortens that on period's window at once.
+    """
+    window = ROUTER_WINDOW + timedelta(seconds=snap.boot_delay_s)
+    applies = snap.router_grace and snap.last_heartbeat_at - snap.on_since <= window
     return longest_timeout(snap.period_s, snap.grace_s, applies)
 
 
@@ -72,7 +84,9 @@ def longest_timeout(period_s: int, grace_s: int, router_grace: bool) -> timedelt
     Period + grace, plus ``ROUTER_GRACE`` when router-reconnect grace is on.
     ``effective_timeout`` adds the router grace only while its window applies, so it is
     never longer: an outage that started before ``t`` is recorded by the first detection
-    cycle after ``t`` + this (the chart's final edit waits for it, INV-03).
+    cycle after ``t`` + this. The chart's final edit waits for max(this, the boot delay)
+    (``lifecycle.settle_time``, INV-03), since a restore can be dated up to the boot delay
+    before it was received.
     """
     timeout = timedelta(seconds=period_s + grace_s)
     return timeout + ROUTER_GRACE if router_grace else timeout

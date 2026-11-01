@@ -6,7 +6,9 @@ Power Monitor tracks whether mains power is on at a few locations. A small mains
 device at each location (a router cron job, an ESP32, a Raspberry Pi; no UPS) sends a
 heartbeat every minute or so. When the heartbeats stop for longer than the location's
 period plus grace, the location's Telegram channel gets an OFF alert; the first heartbeat
-after the outage brings an ON alert. Each channel also gets a pinned weekly chart of when
+after the outage brings an ON alert. Its time is that heartbeat, less the location's boot
+delay if one is set (section 6), so the time the equipment needs to boot counts as power
+on. (Amended 2026-11-01, quick task 261101-g9v.) Each channel also gets a pinned weekly chart of when
 power was on and off, with daily totals, that updates itself (section 10, Weekly chart).
 One admin manages the locations in a small web panel: add, edit and delete them, pause
 them for maintenance, switch their alerts off, rotate a device key, send a test message,
@@ -208,7 +210,17 @@ its OFF within one detection window (period plus grace) after the restart.
    60 and 30, at least 10), the bot token from @BotFather, the numeric chat ID of the
    private test channel (`-100...`; the form's help text says how to find it), the
    alert language (uk, en or ru) and the chart update period (1, 5, 10, 15 or 30 min or
-   1 hour; default 15 min). (Amended 2026-10-06, quick task 261006-of9.) The bot must be
+   1 hour; default 15 min). (Amended 2026-10-06, quick task 261006-of9.) Optionally set
+   the **Boot delay (seconds)** (default 0 = off, 0-600 s): the time from mains power
+   returning to the device's first heartbeat (router, optical terminal and board boot).
+   After an outage the ON time is dated that much earlier, so the ON alert's "was OFF
+   for", the chart, the daily totals and the next OFF's "was ON for" count the boot time
+   as power on. The server cannot tell a boot from any other silence (an ISP drop, a key
+   rotation), so every restore is backdated the same way: an outage only ever gets shorter,
+   by at most the delay, and a silence no longer than the delay is left as it is (logged
+   once at INFO). Enter the shortest boot time you measured. The backdated ON never starts
+   before the outage or inside not-monitored time. (Amended 2026-11-01, quick task
+   261101-g9v.) The bot must be
    an administrator of the channel with the
    "Post messages" and "Edit messages of others" rights (the second one to pin, unpin and
    edit the weekly chart; in a group it needs "Pin messages"). "Post messages" also lets
@@ -406,8 +418,9 @@ changes the rules for `Europe/Kyiv`, bump the Python and postgres image tags.
   - All-silent with a location in maintenance: see "All-silent and maintenance" below.
 - **Late alerts:** an alert sent more than 2 minutes after its transition was recorded
   starts with the local time of its event (the outage start for OFF, the restore time for
-  ON): `🔴 17:27 POWER OFF`, or `🔴 30.09 23:58 POWER OFF` when the event was on another
-  day. While Telegram is unreachable, alerts wait in the outbox and are retried per bot;
+  ON, which is the first heartbeat less the boot delay; lateness still counts from when the
+  ON was recorded): `🔴 17:27 POWER OFF`, or `🔴 30.09 23:58 POWER OFF` when the event was
+  on another day. (Amended 2026-11-01, quick task 261101-g9v.) While Telegram is unreachable, alerts wait in the outbox and are retried per bot;
   heartbeats and detection never wait for Telegram.
 - **Weekly chart:** each location's channel has one pinned chart of the current week,
   in the location's language: one row per day, Monday to Sunday, in `DISPLAY_TZ`, each a
@@ -420,7 +433,8 @@ changes the rules for `Europe/Kyiv`, bump the Python and postgres image tags.
   - At local midnight (`DISPLAY_TZ`) a new chart for the new day is posted silently and
     pinned silently, and the previous day's chart is unpinned. Two charts are pinned for
     a few seconds at most. About two minutes later, once detection has run past
-    midnight by the location's heartbeat timeout plus a short margin, the previous day's
+    midnight by the location's heartbeat timeout (or its boot delay, if longer; Amended
+    2026-11-01, quick task 261101-g9v) plus a short margin, the previous day's
     chart gets its final render (no now marker, the caption names its date, for example
     `No outages on Thu 01.10`). An outage that began just before midnight is then
     counted, unless detection's checks failed in every cycle of that short margin (for
@@ -482,8 +496,9 @@ changes the rules for `Europe/Kyiv`, bump the Python and postgres image tags.
       later. Alerts already queued still go out. The chart, its regular updates and the
       midnight re-pin carry on. (Amended 2026-10-06, quick task 261006-of9.)
     - **Router grace:** while on, OFF waits 180 s longer when the last heartbeat came
-      within 5 minutes after power returned, so a router that restarts after a blackout
-      is not reported as a second outage. It changes only decisions made after the
+      within 5 minutes after the first heartbeat that followed an outage, so a router
+      that restarts after a blackout is not reported as a second outage. (Amended
+      2026-11-01, quick task 261101-g9v.) It changes only decisions made after the
       switch; outages already recorded and their totals stay as they are.
   - **Send test message:** one silent message to the channel with the location's bot
     and chat, to check the token and the chat ID. It is not an alert: it is sent even
@@ -505,8 +520,12 @@ changes the rules for `Europe/Kyiv`, bump the Python and postgres image tags.
     its cause is shown on the page only. If Telegram says the group became a supergroup,
     the page and the notice show the new chat ID (`-100…`): put it in Edit location, then
     send a test message. The chat ID is never changed automatically.
-  - **Edit location:** name, heartbeat period, grace, chat ID, language, chart update
-    period and, optionally, a new bot token. (Amended 2026-10-06, quick task 261006-of9.) The token field is always empty and the token is never shown again
+  - **Edit location:** name, heartbeat period, grace, boot delay, chat ID, language, chart update
+    period and, optionally, a new bot token. (Amended 2026-10-06, quick task 261006-of9.)
+    A new boot delay applies from the next return of power (the next restoring
+    heartbeat); it is not a channel change and never changes past outages, totals or
+    alerts already recorded. The location page shows it as **Boot delay** in the
+    settings. (Amended 2026-11-01, quick task 261101-g9v.) The token field is always empty and the token is never shown again
     (only `123456789:••••••••`); leave it empty to keep the current one. New period and
     grace values apply from the next check and never change past days or their totals.
     A lower value can report OFF at the next check if the device has already been silent
@@ -661,8 +680,9 @@ outbox and go out late (INV-15: blocked 10:00-10:10, last heartbeat 10:02, power
    It must show `power_off`, `pending` and `connect_error`. If it shows `sent`, the
    block did not work: remove it (step 5), plug A back in and start again.
 3. A few minutes later, and at least 5 minutes before the block ends, restore A's power.
-   The restore time is A's **first heartbeat** after power returns, not the moment you
-   plug A in. Reload the location list until A shows **On** and note its **Last
+   The restore time is A's **first heartbeat** after power returns, less A's boot delay
+   (use a location whose boot delay is 0 for this drill), not the moment you
+   plug A in. (Amended 2026-11-01, quick task 261101-g9v.) Reload the location list until A shows **On** and note its **Last
    heartbeat**: that is the restore time. Wait until at least 3 minutes have passed
    since then before you remove the block (step 5). Otherwise the ON may go out less
    than 2 minutes after it was recorded and carry no event time.
@@ -688,8 +708,8 @@ Expected:
 - while Telegram is blocked, the test channel gets nothing from A;
 - within about 60 s of unblocking, A's OFF and then A's ON arrive, exactly once each.
   Both start with their local event time: the OFF with the outage start (step 2), the
-  ON with the restore time, which is A's first heartbeat after power returned
-  (step 3). For example `🔴 10:02 POWER OFF`, then `🟢 10:06 POWER ON`;
+  ON with the restore time, which is A's first heartbeat after power returned, less
+  its boot delay (step 3; Amended 2026-11-01, quick task 261101-g9v). For example `🔴 10:02 POWER OFF`, then `🟢 10:06 POWER ON`;
 - every timed heartbeat took under 1 s;
 - no `❓ … may not have been delivered` notice: a refused connection means "not sent",
   so the alerts were retried.

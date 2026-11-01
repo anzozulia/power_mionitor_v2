@@ -68,14 +68,15 @@ ALERTS_HELP = (
     "queued still go out. The chart, its regular updates and the midnight re-pin carry on."
 )
 ROUTER_GRACE_ON_FLASH = (
-    "Router grace is on. From now on, OFF waits 180 seconds longer right after power returns."
+    "Router grace is on. From now on, OFF waits 180 seconds longer right after the first "
+    "heartbeat following an outage."
 )
 ROUTER_GRACE_ALREADY_ON_FLASH = "Router grace was already on. Nothing changed."
 ROUTER_GRACE_ALREADY_OFF_FLASH = "Router grace was already off. Nothing changed."
 ROUTER_GRACE_HELP = (
     "While on, OFF waits 180 seconds longer when the last heartbeat came within 5 minutes "
-    "after power returned, so a router that restarts after a blackout is not reported as a "
-    "second outage. It changes only decisions made from now on."
+    "after the first heartbeat that followed an outage, so a router that restarts after a "
+    "blackout is not reported as a second outage. It changes only decisions made from now on."
 )
 
 

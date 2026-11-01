@@ -54,15 +54,21 @@ SELECT status, outage_started_at
 
 # off -> on: the first heartbeat after an outage (MON-03). outage_started_at is left as
 # it is; "was OFF for" is computed from the value LOCK_SQL read under the lock.
-# ``at`` is the clamped gate time (IN-01) and ``now`` the receive time. The state keeps the
-# receive time, so detection anchors are never stamped in the future (F-03 follow-up,
-# quick task 261008-vdk R-1); only the timeline and the ON alert's event_at use ``at``.
-# Without a clamp ``at == now`` and nothing changes. LEAST is safe here: both operands are
-# bound, non-NULL parameters. Accepted residual: after a clamped restore on_since lies
-# before the off piece's end, so removing exactly that outage later does not rewind
-# on_since (REWIND_ON_SINCE_SQL needs on_since >= the outage end). That needs a clamped
-# restore (a backward clock step, or a heartbeat that waited on a lapse carve) plus that
-# removal.
+# ``at`` is the restore time and ``now`` the receive time. The restore time is the receive
+# time minus the location's boot delay (MON-03 amended by quick task 261101-g9v), unless
+# the silence was no longer than that delay (the guard: no zero-length outage, so a sent
+# OFF stays removable), then clamped to the outage start and the open interval start
+# (IN-01). So ``at < now`` is normal after a backdated restore: on_since takes ``at``
+# (the next OFF's "was ON for" counts the boot time as power on), while
+# last_heartbeat_at keeps the receive time, so detection anchors are never stamped in the
+# future (F-03 follow-up, quick task 261008-vdk R-1). ``at > now`` only after a forward
+# clamp; LEAST then keeps on_since at the receive time. LEAST is safe here: both operands
+# are bound, non-NULL parameters. Accepted residual: after a forward-clamped restore
+# on_since lies before the off piece's end, so removing exactly that outage later does
+# not rewind on_since (REWIND_ON_SINCE_SQL needs on_since >= the outage end). That needs a
+# clamped restore (a backward clock step, or a heartbeat that waited on a lapse carve)
+# plus that removal. A backdated restore keeps on_since == the off piece's end, so it
+# rewinds as before.
 RESTORE_SQL = """
 UPDATE location_state
    SET status = 'on', on_since = LEAST(%(at)s, %(now)s),
@@ -107,8 +113,9 @@ UPDATE location_state
 #   the rewind crosses the restore gap.
 # Not-monitored pieces are ignored, as lapses never move on_since. The state_version bump
 # comes only with a rewind, so a detector snapshot read before the removal loses its OFF CAS
-# (INV-01). Router grace then counts from the rewound value too, which is right: the power
-# never came back at the removed restore.
+# (INV-01). Router grace then counts from the rewound value too (the window is the rewound
+# on_since + 300 s + the boot delay), which is right: the power never came back at the
+# removed restore.
 REWIND_ON_SINCE_SQL = """
 UPDATE location_state s
    SET on_since = COALESCE(
@@ -144,12 +151,19 @@ DELETED_SQL = "SELECT deleted_at IS NOT NULL FROM location WHERE id = %s"
 # (OFF_CAS_SQL's RETURNING). Neither uses a value read before the transaction began.
 CONFIG_SQL = "SELECT maintenance, alerts_enabled FROM location WHERE id = %s"
 
+# The location's boot delay (quick task 261101-g9v), read by the restore gate on its own
+# cursor right after LOCK_SQL, under the state row lock, so an edit committed before the
+# heartbeat took the lock applies to this restore (INV-06). A single column with no FOR
+# UPDATE: never read through LOCK_SQL, which stays single-table, and never in the web view
+# before the lock.
+BOOT_DELAY_SQL = "SELECT boot_delay_s FROM location WHERE id = %s"
+
 # What the detector checks: monitored locations that are on, with their CAS token. No
 # alerts_enabled here: the snapshot is read outside the OFF transaction, and the admin may
 # toggle alerts before the CAS runs (WR-05).
 SNAPSHOT_SQL = """
 SELECT s.location_id, s.state_version, s.last_heartbeat_at, s.on_since, s.window_start_at,
-       l.period_s, l.grace_s, l.router_grace
+       l.period_s, l.grace_s, l.router_grace, l.boot_delay_s
   FROM location_state s
   JOIN location l ON l.id = s.location_id
  WHERE s.status = 'on' AND NOT l.maintenance AND l.deleted_at IS NULL
@@ -183,6 +197,15 @@ def _config_row(cur: CursorWrapper, location_id: int) -> tuple[bool, bool]:
     if row is None:
         raise LookupError(f"location {location_id} has a state row but no location row")
     return bool(row[0]), bool(row[1])
+
+
+def _boot_delay(cur: CursorWrapper, location_id: int) -> timedelta:
+    """The location's boot delay as a duration, read on the gate's cursor."""
+    cur.execute(BOOT_DELAY_SQL, [location_id])
+    row = cur.fetchone()
+    if row is None:
+        raise LookupError(f"location {location_id} has a state row but no location row")
+    return timedelta(seconds=int(row[0]))
 
 
 def _deleted(cur: CursorWrapper, location_id: int) -> bool:
@@ -241,18 +264,36 @@ def record_heartbeat(location_id: int, now: datetime) -> str:
     its key before a delete may wait on the lock the delete holds; once it gets the lock
     it sees the tombstone and changes nothing: no restore, no interval, no ON alert.
 
-    A restore is stamped at ``max(now, outage start, open interval start)`` (IN-01). After
-    a backward clock step ``now`` can lie before the outage start, and a heartbeat that
-    waited on a lapse carve's lock can lie before the open off piece's new start. Closing
-    the off interval there would violate ``power_interval_end_after_start`` and answer 500
-    on every heartbeat; the clamp keeps the CHECK true and "was OFF for" never negative.
-    The ON alert is dated at ``at`` but recorded at ``now``: the outbox makes a row due at
-    its recorded_at, so after a backward clock step the alert goes out at once instead of
-    waiting until the wall clock reaches ``at`` again. The state keeps the receive time:
-    ``on_since = min(at, now)`` and ``last_heartbeat_at = max(old, now)``, so detection
-    anchors are never stamped in the future and the next OFF is decided one timeout after
-    the last real heartbeat (F-03 follow-up, quick task 261008-vdk R-1). Only the timeline
-    and the ON alert's event_at use the clamped ``at``. Without a clamp ``at == now``.
+    A restore is stamped at ``at = max(restore, outage start, open interval start)``,
+    where ``restore`` is the receive time minus the location's boot delay (MON-03 amended
+    by quick task 261101-g9v): the router, optical terminal and board need that long after
+    mains power returns before the first heartbeat, so the ON is dated that much earlier
+    and the timeline, the chart, the day totals, "was OFF for" and the next OFF's "was ON
+    for" all count the boot time as power on. The guard: when the silence was no longer
+    than the boot delay (``now - delay <= outage start``) it was not a boot after a power
+    return, so ``restore = now`` and the result is exactly today's. Without the guard the
+    restore would land on the outage start and leave a zero-length outage that a sent OFF
+    alert could no longer be removed with. The server cannot tell a boot from other
+    silences, so the outage only ever shrinks, by at most the boot delay. When the delay
+    is set and the backdate was skipped or cut short, one INFO line says so (ids and
+    times only). With a boot delay of 0, ``restore == now`` and nothing changes.
+
+    The clamps (IN-01): after a backward clock step ``now`` can lie before the outage
+    start, and a heartbeat that waited on a lapse carve's lock can lie before the open off
+    piece's new start; the open interval start also keeps a backdated ON out of
+    not-monitored time (a lapse carve, maintenance). Closing the off interval before its
+    start would violate ``power_interval_end_after_start`` and answer 500 on every
+    heartbeat; the clamp keeps the CHECK true and "was OFF for" never negative. Only a
+    forward clamp (``at > now``) logs the once-per-process WARNING.
+
+    One ``at`` feeds the gate, the timeline and the ON alert: ``at < now`` is normal after
+    a backdated restore. The ON alert is dated at ``at`` but recorded at ``now``: the
+    outbox makes a row due at its recorded_at and counts lateness from it, so after a
+    backward clock step the alert goes out at once instead of waiting until the wall
+    clock reaches ``at`` again. The state takes ``on_since = min(at, now)`` and keeps the
+    receive time in ``last_heartbeat_at = max(old, now)``, so detection anchors are never
+    stamped in the future and the next OFF is decided one timeout after the last real
+    heartbeat (F-03 follow-up, quick task 261008-vdk R-1).
 
     The FIRST gate clamps the same way. Before Phase 5 a waiting location had no interval,
     but after a database restore (``powermon.engine.restore``, D-13) it holds an open
@@ -260,7 +301,8 @@ def record_heartbeat(location_id: int, now: datetime) -> str:
     that piece and opens "on" at ``max(now, open interval start)``; a server whose clock
     is behind the dump would otherwise close the piece before its start and answer 500
     on every heartbeat (RESEARCH Pitfall 3). The state again keeps the receive time
-    (R-1). The start is still silent.
+    (R-1). The start is still silent, and it is never backdated by the boot delay; nor
+    is a plain heartbeat.
     """
     params: dict[str, int | datetime] = {"id": location_id, "now": now}
     with transaction.atomic(), connection.cursor() as cur:
@@ -271,9 +313,25 @@ def record_heartbeat(location_id: int, now: datetime) -> str:
         status, outage_started_at = locked
         if status == "off":
             open_start = timeline.open_start(cur, location_id)
-            at = max(t for t in (now, outage_started_at, open_start) if t is not None)
+            delay = _boot_delay(cur, location_id)
+            restore = now - delay
+            if outage_started_at is not None and restore <= outage_started_at:
+                # The guard: a silence no longer than the boot delay was not a boot after
+                # a power return. Behave exactly as without a delay.
+                restore = now
+            at = max(t for t in (restore, outage_started_at, open_start) if t is not None)
             if at > now:
                 _warn_restore_clamped(location_id, at)
+            if delay > timedelta(0) and outage_started_at is not None and at != now - delay:
+                # Ids and times only (OPS-08). No flag, no ops incident.
+                log.info(
+                    "restore for location %s not backdated by its boot delay of %s s "
+                    "(silence %s s): dated at %s",
+                    location_id,
+                    int(delay.total_seconds()),
+                    round((now - outage_started_at).total_seconds()),
+                    at.isoformat(),
+                )
             _run_gate(cur, RESTORE_SQL, {"id": location_id, "at": at, "now": now})
             maintenance, alerts_enabled = _config_row(cur, location_id)
             # Closes the off interval at ``at``, never before its start (the clamp above):
@@ -330,6 +388,7 @@ def read_snapshots() -> list[rules.Snapshot]:
             period_s=row[5],
             grace_s=row[6],
             router_grace=row[7],
+            boot_delay_s=row[8],
         )
         for row in rows
     ]

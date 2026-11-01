@@ -448,6 +448,7 @@ def test_full_key_appears_in_no_other_response(admin: Client) -> None:
             "name": "Home",
             "period_s": "60",
             "grace_s": "30",
+            "boot_delay_s": "0",
             "bot_token": TOKEN,
             "chat_id": "-1001234567890",
             "language": "en",
@@ -674,6 +675,7 @@ def test_setup_guidance_copy(admin: Client, location_factory: Callable[..., Any]
         ("Heartbeat period", "45 s"),
         ("Grace period", "20 s"),
         ("Reported OFF after", "65 s without a heartbeat"),
+        ("Boot delay", "0 s"),
         ("Channel chat ID", "-1009876543210"),
         ("Bot token", "123456789, the rest is hidden"),
     ]
@@ -785,9 +787,10 @@ def test_location_page_settings_and_setup_sections_on_setup(
         ("Grace period", "20 s"),
         (
             "Reported OFF after",
-            f"65 s without a heartbeat ({65 + ROUTER_GRACE_S} s right after power returns, "
-            "router grace on)",
+            f"65 s without a heartbeat ({65 + ROUTER_GRACE_S} s right after the first "
+            "heartbeat following an outage, router grace on)",
         ),
+        ("Boot delay", "0 s"),
         ("Channel chat ID", "-1009876543210"),
         ("Bot token", "987654321, the rest is hidden"),
     ]

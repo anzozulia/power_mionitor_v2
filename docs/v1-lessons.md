@@ -17,11 +17,11 @@ Source: a September 2026 investigation of the v1 codebase (Django, last changed 
 
 ## 2. Keep: what v1 got right
 
-- **Heartbeats:** a heartbeat is any authenticated HTTP request from a mains-powered device without a UPS (a router cron job, an ESP32). The server's receive time is the only timestamp, so device clocks never matter.
+- **Heartbeats:** a heartbeat is any authenticated HTTP request from a mains-powered device without a UPS (a router cron job, an ESP32). The server's receive time is the only timestamp, so device clocks never matter. The one exception is a restore: it is dated at the receive time minus the location's configured boot delay, which is server config, not a device clock. (Amended 2026-11-01, quick task 261101-g9v.)
 - **Timeout rule:** off when `now - last heartbeat > period + grace` (strict `>`). Period and grace are each >= 10 s, with defaults 60 s and 30 s.
-- **Router-reconnect grace** (per-location toggle): add 180 s to the timeout when the last heartbeat arrived <= 300 s after the location's latest on transition (inclusive). The reason: routers without a UPS reboot and reconnect right after power returns, which would otherwise look like a second short outage.
+- **Router-reconnect grace** (per-location toggle): add 180 s to the timeout when the last heartbeat arrived <= 300 s after the location's latest on transition (inclusive). With a boot delay the 300 s still count from the first heartbeat after the outage, i.e. from on transition + boot delay. (Amended 2026-11-01, quick task 261101-g9v.) The reason: routers without a UPS reboot and reconnect right after power returns, which would otherwise look like a second short outage.
 - **Start of monitoring:** the first heartbeat starts monitoring as **on**, silently.
-- **Off start:** an off transition is backdated to the last heartbeat. The on transition happens at the first heartbeat after the outage.
+- **Off start:** an off transition is backdated to the last heartbeat. The on transition happens at the first heartbeat after the outage, minus the location's boot delay (0-600 s, default 0): the time its router, optical terminal and board need to boot after power returns. It is not backdated when the silence was no longer than the delay, and never to before the outage start or into a not-monitored interval. (Amended 2026-11-01, quick task 261101-g9v.)
 - **Durations:** "was ON for" = last heartbeat - on time. "was OFF for" = restore time - outage start. The on and off durations tile the timeline exactly. Example: heartbeats 10:00-10:05, then silence, then a heartbeat at 11:00 gives "ON for 5m" and "OFF for 55m".
 - **Maintenance mode:** no off detection or alerts, while heartbeats and restoration keep working.
 - **Alert format:** emoji + bold localized status + previous-state duration, for example `🔴 POWER OFF` / `⚡ Power was ON for: 5h 12m`. The only text is static strings plus numbers, so there is no HTML-injection surface. Anything user-typed that gets added later must be escaped.
@@ -70,6 +70,7 @@ Source: a September 2026 investigation of the v1 codebase (Django, last changed 
 - **v1 failure:** Alerts came from the location's state, while the chart re-classified heartbeat gaps using the current timeout. Red started at last heartbeat + 90 s. The chart showed 7110 s for an outage the alert reported as 7260 s. The chart restarted the router grace from the previous day's last heartbeat, so it hid 90-270 s outages just after midnight that the engine did alert on. Outages the blocked detector missed showed as red with no alert, and ghost-off states showed as green.
 - **Acceptance:**
   - Given heartbeats until 10:00:00 and the next one at 12:00:00, then the ON alert says "was OFF for 2h"; the off span on the chart is exactly 10:00:00-12:00:00; the row total reads "2h · 1"; the caption at 12:05 shows the same today totals, and the image's now pill shows the time of the last update (12:05).
+  - Given the same heartbeats and a boot delay of 2 min, then the ON alert says "was OFF for 1h 58m", the off span on the chart is exactly 10:00:00-11:58:00, and the row total reads "1h 58m · 1". (Amended 2026-11-01, quick task 261101-g9v.)
   - Given any day in any test, then its on + off + not monitored + no data intervals do not overlap and add up to the day's length (24 h, or 23 h / 25 h on DST days).
   - Given the first heartbeat on Tuesday at 08:00, then Monday and Tuesday 00:00-08:00 are no data and count toward neither off time nor outages.
 - **Covers:** CHRT-01, CHRT-03, CHRT-04, MON-02, MON-03
@@ -91,7 +92,7 @@ Source: a September 2026 investigation of the v1 codebase (Django, last changed 
 - **Covers:** LOC-08, LOC-09, LOC-10
 
 #### INV-06 Changing thresholds never rewrites history
-- **Rule:** Period, grace and router-grace changes apply only to decisions made after the change. Stored intervals are never recomputed.
+- **Rule:** Period, grace and router-grace changes apply only to decisions made after the change. A boot-delay change applies only to restores recorded after it. (Amended 2026-11-01, quick task 261101-g9v.) Stored intervals are never recomputed.
 - **v1 failure:** The chart applied the current timeout to every past day. Raising grace from 30 s to 600 s turned an 8-min outage green. Changing 60/30 to 30/10 turned one 4 h outage into 1200 red slivers totalling 10.67 h.
 - **Acceptance:**
   - Given yesterday has an outage 10:00-10:08 ("8m · 1"), when the admin sets grace to 600 s, then yesterday's row and totals are unchanged.

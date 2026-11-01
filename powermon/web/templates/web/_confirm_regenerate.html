@@ -38,7 +38,7 @@ characters); fragment (set only for the modal, as in web/_confirm_delete.html).
 {% elif state_block == "off" %}
 <div data-testid="state-block" data-tone="info" data-state-block="power-off" class="flex items-start gap-2 rounded-control border border-info-border bg-info-bg p-4 [box-shadow:inset_3px_0_0_var(--info-text)]">
 {% icon "info" class="size-5 shrink-0 text-info-text" %}
-<p class="min-w-0 flex-1 break-words">This location is off now. Until the device has the new key, the return of power is not seen: the outage is recorded until the first heartbeat with the new key, so the chart, the day totals and the ON alert (if alerts are on) count that time as off. Turn maintenance on first to have that time shown as not monitored instead.</p>
+<p class="min-w-0 flex-1 break-words">This location is off now. Until the device has the new key, the return of power is not seen: the outage is recorded until the first heartbeat with the new key (less the boot delay, if one is set), so the chart, the day totals and the ON alert (if alerts are on) count that time as off. Turn maintenance on first to have that time shown as not monitored instead.</p>
 </div>
 {% elif state_block == "waiting" %}
 <div data-testid="state-block" data-tone="info" data-state-block="waiting" class="flex items-start gap-2 rounded-control border border-info-border bg-info-bg p-4 [box-shadow:inset_3px_0_0_var(--info-text)]">
