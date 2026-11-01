@@ -56,15 +56,16 @@ from conftest import (
     terminate_backends,
     wait_for,
 )
-from django.db import IntegrityError, connection, transaction
+from django.db import DataError, IntegrityError, connection, transaction
 
 from powermon.alerts import delivery, outbox, texts
 from powermon.alerts.models import OpsIncident, OutboxMessage
 from powermon.chart import source
 from powermon.chart.models import ChartMessage
 from powermon.engine import history, maintenance, restore, timeline, transitions
-from powermon.engine.models import LocationState, PowerInterval, SystemState
+from powermon.engine.models import LocationState, PowerInterval, PowerIntervalArchive, SystemState
 from powermon.i18n import chart_texts
+from powermon.locations import actions
 from powermon.locations.models import Location
 from powermon.worker import detection, io_loop
 
@@ -1923,3 +1924,208 @@ def test_INV07_4_removal_keeps_on_since(location_factory: Callable[..., Any], ca
     assert _remove(location, _at(9, 0), _at(10, 40)) == "removed"
 
     assert _live(location) == before
+
+
+# DATA-01: the reset and the removal archive the rows they destroy (261101-mm9)
+
+Archived = tuple[str, datetime, datetime | None, datetime | None, str, datetime]
+
+
+def _archive(location: Any) -> list[Archived]:
+    """The location's archived rows as (state, start_at, end_at, outage_start_at, reason,
+    archived_at), oldest piece first."""
+    rows = PowerIntervalArchive.objects.filter(location=location).order_by("start_at", "id")
+    return [
+        (r.state, r.start_at, r.end_at, r.outage_start_at, r.reason, r.archived_at) for r in rows
+    ]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_DATA03_reset_archives_every_piece_then_deletes(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = _two_outages(location_factory)
+    # Another location, started after the day's detection cycles so none of them sees it.
+    other = location_factory()
+    assert transitions.record_heartbeat(other.pk, _at(8, 0)) == "started"
+    other_before = _intervals(other)
+    snapshot = _intervals(location)
+    assert len(snapshot) == 5
+    assert snapshot[-1] == ("on", _at(15, 30), None, None)
+    now = _at(16, 0)
+
+    assert history.reset_history(location.pk, now) == "reset"
+
+    # Every piece, the open one included (end_at None), with the reason and the caller's now.
+    assert _archive(location) == [(*piece, "history_reset", now) for piece in snapshot]
+    assert _intervals(location) == []
+    # Another location's timeline and archive are untouched.
+    assert _intervals(other) == other_before
+    assert _archive(other) == []
+
+
+@pytest.mark.django_db(transaction=True)
+def test_DATA03_second_reset_appends_and_keeps_the_first_archive(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = _two_outages(location_factory)
+    assert history.reset_history(location.pk, _at(16, 0)) == "reset"
+    first = list(PowerIntervalArchive.objects.order_by("id").values())
+    assert len(first) == 5
+    assert transitions.record_heartbeat(location.pk, _at(16, 10)) == "started"
+    assert transitions.record_heartbeat(location.pk, _at(16, 20)) == "plain"
+
+    assert history.reset_history(location.pk, _at(16, 30)) == "reset"
+
+    rows = list(PowerIntervalArchive.objects.order_by("id").values())
+    # The first reset's rows keep their ids and every field; one row is appended.
+    assert rows[:5] == first
+    assert len(rows) == 6
+    new = rows[5]
+    assert (
+        new["state"],
+        new["start_at"],
+        new["end_at"],
+        new["outage_start_at"],
+        new["reason"],
+        new["archived_at"],
+    ) == ("on", _at(16, 10), None, None, "history_reset", _at(16, 30))
+    assert _intervals(location) == []
+
+
+@pytest.mark.django_db(transaction=True)
+def test_DATA03_refused_reset_archives_nothing(location_factory: Callable[..., Any]) -> None:
+    # "in_progress": off, then off in maintenance (D-06).
+    off = _off_since_9(location_factory)
+    off_before = _intervals(off)
+    assert history.reset_history(off.pk, _at(9, 40)) == "in_progress"
+    assert _intervals(off) == off_before
+    assert maintenance.set_maintenance(off.pk, True, _at(9, 30)) is True
+    off_before = _intervals(off)
+    assert history.reset_history(off.pk, _at(9, 40)) == "in_progress"
+    assert _intervals(off) == off_before
+    # "nothing": a location waiting for its first heartbeat.
+    waiting = location_factory()
+    assert history.reset_history(waiting.pk, _at(9, 40)) == "nothing"
+    # "gone": a deleted location with history, and an unknown id.
+    deleted = location_factory()
+    assert transitions.record_heartbeat(deleted.pk, _at(8, 0)) == "started"
+    Location.objects.filter(pk=deleted.pk).update(deleted_at=_at(9, 0))
+    deleted_before = _intervals(deleted)
+    assert history.reset_history(deleted.pk, _at(9, 40)) == "gone"
+    assert history.reset_history(deleted.pk + 1000, _at(9, 40)) == "gone"
+
+    assert PowerIntervalArchive.objects.count() == 0
+    assert _intervals(deleted) == deleted_before
+    assert _intervals(waiting) == []
+
+
+@pytest.mark.django_db(transaction=True)
+def test_DATA03_reset_failure_rolls_the_archive_back(
+    location_factory: Callable[..., Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    location = _two_outages(location_factory)
+    snapshot = _intervals(location)
+    # A failure after the archive insert and the delete, in the same transaction.
+    monkeypatch.setattr(history, "MARK_CHARTS_SQL", "SELECT 1/0")
+
+    with pytest.raises(DataError):
+        history.reset_history(location.pk, _at(16, 0))
+
+    assert PowerIntervalArchive.objects.count() == 0
+    assert _intervals(location) == snapshot
+
+
+@pytest.mark.django_db(transaction=True)
+def test_DATA02_removal_archives_exactly_the_outage_off_pieces(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = _two_outages(location_factory)
+
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "removed"
+
+    # The 09:00 outage's off piece only; the 15:00 outage and the on pieces are not copied.
+    assert _archive(location) == [
+        ("off", _at(9, 0), _at(10, 0), _at(9, 0), "outage_removed", REMOVAL)
+    ]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_DATA02_split_outage_archives_only_its_off_pieces(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = _off_since_9(location_factory)
+    assert maintenance.set_maintenance(location.pk, True, _at(10, 0)) is True
+    assert maintenance.set_maintenance(location.pk, False, _at(10, 10)) is True
+    assert transitions.record_heartbeat(location.pk, _at(11, 0)) == "restored"
+
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "removed"
+
+    # The not-monitored piece 10:00-10:10 is not rewritten, so it is not archived (D-02).
+    assert _archive(location) == [
+        ("off", _at(9, 0), _at(10, 0), _at(9, 0), "outage_removed", REMOVAL),
+        ("off", _at(10, 10), _at(11, 0), _at(9, 0), "outage_removed", REMOVAL),
+    ]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_DATA02_refused_removal_archives_nothing(location_factory: Callable[..., Any]) -> None:
+    # "sending": the outage's OFF alert is in flight (W1-A1).
+    sending = _two_outages(location_factory)
+    off = _row_of(sending, "power_off", _at(9, 0))
+    assert outbox.claim(off.pk) is True
+    assert history.remove_outage(sending.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "sending"
+    assert PowerIntervalArchive.objects.count() == 0
+    # "in_progress": the current outage (INV-07 #3).
+    current = _off_since_9(location_factory)
+    assert history.remove_outage(current.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "in_progress"
+    assert PowerIntervalArchive.objects.count() == 0
+    # "gone": a second removal after a successful one leaves exactly the first copy.
+    location = _two_outages(location_factory)
+    assert history.remove_outage(location.pk, _at(15, 0), now=REMOVAL, tz=KYIV) == "removed"
+    assert history.remove_outage(location.pk, _at(15, 0), now=REMOVAL, tz=KYIV) == "gone"
+    assert _archive(location) == [
+        ("off", _at(15, 0), _at(15, 30), _at(15, 0), "outage_removed", REMOVAL)
+    ]
+    # "gone": a deleted location, and an unknown id.
+    Location.objects.filter(pk=location.pk).update(deleted_at=_at(16, 0))
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "gone"
+    assert history.remove_outage(location.pk + 1000, _at(9, 0), now=REMOVAL, tz=KYIV) == "gone"
+
+    assert PowerIntervalArchive.objects.count() == 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_DATA02_removal_failure_rolls_the_archive_back(
+    location_factory: Callable[..., Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    location = _two_outages(location_factory)
+    snapshot = _intervals(location)
+
+    def boom(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("boom")
+
+    # A failure in the overwrite loop, right after the archive insert.
+    monkeypatch.setattr(history.timeline, "overwrite", boom)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV)
+
+    assert PowerIntervalArchive.objects.count() == 0
+    assert _intervals(location) == snapshot
+
+
+@pytest.mark.django_db(transaction=True)
+def test_DATA01_archive_survives_a_location_delete(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = _two_outages(location_factory)
+    assert history.reset_history(location.pk, _at(16, 0)) == "reset"
+    archived = _archive(location)
+    assert len(archived) == 5
+
+    assert actions.delete_location(location.pk, _at(16, 5)) is True
+
+    # The delete is a tombstone: the location row and its archive stay.
+    assert _archive(location) == archived
+    assert Location.objects.get(pk=location.pk).deleted_at == _at(16, 5)

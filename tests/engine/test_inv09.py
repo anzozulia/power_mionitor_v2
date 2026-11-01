@@ -20,7 +20,14 @@ pins the adapted rule instead (05-06 assumption-delta decision):
   intervals, and a location is only ever soft-deleted through ``deleted_at`` (Phase 4
   D-09). Every ``.delete()`` / ``._raw_delete()`` call in ``powermon/`` must be in
   ``ALLOWED_DELETES``, so a new one fails here until it is reviewed. Both scans are also
-  run on source strings, so they cannot pass vacuously.
+  run on source strings, so they cannot pass vacuously;
+- the reset and the removal copy what they take off the timeline into the append-only
+  ``power_interval_archive`` first (quick task 261101-mm9). The archive is written only by
+  ``history.ARCHIVE_RESET_SQL`` and ``history.ARCHIVE_REMOVED_SQL`` (INSERT...SELECT): no
+  raw SQL or ORM call deletes, truncates or updates its rows, and no ORM call creates them;
+- ``outbox_message``, ``ops_incident`` and ``chart_message`` are history too (the alerts
+  sent, the incidents, the charts posted). Code only ever inserts and updates their rows:
+  no raw SQL deletes or truncates them.
 
 Heartbeat and pass tests are ``django_db(transaction=True)``: the I/O pass calls
 ``close_old_connections()``. Time comes only from the ``FakeClock``; Telegram is faked at
@@ -78,23 +85,73 @@ ALLOWED_DELETES: tuple[tuple[str, str], ...] = (
     ("powermon/web/admin_sync.py", "user_model"),
 )
 
-# A receiver chain through any of these names reaches the timeline: refused even if the
-# allowlist names it. ``intervals`` is the PowerInterval related manager of a location.
-PROTECTED_NAMES = frozenset({"PowerInterval", "Location", "intervals"})
+# The archive model and its related manager on a location (261101-mm9).
+ARCHIVE_NAMES = frozenset({"PowerIntervalArchive", "archived_intervals"})
+# A receiver chain through any of these names reaches the timeline or its archive: refused
+# even if the allowlist names it. ``intervals`` is the PowerInterval related manager of a
+# location.
+PROTECTED_NAMES = frozenset({"PowerInterval", "Location", "intervals"}) | ARCHIVE_NAMES
 DELETE_METHODS = frozenset({"delete", "_raw_delete"})
+# Every ORM write: none may go through the archive model (its only writes are history's
+# two INSERT...SELECT statements).
+ARCHIVE_WRITE_METHODS = DELETE_METHODS | frozenset(
+    {"update", "bulk_update", "update_or_create", "create", "bulk_create", "get_or_create", "save"}
+)
+
+# The history tables beside the timeline that no code may delete from (261101-mm9). The
+# timeline itself (power_interval) keeps its own scan below, with its two allowed DELETEs.
+HISTORY_TABLES = ("power_interval_archive", "outbox_message", "ops_incident", "chart_message")
+_TABLE = r'(?:"?public"?\s*\.\s*)?"?({names})"?(?![\w"])[^"\']*'
+# DELETE FROM one of HISTORY_TABLES, quoted or schema-qualified, any case and whitespace;
+# the lookahead keeps a longer name (outbox_message_old) out.
+DELETE_HISTORY_RE = re.compile(
+    r"\bdelete\s+from\s+(?:only\s+)?" + _TABLE.format(names="|".join(HISTORY_TABLES)),
+    re.IGNORECASE,
+)
+# UPDATE [ONLY] power_interval_archive: no code may change an archived row.
+UPDATE_ARCHIVE_RE = re.compile(
+    r"\bupdate\s+(?:only\s+)?" + _TABLE.format(names="power_interval_archive"), re.IGNORECASE
+)
+# INSERT INTO power_interval_archive: only history's two INSERT...SELECT constants.
+INSERT_ARCHIVE_RE = re.compile(
+    r"\binsert\s+into\s+" + _TABLE.format(names="power_interval_archive"), re.IGNORECASE
+)
+# The two archive statements, whitespace-normalized (D-2 of 261101-mm9).
+ARCHIVE_RESET_TEXT = (
+    "INSERT INTO power_interval_archive (location_id, state, start_at, end_at, "
+    "outage_start_at, archived_at, reason) SELECT location_id, state, start_at, end_at, "
+    "outage_start_at, %(now)s, 'history_reset' FROM power_interval WHERE location_id = %(id)s"
+)
+ARCHIVE_REMOVED_TEXT = (
+    "INSERT INTO power_interval_archive (location_id, state, start_at, end_at, "
+    "outage_start_at, archived_at, reason) SELECT location_id, state, start_at, end_at, "
+    "outage_start_at, %(now)s, 'outage_removed' FROM power_interval WHERE location_id = "
+    "%(id)s AND state = 'off' AND outage_start_at = %(start)s"
+)
 
 # DELETE FROM power_interval, any case and whitespace, the table name optionally
 # double-quoted or schema-qualified; the match runs to the end of the string literal.
 DELETE_TIMELINE_RE = re.compile(
-    r'\bdelete\s+from\s+(?:"?public"?\s*\.\s*)?"?power_interval"?(?![\w"])[^"\']*',
+    r'\bdelete\s+from\s+(?:only\s+)?(?:"?public"?\s*\.\s*)?"?power_interval"?(?![\w"])[^"\']*',
     re.IGNORECASE,
+)
+# Default deny (review of 261101-mm9): nothing in the app reads or writes the archive
+# through the ORM, so its model and related-manager names may appear only where the model
+# is defined, exported and created. A write through a variable (``rows = ...; rows.update()``)
+# cannot hide from this the way it can from the per-call ORM scan.
+ARCHIVE_NAME_FILES = frozenset(
+    {
+        "powermon/engine/models.py",
+        "powermon/models.py",
+        "powermon/migrations/0014_power_interval_archive.py",
+    }
 )
 # TRUNCATE [TABLE] [ONLY] name [, name ...]: the names it lists.
 TRUNCATE_RE = re.compile(
     r'\btruncate\s+(?:table\s+)?((?:only\s+)?[\w".]+(?:\s*,\s*(?:only\s+)?[\w".]+)*)',
     re.IGNORECASE,
 )
-TRUNCATE_PROTECTED = frozenset({"power_interval", "location"})
+TRUNCATE_PROTECTED = frozenset({"power_interval", "location", *HISTORY_TABLES})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -130,8 +187,22 @@ def timeline_sql_deletes(source_text: str, path: str) -> list[tuple[str, str]]:
     return [(path, match.group(0)) for match in DELETE_TIMELINE_RE.finditer(source_text)]
 
 
+def history_sql_deletes(source_text: str, path: str) -> list[tuple[str, str, str]]:
+    """Every ``DELETE FROM`` one of ``HISTORY_TABLES``, as (path, table, text)."""
+    return [
+        (path, match.group(1).lower(), match.group(0))
+        for match in DELETE_HISTORY_RE.finditer(source_text)
+    ]
+
+
+def archive_sql(pattern: re.Pattern[str], source_text: str, path: str) -> list[tuple[str, str]]:
+    """Every match of an archive statement ``pattern`` (UPDATE / INSERT), as (path, text)."""
+    return [(path, match.group(0)) for match in pattern.finditer(source_text)]
+
+
 def protected_truncates(source_text: str, path: str) -> list[tuple[str, str]]:
-    """Every TRUNCATE that lists ``power_interval`` or ``location``, as (path, statement)."""
+    """Every TRUNCATE that lists a protected table (``TRUNCATE_PROTECTED``), as (path,
+    statement)."""
     found = []
     for match in TRUNCATE_RE.finditer(source_text):
         names = set()
@@ -144,7 +215,43 @@ def protected_truncates(source_text: str, path: str) -> list[tuple[str, str]]:
 
 
 def orm_deletes(source_text: str, path: str) -> list[DeleteCall]:
-    """Every call of a method named delete or _raw_delete, with its receiver chain.
+    """Every call of a method named delete or _raw_delete, with its receiver chain."""
+    return orm_calls(source_text, path, DELETE_METHODS)
+
+
+def archive_orm_writes(source_text: str, path: str) -> list[DeleteCall]:
+    """Every ORM write call (``ARCHIVE_WRITE_METHODS``) whose receiver chain goes through
+    the archive model or its related manager: none is allowed."""
+    calls = orm_calls(source_text, path, ARCHIVE_WRITE_METHODS)
+    return [call for call in calls if call.names & ARCHIVE_NAMES]
+
+
+def archive_name_uses(source_text: str, path: str) -> list[tuple[str, int, str]]:
+    """Every use of an archive name: a name, an attribute, an import, a class definition,
+    or a string equal to one (``apps.get_model("powermon", "PowerIntervalArchive")``), as
+    (path, line, name)."""
+    found = []
+    for node in ast.walk(ast.parse(source_text, filename=path)):
+        if isinstance(node, ast.Name):
+            name = node.id
+        elif isinstance(node, ast.Attribute):
+            name = node.attr
+        elif isinstance(node, ast.alias):
+            # The imported name, not the alias: ``import ... as A`` is still a use.
+            name = node.name.rpartition(".")[2]
+        elif isinstance(node, ast.ClassDef):
+            name = node.name
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            name = node.value
+        else:
+            continue
+        if name in ARCHIVE_NAMES:
+            found.append((path, node.lineno, name))
+    return found
+
+
+def orm_calls(source_text: str, path: str, methods: frozenset[str]) -> list[DeleteCall]:
+    """Every call of a method named in ``methods``, with its receiver chain.
 
     The receiver is followed through attributes (``a.b``), calls (``a()``) and subscripts
     (``a[0]``) down to its root name: ``LoginFailure`` for
@@ -155,7 +262,7 @@ def orm_deletes(source_text: str, path: str) -> list[DeleteCall]:
         if not (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
-            and node.func.attr in DELETE_METHODS
+            and node.func.attr in methods
         ):
             continue
         names: set[str] = set()
@@ -388,20 +495,46 @@ def test_INV09_history_older_than_40_days_is_never_pruned(
     assert _day_totals(location, old_day, clock.now()) == totals
 
 
-# Only the timeline writer and the admin's reset delete timeline rows
+# Only the timeline writer and the admin's reset delete history rows (timeline rows only)
 
 
-def test_INV09_only_two_statements_delete_timeline_rows() -> None:
+def test_INV09_only_two_statements_delete_history_rows() -> None:
     deletes: list[tuple[str, str]] = []
+    other_deletes: list[tuple[str, str, str]] = []
     truncates: list[tuple[str, str]] = []
     for path, text in _package_sources():
         deletes += timeline_sql_deletes(text, path)
+        other_deletes += history_sql_deletes(text, path)
         truncates += protected_truncates(text, path)
 
     assert sorted(deletes) == sorted(TIMELINE_DELETES)
     assert timeline.DELETE_SQL == "DELETE FROM power_interval WHERE id = %s"
     assert history.DELETE_HISTORY_SQL == "DELETE FROM power_interval WHERE location_id = %(id)s"
+    # Nothing deletes from the archive, the outbox, the incidents or the chart records.
+    assert other_deletes == []
     assert truncates == []
+
+
+def test_INV09_archive_is_append_only() -> None:
+    updates: list[tuple[str, str]] = []
+    inserts: list[tuple[str, str]] = []
+    writes: list[DeleteCall] = []
+    names: list[tuple[str, int, str]] = []
+    for path, text in _package_sources():
+        updates += archive_sql(UPDATE_ARCHIVE_RE, text, path)
+        inserts += archive_sql(INSERT_ARCHIVE_RE, text, path)
+        writes += archive_orm_writes(text, path)
+        names += archive_name_uses(text, path)
+
+    # No ORM access to the archive outside its definition, export and migration.
+    assert [use for use in names if use[0] not in ARCHIVE_NAME_FILES] == []
+    assert {use[0] for use in names} == ARCHIVE_NAME_FILES
+    assert updates == []
+    # The only archive writes: history's two INSERT...SELECT constants (261101-mm9, D-2).
+    assert [path for path, _text in inserts] == ["powermon/engine/history.py"] * 2
+    assert " ".join(history.ARCHIVE_RESET_SQL.split()) == ARCHIVE_RESET_TEXT
+    assert " ".join(history.ARCHIVE_REMOVED_SQL.split()) == ARCHIVE_REMOVED_TEXT
+    assert writes == []
 
 
 def test_INV09_no_orm_delete_reaches_the_timeline() -> None:
@@ -426,11 +559,50 @@ def test_INV09_delete_scans_flag_a_timeline_delete() -> None:
     assert protected_truncates('X = "truncate public.power_interval"\n', "x.py") != []
     assert protected_truncates('X = "TRUNCATE location_state"\n', "x.py") == []
 
+    # The history-table scans (261101-mm9): a DELETE or TRUNCATE on any of them is flagged.
+    assert history_sql_deletes('X = \'DELETE FROM "public"."outbox_message"\'\n', "x.py") == [
+        ("x.py", "outbox_message", 'DELETE FROM "public"."outbox_message"')
+    ]
+    assert history_sql_deletes(
+        'X = "delete from power_interval_archive where id = 1"\n', "x.py"
+    ) == [("x.py", "power_interval_archive", "delete from power_interval_archive where id = 1")]
+    assert history_sql_deletes("Q = 'delete from only ops_incident'\n", "x.py") == [
+        ("x.py", "ops_incident", "delete from only ops_incident")
+    ]
+    only = 'Q = "DELETE FROM ONLY power_interval WHERE id = 1"\n'
+    assert timeline_sql_deletes(only, "x.py") == [
+        ("x.py", "DELETE FROM ONLY power_interval WHERE id = 1")
+    ]
+    assert history_sql_deletes("Q = 'delete from outbox_message_old'\n", "x.py") == []
+    assert history_sql_deletes("Q = 'delete from power_interval where id = 1'\n", "x.py") == []
+    assert protected_truncates('X = "TRUNCATE chart_message"\n', "x.py") != []
+    assert protected_truncates('X = "TRUNCATE TABLE ops_incident, location_state"\n', "x.py") != []
+    # The archive UPDATE scan: the archive only, never a longer name or the timeline.
+    update = 'X = "UPDATE power_interval_archive SET reason = %s"\n'
+    assert archive_sql(UPDATE_ARCHIVE_RE, update, "x.py") == [
+        ("x.py", "UPDATE power_interval_archive SET reason = %s")
+    ]
+    quoted = 'X = \'update "public"."power_interval_archive" set\'\n'
+    assert archive_sql(UPDATE_ARCHIVE_RE, quoted, "x.py") != []
+    for text in (
+        "X = \"UPDATE power_interval SET state = 'on'\"\n",
+        'X = "UPDATE power_interval_archived_x SET"\n',
+    ):
+        assert archive_sql(UPDATE_ARCHIVE_RE, text, "x.py") == []
+    # The archive INSERT scan finds an extra INSERT, and only into the archive.
+    insert = 'X = "INSERT INTO power_interval_archive (state) VALUES (%s)"\n'
+    assert archive_sql(INSERT_ARCHIVE_RE, insert, "x.py") != []
+    assert (
+        archive_sql(INSERT_ARCHIVE_RE, 'X = "INSERT INTO power_interval (state)"\n', "x.py") == []
+    )
+
     # The ORM scan: a delete that reaches the timeline is refused even when allowlisted.
     reaching = {
         "PowerInterval.objects.filter(location_id=1).delete()\n": "PowerInterval",
         "location.intervals.all().delete()\n": "location",
         "Location.objects.filter(pk=1).delete()\n": "Location",
+        "location.archived_intervals.all().delete()\n": "location",
+        "PowerIntervalArchive.objects.all()._raw_delete(using)\n": "PowerIntervalArchive",
     }
     for text, root in reaching.items():
         calls = orm_deletes(text, "x.py")
@@ -448,3 +620,34 @@ def test_INV09_delete_scans_flag_a_timeline_delete() -> None:
     assert refused_deletes(orm_deletes(login, "x.py"), allowed) == []
     assert refused_deletes(orm_deletes(login * 2, "x.py"), allowed) != []
     assert refused_deletes(orm_deletes(login, "y.py"), allowed) != []
+
+    # The archive ORM write scan: every write through the archive model is refused.
+    archive_writes = [
+        'PowerIntervalArchive.objects.filter(pk=1).update(reason="x")\n',
+        "PowerIntervalArchive.objects.create(state='on')\n",
+        "PowerIntervalArchive.objects.bulk_create(rows)\n",
+        "PowerIntervalArchive.objects.get_or_create(pk=1)\n",
+        "PowerIntervalArchive.objects.bulk_update(rows, ['reason'])\n",
+        "location.archived_intervals.update_or_create(pk=1)\n",
+        "PowerIntervalArchive(state='on').save()\n",
+    ]
+    for text in archive_writes:
+        assert len(archive_orm_writes(text, "x.py")) == 1, text
+    # A write on another model is not the archive scan's business.
+    assert (
+        archive_orm_writes("OutboxMessage.objects.filter(pk=1).update(status='x')\n", "x.py") == []
+    )
+    # A write through a variable escapes the per-call scan, so the name scan catches it.
+    via_variable = "rows = PowerIntervalArchive.objects.all()\nrows.update(reason='x')\n"
+    assert archive_orm_writes(via_variable, "x.py") == []
+    assert archive_name_uses(via_variable, "x.py") == [("x.py", 1, "PowerIntervalArchive")]
+    get_model = 'Archive = apps.get_model("powermon", "PowerIntervalArchive")\n'
+    assert archive_name_uses(get_model, "x.py") == [("x.py", 1, "PowerIntervalArchive")]
+    related = "loc.archived_intervals.first()\n"
+    assert archive_name_uses(related, "x.py") == [("x.py", 1, "archived_intervals")]
+    for imported in (
+        "from powermon.engine.models import PowerIntervalArchive\n",
+        "from powermon.engine.models import PowerIntervalArchive as A\n",
+    ):
+        assert archive_name_uses(imported, "x.py") == [("x.py", 1, "PowerIntervalArchive")]
+    assert archive_name_uses('X = "power_interval_archive"\n', "x.py") == []
