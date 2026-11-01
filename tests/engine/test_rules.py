@@ -74,6 +74,34 @@ def test_K4_last_heartbeat_exactly_300s_keeps_grace() -> None:
     assert _decide(snap, _at(12, 9, 31)).off is True
 
 
+def test_K4_boot_delay_120_window_counts_from_the_first_heartbeat() -> None:
+    # On since 11:58:00 (a restore dated 120 s before the first heartbeat at 12:00:00).
+    # The 300 s window still counts from that first heartbeat, i.e. until 12:05:00.
+    within = _snap(_at(12, 4), _at(11, 58), router_grace=True, boot_delay_s=120)
+    assert rules.effective_timeout(within) == timedelta(seconds=270)
+    assert _decide(within, _at(12, 8, 30)).off is False
+    decision = _decide(within, _at(12, 8, 30, 1))
+    assert decision.off is True
+    assert decision.was_on == timedelta(minutes=6)
+
+    # Edge: exactly 300 s after the first heartbeat keeps the grace (inclusive).
+    edge = _snap(_at(12, 5), _at(11, 58), router_grace=True, boot_delay_s=120)
+    assert rules.effective_timeout(edge) == timedelta(seconds=270)
+
+    # Failure case: 330 s after the first heartbeat is outside the window.
+    outside = _snap(_at(12, 5, 30), _at(11, 58), router_grace=True, boot_delay_s=120)
+    assert rules.effective_timeout(outside) == timedelta(seconds=90)
+    assert _decide(outside, _at(12, 7)).off is False
+    assert _decide(outside, _at(12, 7, 0, 1)).off is True
+
+
+def test_K4_boot_delay_defaults_to_0_and_keeps_k4_literal() -> None:
+    # Without a delay the same 12:04:00 heartbeat after 11:58:00 is 360 s after on.
+    snap = _snap(_at(12, 4), _at(11, 58), router_grace=True)
+    assert snap.boot_delay_s == 0
+    assert rules.effective_timeout(snap) == timedelta(seconds=90)
+
+
 def test_router_grace_off_ignores_the_reconnect_window() -> None:
     snap = _snap(_at(12, 4), _at(12, 0), router_grace=False)
 

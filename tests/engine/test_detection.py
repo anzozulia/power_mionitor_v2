@@ -252,7 +252,7 @@ def test_read_snapshots_lists_only_monitored_on_locations(
     location_factory: Callable[..., Any],
 ) -> None:
     quiet = _silent_since_1005(location_factory, alerts_enabled=False, router_grace=True)
-    loud = _silent_since_1005(location_factory, period_s=120, grace_s=45)
+    loud = _silent_since_1005(location_factory, period_s=120, grace_s=45, boot_delay_s=120)
     _silent_since_1005(location_factory, maintenance=True)
     location_factory()
 
@@ -270,8 +270,9 @@ def test_read_snapshots_lists_only_monitored_on_locations(
         period_s=120,
         grace_s=45,
         router_grace=False,
+        boot_delay_s=120,
     )
-    assert snaps[0].router_grace is True
+    assert (snaps[0].router_grace, snaps[0].boot_delay_s) == (True, 0)
 
 
 @pytest.mark.django_db(transaction=True)
@@ -286,3 +287,58 @@ def test_mark_off_rejects_a_decision_that_is_not_off(
 
     assert _state(location).status == "on"
     assert _outbox() == []
+
+
+# Boot delay (quick task 261101-g9v), end to end through detection.
+
+
+@pytest.mark.django_db(transaction=True)
+def test_K4_boot_delay_router_window_through_run_cycle(
+    location_factory: Callable[..., Any],
+) -> None:
+    # Router grace on, boot delay 120 s: the restore at 12:00 is dated 11:58, and the 300 s
+    # window still counts from the 12:00 heartbeat. The last heartbeat at 12:04 is 360 s
+    # after on_since, inside 300 + 120 s, so OFF waits for period + grace + router grace.
+    _resume_detection(_at(9, 0))
+    location = _silent_since_1005(location_factory, router_grace=True, boot_delay_s=120)
+    assert detection.run_cycle(_at(10, 9, 31)) == 1
+
+    assert transitions.record_heartbeat(location.pk, _at(12, 0)) == "restored"
+    _beat_every_minute(location, _at(12, 1), _at(12, 4))
+    assert _state(location).on_since == _at(11, 58)
+
+    # Without the delay in the snapshot the window would end at 300 s and OFF at 12:05:31.
+    assert detection.run_cycle(_at(12, 8, 30)) == 0
+    assert detection.run_cycle(_at(12, 8, 31)) == 1
+    assert _state(location).outage_started_at == _at(12, 4)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_K3_boot_delay_owner_example_on_for_30m(location_factory: Callable[..., Any]) -> None:
+    # Power returns at 11:00; the board boots for 2 min and sends heartbeats 11:02..11:30,
+    # 28 minutes. With a 120 s boot delay the next OFF says power was on for 30 minutes.
+    _resume_detection(_at(9, 0))
+    location = _silent_since_1005(location_factory, boot_delay_s=120)
+    assert detection.run_cycle(_at(10, 6, 31)) == 1
+
+    assert transitions.record_heartbeat(location.pk, _at(11, 2)) == "restored"
+    _beat_every_minute(location, _at(11, 3), _at(11, 30))
+    assert (_state(location).on_since, _state(location).last_heartbeat_at) == (
+        _at(11, 0),
+        _at(11, 30),
+    )
+
+    assert detection.run_cycle(_at(11, 31, 30)) == 0
+    assert detection.run_cycle(_at(11, 31, 31)) == 1
+
+    state = _state(location)
+    assert (state.status, state.outage_started_at) == ("off", _at(11, 30))
+    off = _outbox(location)[-1]
+    assert (off.kind, off.event_at) == ("power_off", _at(11, 30))
+    assert off.payload == {"was_on_us": 1_800_000_000}
+    text = texts.render_alert(off.kind, location.language, off.payload["was_on_us"])
+    assert "Power was ON for: <b>30m</b>" in text
+    assert _intervals(location)[-2:] == [
+        ("on", _at(11, 0), _at(11, 30), None),
+        ("off", _at(11, 30), None, _at(11, 30)),
+    ]

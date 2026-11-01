@@ -32,7 +32,7 @@ from django.db import IntegrityError, connection, transaction
 
 from powermon.alerts import texts
 from powermon.alerts.models import OutboxMessage
-from powermon.engine import lapse, rules, timeline, transitions
+from powermon.engine import history, lapse, maintenance, rules, timeline, transitions
 from powermon.engine.models import LocationState, PowerInterval, SystemState
 from powermon.locations.models import Location
 from powermon.worker import detection, io_loop
@@ -844,3 +844,232 @@ def test_system_state_is_a_singleton() -> None:
 
     with pytest.raises(IntegrityError, match="system_state_singleton"), transaction.atomic():
         SystemState.objects.create(id=2)
+
+
+# Boot delay (MON-03 amended by quick task 261101-g9v, D-2): the first heartbeat after an
+# outage is dated the location's boot delay earlier, unless the silence was no longer
+# than that delay (the guard), and never before the outage start or the open interval
+# start. The FIRST and PLAIN gates are never backdated; a delay of 0 changes nothing.
+
+
+def _transition_records(caplog: pytest.LogCaptureFixture, level: int) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == transitions.__name__ and r.levelno == level]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_K3_boot_delay_120_restore_is_dated_two_minutes_earlier(
+    location_factory: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    location = _off_since_1005(location_factory, boot_delay_s=120)
+    monkeypatch.setattr(transitions, "_restore_clamp_warned", False)
+    caplog.set_level(logging.INFO, logger=transitions.__name__)
+
+    assert transitions.record_heartbeat(location.pk, _at(11, 2)) == "restored"
+
+    # on_since takes the backdated restore; the last heartbeat keeps the receive time.
+    state = LocationState.objects.get(pk=location.pk)
+    assert (state.status, state.on_since, state.last_heartbeat_at) == ("on", _at(11, 0), _at(11, 2))
+    assert _intervals(location) == [
+        ("on", _at(10, 0), _at(10, 5), None),
+        ("off", _at(10, 5), _at(11, 0), _at(10, 5)),
+        ("on", _at(11, 0), None, None),
+    ]
+    on = OutboxMessage.objects.get(location=location, kind="power_on")
+    # Dated at the restore, recorded, due and expiring from the receive time.
+    assert (on.event_at, on.recorded_at, on.next_attempt_at) == (_at(11, 0), _at(11, 2), _at(11, 2))
+    assert on.expires_at == _at(11, 2) + timedelta(hours=6)
+    assert on.payload == {"was_off_us": 3_300_000_000}
+    assert texts.render_alert(on.kind, location.language, on.payload["was_off_us"]) == (
+        "🟢 <b>POWER ON</b>\n⚡ Power was OFF for: <b>55m</b>"
+    )
+    # A backdate is not a clamp: no WARNING, the once-per-process flag is not used up,
+    # and the full backdate needs no INFO line either.
+    assert transitions._restore_clamp_warned is False
+    assert _transition_records(caplog, logging.WARNING) == []
+    assert _transition_records(caplog, logging.INFO) == []
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("received", "was_off_us"),
+    [((10, 6, 40), 100_000_000), ((10, 7, 0), 120_000_000)],
+    ids=["silence_100s", "silence_exactly_the_delay"],
+)
+def test_K3_boot_delay_guard_short_silence_keeps_todays_result(
+    location_factory: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    received: tuple[int, int, int],
+    was_off_us: int,
+) -> None:
+    # Outage from 10:05 with a 120 s boot delay. A heartbeat at 10:06:40 (or exactly at
+    # 10:07:00, now - delay == the outage start) is not backdated: the silence was no
+    # longer than the delay, so it was no boot after a power return. Without the guard the
+    # outage would shrink to zero length and a sent OFF could no longer be removed.
+    location = _off_since_1005(location_factory, boot_delay_s=120)
+    monkeypatch.setattr(transitions, "_restore_clamp_warned", False)
+    caplog.set_level(logging.INFO, logger=transitions.__name__)
+    now = _at(*received)
+
+    assert transitions.record_heartbeat(location.pk, now) == "restored"
+
+    state = LocationState.objects.get(pk=location.pk)
+    assert (state.status, state.on_since, state.last_heartbeat_at) == ("on", now, now)
+    assert _intervals(location) == [
+        ("on", _at(10, 0), _at(10, 5), None),
+        ("off", _at(10, 5), now, _at(10, 5)),
+        ("on", now, None, None),
+    ]
+    on = OutboxMessage.objects.get(location=location, kind="power_on")
+    assert (on.event_at, on.recorded_at) == (now, now)
+    assert on.payload == {"was_off_us": was_off_us}
+    # One INFO line with ids and times only; no WARNING and the clamp flag untouched.
+    [info] = _transition_records(caplog, logging.INFO)
+    message = info.getMessage()
+    assert f"location {location.pk} " in message
+    assert "boot delay of 120 s" in message
+    assert f"(silence {was_off_us // 1_000_000} s)" in message
+    assert message.endswith(now.isoformat())
+    assert _transition_records(caplog, logging.WARNING) == []
+    assert transitions._restore_clamp_warned is False
+
+
+@pytest.mark.django_db
+def test_INV11_INV03_boot_delay_clamped_to_the_lapse_carve_end(
+    location_factory: Callable[..., Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    # An outage since 10:05 cut by a lapse carve [10:50, 11:01), its open off piece now
+    # starting at 11:01. A heartbeat at 11:02 with a 120 s boot delay would be dated
+    # 11:00, inside not-monitored time: the open interval start clamps it to 11:01.
+    location = location_factory(boot_delay_s=120)
+    _insert(location, "on", _at(10, 0), _at(10, 5))
+    _insert(location, "off", _at(10, 5), _at(10, 50), outage_start_at=_at(10, 5))
+    _insert(location, "not_monitored", _at(10, 50), _at(11, 1))
+    _insert(location, "off", _at(11, 1), None, outage_start_at=_at(10, 5))
+    LocationState.objects.filter(pk=location.pk).update(
+        status="off",
+        on_since=_at(10, 0),
+        last_heartbeat_at=_at(10, 5),
+        outage_started_at=_at(10, 5),
+    )
+    caplog.set_level(logging.INFO, logger=transitions.__name__)
+
+    assert transitions.record_heartbeat(location.pk, _at(11, 2)) == "restored"
+
+    state = LocationState.objects.get(pk=location.pk)
+    assert (state.on_since, state.last_heartbeat_at) == (_at(11, 1), _at(11, 2))
+    # The zero-length off piece from 11:01 is deleted; the outage survives in its earlier
+    # piece, and the on piece starts at the carve end.
+    assert _intervals(location) == [
+        ("on", _at(10, 0), _at(10, 5), None),
+        ("off", _at(10, 5), _at(10, 50), _at(10, 5)),
+        ("not_monitored", _at(10, 50), _at(11, 1), None),
+        ("on", _at(11, 1), None, None),
+    ]
+    [on] = OutboxMessage.objects.filter(location=location)
+    assert on.event_at == _at(11, 1)
+    # INV-03: "was OFF for" = off 45 min + not monitored 11 min = 56 min.
+    assert on.payload == {"was_off_us": 56 * 60 * 1_000_000}
+    [info] = _transition_records(caplog, logging.INFO)
+    assert info.getMessage().endswith(_at(11, 1).isoformat())
+
+    # The outage stays removable: its off piece becomes on, the carve stays.
+    result = history.remove_outage(location.pk, _at(10, 5), now=_at(11, 10), tz="Europe/Kyiv")
+    assert result == "removed"
+    assert _intervals(location)[1] == ("on", _at(10, 5), _at(10, 50), None)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_LOC08_boot_delay_restore_in_maintenance_leaves_the_timeline(
+    location_factory: Callable[..., Any],
+) -> None:
+    # Maintenance from 10:30 during the outage: the backdated 10:29 would reach into the
+    # outage's off piece, but the open not_monitored piece from 10:30 clamps it, and the
+    # timeline is left as it is.
+    location = _off_since_1005(location_factory, boot_delay_s=120)
+    assert maintenance.set_maintenance(location.pk, True, _at(10, 30)) is True
+    stored = _intervals(location)
+    assert stored[-1] == ("not_monitored", _at(10, 30), None, None)
+
+    assert transitions.record_heartbeat(location.pk, _at(10, 31)) == "restored"
+
+    assert _intervals(location) == stored
+    state = LocationState.objects.get(pk=location.pk)
+    assert (state.status, state.on_since, state.last_heartbeat_at) == (
+        "on",
+        _at(10, 30),
+        _at(10, 31),
+    )
+    on = OutboxMessage.objects.get(location=location, kind="power_on")
+    assert (on.event_at, on.payload) == (_at(10, 30), {"was_off_us": 25 * 60 * 1_000_000})
+
+
+@pytest.mark.django_db
+def test_MON01_first_heartbeat_is_never_backdated(
+    location_factory: Callable[..., Any],
+    fixed_now: datetime,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    location = location_factory(boot_delay_s=120)
+    caplog.set_level(logging.INFO, logger=transitions.__name__)
+
+    assert transitions.record_heartbeat(location.pk, fixed_now) == "started"
+    assert transitions.record_heartbeat(location.pk, _at(8, 1)) == "plain"
+
+    state = LocationState.objects.get(pk=location.pk)
+    assert (state.on_since, state.last_heartbeat_at) == (_at(8, 0), _at(8, 1))
+    assert _intervals(location) == [("on", _at(8, 0), None, None)]
+    assert _kinds() == []
+    assert _transition_records(caplog, logging.INFO) == []
+
+
+@pytest.mark.django_db(transaction=True)
+def test_INV06_boot_delay_read_under_the_lock_applies_to_the_next_restore(
+    location_factory: Callable[..., Any],
+) -> None:
+    # The outage was recorded with no boot delay; the admin sets 120 s before power
+    # returns. The restore reads the delay under the row lock, so it applies now.
+    location = _off_since_1005(location_factory)
+    assert location.boot_delay_s == 0
+    assert Location.objects.filter(pk=location.pk).update(boot_delay_s=120) == 1
+
+    assert transitions.record_heartbeat(location.pk, _at(11, 2)) == "restored"
+
+    assert LocationState.objects.get(pk=location.pk).on_since == _at(11, 0)
+    on = OutboxMessage.objects.get(location=location, kind="power_on")
+    assert (on.event_at, on.payload) == (_at(11, 0), {"was_off_us": 3_300_000_000})
+
+
+@pytest.mark.django_db(transaction=True)
+def test_IN01_backward_clock_step_with_a_boot_delay_still_clamps_forward(
+    location_factory: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    location = _off_since_1005(location_factory, boot_delay_s=120)
+    monkeypatch.setattr(transitions, "_restore_clamp_warned", False)
+    caplog.set_level(logging.INFO, logger=transitions.__name__)
+
+    assert transitions.record_heartbeat(location.pk, _at(10, 4)) == "restored"
+
+    state = LocationState.objects.get(pk=location.pk)
+    assert (state.status, state.on_since, state.last_heartbeat_at) == ("on", _at(10, 4), _at(10, 5))
+    on = OutboxMessage.objects.get(location=location, kind="power_on")
+    assert (on.event_at, on.recorded_at, on.payload) == (_at(10, 5), _at(10, 4), {"was_off_us": 0})
+    [warning] = _transition_records(caplog, logging.WARNING)
+    assert f"location {location.pk} " in warning.getMessage()
+    assert transitions._restore_clamp_warned is True
+
+
+@pytest.mark.django_db
+def test_boot_delay_row_missing_raises_lookup_error(location_factory: Callable[..., Any]) -> None:
+    default = location_factory()
+    delayed = location_factory(boot_delay_s=600)
+
+    with connection.cursor() as cur:
+        assert transitions._boot_delay(cur, default.pk) == timedelta(0)
+        assert transitions._boot_delay(cur, delayed.pk) == timedelta(minutes=10)
+        with pytest.raises(LookupError, match="no location row"):
+            transitions._boot_delay(cur, 10**9)
