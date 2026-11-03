@@ -188,7 +188,18 @@ if any, goes first (Pitfall 1); and an ambiguous post, which is posted again
 (D-06), slows down to at most 4 untracked photos an hour. While the bot is degraded (a
 call of it timed out or got a 5xx, ``io_loop.note_bot_health``), a post is made only after
 a ``getMe`` probe answers ok; otherwise it waits like a failed step and no photo is sent
-(quick task 261030-11v). Permanent errors and render
+(quick task 261030-11v). While photo uploads of the bot fail (its last ``sendPhoto`` or
+``editMessageMedia`` timed out or got a 5xx, ``io_loop.note_photo_health``), a post is made
+only after a photo probe answers ok: one ``editMessageMedia`` that re-uploads the
+location's latest chart in its current chat and by its current bot with the picture it
+already shows (a finished day as finished, a live one as of its last render). The probe
+writes nothing. A timeout, 5xx, 429 or unsent probe defers the post like a failed step,
+and no photo is sent; so does any other refusal of the probe (a 400 on the upload, 401,
+403). With no such chart, or when Telegram answers "message to edit not found" (the chart
+was deleted from the channel), the getMe probe runs instead (quick task 261103-b2z).
+Accepted residuals: a restart starts with every bot healthy; a new location's first post,
+and a post whose candidate chart was deleted, fall back to getMe, so during a photo-only
+outage they can still duplicate. Permanent errors and render
 errors wait a fixed 15 min. A step whose call was made but whose record UPDATE raised a
 database error (refresh, pin, finalize, unpin: all idempotent) waits ``step_delay(n)``
 too, so a write that keeps failing never turns into a call per pass. Any other
@@ -210,7 +221,9 @@ Each call logs one INFO line, ``chart <step> for location <id>: <kind> (<code>)
 render_ms=<n> call_ms=<n>``, with no token and no Telegram description (OPS-08); a redraw
 after an outage removal says ``redraw`` in place of ``refresh`` (its key stays the
 refresh step's). A degraded bot's probe before a post logs ``chart probe for location
-<id>: <kind> (<code>) call_ms=<n>`` (261030-11v).
+<id>: <kind> (<code>) call_ms=<n>`` (261030-11v). A photo-degraded bot's photo probe
+before a post logs ``chart photo probe for location <id>: <kind> (<code>) render_ms=<n>
+call_ms=<n>`` (261103-b2z).
 """
 
 import logging
@@ -270,6 +283,10 @@ _MAX_DOUBLINGS = 5
 _RENDERED: tuple[Step, ...] = ("post", "refresh", "finalize")
 # Outcomes no retry will change: the message is refused or gone.
 _PERMANENT_KINDS = ("permanent", "edit_target_missing")
+# What a photo probe concluded (261103-b2z): "ok" (post now), "refused" (Telegram refused
+# the candidate: fall back to getMe), "deferred" (the post waits; a call was made) or
+# "no_call" (render error or stop: the post waits, no call was made).
+_PhotoProbe = Literal["ok", "refused", "deferred", "no_call"]
 # The cleanup of older records (INV-19): a permanent outcome ends the step for good.
 _CLEANUP: tuple[Step, ...] = ("finalize", "unpin")
 # The steps on today's record: its message gone means today's chart is posted again.
@@ -831,18 +848,18 @@ def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | No
         if _stopped(stop) or not outbox.lease_holds(state.lease_pid):
             return False
         client = TelegramClient(location.bot_token)
-        if action.step == "post" and io_loop.is_degraded(state, location.bot_token):
-            # The one chart call that is not idempotent: no blind post while the bot is
-            # degraded (261030-11v, D-1). The probe is a call, so the pass made one.
-            if not _probe_ok(client, action, key, clock, state):
-                return True
-            if _stopped(stop) or not outbox.lease_holds(state.lease_pid):
-                return True
+        # The one chart call that is not idempotent: no blind post while the bot or its
+        # photo uploads are degraded (261030-11v, 261103-b2z).
+        gate = _post_gate(client, action, key, now, tz, clock, state, stop)
+        if gate is not None:
+            return gate
         called = clock.monotonic()
         result = _call(client, action, content)
         call_ms = _ms(clock.monotonic() - called)
         answered = clock.now()
         io_loop.note_bot_health(state, location.bot_token, result)
+        if action.step in _RENDERED:
+            io_loop.note_photo_health(state, location.bot_token, result)
         log.info(
             "chart %s for location %s: %s (%s) render_ms=%d call_ms=%d",
             label,
@@ -902,6 +919,187 @@ def _call(client: TelegramClient, action: Action, content: tuple[bytes, str] | N
     raise ValueError(f"no call for the chart step {action.step!r}")
 
 
+def _post_gate(
+    client: TelegramClient,
+    action: Action,
+    key: str,
+    now: datetime,
+    tz: str,
+    clock: Clock,
+    state: io_loop.RelayState,
+    stop: threading.Event | None,
+) -> bool | None:
+    """The probes before a post; None lets the step's call go ahead, a bool ends the step.
+
+    In order (261030-11v, 261103-b2z):
+
+    - not a post, or a healthy bot: None, with no probe;
+    - photo-degraded (``io_loop.is_photo_degraded``) with a candidate record
+      (``_probe_candidate``): the photo probe (``_photo_probe``). Ok goes on to the post;
+      a deferral returns True (a call was made), a render error or stop False. When
+      Telegram says the candidate's message is gone (``edit_target_missing``: it was
+      deleted), the outcome is recorded and the post is treated like one with no
+      candidate; any other refusal defers the post;
+    - photo-degraded with no candidate (or a refused one): the getMe probe
+      (``_probe_ok``), even if ``degraded`` was cleared meanwhile, for example by an ok
+      alert or by the refused photo probe itself. That is D-2's fallback, and the accepted
+      residual: during a photo-only outage such a post can still duplicate;
+    - otherwise degraded (``io_loop.is_degraded``): the getMe probe, as in 261030-11v.
+
+    A probe that did not answer ok defers the post (``_probe_failed``) and returns True.
+    After any probe call, a stop or a lost lease ends the step with True (a call was made).
+    """
+    if action.step != "post":
+        return None
+    token = action.location.bot_token
+    get_me = io_loop.is_degraded(state, token)
+    if io_loop.is_photo_degraded(state, token):
+        candidate = _probe_candidate(action.location)
+        if candidate is not None:
+            outcome = _photo_probe(client, action, candidate, key, now, tz, clock, state, stop)
+            if outcome == "no_call":
+                return False
+            if outcome == "deferred":
+                return True
+            if _stopped(stop) or not outbox.lease_holds(state.lease_pid):
+                return True
+            if outcome == "ok":
+                return None
+        get_me = True
+    if not get_me:
+        return None
+    if not _probe_ok(client, action, key, clock, state):
+        return True
+    if _stopped(stop) or not outbox.lease_holds(state.lease_pid):
+        return True
+    return None
+
+
+def _probe_candidate(location: ChartLocation) -> ChartRow | None:
+    """The record a photo probe re-uploads, or None (261103-b2z, D-2).
+
+    The location's latest active record (latest ``local_date``, then highest id) that sits
+    in its current chat and was posted by its current bot. A record a history reset marked
+    (``history_reset_at``) or a retired one is never used: it is on its way out. A
+    database error propagates like any other in ``run_step``.
+    """
+    found = (
+        ChartMessage.objects.filter(
+            location_id=location.location_id,
+            retired_at__isnull=True,
+            history_reset_at__isnull=True,
+            chat_id=location.chat_id,
+            bot_key=io_loop.bot_key(location.bot_token),
+        )
+        .order_by("-local_date", "-id")
+        .first()
+    )
+    if found is None:
+        return None
+    return ChartRow(
+        id=found.pk,
+        location_id=location.location_id,
+        local_date=found.local_date,
+        chat_id=found.chat_id,
+        message_id=found.message_id,
+        pinned=found.pinned,
+        pin_failed_at=found.pin_failed_at,
+        last_rendered_at=found.last_rendered_at,
+        finalized_at=found.finalized_at,
+        unpinned_at=found.unpinned_at,
+        bot_key=found.bot_key,
+        history_reset_at=found.history_reset_at,
+        redraw_requested_at=found.redraw_requested_at,
+    )
+
+
+def _probe_content(
+    location: ChartLocation, row: ChartRow, now: datetime, tz: str
+) -> tuple[bytes, str]:
+    """The picture the candidate already shows, so the re-upload changes nothing (261103-b2z).
+
+    A finalized record is drawn as its finished day, exactly as a final edit draws it; an
+    unfinalized one live as of its last render (never later than now). Never with today's
+    date, and never finalized early.
+    """
+    if row.finalized_at is not None:
+        end_of_day = model.next_midnight(row.local_date, tz)
+        return chart_content(location, row.local_date, end_of_day, live=False, tz=tz)
+    as_of = min(row.last_rendered_at, now)
+    return chart_content(location, row.local_date, as_of, live=True, tz=tz)
+
+
+def _photo_probe(
+    client: TelegramClient,
+    action: Action,
+    candidate: ChartRow,
+    key: str,
+    now: datetime,
+    tz: str,
+    clock: Clock,
+    state: io_loop.RelayState,
+    stop: threading.Event | None,
+) -> _PhotoProbe:
+    """One idempotent ``editMessageMedia`` of the candidate before a post (261103-b2z, D-2).
+
+    Telegram's getMe can answer while photo uploads fail (2026-11-03), so while the bot is
+    photo-degraded the post waits for a real upload to succeed. The candidate is
+    re-uploaded with the picture it already shows (``_probe_content``); the probe writes
+    nothing (no record field, no incident). Its outcome feeds both marks. "ok" lets the
+    post go; "message to edit not found" (``edit_target_missing``: the candidate was
+    deleted, "refused") falls back to getMe; any other outcome, a 400/401/403 on the upload
+    included, defers the post (``_probe_failed``) and sends no photo ("deferred"). A
+    render error makes no call and the post waits 15 min; so does a stop or a lost lease
+    before the call ("no_call"). Logs one INFO line, ``chart photo probe for location
+    <id>: <kind> (<code>) render_ms=<n> call_ms=<n>``.
+    """
+    location = action.location
+    started = clock.monotonic()
+    try:
+        png, caption = _probe_content(location, candidate, now, tz)
+    except Error:
+        raise  # the database, not the chart: handled by run_step
+    except Exception as exc:
+        # The class only: an exception's text could carry anything.
+        state.not_before[key] = now + io_loop.PERMANENT_BACKOFF
+        log.error(
+            "chart post for location %s: photo probe render failed (%s); the post waits 15 min",
+            location.location_id,
+            type(exc).__name__,
+        )
+        return "no_call"
+    render_ms = _ms(clock.monotonic() - started)
+    if _stopped(stop) or not outbox.lease_holds(state.lease_pid):
+        return "no_call"
+    called = clock.monotonic()
+    probe = client.edit_message_media(candidate.chat_id, candidate.message_id, png, caption)
+    call_ms = _ms(clock.monotonic() - called)
+    answered = clock.now()
+    io_loop.note_bot_health(state, location.bot_token, probe)
+    io_loop.note_photo_health(state, location.bot_token, probe)
+    log.info(
+        "chart photo probe for location %s: %s (%s) render_ms=%d call_ms=%d",
+        location.location_id,
+        probe.kind,
+        probe.code,
+        render_ms,
+        call_ms,
+    )
+    if probe.kind == "ok":
+        return "ok"
+    if probe.kind == "edit_target_missing":
+        # The candidate's message is gone: it proves nothing about uploads, so getMe decides.
+        return "refused"
+    # Any other refusal (a 400 on the upload, 401, 403) does not show that uploads work, so
+    # the post waits like after a timeout: a getMe fallback here could duplicate again.
+    if probe.kind == "permanent":
+        reason = "Telegram refused the photo probe"
+    else:
+        reason = "photo uploads are failing"
+    _probe_failed(action, key, probe, answered, state, reason=reason)
+    return "deferred"
+
+
 def _probe_ok(
     client: TelegramClient,
     action: Action,
@@ -916,7 +1114,9 @@ def _probe_ok(
     call timed out or got a 5xx (``io_loop.note_bot_health``), a post is made only after a
     ``getMe`` probe answers ok. Any other probe outcome defers the post like a failed step
     (``_probe_failed``) and sends no photo. Logs one INFO line,
-    ``chart probe for location <id>: <kind> (<code>) call_ms=<n>``.
+    ``chart probe for location <id>: <kind> (<code>) call_ms=<n>``. Since 261103-b2z it
+    also runs for a photo-degraded bot's post when no photo probe candidate exists or
+    Telegram refused it (``_post_gate``).
     """
     called = clock.monotonic()
     probe = client.get_me()
@@ -937,7 +1137,13 @@ def _probe_ok(
 
 
 def _probe_failed(
-    action: Action, key: str, probe: SendResult, answered: datetime, state: io_loop.RelayState
+    action: Action,
+    key: str,
+    probe: SendResult,
+    answered: datetime,
+    state: io_loop.RelayState,
+    *,
+    reason: str = "the bot failed its health probe",
 ) -> None:
     """The probe did not answer ok: the post waits like a failed step, and no photo is sent.
 
@@ -953,9 +1159,10 @@ def _probe_failed(
         delay = hold + delay
     state.not_before[key] = answered + delay
     log.warning(
-        "chart post for location %s: the bot failed its health probe (%s, %s); no photo is "
-        "sent and the post is tried again in %d s (attempt %d)",
+        "chart post for location %s: %s (%s, %s); no photo is sent and the post is tried "
+        "again in %d s (attempt %d)",
         action.location.location_id,
+        reason,
         probe.kind,
         probe.code,
         delay // timedelta(seconds=1),
@@ -1430,7 +1637,8 @@ def _fail(
       location's other steps go first once the hold ends;
     - maybe_delivered: ``step_delay(n)``. A post may exist but is never recorded, pinned
       or edited, and is posted again after the wait (D-06), and only after a getMe probe
-      answers ok while the bot is degraded; an edit or pin is idempotent.
+      answers ok while the bot is degraded (or a photo probe while photo uploads fail,
+      261103-b2z); an edit or pin is idempotent.
 
     It never writes ``chat_key``: a chart failure must not hold the channel's alerts.
     """

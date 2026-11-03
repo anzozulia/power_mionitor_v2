@@ -55,9 +55,12 @@ HEALTH_FILE = Path("/tmp/powermon-worker.health")  # noqa: S108 - container-priv
 # How long each loop may go without stamping (D-15). A detection cycle's worst bounded
 # chain (lease check, reconnect, one location's statements) and an I/O row's (claim,
 # send with connect and read timeouts, apply) fit well inside (RESEARCH timing budget).
-# The longest step between two telegram-io stamps is a chart post behind its getMe probe:
-# (5 + 5) + (5 + 30) s, or 55 s with a second address family's connect attempt each, well
-# inside 180 s (quick task 261030-11v; tests/worker/test_io_stall_budget.py).
+# The longest step between two telegram-io stamps is a chart post behind a photo probe
+# that Telegram refused and the getMe probe it falls back to: (5 + 30) + (5 + 5) +
+# (5 + 30) s = 80 s, or 95 s with a second address family's connect attempt each, still
+# well inside 180 s (quick task 261103-b2z). A post behind its photo probe alone takes
+# 70 s (85 s), behind its getMe probe alone 45 s (55 s; quick task 261030-11v).
+# tests/worker/test_io_stall_budget.py proves each.
 DETECTION_STALL_S = 60.0
 IO_STALL_S = 180.0
 STALL_LIMITS_S = {"detection": DETECTION_STALL_S, "telegram-io": IO_STALL_S}
