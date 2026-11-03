@@ -14,6 +14,8 @@ segments (drawn on, not monitored, off, each with a <title>), the hour-cell sepa
 its text[data-testid=tl-total]; and today's now marker g[data-testid=tl-now] (line and pill
 HH:MM).
 
+Below md a muted line above the chart says it scrolls sideways (hidden from md up).
+
 Under the chart: the cap line p[data-testid=compare-timeline-cap] with the
 a[data-testid=compare-earlier] link when the period is longer than 31 days, and the
 details[data-testid=compare-daily] table of the lane totals (closed by default).
@@ -22,6 +24,7 @@ Every geometry value comes from compare_chart; every class is spelled out (state
 through if chains); names are escaped by autoescape. No style attribute, no script.
 {% endcomment %}<div class="flex flex-col gap-3 p-4">
 <p id="compare-timeline-desc" class="sr-only">{{ timeline.desc }}</p>
+<p data-testid="compare-timeline-hint" class="text-label text-fg-muted md:hidden">Scroll sideways to see the whole day.</p>
 <div class="overflow-x-auto">
 <svg data-testid="compare-timeline-chart" role="img" aria-labelledby="compare-timeline-chart-title" aria-describedby="compare-timeline-desc" viewBox="{{ timeline.view_box }}" width="{{ timeline.width }}" height="{{ timeline.height }}" font-size="12" class="block h-auto w-full min-w-[880px] font-sans"><title id="compare-timeline-chart-title">{{ timeline.title }}</title>
 <g data-part="legend">{% for item in timeline.legend %}<rect x="{{ item.x }}" y="7" width="20" height="12" rx="3"{% if item.kind == "on" %} class="fill-st-on"{% elif item.kind == "off" %} class="fill-st-off"{% elif item.kind == "not_monitored" %} fill="url(#cmp-hatch)"{% elif item.kind == "some_off" %} class="fill-cmp-some-off"{% else %} class="fill-cmp-track"{% endif %}></rect><text x="{{ item.text_x }}" y="17.5" class="fill-fg-muted">{{ item.label }}</text>{% endfor %}</g>

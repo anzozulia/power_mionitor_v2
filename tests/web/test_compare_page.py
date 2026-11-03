@@ -606,6 +606,10 @@ def test_compare_page_timeline(admin: Client, location_factory: Callable[..., An
     assert _direct_title(chart).startswith("Timeline of power on and off")
     desc = page.find(id=str(chart["aria-describedby"]))
     assert isinstance(desc, Tag) and text(desc)
+    # Phones: one muted line says the chart scrolls sideways (hidden from md up).
+    hint = by_testid(page, "compare-timeline-hint")
+    assert text(hint) == "Scroll sideways to see the whole day."
+    assert hint.find_next("svg") is chart
     days = all_by_testid(chart, "tl-day")
     assert [day["data-day"] for day in days] == [
         "2026-09-25",
@@ -670,6 +674,14 @@ def test_compare_page_timeline_cap(admin: Client, location_factory: Callable[...
     assert not all_by_testid(shown, "compare-timeline-cap")
 
 
+def _terms(card: Tag) -> list[tuple[str, str]]:
+    """A phone card's labelled values: (dt text, dd text) pairs in order."""
+    return [
+        (text(term), text(value))
+        for term, value in zip(card.find_all("dt"), card.find_all("dd"), strict=True)
+    ]
+
+
 @pytest.mark.django_db
 def test_compare_page_overlap(admin: Client, location_factory: Callable[..., Any]) -> None:
     home, office, shop = _fixture(location_factory)
@@ -694,41 +706,64 @@ def test_compare_page_overlap(admin: Client, location_factory: Callable[..., Any
     _headers, pairs = table(page, "compare-pairs")
     assert pairs == [
         [
-            "Home ↔ Office",
+            "A · Home B · Office",
             "1h",
             "40%",
             "100%",
-            "1 of Home's 2 · 1 of Office's 1",
+            "A 1 of 2 B 1 of 1",
             "same minute",
             "same minute",
         ],
         [
-            "Home ↔ Shop",
+            "A · Home B · Shop",
             "30m",
             "20%",
             "14%",
-            "1 of Home's 2 · 1 of Shop's 2",
-            "Shop 30m later",
-            "Shop 1h later",
+            "A 1 of 2 B 1 of 2",
+            "B 30m later",
+            "B 1h later",
         ],
         [
-            "Office ↔ Shop",
+            "A · Office B · Shop",
             "30m",
             "50%",
             "14%",
-            "1 of Office's 1 · 1 of Shop's 2",
-            "Shop 30m later",
-            "Shop 1h later",
+            "A 1 of 1 B 1 of 2",
+            "B 30m later",
+            "B 1h later",
         ],
     ]
     rows = all_by_testid(page, "pair-row")
     assert [(row["data-a"], row["data-b"]) for row in rows] == [(h, o), (h, s), (o, s)]
+    # The phone cards: the same pairs in the same order, values labelled; the table hooks
+    # are on the table only, so pair-row counts each pair once.
+    pair_cards = all_by_testid(page, "pair-card")
+    assert [(card["data-a"], card["data-b"]) for card in pair_cards] == [(h, o), (h, s), (o, s)]
+    assert all(not all_by_testid(card, "pair-row") for card in pair_cards)
+    assert text(pair_cards[1]).startswith("A · Home B · Shop ")
+    assert _terms(pair_cards[1]) == [
+        ("Both off", "30m"),
+        ("Coinciding outages", "A 1 of 2 B 1 of 2"),
+        ("% of A's off", "20%"),
+        ("% of B's off", "14%"),
+        ("Start gap", "B 30m later"),
+        ("End gap", "B 1h later"),
+    ]
     assert not all_by_testid(page, "compare-pairs-none")
     # Exactly one simultaneous outage, all three off together inside it.
     _headers, sims = table(page, "compare-simultaneous")
     assert sims == [["Thu 01.10 12:00", "Thu 01.10 13:00", "1h", "Home, Office, Shop all 3"]]
     assert len(all_by_testid(page, "sim-row")) == 1
     assert text(by_testid(page, "sim-all")) == "all 3"
+    sim_cards = all_by_testid(page, "sim-card")
+    assert [_terms(card) for card in sim_cards] == [
+        [
+            ("Start", "Thu 01.10 12:00"),
+            ("End", "Thu 01.10 13:00"),
+            ("Duration", "1h"),
+            ("Locations off", "Home, Office, Shop all 3"),
+        ]
+    ]
     assert not all_by_testid(page, "compare-simultaneous-empty")
     assert not all_by_testid(page, "compare-simultaneous-cap")
     assert not all_by_testid(page, "compare-overlap-single")
@@ -747,6 +782,8 @@ def test_compare_page_one_location_charts(
     )
     assert not all_by_testid(page, "compare-matrix")
     assert not all_by_testid(page, "compare-simultaneous")
+    assert not all_by_testid(page, "pair-card")
+    assert not all_by_testid(page, "sim-card")
     lanes = all_by_testid(page, "tl-lane")
     assert {lane["data-location-id"] for lane in lanes} == {str(home.pk)}
     assert len(lanes) == 7
@@ -782,6 +819,14 @@ def test_compare_page_hours(admin: Client, location_factory: Callable[..., Any])
     }
     assert peaks[str(home.pk)] == "peak 09–10 · 14%"
     assert peaks["together"] == "peak 12–13 · 7%"
+    # The printed shares are plain text: no halo stroke behind any number.
+    assert "14" in [text(label) for label in chart.find_all("text")]
+    assert not [
+        label
+        for label in chart.find_all("text")
+        if label.has_attr("stroke-width") or label.has_attr("paint-order")
+    ]
+    assert text(by_testid(page, "compare-hours-hint")) == "Scroll sideways to see the whole day."
     assert text(by_testid(page, "compare-hours-legend")).startswith(
         "Red: share of monitored time the power was off in that hour (darker = more). "
         "Green: power always on in that hour. Grey: not monitored."

@@ -29,6 +29,7 @@ from powermon.web.compare_chart import (
     kpi_tiles,
     percent_text,
     scoreboard,
+    side_count_text,
     summary_text,
     total_text,
     truncate_name,
@@ -138,14 +139,29 @@ def test_duration_and_total_text() -> None:
 
 
 def test_gap_text() -> None:
-    assert gap_text(4 * M, "Office") == "Office 4m later"
-    assert gap_text(-12 * M, "Office") == "Office 12m earlier"
+    # Expected: B's gap against A, named by its side letter, never by its name.
+    assert gap_text(4 * M) == "B 4m later"
+    assert gap_text(-12 * M) == "B 12m earlier"
+    assert gap_text(-(H + 55 * M)) == "B 1h 55m earlier"
     # Edge: below one minute either way is the same minute.
-    assert gap_text(59_000_000, "Office") == "same minute"
-    assert gap_text(-59_000_000, "Office") == "same minute"
-    assert gap_text(60_000_000, "Office") == "Office 1m later"
+    assert gap_text(59_000_000) == "same minute"
+    assert gap_text(-59_000_000) == "same minute"
+    assert gap_text(60_000_000) == "B 1m later"
     # Failure: no overlapping outage pair.
-    assert gap_text(None, "Office") == "—"
+    assert gap_text(None) == "—"
+
+
+def test_side_count_text() -> None:
+    # Expected: one short line per side.
+    assert side_count_text("A", 8, 9) == "A 8 of 9"
+    assert side_count_text("B", 1, 1) == "B 1 of 1"
+    # Edge: no coinciding outage, and every outage coinciding.
+    assert side_count_text("A", 0, 3) == "A 0 of 3"
+    assert side_count_text("B", 3, 3) == "B 3 of 3"
+    # Failure: an unknown side or an impossible count.
+    for side, coinciding, outages in (("C", 1, 2), ("a", 1, 2), ("A", 3, 2), ("B", -1, 2)):
+        with pytest.raises(ValueError):
+            side_count_text(side, coinciding, outages)
 
 
 def test_truncate_name() -> None:
@@ -526,15 +542,15 @@ def test_overlap_on_the_fixture() -> None:
     assert cells[(1, 2)].sr == ("While Home was off, Office was also off 40% of the time (1h).")
     diagonal = cells[(1, 1)]
     assert (diagonal.diagonal, diagonal.share, diagonal.value) == (True, "", "2h 30m")
-    assert [(p.label, p.both) for p in view.pairs] == [
-        ("Home ↔ Office", "1h"),
-        ("Home ↔ Shop", "30m"),
-        ("Office ↔ Shop", "30m"),
+    assert [(p.name_a, p.name_b, p.both) for p in view.pairs] == [
+        ("Home", "Office", "1h"),
+        ("Home", "Shop", "30m"),
+        ("Office", "Shop", "30m"),
     ]
     first = view.pairs[0]
-    assert first.coinciding == "1 of Home's 2 · 1 of Office's 1"
+    assert (first.coinciding_a, first.coinciding_b) == ("A 1 of 2", "B 1 of 1")
     assert (first.start_gap, first.end_gap) == ("same minute", "same minute")
-    assert (view.pairs[1].start_gap, view.pairs[1].end_gap) == ("Shop 30m later", "Shop 1h later")
+    assert (view.pairs[1].start_gap, view.pairs[1].end_gap) == ("B 30m later", "B 1h later")
     assert view.never is None
     assert len(view.simultaneous) == 1
     sim = view.simultaneous[0]
@@ -586,13 +602,29 @@ def test_hour_fill() -> None:
     assert compare_chart.hour_fill(H, 2 * H) == ("off", "0.60")
 
 
+def test_hour_ink() -> None:
+    # Expected: the soft ink on a mid off fill, the strong ink on a full one.
+    assert compare_chart.hour_ink(H, 2 * H) == "soft"
+    assert compare_chart.hour_ink(H, H) == "strong"
+    # Edge: the bucket starts at opacity 0.90 (share 7/8 = 0.90), 0.89 stays soft.
+    assert compare_chart.hour_fill(7 * H, 8 * H) == ("off", "0.90")
+    assert compare_chart.hour_ink(7 * H, 8 * H) == "strong"
+    assert compare_chart.hour_fill(86 * H, 100 * H) == ("off", "0.88")
+    assert compare_chart.hour_ink(86 * H, 100 * H) == "soft"
+    assert compare_chart.hour_ink(1, 1000 * H) == "soft"
+    # Failure: no monitored time, or never off (never labelled), keeps the soft ink.
+    assert compare_chart.hour_ink(0, 0) == "soft"
+    assert compare_chart.hour_ink(H, 0) == "soft"
+    assert compare_chart.hour_ink(0, H) == "soft"
+
+
 def test_hours_on_the_fixture() -> None:
     view = compare_chart.hours(_result(*FIXTURE))
     lanes = {lane.key: lane for lane in view.lanes}
 
     assert list(lanes) == ["1", "2", "3", "together"]
     home12 = lanes["1"].cells[12]
-    assert (home12.pct, home12.label, home12.fill) == ("14", "14", "off")
+    assert (home12.pct, home12.label, home12.fill, home12.ink) == ("14", "14", "off", "soft")
     assert home12.title == "Home · 12:00–13:00 · off 14% of monitored time (1h of 7h)"
     office3 = lanes["2"].cells[3]
     assert (office3.pct, office3.label, office3.fill, office3.opacity) == ("0", "", "on", "0.35")

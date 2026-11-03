@@ -178,6 +178,8 @@
   --color-cmp-hatch-base: var(--cmp-hatch-base);
   --color-cmp-hatch: var(--cmp-hatch);
   --color-cmp-now: var(--cmp-now);
+  --color-cmp-ink: var(--cmp-ink);
+  --color-cmp-ink-strong: var(--cmp-ink-strong);
   --shadow-pop: var(--sh-pop);
   --shadow-modal: var(--sh-modal);
   --shadow-knob: var(--sh-knob);
@@ -272,6 +274,8 @@
   --cmp-hatch-base: #E2E0DA;
   --cmp-hatch: #A09D94;
   --cmp-now: #1A1A19;
+  --cmp-ink: #000000;
+  --cmp-ink-strong: #FFFFFF;
   --sh-pop: 0px 8px 24px #0206172E;
   --sh-modal: 0px 24px 48px #0206174D;
   --sh-knob: 0px 1px 2px #0206174D;
@@ -376,6 +380,8 @@
   --cmp-hatch-base: #5B5852;
   --cmp-hatch: #A09D94;
   --cmp-now: #E5E9F0;
+  --cmp-ink: #E5E9F0;
+  --cmp-ink-strong: #FFFFFF;
   --sh-pop: 0px 12px 32px #0000008C;
   --sh-modal: 0px 24px 48px #000000A6;
   --sh-knob: 0px 1px 2px #00000080;
@@ -473,6 +479,8 @@
     --cmp-hatch-base: #5B5852;
     --cmp-hatch: #A09D94;
     --cmp-now: #E5E9F0;
+    --cmp-ink: #E5E9F0;
+    --cmp-ink-strong: #FFFFFF;
     --sh-pop: 0px 12px 32px #0000008C;
     --sh-modal: 0px 24px 48px #000000A6;
     --sh-knob: 0px 1px 2px #00000080;

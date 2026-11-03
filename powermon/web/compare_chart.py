@@ -10,7 +10,8 @@ Task 2a's part:
 - the text helpers shared by every card: ``percent_text`` ("42%", "<1%", "—"),
   ``duration_text`` (the chart's total format in English: ``3h 20m``, ``45m``, ``<1m``),
   ``total_text`` (the chart's daily total: ``3h 20m · 2``, "no outages", "—"),
-  ``gap_text`` (a signed start or end gap: "Office 4m later", "same minute") and
+  ``gap_text`` (a signed start or end gap of location B: "B 4m later", "same minute"),
+  ``side_count_text`` (a pair's coinciding outages for one side: "A 8 of 9") and
   ``truncate_name`` (a deterministic width estimate at 12 px, cut with "…");
 - ``summary_text``: the filter card's one line, "3 locations · 25 Sep – 1 Oct 2026 (7 days)";
 - ``kpi_tiles``: the KPI card (D-5 item 2). Ties go to name order (the comparison's input
@@ -34,7 +35,8 @@ Task 2b's part (D-6 to D-9, the plan's "Design: page geometry, texts and hooks")
 - ``together_total``: "all off 1h 5m", "no overlap" (R-8) or "—";
 - ``overlap``: the pair matrix (buckets 0..5, the zero-off row rule), the pairs and the
   simultaneous outages;
-- ``hours``: the hour-of-day lanes with the cell fill rule (track, always on, off opacity);
+- ``hours``: the hour-of-day lanes with the cell fill rule (track, always on, off opacity)
+  and the ink of the printed share per opacity bucket (``hour_ink``);
 - ``weeks``: the by-week table with its proportional bars.
 """
 
@@ -55,6 +57,8 @@ LESS_THAN_ONE = "<1%"
 PARTIAL_TAG = "partial data"
 # A start or end gap below one minute reads "same minute".
 _MINUTE_US = 60_000_000
+# The pairs table names a pair's two locations A and B (the column headers use them too).
+PAIR_SIDES = ("A", "B")
 
 # truncate_name's width estimate, in tenths of a pixel at 12 px (Inter).
 _NARROW = frozenset("ilj.,:;'|!")
@@ -98,14 +102,28 @@ def total_text(off_us: int, count: int, monitored: bool) -> str:
     return f"{main}{suffix}"
 
 
-def gap_text(gap_us: int | None, b_name: str) -> str:
-    """A signed gap of B against A: "{B} 4m later", "{B} 12m earlier", "same minute", "—"."""
+def gap_text(gap_us: int | None) -> str:
+    """A signed gap of the pair's location B against A: "B 4m later", "B 12m earlier",
+    "same minute" (below one minute either way), "—" (no pair of overlapping outages)."""
     if gap_us is None:
         return NONE_TEXT
     if abs(gap_us) < _MINUTE_US:
         return SAME_MINUTE
     word = "later" if gap_us > 0 else "earlier"
-    return f"{b_name} {duration_text(abs(gap_us))} {word}"
+    return f"{PAIR_SIDES[1]} {duration_text(abs(gap_us))} {word}"
+
+
+def side_count_text(side: str, coinciding: int, outages: int) -> str:
+    """One side's coinciding outages of a pair: "A 8 of 9" (``side`` is "A" or "B").
+
+    ValueError for another side, a negative count or more coinciding outages than outages
+    (compare.py never produces either).
+    """
+    if side not in PAIR_SIDES:
+        raise ValueError(f"unknown pair side {side!r}")
+    if not 0 <= coinciding <= outages:
+        raise ValueError(f"{coinciding} of {outages} coinciding outages")
+    return f"{side} {coinciding} of {outages}"
 
 
 def _char_width(ch: str) -> int:
@@ -378,6 +396,8 @@ _NOW_OVERHANG = 6
 TOGETHER = "together"
 TOGETHER_NAME = "Together"
 TOGETHER_HOURS_NAME = "Together (all off)"
+# From this off-fill opacity (percent) up, a cell's printed share uses the strong ink.
+STRONG_INK_LEVEL = 90
 EARLIER_LABEL = "Earlier days"
 TIMELINE_CAP = f"The timeline shows the last {compare.TIMELINE_DAYS} days of the period."
 TOTALS_HEADER = chart_texts.TOTALS_HEADER[LANG]
@@ -870,11 +890,13 @@ class MatrixHead:
 class PairRow:
     a: int
     b: int
-    label: str
+    name_a: str
+    name_b: str
     both: str
     share_a: str
     share_b: str
-    coinciding: str
+    coinciding_a: str
+    coinciding_b: str
     start_gap: str
     end_gap: str
 
@@ -977,16 +999,15 @@ def overlap(result: compare.Comparison) -> Overlap:
             PairRow(
                 a=p.a,
                 b=p.b,
-                label=f"{a.name} ↔ {b.name}",
+                name_a=a.name,
+                name_b=b.name,
                 both=duration_text(p.both_off_us),
                 share_a=percent_text(p.share_a, True),
                 share_b=percent_text(p.share_b, True),
-                coinciding=(
-                    f"{p.coinciding_a} of {a.name}'s {p.outages_a}{chart_texts.DOT}"
-                    f"{p.coinciding_b} of {b.name}'s {p.outages_b}"
-                ),
-                start_gap=gap_text(p.start_gap_us, b.name),
-                end_gap=gap_text(p.end_gap_us, b.name),
+                coinciding_a=side_count_text("A", p.coinciding_a, p.outages_a),
+                coinciding_b=side_count_text("B", p.coinciding_b, p.outages_b),
+                start_gap=gap_text(p.start_gap_us),
+                end_gap=gap_text(p.end_gap_us),
             )
         )
     left = len(result.pairs) - len(rows)
@@ -1023,6 +1044,7 @@ class HourCellView:
     text_x: str
     fill: str
     opacity: str
+    ink: str
     pct: str
     label: str
     title: str
@@ -1057,6 +1079,11 @@ class Hours:
     lanes: tuple[HourLaneView, ...]
 
 
+def _off_level(off_us: int, monitored_us: int) -> int:
+    """An off cell's fill opacity in percent: 20 + 80 × share, rounded down (INFO-7)."""
+    return 20 + 80 * min(off_us, monitored_us) // monitored_us
+
+
 def hour_fill(off_us: int, monitored_us: int) -> tuple[str, str]:
     """A cell's (fill, opacity): "track" with no monitored time, "on" at 0.35 when the power
     was always on, else "off" at (20 + 80 × share) %, two decimals (INFO-7)."""
@@ -1064,8 +1091,23 @@ def hour_fill(off_us: int, monitored_us: int) -> tuple[str, str]:
         return "track", "1"
     if off_us <= 0:
         return "on", "0.35"
-    level = 20 + 80 * min(off_us, monitored_us) // monitored_us
+    level = _off_level(off_us, monitored_us)
     return "off", f"{level // 100}.{level % 100:02d}"
+
+
+def hour_ink(off_us: int, monitored_us: int) -> str:
+    """The ink of a cell's printed share, by its opacity bucket: "strong" on an off fill at
+    ``STRONG_INK_LEVEL`` % or more, else "soft".
+
+    The two inks are the ``--cmp-ink`` and ``--cmp-ink-strong`` tokens. In the light theme
+    the soft ink is near-black (at least 4.6:1 on every off fill below the bucket) and the
+    strong ink white (at least 4.5:1 from the bucket up); in the dark theme both are light
+    (the composited fills are dark). The ratios are in the task's polish-notes.md. A cell
+    without monitored time or without off time is never labelled; it gets "soft".
+    """
+    if monitored_us <= 0 or off_us <= 0:
+        return "soft"
+    return "strong" if _off_level(off_us, monitored_us) >= STRONG_INK_LEVEL else "soft"
 
 
 def _hour_label(h: int) -> str:
@@ -1126,6 +1168,7 @@ def hours(result: compare.Comparison) -> Hours:
                     text_x=tenths(h * _HOUR_T + _HOUR_T // 2),
                     fill=fill,
                     opacity=opacity,
+                    ink=hour_ink(cell.off_us, cell.monitored_us),
                     pct="" if value is None else str(value),
                     label=str(value) if show else "",
                     title=_hour_title(name, h, cell),
