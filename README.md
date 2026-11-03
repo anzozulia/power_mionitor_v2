@@ -460,6 +460,11 @@ changes the rules for `Europe/Kyiv`, bump the Python and postgres image tags.
     posted for it until a quick getMe check answers; then exactly one is posted. Chart
     uploads wait up to 30 s for Telegram's answer. (Amended 2026-10-30, quick task
     261030-11v.)
+    While its photo uploads fail (a chart upload timed out or got a 5xx and none has
+    succeeded since), a new chart is posted only after a re-upload of the channel's
+    latest chart, with the picture it already shows, succeeds; a getMe answer alone is
+    not enough. With no such chart, or if Telegram answers that the chart was deleted, the
+    getMe check decides; any other refusal makes the post wait. (Amended 2026-11-03, quick task 261103-b2z.)
   - A channel pin may leave a "pinned a photo" service message in the channel each day
     (Telegram's behaviour; it is checked once in section 12).
   - Cost: a render takes about 0.1 to 0.3 s of CPU and about 35 MB of extra worker memory
@@ -473,6 +478,9 @@ changes the rules for `Europe/Kyiv`, bump the Python and postgres image tags.
     token change or a delete; "Location page" below; `redraw` follows an outage removal).
     While a bot is degraded, the getMe check before a post logs `chart probe for location
     <id>: <kind> (<code>) call_ms=<n>` (quick task 261030-11v).
+    While its photo uploads fail, the re-upload before a post logs `chart photo probe for
+    location <id>: <kind> (<code>) render_ms=<n> call_ms=<n>`. (Amended 2026-11-03, quick
+    task 261103-b2z.)
     Each delete of a removed outage's alert logs `alert delete for location <id>: <kind>
     (<code>) outbox <id>`, at WARNING when Telegram refused it or it was too old. A pass
     makes either one delete or one chart call, never both. (Amended 2026-10-06, quick task 261006-qv7.)
