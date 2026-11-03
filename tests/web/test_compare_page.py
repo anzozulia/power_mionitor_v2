@@ -5,7 +5,8 @@ GET search form (location chips with the status LED, the period radios, the date
 validation), the seven section wrappers in D-5 order with the jump bar, the KPI tiles and
 the outage scoreboard, the escaping of user-typed names, the secret scan and the query
 budget. Task 2b's part: the timeline (day groups, lanes, segment titles, totals, the now
-marker, the 31-day cap and "Earlier days", the daily-totals table), the overlap card
+marker, the window of up to 31 days paged by "Earlier days" / "Later days" through ``tl``,
+the daily-totals table), the overlap card
 (matrix, pairs, simultaneous outages, the one-location line), the hours chart, the weeks
 table, the escaping inside the SVGs and the decorative-SVG rule. The page is read only
 through tests/web/pages.py and its test hooks.
@@ -206,6 +207,10 @@ def test_compare_page(admin: Client, location_factory: Callable[..., Any]) -> No
     # The form: a GET search form to /compare/; every chip checked, with its status LED.
     form = by_testid(page, "compare-form")
     assert (form["method"], form["role"], form["action"]) == ("get", "search", URL)
+    # IN-06: the server validates; the date inputs' min/max never block a preset submit.
+    assert form.has_attr("novalidate")
+    # The form does not carry the timeline's tl: a new comparison resets the window.
+    assert form.find(attrs={"name": "tl"}) is None
     chips = all_by_testid(form, "compare-loc-chip")
     assert [text(chip) for chip in chips] == ["Home", "Office", "Shop"]
     assert [chip["data-location-id"] for chip in chips] == [
@@ -257,9 +262,10 @@ def test_compare_page_frame_numbers(admin: Client, location_factory: Callable[..
         "Days with outages",
         "Monitored",
     ]
+    # IN-02: Home's 30m not monitored is 99.7 % monitored, which reads ">99%", not "100%".
     assert rows == [
         ["1", "Shop", "3h 30m", "2%", "2", "1h 45m", "2h · 01.10", "1 of 7", "100%"],
-        ["2", "Home", "2h 30m", "2%", "2", "1h 15m", "1h 30m · 28.09", "2 of 7", "100%"],
+        ["2", "Home", "2h 30m", "2%", "2", "1h 15m", "1h 30m · 28.09", "2 of 7", ">99%"],
         ["3", "Office", "1h", "1%", "1", "1h", "1h · 01.10", "1 of 7", "100%"],
     ]
     board = by_testid(page, "compare-scoreboard-table")
@@ -308,7 +314,8 @@ def test_compare_page_frame_numbers(admin: Client, location_factory: Callable[..
     assert "01.10" in text(tiles["longest"])
     assert _value(tiles["all-off"]) == "30m"
     assert "<1%" in text(tiles["all-off"])
-    assert _value(tiles["power-somewhere"]) == "100%"
+    # IN-02: the 30m with every location off is not "power somewhere": ">99%".
+    assert _value(tiles["power-somewhere"]) == ">99%"
 
 
 # Custom range, one location, no locations
@@ -425,6 +432,53 @@ def test_compare_page_invalid_dates_come_back_as_typed(
     assert field(page, "from")["aria-invalid"] == "true"
     assert "id_from_error" in str(field(page, "from")["aria-describedby"])
     assert not field(page, "to").has_attr("aria-invalid")
+
+
+# Verification info 1: with a preset the dates are ignored entirely (no field error).
+PRESET_IGNORES_DATES = [
+    "?range=7d&from=garbage&to=2099-01-01",
+    "?from=garbage&to=nonsense",
+    "?range=7d&from=2025-06-01&to=2026-10-02",
+    "?range=7d&from=2026-09-30&to=2026-09-20",
+]
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("query", PRESET_IGNORES_DATES)
+def test_compare_page_preset_ignores_the_dates(
+    admin: Client, location_factory: Callable[..., Any], query: str
+) -> None:
+    _fixture(location_factory)
+
+    page = _page(admin, query)
+
+    assert not all_by_testid(page, "error-summary")
+    assert (field_error(page, "from"), field_error(page, "to")) == (None, None)
+    # The date inputs show the preset's effective dates, not the ignored text.
+    assert (field(page, "from")["value"], field(page, "to")["value"]) == (
+        "2026-09-25",
+        "2026-10-01",
+    )
+    assert text(by_testid(page, "compare-summary")).endswith("(7 days)")
+    by_testid(page, "compare-scoreboard-table")
+
+
+@pytest.mark.django_db
+def test_compare_page_preset_with_another_error_still_shows_its_dates(
+    admin: Client, location_factory: Callable[..., Any]
+) -> None:
+    # Edge: an invalid page with a preset (no location picked) still shows the preset's
+    # dates and no date error; only the location error is listed.
+    _fixture(location_factory)
+
+    page = _page(admin, "?loc=&range=14d&from=garbage")
+
+    assert field_error(page, "loc") == "Pick at least one location."
+    assert field_error(page, "from") is None
+    assert (field(page, "from")["value"], field(page, "to")["value"]) == (
+        "2026-09-18",
+        "2026-10-01",
+    )
 
 
 @pytest.mark.django_db
@@ -642,8 +696,8 @@ def test_compare_page_timeline(admin: Client, location_factory: Callable[..., An
     assert _total(page, "2026-09-25", str(home.pk)) == "no outages"
     # Monday 28.09 opens a new week: one divider.
     assert len(all_by_testid(chart, "tl-week-divider")) == 1
-    # No cap for 7 days.
-    assert not all_by_testid(page, "compare-timeline-cap")
+    # No paging for 7 days.
+    assert not all_by_testid(page, "compare-timeline-window")
     assert not all_by_testid(page, "compare-earlier")
     # The daily totals as a table, closed by default.
     daily = by_testid(page, "compare-daily")
@@ -654,24 +708,159 @@ def test_compare_page_timeline(admin: Client, location_factory: Callable[..., An
     assert rows[-1] == ["Thu 01.10", "1h · 1", "1h · 1", "3h 30m · 2", "all off 30m"]
 
 
+def _pager(page: Tag) -> dict[str, str]:
+    """The timeline's paging links (top and bottom) by testid, as their hrefs."""
+    hooks = ("compare-earlier", "compare-later", "compare-earlier-bottom", "compare-later-bottom")
+    return {hook: str(by_testid(page, hook)["href"]) for hook in hooks if all_by_testid(page, hook)}
+
+
+def _days_shown(page: Tag) -> list[str]:
+    return [str(day["data-day"]) for day in all_by_testid(page, "tl-day")]
+
+
+SAME_SECTIONS = ("compare-kpis", "compare-scoreboard", "compare-overlap", "compare-hours")
+
+
 @pytest.mark.django_db
-def test_compare_page_timeline_cap(admin: Client, location_factory: Callable[..., Any]) -> None:
-    home, office, shop = _fixture(location_factory)
+def test_compare_page_timeline_window_default(
+    admin: Client, location_factory: Callable[..., Any]
+) -> None:
+    _fixture(location_factory)
 
-    page = _page(admin, "?range=custom&from=2026-08-22&to=2026-10-01")
+    page = _page(admin, "?range=90d")
 
-    cap = by_testid(page, "compare-timeline-cap")
-    assert "The timeline shows the last 31 days of the period." in text(cap)
-    assert len(all_by_testid(page, "tl-day")) == 31
-    earlier = by_testid(cap, "compare-earlier")
-    assert text(earlier) == "Earlier days"
-    assert earlier["href"] == (
-        f"?loc={home.pk}&loc={office.pk}&loc={shop.pk}&range=custom&from=2026-08-22&to=2026-08-31"
+    days = _days_shown(page)
+    assert (len(days), days[0], days[-1]) == (31, "2026-09-01", "2026-10-01")
+    window = by_testid(page, "compare-timeline-window")
+    assert text(window).startswith("Showing 01.09 – 01.10 of the period.")
+    # The window line comes before the chart, the bottom pager after it.
+    chart = by_testid(page, "compare-timeline-chart")
+    assert window.find_next("svg") is chart
+    assert by_testid(page, "compare-timeline-pager").find_previous("svg") is chart
+    # Expected: only an earlier page at the period's end, top and bottom, same href.
+    assert _pager(page) == {
+        "compare-earlier": "?range=90d&tl=2026-08-31",
+        "compare-earlier-bottom": "?range=90d&tl=2026-08-31",
+    }
+    assert text(by_testid(page, "compare-earlier")) == "Earlier days"
+    # The daily-totals table follows the window.
+    _headers, rows = table(page, "compare-daily-table")
+    assert (len(rows), rows[0][0], rows[-1][0]) == (31, "Tue 01.09", "Thu 01.10")
+
+
+@pytest.mark.django_db
+def test_compare_page_timeline_pages_back_twice(
+    admin: Client, location_factory: Callable[..., Any]
+) -> None:
+    _fixture(location_factory)
+    default = _page(admin, "?range=90d")
+
+    second = _page(admin, _pager(default)["compare-earlier"])
+    days = _days_shown(second)
+    assert (len(days), days[0], days[-1]) == (31, "2026-08-01", "2026-08-31")
+    assert text(by_testid(second, "compare-timeline-window")).startswith(
+        "Showing 01.08 – 31.08 of the period."
     )
-    # Expected: following the link shows the earlier window as a valid page.
-    shown = _page(admin, str(earlier["href"]))
-    assert len(all_by_testid(shown, "tl-day")) == 10
-    assert not all_by_testid(shown, "compare-timeline-cap")
+    assert _pager(second) == {
+        "compare-earlier": "?range=90d&tl=2026-07-31",
+        "compare-later": "?range=90d&tl=2026-10-01",
+        "compare-earlier-bottom": "?range=90d&tl=2026-07-31",
+        "compare-later-bottom": "?range=90d&tl=2026-10-01",
+    }
+    assert text(by_testid(second, "compare-later")) == "Later days"
+    assert not all_by_testid(second, "tl-now")
+
+    # The first window starts at the period's start: no earlier page.
+    first = _page(admin, _pager(second)["compare-earlier"])
+    days = _days_shown(first)
+    assert (len(days), days[0], days[-1]) == (28, "2026-07-04", "2026-07-31")
+    assert _pager(first) == {
+        "compare-later": "?range=90d&tl=2026-08-31",
+        "compare-later-bottom": "?range=90d&tl=2026-08-31",
+    }
+    # Later days lead back to the second window, and from there to the default one.
+    assert _days_shown(_page(admin, _pager(first)["compare-later"])) == _days_shown(second)
+    assert _days_shown(_page(admin, _pager(second)["compare-later"])) == _days_shown(default)
+
+    # Every other section keeps the whole period: the same numbers on every page.
+    for name in SAME_SECTIONS:
+        assert text(by_testid(first, name)) == text(by_testid(default, name)), name
+    assert table(first, "compare-weeks-table") == table(default, "compare-weeks-table")
+    assert text(by_testid(first, "compare-summary")) == text(by_testid(default, "compare-summary"))
+
+
+@pytest.mark.django_db
+def test_compare_page_timeline_links_keep_every_other_param(
+    admin: Client, location_factory: Callable[..., Any]
+) -> None:
+    home, office, _shop_ = _fixture(location_factory)
+    query = f"?loc=&loc={home.pk}&loc={office.pk}&range=custom&from=2026-08-22&to=2026-10-01"
+
+    page = _page(admin, f"{query}&tl=2026-09-15")
+
+    days = _days_shown(page)
+    assert (days[0], days[-1]) == ("2026-08-22", "2026-09-15")
+    assert _pager(page) == {
+        "compare-later": f"{query}&tl=2026-10-01",
+        "compare-later-bottom": f"{query}&tl=2026-10-01",
+    }
+    # The form keeps the custom period and never carries tl.
+    assert (field(page, "from")["value"], field(page, "to")["value"]) == (
+        "2026-08-22",
+        "2026-10-01",
+    )
+    assert by_testid(page, "compare-form").find(attrs={"name": "tl"}) is None
+
+
+CLAMPED_TL = [
+    # (tl, the first and last day shown): navigation is clamped, never an error.
+    ("2020-01-01", ("2026-07-04", "2026-07-04")),
+    ("2099-12-31", ("2026-09-01", "2026-10-01")),
+    ("garbage", ("2026-09-01", "2026-10-01")),
+    ("2026-02-30", ("2026-09-01", "2026-10-01")),
+    ("", ("2026-09-01", "2026-10-01")),
+]
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(("tl", "shown"), CLAMPED_TL)
+def test_compare_page_timeline_clamps_tl(
+    admin: Client, location_factory: Callable[..., Any], tl: str, shown: tuple[str, str]
+) -> None:
+    _fixture(location_factory)
+    default = _page(admin, "?range=90d")
+
+    page = _page(admin, f"?range=90d&tl={tl}")
+
+    assert not all_by_testid(page, "error-summary")
+    days = _days_shown(page)
+    assert (days[0], days[-1]) == shown
+    for name in SAME_SECTIONS:
+        assert text(by_testid(page, name)) == text(by_testid(default, name)), name
+
+
+@pytest.mark.django_db
+def test_compare_page_short_period_has_no_pager(
+    admin: Client, location_factory: Callable[..., Any]
+) -> None:
+    # A period that fits one window shows it whole, with no paging line or link.
+    _fixture(location_factory)
+
+    page = _page(admin, "?range=30d")
+
+    assert len(_days_shown(page)) == 30
+    assert not all_by_testid(page, "compare-timeline-window")
+    assert not all_by_testid(page, "compare-timeline-pager")
+    assert _pager(page) == {}
+    # Edge: a hand-made tl inside it still clamps the window's start at the period's start
+    # (up to 31 days ending at tl) and offers the way back with "Later days".
+    paged = _page(admin, "?range=30d&tl=2026-09-10")
+    days = _days_shown(paged)
+    assert (days[0], days[-1]) == ("2026-09-02", "2026-09-10")
+    assert _pager(paged) == {
+        "compare-later": "?range=30d&tl=2026-10-01",
+        "compare-later-bottom": "?range=30d&tl=2026-10-01",
+    }
 
 
 def _terms(card: Tag) -> list[tuple[str, str]]:
@@ -852,6 +1041,96 @@ def test_compare_page_weeks(admin: Client, location_factory: Callable[..., Any])
     assert text(cells[("2026-09-28", "together")]) == "30m · 1"
     assert text(cells[("2026-09-21", str(home.pk))]) == "no outages"
     assert cells[("2026-09-28", str(office.pk))]["data-off-us"] == str(60 * 60_000_000)
+
+
+@pytest.mark.django_db
+def test_compare_page_together_zero_case(
+    admin: Client, location_factory: Callable[..., Any]
+) -> None:
+    # WR-01: Home is off (09:00-10:00 local on 28.09), Barn is on all the time. They were
+    # monitored together but never all off at once: "no overlap", never "no outages" or
+    # a green "always on" Together cell.
+    home = _home(location_factory)
+    barn = location_factory(name="Barn", bot_token=TOKEN)
+    _store(barn, ("on", START, None, None))
+    _live(barn, "on", last_heartbeat_at=_t(10, 1, 15, 59), on_since=START)
+
+    page = _page(admin, f"?loc={home.pk}&loc={barn.pk}")
+
+    assert _value(_kpis(page)["all-off"]) == "no overlap"
+    assert _total(page, "2026-09-28", "together") == "no overlap"
+    chart = by_testid(page, "compare-hours-chart")
+    together = {
+        str(cell["data-hour"]): cell
+        for cell in all_by_testid(chart, "hour-cell")
+        if cell["data-location-id"] == "together"
+    }
+    nine = together["9"]
+    assert "fill-cmp-track" in nine["class"] and "fill-st-on" not in nine["class"]
+    assert _direct_title(nine) == "Together (all off) · 09:00–10:00 · never all off at once"
+    assert all("fill-st-on" not in cell["class"] for cell in together.values())
+    peaks = {
+        str(peak["data-location-id"]): text(peak) for peak in all_by_testid(chart, "hour-peak")
+    }
+    assert (peaks["together"], peaks[str(home.pk)]) == ("no overlap", "peak 09–10 · 14%")
+    # Home's own lane still shows its off hour in the off colour.
+    home_nine = [
+        cell
+        for cell in all_by_testid(chart, "hour-cell")
+        if (cell["data-location-id"], cell["data-hour"]) == (str(home.pk), "9")
+    ]
+    assert "fill-st-off" in home_nine[0]["class"]
+    assert text(by_testid(page, "compare-hours-legend")).endswith(
+        "Together: red = all selected locations off at once; grey = never all off at once, "
+        "or not monitored together."
+    )
+    weeks = {
+        (str(cell["data-week"]), str(cell["data-location-id"])): text(cell)
+        for cell in all_by_testid(page, "week-cell")
+    }
+    assert weeks[("2026-09-28", "together")] == "no overlap"
+    assert weeks[("2026-09-28", str(barn.pk))] == "no outages"
+
+
+@pytest.mark.django_db
+def test_compare_page_one_location_has_no_together_legend(
+    admin: Client, location_factory: Callable[..., Any]
+) -> None:
+    home = _home(location_factory)
+    _office(location_factory)
+
+    page = _page(admin, f"?loc={home.pk}")
+
+    assert "Together" not in text(by_testid(page, "compare-hours-legend"))
+
+
+@pytest.mark.django_db
+def test_compare_page_simultaneous_cut_by_the_period(
+    admin: Client, location_factory: Callable[..., Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # WR-02, the reviewer's probe: both off since 31.10 22:00 local (20:00 UTC) and still
+    # off at now (03.11); the period is the single day 01.11.
+    _clock(monkeypatch, datetime(2026, 11, 3, 10, 0, tzinfo=UTC))
+    since = datetime(2026, 10, 31, 20, 0, tzinfo=UTC)
+    for name in ("Home", "Office"):
+        location = location_factory(name=name, bot_token=TOKEN)
+        _store(location, ("on", START, since, None), ("off", since, None, since))
+        _live(location, "off", last_heartbeat_at=since, outage_started_at=since)
+
+    page = _page(admin, "?range=custom&from=2026-11-01&to=2026-11-01")
+
+    (row,) = all_by_testid(page, "sim-row")
+    assert [text(cell) for cell in row.find_all("td")][:3] == [
+        "before Sun 01.11 00:00",
+        "after Mon 02.11 00:00",
+        "≥ 24h",
+    ]
+    (card,) = all_by_testid(page, "sim-card")
+    assert _terms(card)[:3] == [
+        ("Start", "before Sun 01.11 00:00"),
+        ("End", "after Mon 02.11 00:00"),
+        ("Duration", "≥ 24h"),
+    ]
 
 
 @pytest.mark.django_db

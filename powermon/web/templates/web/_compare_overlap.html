@@ -8,7 +8,7 @@ The Compare page's overlap card (quick task 261103-lfm, D-7). Parameter: overlap
     cells td[data-testid=matrix-cell][data-row-id][data-col-id][data-share][data-bucket]
     (the diagonal has data-col-id equal to data-row-id and no data-share), each read as one
     visually hidden sentence; the shown percent and duration are aria-hidden. The bucket
-    tone goes through a spelled-out if chain (bg-st-off/10 to /70, never above 70 %, so
+    (from the rounded percent the cell prints) goes through a spelled-out if chain (bg-st-off/10 to /70, never above 70 %, so
     the fg text stays AA in both themes). Header names are truncated with the full name
     in title;
   - the pairs table[data-testid=compare-pairs] (tr[data-testid=pair-row][data-a][data-b],
@@ -16,7 +16,8 @@ The Compare page's overlap card (quick task 261103-lfm, D-7). Parameter: overlap
     lines, the coinciding outages read "A 8 of 9" / "B 8 of 9" and the gaps "B 6m
     earlier") and p[data-testid=compare-pairs-none] for the pairs never off together;
   - the simultaneous outages table[data-testid=compare-simultaneous]
-    (tr[data-testid=sim-row], the [data-testid=sim-all] tag), or
+    (tr[data-testid=sim-row], the [data-testid=sim-all] tag; a span cut by the period
+    reads Start "before …", End "after …" and Duration "≥ …"), or
     p[data-testid=compare-simultaneous-empty]; p[data-testid=compare-simultaneous-cap]
     when more than 100 were found.
   Both tables show from md. Below md the same rows are stacked cards with labelled values,

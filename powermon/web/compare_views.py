@@ -10,7 +10,14 @@ nothing.
   sentinel makes "every chip unchecked" an error instead of "all". ``range`` is a preset
   (``7d`` by default, ``14d``, ``30d``, ``90d``: n days ending today in the display TZ) or
   ``custom`` with ``from`` and ``to`` (both required, ``from <= to``, ``to <= today``, at most
-  366 days, from 01.01.2026). Every bad input is a field error on a 200 page, never a 500.
+  366 days, from 01.01.2026). With a preset, ``from`` and ``to`` are ignored entirely (no
+  field error; the date inputs show the preset's dates). Every bad input is a field error
+  on a 200 page, never a 500.
+- ``tl`` (not a form field) pages the timeline: the local date of its window's last day,
+  default the period's last day. The timeline shows up to 31 days at a time; Earlier/Later
+  days page through the period while every other section keeps the whole period. An
+  absent, malformed or out-of-period ``tl`` is clamped into the period (navigation, never
+  an error). The filter form does not carry it, so a new comparison resets the window.
 - With a valid form the page reads the live rows (2 queries) and the selected locations'
   pieces and whole outages (``compare_data.load_series``, 2 queries in one snapshot), runs
   the pure ``compare.compare`` and renders the view models of ``compare_chart``: the KPI
@@ -100,6 +107,10 @@ class CompareForm(forms.Form):
         if "range" in self.errors:
             return data
         if key != CUSTOM:
+            # The dates apply to Custom only: a preset ignores them, typed garbage included.
+            for name in ("from", "to"):
+                self.errors.pop(name, None)
+                data.pop(name, None)
             data["first"], data["last"] = compare.preset_dates(key, self.today)
             return data
         first, last = data.get("from"), data.get("to")
@@ -138,8 +149,9 @@ def _query(request: HttpRequest, rows: Sequence[LiveRow]) -> QueryDict:
 def _filter_context(form: CompareForm, data: QueryDict, rows: Sequence[LiveRow]) -> dict[str, Any]:
     """What the filter card renders: the chips, the range options and the date values.
 
-    A valid form shows the effective period in the date inputs; an invalid one shows the
-    submitted text back, so the admin can correct it.
+    A valid form shows the effective period in the date inputs, and so does a preset
+    range (its dates are ignored); an invalid custom one shows the submitted text back, so
+    the admin can correct it.
     """
     selected = set(data.getlist("loc"))
     chips = [
@@ -154,6 +166,9 @@ def _filter_context(form: CompareForm, data: QueryDict, rows: Sequence[LiveRow])
     if form.is_valid():
         from_value = form.cleaned_data["first"].isoformat()
         to_value = form.cleaned_data["last"].isoformat()
+    elif current in compare.PRESETS:
+        first, last = compare.preset_dates(current, form.today)
+        from_value, to_value = first.isoformat(), last.isoformat()
     else:
         from_value = data.get("from", "")
         to_value = data.get("to", "")
@@ -165,6 +180,15 @@ def _filter_context(form: CompareForm, data: QueryDict, rows: Sequence[LiveRow])
         "earliest": compare.EARLIEST.isoformat(),
         "today": form.today.isoformat(),
     }
+
+
+def _timeline_last(data: QueryDict) -> date | None:
+    """The ``tl`` query value as a date; None when absent or malformed (never an error)."""
+    raw = data.get(compare_chart.TIMELINE_PARAM, "")
+    try:
+        return date.fromisoformat(raw) if raw else None
+    except ValueError:
+        return None
 
 
 class CompareView(View):
@@ -195,7 +219,10 @@ class CompareView(View):
             first, last = form.cleaned_data["first"], form.cleaned_data["last"]
             period = compare.period_of(first, last, now, tz)
             series = compare_data.load_series(selected, period, now)
-            result = compare.compare(series, period, now, tz)
+            result = compare.compare(
+                series, period, now, tz, timeline_last=_timeline_last(request.GET)
+            )
+            query = [(key, value) for key, values in request.GET.lists() for value in values]
             statuses = {row.pk: row.status for row in selected}
             context.update(
                 results=True,
@@ -203,7 +230,7 @@ class CompareView(View):
                 kpis=compare_chart.kpi_tiles(result),
                 scoreboard=compare_chart.scoreboard(result, statuses),
                 several=len(selected) > 1,
-                timeline=compare_chart.timeline(result),
+                timeline=compare_chart.timeline(result, query),
                 overlap=compare_chart.overlap(result),
                 hours=compare_chart.hours(result),
                 weeks=compare_chart.weeks(result),

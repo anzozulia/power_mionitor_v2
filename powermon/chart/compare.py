@@ -22,12 +22,16 @@ Rules:
 - Pairs (D-4): both-off time, asymmetric shares, coinciding outages and the signed median
   start and end gaps over every overlapping outage pair.
 - Simultaneous outages (D-4): the maximal spans of P in which at least two locations are
-  off at once, newest first, at most ``SIM_CAP``.
+  off at once, newest first, at most ``SIM_CAP``. A span cut by P's start or end is flagged
+  (``starts_before``, ``ends_after``) so the page does not show P's edge as its real start
+  or end.
 - Day lanes (D-6): exactly the Telegram chart's day slicing (``model._row``'s algorithm on
   ``model.day_bounds``, ``model.transitions`` and ``model.wall_us``): positions follow the
   local wall clock, totals follow real time (INV-08), a day is local midnight to the next
   (INV-03), the fall-back day's first repeated hour is not drawn and the spring-forward
-  hour stays empty. Each day's frame is computed once and shared by every lane.
+  hour stays empty. Each day's frame is computed once and shared by every lane. The
+  timeline shows up to 31 days at a time (``timeline_window``); Earlier/Later days page
+  through the period without changing any other number.
 - Hours (D-8): wall-clock off and monitored time per local hour, summed over the drawn day
   segments of every day of P. Weeks (D-9): Monday-to-Sunday weeks overlapping P, newest
   first, in real time.
@@ -107,19 +111,41 @@ def preset_dates(key: str, today: date) -> tuple[date, date]:
     return today - timedelta(days=PRESETS[key] - 1), today
 
 
-def timeline_window(
-    first: date, last: date, days: int = TIMELINE_DAYS
-) -> tuple[date, tuple[date, date] | None]:
-    """The first date the timeline shows and the "earlier days" window before it, if any.
+@dataclass(frozen=True)
+class TimelineWindow:
+    """The dates the timeline shows, ``first..last``, and the ``tl`` of its neighbours.
 
-    The timeline shows at most the last ``days`` dates. The earlier window is the ``days``
-    dates before the shown ones, clamped to ``first``; None when everything is shown.
+    ``earlier`` is the last date of the window before (None when the window starts at the
+    period's first date); ``later`` is the last date of the window after (None when the
+    window ends at the period's last date).
     """
-    shown_first = max(first, last - timedelta(days=days - 1))
-    if shown_first == first:
-        return shown_first, None
-    earlier_first = max(first, shown_first - timedelta(days=days))
-    return shown_first, (earlier_first, shown_first - timedelta(days=1))
+
+    first: date
+    last: date
+    earlier: date | None
+    later: date | None
+
+
+def timeline_window(
+    first: date, last: date, end: date | None = None, days: int = TIMELINE_DAYS
+) -> TimelineWindow:
+    """The timeline's window of the period ``first..last``: up to ``days`` dates ending at
+    ``end`` (default ``last``), never before ``first``.
+
+    ``end`` is navigation, not a filter: a date outside the period is clamped into it.
+    "Earlier" ends the day before the window (its start is clamped at ``first`` in turn);
+    "later" is the window's next ``days`` dates, clamped at ``last``. ValueError for
+    ``last < first`` or ``days < 1``.
+    """
+    if last < first:
+        raise ValueError("the period must not end before it starts")
+    if days < 1:
+        raise ValueError(f"a timeline window needs at least one day, not {days}")
+    shown_last = min(max(end if end is not None else last, first), last)
+    shown_first = max(first, shown_last - timedelta(days=days - 1))
+    earlier = shown_first - timedelta(days=1) if shown_first > first else None
+    later = min(last, shown_last + timedelta(days=days)) if shown_last < last else None
+    return TimelineWindow(shown_first, shown_last, earlier, later)
 
 
 def percent(num: int, den: int) -> int | None:
@@ -233,7 +259,13 @@ class PairStats:
 
 @dataclass(frozen=True)
 class SimOutage:
-    """A maximal span of P with at least two locations off at once; ``end`` None at now."""
+    """A maximal span of P with at least two locations off at once; ``end`` None at now.
+
+    The span is clipped to P. ``starts_before``: it begins at P's start and at least two of
+    its locations were already off before P (their off pieces start before P's start).
+    ``ends_after``: it reaches P's end, P ends before now, and at least two of its
+    locations stay off past P's end (their off pieces end after it or are still open).
+    """
 
     start: datetime
     end: datetime | None
@@ -241,6 +273,8 @@ class SimOutage:
     keys: tuple[int, ...]
     peak: int
     all_n: bool
+    starts_before: bool = False
+    ends_after: bool = False
 
 
 @dataclass(frozen=True)
@@ -312,8 +346,7 @@ class Comparison:
     pairs: tuple[PairStats, ...]
     simultaneous: tuple[SimOutage, ...]
     simultaneous_total: int
-    timeline_first: date
-    earlier: tuple[date, date] | None
+    window: TimelineWindow
     days: tuple[DayLanes, ...]
     hours: tuple[HourLane, ...]
     weeks: tuple[WeekRow, ...]
@@ -466,25 +499,33 @@ def _location_stats(
 
 @dataclass(frozen=True)
 class _Elem:
-    """An elementary span of P: how many locations are on and off, and which are off."""
+    """An elementary span of P: how many locations are on and off, and which are off.
+
+    With at least two off: ``off_before`` counts the off locations whose off piece starts
+    before P (only on the span at P's start), ``off_after`` those whose off piece ends after
+    P or is open (only on the span at P's end).
+    """
 
     start: datetime
     end: datetime
     on: int
     off: int
     off_keys: frozenset[int]
+    off_before: int = 0
+    off_after: int = 0
 
 
 def _sweep(all_clips: list[list[_Clip]], period: Period) -> list[_Elem]:
     """The elementary spans of P between consecutive piece boundaries of any location."""
-    # (instant, 0 = end before 1 = start, location index, state)
-    events: list[tuple[datetime, int, int, str]] = []
+    # (instant, 0 = end before 1 = start, location index, the raw piece)
+    events: list[tuple[datetime, int, int, model.Piece]] = []
     for i, clips in enumerate(all_clips):
         for s, e, p in clips:
-            events.append((s, 1, i, p.state))
-            events.append((e, 0, i, p.state))
+            events.append((s, 1, i, p))
+            events.append((e, 0, i, p))
     events.sort(key=lambda ev: (ev[0], ev[1]))
     state: list[str | None] = [None] * len(all_clips)
+    piece: list[model.Piece | None] = [None] * len(all_clips)
     on = off = 0
     off_set: set[int] = set()
     elems: list[_Elem] = []
@@ -492,7 +533,8 @@ def _sweep(all_clips: list[list[_Clip]], period: Period) -> list[_Elem]:
     k = 0
     while t < period.end:
         while k < len(events) and events[k][0] <= t:
-            _, kind, i, st = events[k]
+            _, kind, i, p = events[k]
+            st = p.state
             if kind == 0:
                 if state[i] == "on":
                     on -= 1
@@ -500,8 +542,10 @@ def _sweep(all_clips: list[list[_Clip]], period: Period) -> list[_Elem]:
                     off -= 1
                     off_set.discard(i)
                 state[i] = None
+                piece[i] = None
             else:
                 state[i] = st
+                piece[i] = p
                 if st == "on":
                     on += 1
                 elif st == "off":
@@ -510,7 +554,17 @@ def _sweep(all_clips: list[list[_Clip]], period: Period) -> list[_Elem]:
             k += 1
         nxt = events[k][0] if k < len(events) else period.end
         nxt = min(nxt, period.end)
-        elems.append(_Elem(t, nxt, on, off, frozenset(off_set) if off >= 2 else frozenset()))
+        if off >= 2:
+            raw = [q for i in off_set if (q := piece[i]) is not None]
+            before = sum(1 for p in raw if p.start < period.start) if t == period.start else 0
+            after = (
+                sum(1 for p in raw if p.end is None or p.end > period.end)
+                if nxt == period.end
+                else 0
+            )
+            elems.append(_Elem(t, nxt, on, off, frozenset(off_set), before, after))
+        else:
+            elems.append(_Elem(t, nxt, on, off, frozenset()))
         t = nxt
     return elems
 
@@ -549,7 +603,9 @@ def _together(elems: list[_Elem], n: int) -> tuple[TogetherStats, list[TogetherS
     return TogetherStats(all_off, any_on, joint, known), spans
 
 
-def _simultaneous(elems: list[_Elem], keys: list[int], now: datetime) -> list[SimOutage]:
+def _simultaneous(
+    elems: list[_Elem], keys: list[int], period: Period, now: datetime
+) -> list[SimOutage]:
     n = len(keys)
     found: list[SimOutage] = []
     cur: list[_Elem] = []
@@ -562,14 +618,17 @@ def _simultaneous(elems: list[_Elem], keys: list[int], now: datetime) -> list[Si
         for el in cur:
             members |= el.off_keys
         peak = max(el.off for el in cur)
+        ongoing = end >= now
         found.append(
             SimOutage(
                 start=start,
-                end=None if end >= now else end,
+                end=None if ongoing else end,
                 duration_us=_us(start, end),
                 keys=tuple(keys[i] for i in sorted(members)),
                 peak=peak,
                 all_n=peak == n,
+                starts_before=start == period.start and cur[0].off_before >= 2,
+                ends_after=not ongoing and end == period.end and cur[-1].off_after >= 2,
             )
         )
         cur.clear()
@@ -686,11 +745,19 @@ def _checked_series(s: Series) -> tuple[list[model.Piece], dict[datetime, Outage
     return pieces, recs
 
 
-def compare(series: Sequence[Series], period: Period, now: datetime, tz: str) -> Comparison:
+def compare(
+    series: Sequence[Series],
+    period: Period,
+    now: datetime,
+    tz: str,
+    *,
+    timeline_last: date | None = None,
+) -> Comparison:
     """Every number of the Compare page for ``series`` (name order, kept everywhere) over P.
 
-    ValueError for a naive ``now``, a bad piece, or an off piece in P whose outage is
-    missing from its series' ``outages``.
+    ``timeline_last`` picks the timeline's window (``timeline_window``); it changes only
+    ``window`` and ``days``, never another number. ValueError for a naive ``now``, a bad
+    piece, or an off piece in P whose outage is missing from its series' ``outages``.
     """
     now = _utc(now)
     today = model.local_today(now, tz)
@@ -737,7 +804,7 @@ def compare(series: Sequence[Series], period: Period, now: datetime, tz: str) ->
     if n >= 2:
         elems = _sweep(all_clips, period)
         together, spans = _together(elems, n)
-        sims = _simultaneous(elems, keys, now)
+        sims = _simultaneous(elems, keys, period, now)
         for i in range(n):
             for j in range(i + 1, n):
                 pairs.append(
@@ -745,7 +812,7 @@ def compare(series: Sequence[Series], period: Period, now: datetime, tz: str) ->
                 )
         t_lanes = _together_lanes(spans, frames, tz)
 
-    timeline_first, earlier = timeline_window(period.first, period.last)
+    window = timeline_window(period.first, period.last, timeline_last)
     day_lanes = tuple(
         DayLanes(
             day=frame.day,
@@ -754,7 +821,7 @@ def compare(series: Sequence[Series], period: Period, now: datetime, tz: str) ->
             together=t_lanes[k] if t_lanes else None,
         )
         for k, frame in enumerate(frames)
-        if frame.day >= timeline_first
+        if window.first <= frame.day <= window.last
     )
 
     hours: list[HourLane] = []
@@ -810,8 +877,7 @@ def compare(series: Sequence[Series], period: Period, now: datetime, tz: str) ->
         pairs=tuple(pairs),
         simultaneous=tuple(sims[:SIM_CAP]),
         simultaneous_total=len(sims),
-        timeline_first=timeline_first,
-        earlier=earlier,
+        window=window,
         days=day_lanes,
         hours=tuple(hours),
         weeks=tuple(weeks),

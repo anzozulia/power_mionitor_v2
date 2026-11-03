@@ -669,6 +669,13 @@ BROKEN = [
         '<input type="hidden" name="csrfmiddlewaretoken" value="csrf-value">',
         "GET form to '/compare/' carries a CSRF token",
     ),
+    # IN-07 (quick task 261103-lfm): nor a password input, whose value would land in the URL.
+    (
+        '<form method="dialog">',
+        '<form method="get" role="search" action="/compare/">'
+        '<label>Key <input type="Password" name="key"></label>',
+        "GET form to '/compare/' carries a password input",
+    ),
     (
         '<input type="hidden" name="csrfmiddlewaretoken" value="csrf-value">',
         "",

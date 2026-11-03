@@ -6,7 +6,9 @@ submitted text on an invalid one), earliest and today (the date inputs' bounds) 
 (the one line under the form; only on a valid page).
 
 - One GET search form (role=search, no CSRF token: a token in a URL would leak, R-1) to
-  /compare/, so a comparison is a bookmarkable link and the page needs no JS.
+  /compare/, so a comparison is a bookmarkable link and the page needs no JS. novalidate:
+  the server validates, so the date inputs' min/max never block switching to a preset.
+  The form does not carry the timeline's tl, so a new comparison resets its window.
 - The error summary first when the form is invalid (its links go to #id_loc, #id_range,
   #id_from and #id_to).
 - The hidden empty loc sentinel, so a submit with every chip unchecked reads as "none"
@@ -15,12 +17,13 @@ submitted text on an invalid one), earliest and today (the date inputs' bounds) 
   (aria-hidden, styled from the label's data-status exactly like the sidebar's: on, off,
   maintenance hatch, waiting ring) and the name. 44 px tall, 32 px on a fine pointer from md.
 - fieldset#id_range: the period radios (7, 14, 30, 90 days, Custom).
-- The From and To date inputs, always shown and prefilled; they apply to Custom only.
+- The From and To date inputs, always shown and prefilled (with the preset's dates for a
+  preset); they apply to Custom only.
 - The Compare button and the Reset link (back to every location over 7 days).
 - Field errors at id_<name>_error, wired by aria-describedby and aria-invalid.
 
 Every class is spelled out; no class name is built from data.
-{% endcomment %}<form method="get" action="{% url 'location-compare' %}" role="search" aria-label="Compare filters" data-testid="compare-form" class="flex flex-col gap-4 p-4">
+{% endcomment %}<form method="get" action="{% url 'location-compare' %}" role="search" aria-label="Compare filters" data-testid="compare-form" novalidate class="flex flex-col gap-4 p-4">
 {% if form.errors %}{% include "partials/_error_summary.html" with form=form title=form.form_error only %}{% endif %}
 <input type="hidden" name="loc" value="">
 <fieldset id="id_loc" tabindex="-1" class="flex min-w-0 flex-col gap-2 focus:outline-none"{% if form.loc.errors %} aria-describedby="id_loc_error"{% endif %}>

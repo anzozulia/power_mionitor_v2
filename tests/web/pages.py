@@ -20,7 +20,8 @@ attribute order or DOM depth (TEST-STRATEGY §1 rule 3, §5.1).
   ``section``; and the checks ``assert_page`` (the 15 page invariants of TEST-STRATEGY
   §5.2), ``assert_no_injected_script`` and ``assert_no_secrets`` (§5.3).
 - Invariant 10 allows one GET form shape (R-1 of quick task 261103-lfm): a
-  ``method="get"`` form with ``role="search"`` and no CSRF input (the Compare filters).
+  ``method="get"`` form with ``role="search"``, no CSRF input and no password input (the
+  Compare filters).
   Every other form still POSTs with a CSRF token or is a modal's ``method="dialog"``.
 - ``text()`` is the text a screen reader gets: whitespace collapsed, visually hidden text
   kept, ``aria-hidden="true"`` subtrees (icons, masked glyphs) skipped.
@@ -654,7 +655,8 @@ def assert_page(
         assert _lower(meta, "http-equiv") != "refresh", "the page has a meta refresh"
     # 10. Every form POSTs with a CSRF input holding a token, or is the modal's
     # method="dialog", or is a search form (method="get" with role="search", R-1 of quick
-    # task 261103-lfm) that carries NO CSRF input: a token in a GET URL would leak. A
+    # task 261103-lfm) that carries NO CSRF input and NO password input: a token or a
+    # secret in a GET URL would leak into the address bar, history and logs. A
     # partial included with ``only`` loses the context processor's csrf_token unless the
     # caller passes it, and its input then posts an empty token.
     for form in _tags(soup.find_all("form")):
@@ -668,6 +670,12 @@ def assert_page(
                 if found.get("name") == "csrfmiddlewaretoken"
             ]
             assert not leaked, f"GET form to {action!r} carries a CSRF token"
+            secret = [
+                found
+                for found in _tags(form.find_all("input"))
+                if _lower(found, "type") == "password"
+            ]
+            assert not secret, f"GET form to {action!r} carries a password input"
             continue
         assert method == "post", f"form to {action!r} is not a POST form"
         tokens = [

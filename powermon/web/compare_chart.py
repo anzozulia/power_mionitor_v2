@@ -7,7 +7,8 @@ element and every class, and Django escapes every string (location names are use
 
 Task 2a's part:
 
-- the text helpers shared by every card: ``percent_text`` ("42%", "<1%", "—"),
+- the text helpers shared by every card: ``percent_text`` ("42%", "<1%", ">99%", "—")
+  and ``share_text`` (the same for a ``num / den`` share),
   ``duration_text`` (the chart's total format in English: ``3h 20m``, ``45m``, ``<1m``),
   ``total_text`` (the chart's daily total: ``3h 20m · 2``, "no outages", "—"),
   ``gap_text`` (a signed start or end gap of location B: "B 4m later", "same minute"),
@@ -16,7 +17,9 @@ Task 2a's part:
 - ``summary_text``: the filter card's one line, "3 locations · 25 Sep – 1 Oct 2026 (7 days)";
 - ``kpi_tiles``: the KPI card (D-5 item 2). Ties go to name order (the comparison's input
   order); the longest outage ties to the earlier start. A tile that cannot be computed
-  (no monitored time) shows "—"; a fleet without an outage shows "no outages";
+  (no monitored time) shows "—"; a fleet without an outage shows "no outages"; the
+  all-off tile says "no overlap" when the locations were monitored together but never all
+  off at once;
 - ``scoreboard``: the outage scoreboard (D-5 item 3), sorted by off time in P, most first,
   ties in name order, with the rank and a bar width in percent of the largest off time (a
   non-zero off time is at least 1).
@@ -31,13 +34,18 @@ Task 2b's part (D-6 to D-9, the plan's "Design: page geometry, texts and hooks")
 - ``timeline``: the Telegram chart rebuilt for the browser (legend, top and bottom hour
   axes, 3-hour gridlines, one day group per local day with one lane per location and the
   Together lane, the today band, the now marker and pill, week dividers, segment titles,
-  the totals, the 31-day cap and the "Earlier days" query, the daily-totals table);
+  the totals, the window of up to 31 days with its "Earlier days" and "Later days"
+  queries, which page through the period and keep every other filter, and the
+  daily-totals table);
 - ``together_total``: "all off 1h 5m", "no overlap" (R-8) or "—";
-- ``overlap``: the pair matrix (buckets 0..5, the zero-off row rule), the pairs and the
-  simultaneous outages;
-- ``hours``: the hour-of-day lanes with the cell fill rule (track, always on, off opacity)
-  and the ink of the printed share per opacity bucket (``hour_ink``);
-- ``weeks``: the by-week table with its proportional bars.
+- ``overlap``: the pair matrix (buckets 0..5 of the printed percent, the zero-off row
+  rule), the pairs and the simultaneous outages (a span cut by the period reads "before
+  …", "after …" and "≥ …");
+- ``hours``: the hour-of-day lanes with the cell fill rule (track, always on, off opacity;
+  the Together lane never paints "always on": its zero case is the track colour) and the
+  ink of the printed share per opacity bucket (``hour_ink``);
+- ``weeks``: the by-week table with its proportional bars ("no overlap" in the Together
+  column when the locations were never all off at once).
 """
 
 from collections.abc import Mapping, Sequence
@@ -52,8 +60,11 @@ from powermon.i18n.duration import format_total_duration
 LANG = "en"
 NONE_TEXT = "—"
 NO_OUTAGES = chart_texts.NO_OUTAGES[LANG]
+# Together's zero case: monitored together, never all off at once (R-8).
+NO_OVERLAP = "no overlap"
 SAME_MINUTE = "same minute"
 LESS_THAN_ONE = "<1%"
+MORE_THAN_99 = ">99%"
 PARTIAL_TAG = "partial data"
 # A start or end gap below one minute reads "same minute".
 _MINUTE_US = 60_000_000
@@ -82,13 +93,21 @@ TILE_LABELS = {
 # Text helpers
 
 
-def percent_text(p: int | None, nonzero: bool) -> str:
-    """A percent: "—" for None, "<1%" for a non-zero value rounding to 0, else "N%"."""
+def percent_text(p: int | None, nonzero: bool, full: bool = True) -> str:
+    """A percent: "—" for None, "<1%" for a non-zero value rounding to 0, ">99%" for a
+    value below 100 % (``full`` False) rounding to 100, else "N%"."""
     if p is None:
         return NONE_TEXT
     if p == 0 and nonzero:
         return LESS_THAN_ONE
+    if p == 100 and not full:
+        return MORE_THAN_99
     return f"{p}%"
+
+
+def share_text(num: int, den: int) -> str:
+    """``num / den`` as ``percent_text``: "42%", "<1%", ">99%", "100%" or "—" (``den`` 0)."""
+    return percent_text(compare.percent(num, den), num > 0, num >= den)
 
 
 def duration_text(us: int) -> str:
@@ -265,12 +284,12 @@ def kpi_tiles(result: compare.Comparison) -> tuple[Tile, ...]:
         if together.jointly_monitored_us == 0:
             tiles.append(Tile("all-off", TILE_LABELS["all-off"], NONE_TEXT))
         else:
-            share = percent_text(together.all_off_share, together.all_off_us > 0)
+            share = share_text(together.all_off_us, together.jointly_monitored_us)
             tiles.append(
                 Tile(
                     "all-off",
                     TILE_LABELS["all-off"],
-                    duration_text(together.all_off_us) if together.all_off_us else NO_OUTAGES,
+                    duration_text(together.all_off_us) if together.all_off_us else NO_OVERLAP,
                     note=f"{share} of jointly monitored time",
                 )
             )
@@ -278,7 +297,7 @@ def kpi_tiles(result: compare.Comparison) -> tuple[Tile, ...]:
             Tile(
                 "power-somewhere",
                 TILE_LABELS["power-somewhere"],
-                percent_text(together.any_on_share, together.any_on_us > 0),
+                share_text(together.any_on_us, together.known_us),
                 note="of the time any location was monitored",
             )
         )
@@ -348,12 +367,12 @@ def scoreboard(result: compare.Comparison, statuses: Mapping[int, str]) -> tuple
                 off_us=s.off_us,
                 off_text=_off_text(s),
                 bar_width=bar_width(s.off_us, max_off),
-                off_share_text=percent_text(s.off_share, s.off_us > 0),
+                off_share_text=share_text(s.off_us, s.monitored_us),
                 outages_text=str(s.outage_count),
                 avg_text=NONE_TEXT if s.avg_outage_us is None else duration_text(s.avg_outage_us),
                 longest_text=longest,
                 days_text=f"{s.days_with_outages} of {s.days_total}",
-                monitored_text=percent_text(s.coverage, s.monitored_us > 0),
+                monitored_text=share_text(s.monitored_us, s.period_us),
                 partial=s.partial_data,
             )
         )
@@ -399,7 +418,9 @@ TOGETHER_HOURS_NAME = "Together (all off)"
 # From this off-fill opacity (percent) up, a cell's printed share uses the strong ink.
 STRONG_INK_LEVEL = 90
 EARLIER_LABEL = "Earlier days"
-TIMELINE_CAP = f"The timeline shows the last {compare.TIMELINE_DAYS} days of the period."
+LATER_LABEL = "Later days"
+# The timeline's own paging parameter: the local date of the window's last day.
+TIMELINE_PARAM = "tl"
 TOTALS_HEADER = chart_texts.TOTALS_HEADER[LANG]
 STATE_WORDS = {
     "on": "Power on",
@@ -475,18 +496,15 @@ def together_total(all_off_us: int, joint_us: int) -> str:
     if all_off_us > 0:
         return f"all off {duration_text(all_off_us)}"
     if joint_us > 0:
-        return "no overlap"
+        return NO_OVERLAP
     return NONE_TEXT
 
 
-def earlier_query(keys: Sequence[int], earlier: tuple[date, date]) -> str:
-    """The "Earlier days" query: the same locations, the custom period ``earlier``."""
-    pairs = [("loc", str(key)) for key in keys]
-    pairs += [
-        ("range", "custom"),
-        ("from", earlier[0].isoformat()),
-        ("to", earlier[1].isoformat()),
-    ]
+def page_query(query: Sequence[tuple[str, str]], last: date) -> str:
+    """A timeline page's query: every pair of ``query`` but ``tl`` kept exactly, in order,
+    then ``tl`` set to ``last`` (urlencoded, so no user input is pasted into the URL)."""
+    pairs = [(key, value) for key, value in query if key != TIMELINE_PARAM]
+    pairs.append((TIMELINE_PARAM, last.isoformat()))
     return urlencode(pairs)
 
 
@@ -611,9 +629,10 @@ class Timeline:
     bottom_axis_y: str
     separators: tuple[Separator, ...]
     groups: tuple[DayGroup, ...]
-    capped: bool
-    cap_text: str
+    paged: bool
+    window_text: str
     earlier_query: str | None
+    later_query: str | None
     columns: tuple[str, ...]
     daily: tuple[DailyRow, ...]
 
@@ -721,8 +740,13 @@ def _now_marker(result: compare.Comparison, first_top: int, last_bottom: int) ->
     )
 
 
-def timeline(result: compare.Comparison) -> Timeline:
-    """The timeline card's view model: the shown window's day groups, oldest at the top."""
+def timeline(result: compare.Comparison, query: Sequence[tuple[str, str]] = ()) -> Timeline:
+    """The timeline card's view model: the shown window's day groups, oldest at the top.
+
+    ``query`` is the page's query as (name, value) pairs; the "Earlier days" and "Later
+    days" queries keep every pair of it but ``tl`` and set ``tl`` (``page_query``). The
+    window line and the links show when the period is longer than the window.
+    """
     stats = result.locations
     several = len(stats) > 1
     names = [s.name for s in stats]
@@ -814,10 +838,11 @@ def timeline(result: compare.Comparison) -> Timeline:
         if shown
         else NONE_TEXT
     )
-    earlier = (
-        earlier_query([s.key for s in stats], result.earlier)
-        if result.earlier is not None
-        else None
+    window = result.window
+    paged = window.earlier is not None or window.later is not None
+    window_text = (
+        f"Showing {chart_texts.row_date(window.first)}{chart_texts.DASH}"
+        f"{chart_texts.row_date(window.last)} of the period."
     )
     desc = (
         f"One group of lanes per day from {span}, one lane per location"
@@ -839,9 +864,10 @@ def timeline(result: compare.Comparison) -> Timeline:
         bottom_axis_y=str(plot_bottom + 16),
         separators=_separators(),
         groups=tuple(groups),
-        capped=result.earlier is not None,
-        cap_text=TIMELINE_CAP,
-        earlier_query=earlier,
+        paged=paged,
+        window_text=window_text,
+        earlier_query=None if window.earlier is None else page_query(query, window.earlier),
+        later_query=None if window.later is None else page_query(query, window.later),
         columns=(*names, *([TOGETHER_NAME] if several else [])),
         daily=tuple(daily),
     )
@@ -850,12 +876,18 @@ def timeline(result: compare.Comparison) -> Timeline:
 # Overlap (D-7)
 
 
-def matrix_bucket(num: int, den: int) -> int:
-    """The matrix cell's tone bucket: 0 for no share, else <10, 10-25, 25-50, 50-75, >=75."""
-    if den <= 0 or num <= 0:
+def matrix_bucket(share: int | None, nonzero: bool) -> int:
+    """The matrix cell's tone bucket from the ROUNDED percent the cell prints (IN-01): 0 for
+    no share, else <10, 10-25, 25-50, 50-75, >=75 ("<1%" is bucket 1, "10%" bucket 2).
+
+    ValueError for a share outside 0..100.
+    """
+    if share is None or not nonzero:
         return 0
+    if not 0 <= share <= 100:
+        raise ValueError(f"a share of {share}%")
     for bucket, edge in enumerate((10, 25, 50, 75), start=1):
-        if 100 * num < edge * den:
+        if share < edge:
             return bucket
     return 5
 
@@ -952,7 +984,7 @@ def _matrix_cell(
         sr = f"{a.name} had no off time, so there is no share with {b.name}."
         return MatrixCell(b.key, False, "", 0, NONE_TEXT, "", sr)
     share = pair.share_a if first else pair.share_b
-    value = percent_text(share, both > 0)
+    value = share_text(both, a.off_us)
     detail = duration_text(both) if both else NO_OUTAGES
     sr = (
         f"While {a.name} was off, {b.name} was also off {value} of the time"
@@ -962,7 +994,7 @@ def _matrix_cell(
         b.key,
         False,
         "" if share is None else str(share),
-        matrix_bucket(both, a.off_us),
+        matrix_bucket(share, both > 0),
         value,
         detail,
         sr,
@@ -972,6 +1004,28 @@ def _matrix_cell(
 def _local_stamp(result: compare.Comparison, at: datetime) -> str:
     day = chart_texts.weekday_date(model.local_today(at, result.tz), LANG)
     return f"{day} {times.hm(at, result.tz)}"
+
+
+def sim_start_text(result: compare.Comparison, sim: compare.SimOutage) -> str:
+    """A simultaneous outage's start: "Thu 01.10 12:00", or "before Sun 01.11 00:00" when
+    it began before the period (WR-02)."""
+    stamp = _local_stamp(result, sim.start)
+    return f"before {stamp}" if sim.starts_before else stamp
+
+
+def sim_end_text(result: compare.Comparison, sim: compare.SimOutage) -> str:
+    """A simultaneous outage's end: "ongoing" at now, "after Mon 02.11 00:00" when it goes
+    on past the period's end (WR-02), else the local end."""
+    if sim.end is None:
+        return "ongoing"
+    stamp = _local_stamp(result, sim.end)
+    return f"after {stamp}" if sim.ends_after else stamp
+
+
+def sim_duration_text(sim: compare.SimOutage) -> str:
+    """The duration in the period, "≥ 24h" when the period cut the span at either end."""
+    text = duration_text(sim.duration_us)
+    return f"≥ {text}" if sim.starts_before or sim.ends_after else text
 
 
 def overlap(result: compare.Comparison) -> Overlap:
@@ -1002,8 +1056,8 @@ def overlap(result: compare.Comparison) -> Overlap:
                 name_a=a.name,
                 name_b=b.name,
                 both=duration_text(p.both_off_us),
-                share_a=percent_text(p.share_a, True),
-                share_b=percent_text(p.share_b, True),
+                share_a=share_text(p.both_off_us, a.off_us),
+                share_b=share_text(p.both_off_us, b.off_us),
                 coinciding_a=side_count_text("A", p.coinciding_a, p.outages_a),
                 coinciding_b=side_count_text("B", p.coinciding_b, p.outages_b),
                 start_gap=gap_text(p.start_gap_us),
@@ -1019,9 +1073,9 @@ def overlap(result: compare.Comparison) -> Overlap:
     n = len(stats)
     sims = tuple(
         SimRow(
-            start=_local_stamp(result, sim.start),
-            end="ongoing" if sim.end is None else _local_stamp(result, sim.end),
-            duration=duration_text(sim.duration_us),
+            start=sim_start_text(result, sim),
+            end=sim_end_text(result, sim),
+            duration=sim_duration_text(sim),
             names=", ".join(by_key[key].name for key in sim.keys),
             all_n=sim.all_n,
             all_text=f"all {n}",
@@ -1077,6 +1131,7 @@ class Hours:
     grid_y2: str
     separators: tuple[Separator, ...]
     lanes: tuple[HourLaneView, ...]
+    together: bool
 
 
 def _off_level(off_us: int, monitored_us: int) -> int:
@@ -1084,13 +1139,18 @@ def _off_level(off_us: int, monitored_us: int) -> int:
     return 20 + 80 * min(off_us, monitored_us) // monitored_us
 
 
-def hour_fill(off_us: int, monitored_us: int) -> tuple[str, str]:
+def hour_fill(off_us: int, monitored_us: int, *, together: bool = False) -> tuple[str, str]:
     """A cell's (fill, opacity): "track" with no monitored time, "on" at 0.35 when the power
-    was always on, else "off" at (20 + 80 × share) %, two decimals (INFO-7)."""
+    was always on, else "off" at (20 + 80 × share) %, two decimals (INFO-7).
+
+    ``together`` (the Together lane, WR-01): ``off_us`` is the all-off time and
+    ``monitored_us`` the jointly monitored time. Never all off at once is not "always on",
+    so that cell keeps the track colour too.
+    """
     if monitored_us <= 0:
         return "track", "1"
     if off_us <= 0:
-        return "on", "0.35"
+        return ("track", "1") if together else ("on", "0.35")
     level = _off_level(off_us, monitored_us)
     return "off", f"{level // 100}.{level % 100:02d}"
 
@@ -1114,11 +1174,21 @@ def _hour_label(h: int) -> str:
     return f"{h:02d}:00–{h + 1:02d}:00"
 
 
-def _hour_title(name: str, h: int, cell: compare.HourCell) -> str:
+def _hour_title(name: str, h: int, cell: compare.HourCell, *, together: bool = False) -> str:
     head = f"{name}{chart_texts.DOT}{_hour_label(h)}{chart_texts.DOT}"
+    if together:
+        if cell.monitored_us == 0:
+            return f"{head}not monitored together"
+        if cell.off_us == 0:
+            return f"{head}never all off at once"
+        return (
+            f"{head}all off {share_text(cell.off_us, cell.monitored_us)} of jointly "
+            f"monitored time ({duration_text(cell.off_us)} of "
+            f"{duration_text(cell.monitored_us)})"
+        )
     if cell.monitored_us == 0:
         return f"{head}not monitored"
-    pct = percent_text(cell.value, cell.off_us > 0)
+    pct = share_text(cell.off_us, cell.monitored_us)
     return (
         f"{head}off {pct} of monitored time "
         f"({duration_text(cell.off_us) if cell.off_us else '0m'} of "
@@ -1126,7 +1196,7 @@ def _hour_title(name: str, h: int, cell: compare.HourCell) -> str:
     )
 
 
-def _peak(cells: Sequence[compare.HourCell]) -> tuple[str, str]:
+def _peak(cells: Sequence[compare.HourCell], *, together: bool = False) -> tuple[str, str]:
     if not any(c.monitored_us for c in cells):
         return NONE_TEXT, "subtle"
     best: int | None = None
@@ -1139,10 +1209,11 @@ def _peak(cells: Sequence[compare.HourCell]) -> tuple[str, str]:
         ):
             best = h
     if best is None:
-        return NO_OUTAGES, "muted"
+        return (NO_OVERLAP if together else NO_OUTAGES), "muted"
     cell = cells[best]
     return (
-        f"peak {best:02d}–{best + 1:02d}{chart_texts.DOT}{percent_text(cell.value, True)}",
+        f"peak {best:02d}–{best + 1:02d}{chart_texts.DOT}"
+        f"{share_text(cell.off_us, cell.monitored_us)}",
         "strong",
     )
 
@@ -1158,7 +1229,7 @@ def hours(result: compare.Comparison) -> Hours:
         lane_top = top + i * HOUR_PITCH
         cells = []
         for h, cell in enumerate(lane.cells):
-            fill, opacity = hour_fill(cell.off_us, cell.monitored_us)
+            fill, opacity = hour_fill(cell.off_us, cell.monitored_us, together=together)
             value = cell.value
             show = value is not None and value >= 10
             cells.append(
@@ -1171,10 +1242,10 @@ def hours(result: compare.Comparison) -> Hours:
                     ink=hour_ink(cell.off_us, cell.monitored_us),
                     pct="" if value is None else str(value),
                     label=str(value) if show else "",
-                    title=_hour_title(name, h, cell),
+                    title=_hour_title(name, h, cell, together=together),
                 )
             )
-        peak, tone = _peak(lane.cells)
+        peak, tone = _peak(lane.cells, together=together)
         lanes.append(
             HourLaneView(
                 key=TOGETHER if together else str(lane.key),
@@ -1203,6 +1274,7 @@ def hours(result: compare.Comparison) -> Hours:
         grid_y2=str(bottom + 2),
         separators=_separators(),
         lanes=tuple(lanes),
+        together=any(lane.together for lane in lanes),
     )
 
 
@@ -1238,6 +1310,14 @@ def _week_tone(cell: compare.WeekCell) -> str:
     return "muted" if cell.count == 0 else "strong"
 
 
+def week_text(cell: compare.WeekCell, *, together: bool = False) -> str:
+    """A week cell: the chart's total ("3h 20m · 2", "no outages", "—"); the Together
+    column says "no overlap" when monitored together but never all off at once (WR-01)."""
+    if together and cell.monitored and cell.off_us == 0:
+        return NO_OVERLAP
+    return total_text(cell.off_us, cell.count, cell.monitored)
+
+
 def weeks(result: compare.Comparison) -> Weeks:
     """The by-week table (D-9): newest week first, bars scaled to the table's largest cell."""
     keys = [str(s.key) for s in result.locations]
@@ -1263,7 +1343,7 @@ def weeks(result: compare.Comparison) -> Weeks:
                     WeekCellView(
                         key=key,
                         off_us=cell.off_us,
-                        text=total_text(cell.off_us, cell.count, cell.monitored),
+                        text=week_text(cell, together=key == TOGETHER),
                         tone=_week_tone(cell),
                         bar=bar_width(cell.off_us, largest),
                     )

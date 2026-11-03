@@ -3,7 +3,8 @@
 Task 2a's part: the text helpers (percent, duration, daily total, signed gap, name
 truncation, the summary line), the KPI tiles and the scoreboard rows. Task 2b's part: the
 shared x-geometry (the bar mapping, the OFF minimum width), the Together total, the segment
-titles, the timeline view (31-day cap, "Earlier days" query), the matrix buckets and the
+titles, the timeline view (31-day window, the "Earlier/Later days" queries), the matrix
+buckets and the
 zero-off row, the pairs and simultaneous rows, the hour-cell fill and the weeks. All built
 from a real
 ``compare.compare`` result over the plan's page fixture (Home, Office, Shop over the 7 days
@@ -29,6 +30,7 @@ from powermon.web.compare_chart import (
     kpi_tiles,
     percent_text,
     scoreboard,
+    share_text,
     side_count_text,
     summary_text,
     total_text,
@@ -124,6 +126,23 @@ def test_percent_text() -> None:
     assert percent_text(100, True) == "100%"
     # Failure: no denominator gives the dash.
     assert percent_text(None, True) == "—"
+    # IN-02: a value below 100 % that rounds to 100 is ">99%", symmetric to "<1%".
+    assert percent_text(100, True, full=False) == ">99%"
+    assert percent_text(99, True, full=False) == "99%"
+
+
+def test_share_text() -> None:
+    # Expected: half up; 99.4 % prints 99 %.
+    assert share_text(994, 1000) == "99%"
+    assert share_text(42, 100) == "42%"
+    # Edge: 99.5 % rounds to 100 but is not complete; exactly 100 % is "100%".
+    assert share_text(995, 1000) == ">99%"
+    assert share_text(9_999, 10_000) == ">99%"
+    assert share_text(1000, 1000) == "100%"
+    assert share_text(4, 1000) == "<1%"
+    assert share_text(0, 1000) == "0%"
+    # Failure: no denominator gives the dash.
+    assert share_text(0, 0) == "—"
 
 
 def test_duration_and_total_text() -> None:
@@ -216,7 +235,8 @@ def test_kpi_tiles_on_the_fixture() -> None:
     assert (longest.name, longest.value, longest.note) == ("Shop", "2h", "01.10")
     assert tiles["all-off"].value == "30m"
     assert tiles["all-off"].note == "<1% of jointly monitored time"
-    assert tiles["power-somewhere"].value == "100%"
+    # IN-02: power was on somewhere all the time but the 30m all off: ">99%", not "100%".
+    assert tiles["power-somewhere"].value == ">99%"
     assert tiles["off-most"].label == "Off time, most"
 
 
@@ -233,14 +253,25 @@ def test_kpi_tiles_ties_and_edges() -> None:
         "outages-most",
         "longest",
     ]
-    # Edge: monitored but never off gives "no outages"; the all-off tile says so too.
+    # Edge: monitored but never off gives "no outages"; the all-off tile says "no overlap"
+    # (WR-01: monitored together, never all off at once).
     quiet = _tiles(_result(_quiet(5, "Barn"), _quiet(6, "Cellar")))
     assert quiet["off-most"].value == "no outages" and quiet["off-most"].name is None
     assert quiet["outages-most"].value == "no outages"
     assert quiet["longest"].value == "no outages"
-    assert quiet["all-off"].value == "no outages"
+    assert quiet["all-off"].value == "no overlap"
     assert quiet["all-off"].note == "0% of jointly monitored time"
     assert quiet["power-somewhere"].value == "100%"
+
+
+def test_kpi_all_off_when_one_location_is_off_alone() -> None:
+    # WR-01: Home is off, Barn is on all the time: never all off at once, not "no outages".
+    tiles = _tiles(_result(_home(), _quiet(5, "Barn")))
+    assert tiles["all-off"].value == "no overlap"
+    assert tiles["all-off"].note == "0% of jointly monitored time"
+    # Failure: never monitored together gives the dash.
+    alone = _tiles(_result(_home(), compare.Series(7, "Empty", (), ())))
+    assert alone["all-off"].value == "—" and alone["all-off"].note is None
 
 
 def test_kpi_tiles_without_data_show_a_dash() -> None:
@@ -276,7 +307,8 @@ def test_scoreboard_on_the_fixture() -> None:
     assert (office.off_text, office.off_share_text) == ("1h", "1%")
     assert (shop.off_text, shop.longest_text, shop.days_text) == ("3h 30m", "2h · 01.10", "1 of 7")
     assert [r.bar_width for r in rows] == [100, 71, 28]
-    assert [r.monitored_text for r in rows] == ["100%", "100%", "100%"]
+    # IN-02: Home's 30m not monitored leaves it below 100 %: ">99%".
+    assert [r.monitored_text for r in rows] == ["100%", ">99%", "100%"]
     assert not any(r.partial for r in rows)
 
 
@@ -468,23 +500,46 @@ def test_timeline_on_the_fixture() -> None:
     assert timeline.groups[0].lanes[0].total == "no outages"
     assert timeline.columns == ("Home", "Office", "Shop", "Together")
     assert timeline.daily[-1].cells == ("1h · 1", "1h · 1", "3h 30m · 2", "all off 30m")
-    assert not timeline.capped and timeline.earlier_query is None
+    assert not timeline.paged
+    assert (timeline.earlier_query, timeline.later_query) == (None, None)
     assert len(timeline.legend) == 5
     # The legend items do not overlap.
     xs = [float(item.x) for item in timeline.legend]
     assert xs == sorted(xs) and len(set(xs)) == len(xs)
 
 
-def test_timeline_cap_and_earlier_days() -> None:
-    timeline = compare_chart.timeline(_result(*FIXTURE, first=date(2026, 8, 22)))
+QUERY = (
+    ("loc", ""),
+    ("loc", "1"),
+    ("loc", "2"),
+    ("range", "custom"),
+    ("from", "2026-08-22"),
+    ("to", "2026-10-01"),
+)
 
-    assert timeline.capped
+
+def test_timeline_window_and_paging_links() -> None:
+    timeline = compare_chart.timeline(_result(*FIXTURE, first=date(2026, 8, 22)), QUERY)
+
+    assert timeline.paged
     assert len(timeline.groups) == 31
     assert timeline.groups[0].day == "2026-09-01"
+    assert timeline.window_text == "Showing 01.09 – 01.10 of the period."
     assert timeline.earlier_query == (
-        "loc=1&loc=2&loc=3&range=custom&from=2026-08-22&to=2026-08-31"
+        "loc=&loc=1&loc=2&range=custom&from=2026-08-22&to=2026-10-01&tl=2026-08-31"
     )
-    assert timeline.cap_text == "The timeline shows the last 31 days of the period."
+    assert timeline.later_query is None
+    # The first window: no earlier page, a later one back to the period's end.
+    period = compare.period_of(date(2026, 8, 22), WEEK[1], NOW, KYIV)
+    first = compare.compare(FIXTURE, period, NOW, KYIV, timeline_last=date(2026, 8, 31))
+    paged = compare_chart.timeline(first, (*QUERY, ("tl", "2026-08-31")))
+    assert [group.day for group in paged.groups][:1] == ["2026-08-22"]
+    assert len(paged.groups) == 10
+    assert paged.window_text == "Showing 22.08 – 31.08 of the period."
+    assert paged.earlier_query is None
+    assert paged.later_query == (
+        "loc=&loc=1&loc=2&range=custom&from=2026-08-22&to=2026-10-01&tl=2026-10-01"
+    )
     # Edge: one location has no Together lane and no "Some off" legend item.
     single = compare_chart.timeline(_result(_home()))
     assert all(len(group.lanes) == 1 for group in single.groups)
@@ -492,13 +547,19 @@ def test_timeline_cap_and_earlier_days() -> None:
     assert single.columns == ("Home",)
 
 
-def test_earlier_query() -> None:
-    assert compare_chart.earlier_query([1, 2], (date(2026, 8, 1), date(2026, 8, 31))) == (
-        "loc=1&loc=2&range=custom&from=2026-08-01&to=2026-08-31"
+def test_page_query() -> None:
+    # Expected: every other pair kept exactly, in order; tl set last.
+    assert compare_chart.page_query((("loc", "1"), ("range", "90d")), date(2026, 8, 31)) == (
+        "loc=1&range=90d&tl=2026-08-31"
     )
-    # Edge: no location keys still gives a valid custom period.
-    assert compare_chart.earlier_query([], (date(2026, 8, 1), date(2026, 8, 1))) == (
-        "range=custom&from=2026-08-01&to=2026-08-01"
+    # Edge: an old tl (even several) is replaced, and no query at all still works.
+    assert compare_chart.page_query(
+        (("tl", "x"), ("range", "90d"), ("tl", "2026-01-01")), date(2026, 8, 1)
+    ) == ("range=90d&tl=2026-08-01")
+    assert compare_chart.page_query((), date(2026, 8, 1)) == "tl=2026-08-01"
+    # Failure-proof: user input is urlencoded, never pasted into the URL.
+    assert compare_chart.page_query((("loc", "1&tl=x"), ("<b>", '"q"')), date(2026, 8, 1)) == (
+        "loc=1%26tl%3Dx&%3Cb%3E=%22q%22&tl=2026-08-01"
     )
 
 
@@ -514,16 +575,45 @@ def test_timeline_without_now_marker_for_a_past_period() -> None:
 
 
 def test_matrix_bucket_edges() -> None:
-    assert compare_chart.matrix_bucket(0, 100) == 0
-    assert compare_chart.matrix_bucket(999, 10_000) == 1
-    assert compare_chart.matrix_bucket(10, 100) == 2
-    assert compare_chart.matrix_bucket(2499, 10_000) == 2
-    assert compare_chart.matrix_bucket(25, 100) == 3
-    assert compare_chart.matrix_bucket(50, 100) == 4
-    assert compare_chart.matrix_bucket(75, 100) == 5
-    assert compare_chart.matrix_bucket(100, 100) == 5
-    # Failure: no off time in the row.
-    assert compare_chart.matrix_bucket(0, 0) == 0
+    assert compare_chart.matrix_bucket(0, False) == 0
+    assert compare_chart.matrix_bucket(0, True) == 1  # prints "<1%"
+    assert compare_chart.matrix_bucket(9, True) == 1
+    assert compare_chart.matrix_bucket(10, True) == 2
+    assert compare_chart.matrix_bucket(24, True) == 2
+    assert compare_chart.matrix_bucket(25, True) == 3
+    assert compare_chart.matrix_bucket(50, True) == 4
+    assert compare_chart.matrix_bucket(75, True) == 5
+    assert compare_chart.matrix_bucket(100, True) == 5
+    # Failure: no share, or a share outside 0..100.
+    assert compare_chart.matrix_bucket(None, True) == 0
+    with pytest.raises(ValueError):
+        compare_chart.matrix_bucket(101, True)
+
+
+def _off_for(key: int, name: str, minutes: int) -> compare.Series:
+    """On from START, off for ``minutes`` from 30.09 00:00 UTC, then on."""
+    s = _t(9, 30, 0)
+    e = s + timedelta(minutes=minutes)
+    pieces = (
+        model.Piece("on", START, s, None),
+        model.Piece("off", s, e, s),
+        model.Piece("on", e, None, None),
+    )
+    return compare.Series(key, name, pieces, (compare.OutageRec(s, e, minutes * M),))
+
+
+def test_matrix_bucket_follows_the_printed_percent() -> None:
+    # IN-01: 9.6 % prints "10%" and is tinted in the 10-25 bucket; 74.6 % prints "75%".
+    def pair(a_min: int, b_min: int) -> compare_chart.MatrixCell:
+        view = compare_chart.overlap(_result(_off_for(1, "A", a_min), _off_for(2, "B", b_min)))
+        return _cells(view)[(1, 2)]
+
+    edge = pair(1000, 96)
+    assert (edge.value, edge.share, edge.bucket) == ("10%", "10", 2)
+    below = pair(1000, 94)
+    assert (below.value, below.bucket) == ("9%", 1)
+    top = pair(1000, 746)
+    assert (top.value, top.bucket) == ("75%", 5)
 
 
 def _cells(view: compare_chart.Overlap) -> dict[tuple[int, int], compare_chart.MatrixCell]:
@@ -602,6 +692,15 @@ def test_hour_fill() -> None:
     assert compare_chart.hour_fill(H, 2 * H) == ("off", "0.60")
 
 
+def test_hour_fill_together() -> None:
+    # WR-01. Expected: all-off time keeps the off scale.
+    assert compare_chart.hour_fill(H, 2 * H, together=True) == ("off", "0.60")
+    # Edge: monitored together but never all off is the track colour, never "on".
+    assert compare_chart.hour_fill(0, H, together=True) == ("track", "1")
+    # Failure: no jointly monitored time is the track colour too.
+    assert compare_chart.hour_fill(0, 0, together=True) == ("track", "1")
+
+
 def test_hour_ink() -> None:
     # Expected: the soft ink on a mid off fill, the strong ink on a full one.
     assert compare_chart.hour_ink(H, 2 * H) == "soft"
@@ -634,6 +733,36 @@ def test_hours_on_the_fixture() -> None:
     assert lanes["1"].peak == "peak 09–10 · 14%"
     assert lanes["together"].name == "Together (all off)"
     assert lanes["together"].peak == "peak 12–13 · 7%"
+    assert view.together
+    # WR-01: an hour monitored together but never all off is the track colour, no number.
+    together3 = lanes["together"].cells[3]
+    assert (together3.fill, together3.label, together3.pct) == ("track", "", "0")
+    assert together3.title == "Together (all off) · 03:00–04:00 · never all off at once"
+    together12 = lanes["together"].cells[12]
+    assert together12.fill == "off"
+    assert together12.title == (
+        "Together (all off) · 12:00–13:00 · all off 7% of jointly monitored time (30m of 7h)"
+    )
+
+
+def test_hours_together_zero_and_unmonitored() -> None:
+    # Expected: one location off alone; Together is never all off at once.
+    lanes = compare_chart.hours(_result(_home(), _quiet(4, "Quiet"))).lanes
+    together = lanes[-1]
+    assert together.peak == "no overlap" and together.tone == "muted"
+    assert {cell.fill for cell in together.cells} == {"track"}
+    assert {cell.label for cell in together.cells} == {""}
+    assert together.cells[9].title == "Together (all off) · 09:00–10:00 · never all off at once"
+    # Home's own lane still shows its off hour.
+    assert lanes[0].cells[9].fill == "off"
+    # Failure: never monitored together gives the dash and "not monitored together".
+    nothing = compare.Series(9, "Nothing", (), ())
+    alone = compare_chart.hours(_result(_home(), nothing)).lanes[-1]
+    assert alone.peak == "—"
+    assert {cell.fill for cell in alone.cells} == {"track"}
+    assert alone.cells[9].title == "Together (all off) · 09:00–10:00 · not monitored together"
+    # One location: no Together row and no Together legend sentence.
+    assert not compare_chart.hours(_result(_home())).together
 
 
 def test_hours_without_monitored_time() -> None:
@@ -672,6 +801,21 @@ def test_weeks_on_the_fixture() -> None:
     assert compare_chart.weeks(_result(_home())).columns == ("Home",)
 
 
+def test_weeks_together_zero_case() -> None:
+    # WR-01: monitored together but never all off at once reads "no overlap".
+    view = compare_chart.weeks(_result(_home(), _quiet(4, "Quiet")))
+    cells = {cell.key: cell for cell in view.rows[0].cells}
+    assert (cells["together"].text, cells["together"].tone) == ("no overlap", "muted")
+    assert cells["4"].text == "no outages"
+    # Failure: never monitored together gives the dash.
+    alone = compare_chart.weeks(_result(_home(), compare.Series(9, "Nothing", (), ())))
+    assert {cell.key: cell.text for cell in alone.rows[0].cells}["together"] == "—"
+    # The text helper on its own.
+    assert compare_chart.week_text(compare.WeekCell(0, 0, True), together=True) == "no overlap"
+    assert compare_chart.week_text(compare.WeekCell(0, 0, True)) == "no outages"
+    assert compare_chart.week_text(compare.WeekCell(H, 1, True), together=True) == "1h · 1"
+
+
 def _flicker(key: int, name: str, count: int) -> compare.Series:
     """``count`` half-hour outages, one every hour from 25.09 00:00 UTC, then on."""
     base = _t(9, 25, 0)
@@ -685,6 +829,47 @@ def _flicker(key: int, name: str, count: int) -> compare.Series:
         pieces.append(model.Piece("on", s + half, end, None))
         outages.append(compare.OutageRec(s, s + half, 30 * M))
     return compare.Series(key, name, tuple(pieces), tuple(outages))
+
+
+CUT_NOW = datetime(2026, 11, 3, 10, 0, tzinfo=UTC)
+
+
+def _off_since(key: int, name: str, since: datetime, end: datetime | None) -> compare.Series:
+    pieces = [model.Piece("on", datetime(2026, 10, 30, tzinfo=UTC), since, None)]
+    pieces.append(model.Piece("off", since, end, since))
+    if end is not None:
+        pieces.append(model.Piece("on", end, None, None))
+    off_us = ((end or CUT_NOW) - since) // model.ONE_US
+    return compare.Series(key, name, tuple(pieces), (compare.OutageRec(since, end, off_us),))
+
+
+def _cut_rows(*series: compare.Series) -> tuple[compare_chart.SimRow, ...]:
+    day = date(2026, 11, 1)
+    period = compare.period_of(day, day, CUT_NOW, KYIV)
+    return compare_chart.overlap(compare.compare(series, period, CUT_NOW, KYIV)).simultaneous
+
+
+def test_simultaneous_cut_by_the_period() -> None:
+    # WR-02, the reviewer's probe: both off since 31.10 22:00 local, still off at now 03.11.
+    since = datetime(2026, 10, 31, 20, 0, tzinfo=UTC)
+    (row,) = _cut_rows(_off_since(1, "Home", since, None), _off_since(2, "Office", since, None))
+    assert (row.start, row.end, row.duration) == (
+        "before Sun 01.11 00:00",
+        "after Mon 02.11 00:00",
+        "≥ 24h",
+    )
+    # Edge: off exactly from the period's start to its end is shown as is.
+    start = datetime(2026, 10, 31, 22, 0, tzinfo=UTC)
+    end = datetime(2026, 11, 1, 22, 0, tzinfo=UTC)
+    (exact,) = _cut_rows(_off_since(1, "Home", start, end), _off_since(2, "Office", start, end))
+    assert (exact.start, exact.end, exact.duration) == (
+        "Sun 01.11 00:00",
+        "Mon 02.11 00:00",
+        "24h",
+    )
+    # Failure: only one location beyond the edge does not flag the span.
+    (one,) = _cut_rows(_off_since(1, "Home", since, None), _off_since(2, "Office", start, end))
+    assert (one.start, one.end, one.duration) == ("Sun 01.11 00:00", "Mon 02.11 00:00", "24h")
 
 
 def test_overlap_simultaneous_cap() -> None:

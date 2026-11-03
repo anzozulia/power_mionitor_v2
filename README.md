@@ -1484,7 +1484,8 @@ Each text is also a manifest entry. The chart's Inter TTFs have their own licenc
 
 "Compare" in the sidebar (`/compare/`) compares locations over one period. Pick the
 locations (all by default) and a period: 7, 14, 30 or 90 days ending today, or a custom
-period. The filters are a plain GET form, so every comparison is a bookmarkable URL. The
+period. The filters are a plain GET form, so every comparison is a bookmarkable URL. With
+a preset period the From and To dates are ignored (they show the preset's dates). The
 page has seven cards:
 
 1. **Filters.**
@@ -1495,17 +1496,22 @@ page has seven cards:
    per day.
 4. **Timeline:** the Telegram chart's day lanes drawn in the browser, one lane per location
    plus a "Together" lane (all off at once) for two or more, with hover titles, the today
-   band and the now marker. A daily-totals table sits under it.
+   band and the now marker. The timeline shows up to 31 days at a time; "Earlier days"
+   and "Later days" page through the period (the `tl` query parameter) while every other
+   card keeps the whole period. A daily-totals table of the shown days sits under it.
 5. **Overlap:** the share of each location's off time when another was off too, the
    pairs (both off, coinciding outages, start and end gaps), and the simultaneous outages.
-6. **Hours:** the off share by hour of day.
+   A simultaneous outage cut by the period's edge reads "before …" / "after …" with a
+   "≥" duration (the time inside the period).
+6. **Hours:** the off share by hour of day. The Together row is red only for time with
+   every selected location off at once; "never all off at once" is grey, not green.
 7. **Weeks:** off time and outage count per Monday-to-Sunday week.
 
 Limits:
 - A custom period starts on 01.01.2026 or later, ends today or earlier, and spans at most
   366 days.
-- The timeline shows the last 31 days of the period. "Earlier days" opens the up to 31
-  days before them as a custom period.
+- The timeline shows up to 31 days at a time, by default the last 31 days of the period;
+  Earlier/Later days page through the period without changing it.
 - At most 100 simultaneous outages are listed, newest first, with the total.
 
 The page only reads the stored timeline, in one consistent read-only snapshot (at most 4

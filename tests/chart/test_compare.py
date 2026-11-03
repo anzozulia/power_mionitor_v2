@@ -195,17 +195,62 @@ def test_preset_dates() -> None:
         compare.preset_dates("1y", today)
 
 
-def test_timeline_window() -> None:
+def _days(n: int) -> timedelta:
+    return timedelta(days=n)
+
+
+def test_timeline_window_default_and_short_periods() -> None:
     last = date(2026, 10, 31)
-    assert compare.timeline_window(date(2026, 10, 1), last) == (date(2026, 10, 1), None)
-    first90 = last - timedelta(days=89)
-    shown, earlier = compare.timeline_window(first90, last)
-    assert shown == last - timedelta(days=30)
-    assert earlier == (last - timedelta(days=61), last - timedelta(days=31))
-    first40 = last - timedelta(days=39)
-    shown, earlier = compare.timeline_window(first40, last)
-    assert shown == last - timedelta(days=30)
-    assert earlier == (first40, last - timedelta(days=31))
+    # Expected: a period of at most 31 days is shown whole, with no neighbour.
+    assert compare.timeline_window(date(2026, 10, 1), last) == compare.TimelineWindow(
+        date(2026, 10, 1), last, None, None
+    )
+    # Default window of 90 days: the last 31 days, earlier ends the day before.
+    first90 = last - _days(89)
+    assert compare.timeline_window(first90, last) == compare.TimelineWindow(
+        last - _days(30), last, last - _days(31), None
+    )
+    # Edge: 40 days; the earlier window is clamped at the period's start later on.
+    first40 = last - _days(39)
+    w = compare.timeline_window(first40, last)
+    assert (w.first, w.earlier) == (last - _days(30), last - _days(31))
+    assert compare.timeline_window(first40, last, w.earlier) == compare.TimelineWindow(
+        first40, last - _days(31), None, last
+    )
+
+
+def test_timeline_window_pages_back_twice_through_90_days() -> None:
+    last = date(2026, 10, 31)
+    first = last - _days(89)
+    w1 = compare.timeline_window(first, last)
+    assert w1.earlier is not None
+    w2 = compare.timeline_window(first, last, w1.earlier)
+    assert w2 == compare.TimelineWindow(last - _days(61), last - _days(31), last - _days(62), last)
+    assert w2.earlier is not None
+    w3 = compare.timeline_window(first, last, w2.earlier)
+    # The first window: it starts at the period's start, so there is no earlier page.
+    assert w3 == compare.TimelineWindow(first, last - _days(62), None, last - _days(31))
+    # Later from the first window returns the second one.
+    assert w3.later is not None
+    assert compare.timeline_window(first, last, w3.later) == w2
+
+
+def test_timeline_window_clamps_the_end_into_the_period() -> None:
+    last = date(2026, 10, 31)
+    first = last - _days(89)
+    # An end after the period is the period's last day (the default window).
+    assert compare.timeline_window(first, last, date(2027, 5, 1)) == compare.timeline_window(
+        first, last
+    )
+    # An end before the period is its first day: a one-day window, no earlier page.
+    assert compare.timeline_window(first, last, date(2025, 1, 1)) == compare.TimelineWindow(
+        first, first, None, first + _days(31)
+    )
+    # Failure: a reversed period or an empty window.
+    with pytest.raises(ValueError):
+        compare.timeline_window(last, first)
+    with pytest.raises(ValueError):
+        compare.timeline_window(first, last, days=0)
 
 
 @pytest.mark.parametrize(
@@ -522,6 +567,65 @@ def test_simultaneous_reaching_now_is_ongoing() -> None:
     assert (sim.keys, sim.peak, sim.all_n) == ((1, 2), 2, False)
 
 
+# WR-02: a simultaneous outage cut by the period's edges. Kyiv is UTC+2 from 25.10, so the
+# local day 01.11 runs 31.10 22:00 .. 01.11 22:00 UTC; now is 03.11 10:00 UTC.
+CUT_NOW = _utc("2026-11-03 10:00")
+CUT_DAY = date(2026, 11, 1)
+
+
+def _cut(a: list[Piece], b: list[Piece]) -> compare.SimOutage:
+    c = run([ser(1, "A", a, CUT_NOW), ser(2, "B", b, CUT_NOW)], CUT_DAY, CUT_DAY, CUT_NOW)
+    (sim,) = c.simultaneous
+    return sim
+
+
+def test_simultaneous_cut_by_both_ends_of_p() -> None:
+    # The reviewer's probe: both off since 31.10 22:00 local (20:00 UTC), still off at now.
+    a = [on("2026-10-30 00:00", "2026-10-31 20:00"), off("2026-10-31 20:00", None)]
+    b = [on("2026-10-30 00:00", "2026-10-31 20:00"), off("2026-10-31 20:00", None)]
+    sim = _cut(a, b)
+    assert (sim.start, sim.end) == (_utc("2026-10-31 22:00"), _utc("2026-11-01 22:00"))
+    assert sim.duration_us == 24 * H
+    assert (sim.starts_before, sim.ends_after) == (True, True)
+
+
+def test_simultaneous_exactly_at_the_edges_of_p_is_not_cut() -> None:
+    # Edge: off pieces starting exactly at P's start and ending exactly at P's end.
+    a = [
+        on("2026-10-30 00:00", "2026-10-31 22:00"),
+        off("2026-10-31 22:00", "2026-11-01 22:00"),
+        on("2026-11-01 22:00", None),
+    ]
+    sim = _cut(a, list(a))
+    assert sim.duration_us == 24 * H
+    assert (sim.starts_before, sim.ends_after) == (False, False)
+
+
+def test_simultaneous_needs_two_locations_beyond_the_edge() -> None:
+    # Failure: only A was off before P and only A stays off after it; B is off exactly
+    # inside P, so the span is not flagged at either end.
+    a = [on("2026-10-30 00:00", "2026-10-31 20:00"), off("2026-10-31 20:00", None)]
+    b = [
+        on("2026-10-30 00:00", "2026-10-31 22:00"),
+        off("2026-10-31 22:00", "2026-11-01 22:00"),
+        on("2026-11-01 22:00", None),
+    ]
+    sim = _cut(a, b)
+    assert (sim.starts_before, sim.ends_after) == (False, False)
+    # A span inside P is never flagged either (the fixture), nor one ongoing at now.
+    fixture = run(fixture_series(), FIX_FIRST, FIX_LAST, FIX_NOW)
+    assert not any(s.starts_before or s.ends_after for s in fixture.simultaneous)
+
+
+def test_simultaneous_ongoing_at_now_is_not_ends_after() -> None:
+    # Edge: P ends at now (today), so the span is ongoing, not "after".
+    now = _utc("2026-11-01 10:00")
+    a = [on("2026-10-30 00:00", "2026-10-31 20:00"), off("2026-10-31 20:00", None)]
+    c = run([ser(1, "A", a, now), ser(2, "B", a, now)], CUT_DAY, CUT_DAY, now)
+    (sim,) = c.simultaneous
+    assert (sim.end, sim.starts_before, sim.ends_after) == (None, True, False)
+
+
 def test_simultaneous_capped_at_100_newest_first() -> None:
     base0 = _utc("2026-09-25 00:00")
     a: list[Piece] = []
@@ -609,11 +713,28 @@ def test_timeline_shows_the_last_31_days() -> None:
     now = _utc("2026-10-31 12:00")
     pieces = [on("2026-09-01 00:00", None)]
     c = run([ser(1, "A", pieces, now)], date(2026, 9, 22), date(2026, 10, 31), now)
-    assert c.timeline_first == date(2026, 10, 1)
-    assert c.earlier == (date(2026, 9, 22), date(2026, 9, 30))
+    assert (c.window.first, c.window.last) == (date(2026, 10, 1), date(2026, 10, 31))
+    assert (c.window.earlier, c.window.later) == (date(2026, 9, 30), None)
     assert len(c.days) == 31 and c.days[-1].is_today
     # Every other section still covers all 40 days.
     assert c.locations[0].days_total == 40
+
+
+def test_timeline_last_moves_only_the_window() -> None:
+    now = _utc("2026-10-31 12:00")
+    a = [on("2026-09-01 00:00", "2026-09-23 10:00"), off("2026-09-23 10:00", None)]
+    b = [on("2026-09-01 00:00", "2026-09-23 11:00"), off("2026-09-23 11:00", None)]
+    series = [ser(1, "A", a, now), ser(2, "B", b, now)]
+    period = compare.period_of(date(2026, 9, 22), date(2026, 10, 31), now, KYIV)
+    default = compare.compare(series, period, now, KYIV)
+    paged = compare.compare(series, period, now, KYIV, timeline_last=date(2026, 9, 30))
+
+    assert [d.day for d in paged.days] == [date(2026, 9, 22) + _days(i) for i in range(9)]
+    assert (paged.window.earlier, paged.window.later) == (None, date(2026, 10, 31))
+    assert not any(d.is_today for d in paged.days)
+    # Every number but the window and its days is the same.
+    for name in ("locations", "together", "spans", "pairs", "simultaneous", "hours", "weeks"):
+        assert getattr(paged, name) == getattr(default, name), name
 
 
 # Hours (D-8)
