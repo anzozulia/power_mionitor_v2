@@ -253,13 +253,13 @@ def test_kpi_tiles_ties_and_edges() -> None:
         "outages-most",
         "longest",
     ]
-    # Edge: monitored but never off gives "no outages"; the all-off tile says "no overlap"
+    # Edge: monitored but never off gives "no outages"; the all-off tile says "never all off"
     # (WR-01: monitored together, never all off at once).
     quiet = _tiles(_result(_quiet(5, "Barn"), _quiet(6, "Cellar")))
     assert quiet["off-most"].value == "no outages" and quiet["off-most"].name is None
     assert quiet["outages-most"].value == "no outages"
     assert quiet["longest"].value == "no outages"
-    assert quiet["all-off"].value == "no overlap"
+    assert quiet["all-off"].value == "never all off"
     assert quiet["all-off"].note == "0% of jointly monitored time"
     assert quiet["power-somewhere"].value == "100%"
 
@@ -267,7 +267,7 @@ def test_kpi_tiles_ties_and_edges() -> None:
 def test_kpi_all_off_when_one_location_is_off_alone() -> None:
     # WR-01: Home is off, Barn is on all the time: never all off at once, not "no outages".
     tiles = _tiles(_result(_home(), _quiet(5, "Barn")))
-    assert tiles["all-off"].value == "no overlap"
+    assert tiles["all-off"].value == "never all off"
     assert tiles["all-off"].note == "0% of jointly monitored time"
     # Failure: never monitored together gives the dash.
     alone = _tiles(_result(_home(), compare.Series(7, "Empty", (), ())))
@@ -432,7 +432,7 @@ def test_off_minimum_width() -> None:
 def test_together_total() -> None:
     assert compare_chart.together_total(H + 5 * M, 10 * H) == "all off 1h 5m"
     # Edge (R-8): jointly monitored without an all-off moment.
-    assert compare_chart.together_total(0, 10 * H) == "no overlap"
+    assert compare_chart.together_total(0, 10 * H) == "never all off"
     # Failure: never jointly monitored.
     assert compare_chart.together_total(0, 0) == "—"
 
@@ -495,7 +495,7 @@ def test_timeline_on_the_fixture() -> None:
     assert [seg.title for seg in together.segments if seg.state == "all_off"] == [
         "Together · All off · 12:30–13:00 · 30m"
     ]
-    assert timeline.groups[0].lanes[-1].total == "no overlap"
+    assert timeline.groups[0].lanes[-1].total == "never all off"
     assert home.total == "1h · 1"
     assert timeline.groups[0].lanes[0].total == "no outages"
     assert timeline.columns == ("Home", "Office", "Shop", "Together")
@@ -620,6 +620,35 @@ def _cells(view: compare_chart.Overlap) -> dict[tuple[int, int], compare_chart.M
     return {(row.key, cell.col): cell for row in view.matrix for cell in row.cells}
 
 
+def test_matrix_zero_overlap_reads_no_overlap_and_no_data_reads_dash() -> None:
+    # Pre-ship review: Home (off 28.09 and 01.10) and Night (off 30.09 00:00-01:00 UTC) both
+    # had outages that never overlapped, so their cells say "no overlap", never "no outages".
+    empty = compare.Series(7, "Empty", (), ())
+    view = compare_chart.overlap(_result(_home(), _off_for(6, "Night", 60), empty))
+    cells = _cells(view)
+
+    assert (cells[(1, 6)].value, cells[(1, 6)].detail) == ("0%", "no overlap")
+    assert (cells[(6, 1)].value, cells[(6, 1)].detail) == ("0%", "no overlap")
+    # Edge: a column location with no monitored time at all reads "—", as its own row does.
+    assert (cells[(1, 7)].value, cells[(1, 7)].detail) == ("0%", "—")
+    assert (cells[(7, 1)].value, cells[(7, 1)].detail) == ("—", "")
+    # Failure guard: an overlapping pair still prints its both-off time.
+    overlapping = _cells(compare_chart.overlap(_result(_home(), _office())))
+    assert (overlapping[(1, 2)].value, overlapping[(1, 2)].detail) == ("40%", "1h")
+
+
+def test_together_zero_case_with_three_locations_reads_never_all_off() -> None:
+    # Pre-ship review: Home and Office overlap 01.10 09:00-10:00 UTC while Quiet stays on,
+    # so all three were never off at once; "no overlap" would contradict the pairs table.
+    result = _result(_home(), _office(), _quiet(4, "Quiet"))
+
+    assert _tiles(result)["all-off"].value == "never all off"
+    view = compare_chart.overlap(result)
+    assert [row.both for row in view.pairs][:1] == ["1h"]
+    # Edge: with every location off at once the tile shows the duration instead.
+    assert _tiles(_result(_home(), _office()))["all-off"].value == "1h"
+
+
 def test_overlap_on_the_fixture() -> None:
     view = compare_chart.overlap(_result(*FIXTURE))
     cells = _cells(view)
@@ -682,6 +711,16 @@ def test_overlap_single_location() -> None:
 
 
 # Task 2b: hours and weeks
+
+
+def test_cell_number() -> None:
+    # Expected: the rounded percent without the sign.
+    assert compare_chart._cell_number(42, 42, 100) == "42"
+    assert compare_chart._cell_number(100, H, H) == "100"
+    # Edge: below 100 % but rounding to 100 is ">99", as its title says ">99%".
+    assert compare_chart._cell_number(100, 359 * M, 360 * M) == ">99"
+    # Failure: no value prints nothing.
+    assert compare_chart._cell_number(None, 0, 0) == ""
 
 
 def test_hour_fill() -> None:
@@ -749,7 +788,7 @@ def test_hours_together_zero_and_unmonitored() -> None:
     # Expected: one location off alone; Together is never all off at once.
     lanes = compare_chart.hours(_result(_home(), _quiet(4, "Quiet"))).lanes
     together = lanes[-1]
-    assert together.peak == "no overlap" and together.tone == "muted"
+    assert together.peak == "never all off" and together.tone == "muted"
     assert {cell.fill for cell in together.cells} == {"track"}
     assert {cell.label for cell in together.cells} == {""}
     assert together.cells[9].title == "Together (all off) · 09:00–10:00 · never all off at once"
@@ -802,16 +841,16 @@ def test_weeks_on_the_fixture() -> None:
 
 
 def test_weeks_together_zero_case() -> None:
-    # WR-01: monitored together but never all off at once reads "no overlap".
+    # WR-01: monitored together but never all off at once reads "never all off".
     view = compare_chart.weeks(_result(_home(), _quiet(4, "Quiet")))
     cells = {cell.key: cell for cell in view.rows[0].cells}
-    assert (cells["together"].text, cells["together"].tone) == ("no overlap", "muted")
+    assert (cells["together"].text, cells["together"].tone) == ("never all off", "muted")
     assert cells["4"].text == "no outages"
     # Failure: never monitored together gives the dash.
     alone = compare_chart.weeks(_result(_home(), compare.Series(9, "Nothing", (), ())))
     assert {cell.key: cell.text for cell in alone.rows[0].cells}["together"] == "—"
     # The text helper on its own.
-    assert compare_chart.week_text(compare.WeekCell(0, 0, True), together=True) == "no overlap"
+    assert compare_chart.week_text(compare.WeekCell(0, 0, True), together=True) == "never all off"
     assert compare_chart.week_text(compare.WeekCell(0, 0, True)) == "no outages"
     assert compare_chart.week_text(compare.WeekCell(H, 1, True), together=True) == "1h · 1"
 

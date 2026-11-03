@@ -1492,8 +1492,7 @@ page has seven cards:
 2. **Summary:** who was off longest and had the most outages, the longest outage, the time
    all locations were off together, and the time power was on somewhere.
 3. **Outages by location:** off time, off share, monitored share ("partial data" below
-   90 %), outage count, average, median and longest outage, days with outages and off time
-   per day.
+   90 %), outage count, average and longest outage, and days with outages.
 4. **Timeline:** the Telegram chart's day lanes drawn in the browser, one lane per location
    plus a "Together" lane (all off at once) for two or more, with hover titles, the today
    band and the now marker. The timeline shows up to 31 days at a time; "Earlier days"
@@ -1501,6 +1500,9 @@ page has seven cards:
    card keeps the whole period. A daily-totals table of the shown days sits under it.
 5. **Overlap:** the share of each location's off time when another was off too, the
    pairs (both off, coinciding outages, start and end gaps), and the simultaneous outages.
+   A pair that was never off at the same time reads "no overlap"; with three or more
+   locations, the "Together" figures (all off at once) read "never all off" when two of
+   them overlapped but never all.
    A simultaneous outage cut by the period's edge reads "before …" / "after …" with a
    "≥" duration (the time inside the period).
 6. **Hours:** the off share by hour of day. The Together row is red only for time with

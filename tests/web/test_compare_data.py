@@ -132,6 +132,52 @@ def test_whole_outage_matches_group_outages_and_recent_outages(
 
 
 @pytest.mark.django_db
+def test_shared_outage_start_never_leaks_into_another_location(
+    location_factory: Callable[..., Any],
+) -> None:
+    # Expected: Alpha's outage crosses P's start; Beta has an outage with the very same
+    # start that ended before P. OUTAGES_SQL's ``= ANY`` filter matches both, and only
+    # Alpha's (location, start) pair is kept: Beta has no outage in P.
+    alpha, beta = location_factory(name="Alpha"), location_factory(name="Beta")
+    start = "2026-09-21 20:00"
+    a_end, b_end = "2026-09-25 22:00", "2026-09-21 22:00"
+    _store(alpha, [("off", start, a_end, start), ("on", a_end, None, None)])
+    _store(beta, [("off", start, b_end, start), ("on", b_end, None, None)])
+
+    a, b = compare_data.load_series([_row(alpha.pk), _row(beta.pk)], _period(*WEEK), NOW)
+
+    assert [o.start for o in a.outages] == [_utc(start)]
+    assert a.outages[0].off_us == (_utc(a_end) - _utc(start)) // model.ONE_US
+    assert b.outages == ()
+    assert [p.state for p in b.pieces] == ["on"]
+
+
+@pytest.mark.django_db
+def test_no_off_piece_in_p_reads_no_outage(location_factory: Callable[..., Any]) -> None:
+    # Edge: no off piece in P gives an empty start list; the second query still runs
+    # (a constant query count) and finds nothing, even with outages outside P.
+    location = location_factory(name="Calm")
+    _store(
+        location,
+        [
+            ("off", "2026-09-01 08:00", "2026-09-01 09:00", "2026-09-01 08:00"),
+            ("on", "2026-09-01 09:00", None, None),
+        ],
+    )
+
+    (series,) = compare_data.load_series([_row(location.pk)], _period(*WEEK), NOW)
+
+    assert series.outages == ()
+    assert [p.state for p in series.pieces] == ["on"]
+
+
+def test_outages_sql_has_no_subquery() -> None:
+    # Failure guard: the (location_id, outage_start_at) IN (SELECT ...) form was planned as
+    # a nested loop and hit the 5 s statement timeout on CI for 20 locations x 366 days.
+    assert compare_data.OUTAGES_SQL.upper().count("SELECT") == 1
+
+
+@pytest.mark.django_db
 def test_current_outage_has_no_end(location_factory: Callable[..., Any]) -> None:
     location = location_factory(name="Alpha")
     _store(
@@ -305,8 +351,12 @@ def test_page_reads_stay_within_four_queries(
 
 
 def test_sql_uses_named_parameters_only() -> None:
-    for sql in (compare_data.PIECES_SQL, compare_data.OUTAGES_SQL):
-        for name in ("%(ids)s", "%(a)s", "%(b)s"):
+    expected = {
+        compare_data.PIECES_SQL: ("%(ids)s", "%(a)s", "%(b)s"),
+        compare_data.OUTAGES_SQL: ("%(ids)s", "%(lo)s", "%(starts)s"),
+    }
+    for sql, names in expected.items():
+        for name in names:
             assert name in sql
         assert "{" not in sql
         assert "%s" not in sql

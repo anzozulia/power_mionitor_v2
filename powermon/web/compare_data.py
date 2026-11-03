@@ -10,6 +10,13 @@ outbox, so it writes, sends and queues nothing.
   overlapping P, one ``location_id = ANY(...)`` overlap query in start order) and
   ``OUTAGES_SQL`` (every off piece of every outage that has an off piece overlapping P, so
   an outage that started before P keeps its whole off time). Named parameters only.
+- ``OUTAGES_SQL`` has no subquery: the outage starts come from ``PIECES_SQL``'s off pieces
+  (in Python), and the query is one range scan of the ``(location_id, start_at)`` index
+  from the earliest of them (an outage's off pieces never start before its outage start)
+  with a hashed ``= ANY`` filter; Python then keeps exactly the wanted
+  ``(location, outage start)`` pairs. The earlier ``(location_id, outage_start_at) IN
+  (SELECT ...)`` form was planned as a nested loop on a freshly loaded table and hit the 5 s
+  statement timeout for 20 locations x 366 days on CI (pre-ship review, PR #12).
 - Snapshot: both queries run in one read-only REPEATABLE READ transaction when this is the
   outermost transaction, so an outage removal or a history reset that commits between them
   can never split the two reads. Inside a caller's transaction they run in that
@@ -45,16 +52,16 @@ SELECT location_id, state, start_at, end_at, outage_start_at
  ORDER BY location_id, start_at
 """
 
-# Every off piece of every outage of the selected locations that has an off piece
-# overlapping [a, b), also the pieces outside [a, b).
+# The off pieces of the selected locations whose outage start is one of ``starts`` (the
+# outages with an off piece overlapping [a, b), taken from PIECES_SQL's rows), also the
+# pieces outside [a, b). ``lo`` is the earliest of those starts: no off piece starts
+# before its outage, so the (location_id, start_at) index bounds the scan. A superset when
+# two locations share an outage start; _read keeps the wanted (location, start) pairs.
 OUTAGES_SQL = """
 SELECT location_id, start_at, end_at, outage_start_at
   FROM power_interval
- WHERE state = 'off' AND location_id = ANY(%(ids)s)
-   AND (location_id, outage_start_at) IN (
-       SELECT location_id, outage_start_at FROM power_interval
-        WHERE location_id = ANY(%(ids)s) AND state = 'off'
-          AND start_at < %(b)s AND (end_at IS NULL OR end_at > %(a)s))
+ WHERE location_id = ANY(%(ids)s) AND state = 'off' AND start_at >= %(lo)s
+   AND outage_start_at = ANY(%(starts)s::timestamptz[])
  ORDER BY location_id, outage_start_at, start_at
 """
 
@@ -68,8 +75,11 @@ def _read(ids: list[int], period: compare.Period) -> tuple[list[_Row], list[_Row
     with connection.cursor() as cur:
         cur.execute(PIECES_SQL, params)
         pieces = cur.fetchall()
-        cur.execute(OUTAGES_SQL, params)
-        outages = cur.fetchall()
+        wanted = {(row[0], row[4]) for row in pieces if row[1] == "off"}
+        starts = sorted({start for _loc, start in wanted})
+        lo = starts[0] if starts else period.start
+        cur.execute(OUTAGES_SQL, {"ids": ids, "lo": lo, "starts": starts})
+        outages = [row for row in cur.fetchall() if (row[0], row[3]) in wanted]
     return pieces, outages
 
 

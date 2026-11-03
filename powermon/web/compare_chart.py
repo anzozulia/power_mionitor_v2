@@ -18,7 +18,7 @@ Task 2a's part:
 - ``kpi_tiles``: the KPI card (D-5 item 2). Ties go to name order (the comparison's input
   order); the longest outage ties to the earlier start. A tile that cannot be computed
   (no monitored time) shows "—"; a fleet without an outage shows "no outages"; the
-  all-off tile says "no overlap" when the locations were monitored together but never all
+  all-off tile says "never all off" when the locations were monitored together but never all
   off at once;
 - ``scoreboard``: the outage scoreboard (D-5 item 3), sorted by off time in P, most first,
   ties in name order, with the rank and a bar width in percent of the largest off time (a
@@ -37,14 +37,14 @@ Task 2b's part (D-6 to D-9, the plan's "Design: page geometry, texts and hooks")
   the totals, the window of up to 31 days with its "Earlier days" and "Later days"
   queries, which page through the period and keep every other filter, and the
   daily-totals table);
-- ``together_total``: "all off 1h 5m", "no overlap" (R-8) or "—";
+- ``together_total``: "all off 1h 5m", "never all off" (R-8) or "—";
 - ``overlap``: the pair matrix (buckets 0..5 of the printed percent, the zero-off row
   rule), the pairs and the simultaneous outages (a span cut by the period reads "before
   …", "after …" and "≥ …");
 - ``hours``: the hour-of-day lanes with the cell fill rule (track, always on, off opacity;
   the Together lane never paints "always on": its zero case is the track colour) and the
   ink of the printed share per opacity bucket (``hour_ink``);
-- ``weeks``: the by-week table with its proportional bars ("no overlap" in the Together
+- ``weeks``: the by-week table with its proportional bars ("never all off" in the Together
   column when the locations were never all off at once).
 """
 
@@ -60,7 +60,10 @@ from powermon.i18n.duration import format_total_duration
 LANG = "en"
 NONE_TEXT = "—"
 NO_OUTAGES = chart_texts.NO_OUTAGES[LANG]
-# Together's zero case: monitored together, never all off at once (R-8).
+# Together's zero case: monitored together, never all off at once (R-8, amended by the
+# pre-ship review: "no overlap" was false with 3+ locations when two of them overlapped).
+NEVER_ALL_OFF = "never all off"
+# A pair's zero case in the matrix: both monitored, never off at the same time.
 NO_OVERLAP = "no overlap"
 SAME_MINUTE = "same minute"
 LESS_THAN_ONE = "<1%"
@@ -289,7 +292,7 @@ def kpi_tiles(result: compare.Comparison) -> tuple[Tile, ...]:
                 Tile(
                     "all-off",
                     TILE_LABELS["all-off"],
-                    duration_text(together.all_off_us) if together.all_off_us else NO_OVERLAP,
+                    duration_text(together.all_off_us) if together.all_off_us else NEVER_ALL_OFF,
                     note=f"{share} of jointly monitored time",
                 )
             )
@@ -492,11 +495,11 @@ def segment_title(name: str, state: str, start_us: int, end_us: int) -> str:
 
 
 def together_total(all_off_us: int, joint_us: int) -> str:
-    """The Together lane's total: "all off 1h 5m", "no overlap" (R-8) or "—"."""
+    """The Together lane's total: "all off 1h 5m", "never all off" (R-8) or "—"."""
     if all_off_us > 0:
         return f"all off {duration_text(all_off_us)}"
     if joint_us > 0:
-        return NO_OVERLAP
+        return NEVER_ALL_OFF
     return NONE_TEXT
 
 
@@ -985,7 +988,10 @@ def _matrix_cell(
         return MatrixCell(b.key, False, "", 0, NONE_TEXT, "", sr)
     share = pair.share_a if first else pair.share_b
     value = share_text(both, a.off_us)
-    detail = duration_text(both) if both else NO_OUTAGES
+    if both:
+        detail = duration_text(both)
+    else:
+        detail = NO_OVERLAP if b.monitored_us else NONE_TEXT
     sr = (
         f"While {a.name} was off, {b.name} was also off {value} of the time"
         f" ({duration_text(both) if both else 'never'})."
@@ -1209,13 +1215,23 @@ def _peak(cells: Sequence[compare.HourCell], *, together: bool = False) -> tuple
         ):
             best = h
     if best is None:
-        return (NO_OVERLAP if together else NO_OUTAGES), "muted"
+        return (NEVER_ALL_OFF if together else NO_OUTAGES), "muted"
     cell = cells[best]
     return (
         f"peak {best:02d}–{best + 1:02d}{chart_texts.DOT}"
         f"{share_text(cell.off_us, cell.monitored_us)}",
         "strong",
     )
+
+
+def _cell_number(value: int | None, off_us: int, monitored_us: int) -> str:
+    """The number printed in an hour cell: the rounded percent without "%", or ">99" for a
+    share below 100 % that rounds to 100 (the cell's title says ">99%")."""
+    if value is None:
+        return ""
+    if value == 100 and off_us < monitored_us:
+        return ">99"
+    return str(value)
 
 
 def hours(result: compare.Comparison) -> Hours:
@@ -1241,7 +1257,7 @@ def hours(result: compare.Comparison) -> Hours:
                     opacity=opacity,
                     ink=hour_ink(cell.off_us, cell.monitored_us),
                     pct="" if value is None else str(value),
-                    label=str(value) if show else "",
+                    label=_cell_number(value, cell.off_us, cell.monitored_us) if show else "",
                     title=_hour_title(name, h, cell, together=together),
                 )
             )
@@ -1312,9 +1328,9 @@ def _week_tone(cell: compare.WeekCell) -> str:
 
 def week_text(cell: compare.WeekCell, *, together: bool = False) -> str:
     """A week cell: the chart's total ("3h 20m · 2", "no outages", "—"); the Together
-    column says "no overlap" when monitored together but never all off at once (WR-01)."""
+    column says "never all off" when monitored together but never all off at once (WR-01)."""
     if together and cell.monitored and cell.off_us == 0:
-        return NO_OVERLAP
+        return NEVER_ALL_OFF
     return total_text(cell.off_us, cell.count, cell.monitored)
 
 

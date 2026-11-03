@@ -691,7 +691,7 @@ def test_compare_page_timeline(admin: Client, location_factory: Callable[..., An
         str(13 * 3_600_000_000),
     )
     assert _total(page, "2026-10-01", "together") == "all off 30m"
-    assert _total(page, "2026-09-25", "together") == "no overlap"
+    assert _total(page, "2026-09-25", "together") == "never all off"
     assert _total(page, "2026-10-01", str(shop.pk)) == "3h 30m · 2"
     assert _total(page, "2026-09-25", str(home.pk)) == "no outages"
     # Monday 28.09 opens a new week: one divider.
@@ -708,10 +708,18 @@ def test_compare_page_timeline(admin: Client, location_factory: Callable[..., An
     assert rows[-1] == ["Thu 01.10", "1h · 1", "1h · 1", "3h 30m · 2", "all off 30m"]
 
 
+TIMELINE_ANCHOR = "#compare-timeline"
+
+
 def _pager(page: Tag) -> dict[str, str]:
-    """The timeline's paging links (top and bottom) by testid, as their hrefs."""
+    """The timeline's paging links (top and bottom) by testid, as their hrefs without the
+    anchor; every link must end with it, so a page step lands on the timeline again."""
     hooks = ("compare-earlier", "compare-later", "compare-earlier-bottom", "compare-later-bottom")
-    return {hook: str(by_testid(page, hook)["href"]) for hook in hooks if all_by_testid(page, hook)}
+    present = [hook for hook in hooks if all_by_testid(page, hook)]
+    links = {hook: str(by_testid(page, hook)["href"]) for hook in present}
+    for hook, href in links.items():
+        assert href.endswith(TIMELINE_ANCHOR), f"{hook} does not land on the timeline: {href}"
+    return {hook: href.removesuffix(TIMELINE_ANCHOR) for hook, href in links.items()}
 
 
 def _days_shown(page: Tag) -> list[str]:
@@ -1048,7 +1056,7 @@ def test_compare_page_together_zero_case(
     admin: Client, location_factory: Callable[..., Any]
 ) -> None:
     # WR-01: Home is off (09:00-10:00 local on 28.09), Barn is on all the time. They were
-    # monitored together but never all off at once: "no overlap", never "no outages" or
+    # monitored together but never all off at once: "never all off", never "no outages" or
     # a green "always on" Together cell.
     home = _home(location_factory)
     barn = location_factory(name="Barn", bot_token=TOKEN)
@@ -1057,8 +1065,8 @@ def test_compare_page_together_zero_case(
 
     page = _page(admin, f"?loc={home.pk}&loc={barn.pk}")
 
-    assert _value(_kpis(page)["all-off"]) == "no overlap"
-    assert _total(page, "2026-09-28", "together") == "no overlap"
+    assert _value(_kpis(page)["all-off"]) == "never all off"
+    assert _total(page, "2026-09-28", "together") == "never all off"
     chart = by_testid(page, "compare-hours-chart")
     together = {
         str(cell["data-hour"]): cell
@@ -1072,7 +1080,7 @@ def test_compare_page_together_zero_case(
     peaks = {
         str(peak["data-location-id"]): text(peak) for peak in all_by_testid(chart, "hour-peak")
     }
-    assert (peaks["together"], peaks[str(home.pk)]) == ("no overlap", "peak 09–10 · 14%")
+    assert (peaks["together"], peaks[str(home.pk)]) == ("never all off", "peak 09–10 · 14%")
     # Home's own lane still shows its off hour in the off colour.
     home_nine = [
         cell
@@ -1088,7 +1096,7 @@ def test_compare_page_together_zero_case(
         (str(cell["data-week"]), str(cell["data-location-id"])): text(cell)
         for cell in all_by_testid(page, "week-cell")
     }
-    assert weeks[("2026-09-28", "together")] == "no overlap"
+    assert weeks[("2026-09-28", "together")] == "never all off"
     assert weeks[("2026-09-28", str(barn.pk))] == "no outages"
 
 
