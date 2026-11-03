@@ -656,6 +656,7 @@ Legend: **—** never present; **mask** only `{bot_id}:••••••••`
 | S9 regenerate: page and fragment | — | — | — | — (the marker is an HMAC) |
 | S9 Regenerate POST (`no-store`) | — | mask in `settings-panel` only | new key in `#device-key` and the 4 examples only; old key nowhere | — |
 | S10 remove outage, S11 reset: pages, fragments, and every refusal redirect | — | — | — | — |
+| S14 compare page, every state | — | — | — | — |
 | Every action's redirect and the following page's toasts (switches, test message incl. Telegram errors carrying the token, edit, delete, remove, reset) | — | as on the target page | — | — |
 | E1 404, E2 403 CSRF, E3 500 | — | — | — | — |
 | **Status JSON** | — | — | — | — (and no `•` at all) |

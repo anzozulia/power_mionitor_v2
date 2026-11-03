@@ -1,0 +1,63 @@
+{% comment %}
+The Compare page's outage scoreboard (quick task 261103-lfm, D-5 item 3). Parameter:
+scoreboard (compare_chart.ScoreRow, most off time first, ties in name order).
+
+- From md: table[data-testid=compare-scoreboard-table] with a sticky uppercase header (under
+  the 48 px top bar) and one tr[data-testid=compare-row][data-location-id][data-rank] per
+  location: the rank, the location (status LED + name, a[data-testid=compare-location-link]
+  to its page; never the list's location-link hook), the off time with a decorative bar
+  svg[data-testid=off-bar][data-off-us] (aria-hidden, not focusable, width in percent of
+  the largest off time), the off share, the outage count, the average and the longest
+  outage (with its local date), the days with outages ("n of N") and the monitored share
+  with the [data-testid=partial-data] tag below 90%. Numbers are mono; rows are 36 px
+  from xl.
+- Below md the same rows as stacked cards li[data-testid=compare-card][data-location-id],
+  in the same order.
+
+Every class is spelled out; no class name is built from data.
+{% endcomment %}<div class="hidden overflow-clip rounded-b-[5px] md:block">
+<table data-testid="compare-scoreboard-table" class="w-full border-collapse">
+<caption class="sr-only">Outages by location</caption>
+<thead>
+<tr>
+<th scope="col" class="sticky top-12 z-1 w-10 bg-surface-muted py-2 pr-2 pl-4 text-right text-label font-semibold uppercase tracking-label text-fg-muted [box-shadow:inset_0_-1px_0_var(--border)]"><span aria-hidden="true">#</span><span class="sr-only">Rank</span></th>
+<th scope="col" class="sticky top-12 z-1 bg-surface-muted px-3 py-2 text-left text-label font-semibold uppercase tracking-label text-fg-muted [box-shadow:inset_0_-1px_0_var(--border)]">Location</th>
+<th scope="col" class="sticky top-12 z-1 bg-surface-muted px-3 py-2 text-left text-label font-semibold uppercase tracking-label text-fg-muted [box-shadow:inset_0_-1px_0_var(--border)]">Off time</th>
+<th scope="col" class="sticky top-12 z-1 bg-surface-muted px-3 py-2 text-right text-label font-semibold uppercase tracking-label text-fg-muted [box-shadow:inset_0_-1px_0_var(--border)]">Off share</th>
+<th scope="col" class="sticky top-12 z-1 bg-surface-muted px-3 py-2 text-right text-label font-semibold uppercase tracking-label text-fg-muted [box-shadow:inset_0_-1px_0_var(--border)]">Outages</th>
+<th scope="col" class="sticky top-12 z-1 bg-surface-muted px-3 py-2 text-right text-label font-semibold uppercase tracking-label text-fg-muted [box-shadow:inset_0_-1px_0_var(--border)]">Avg outage</th>
+<th scope="col" class="sticky top-12 z-1 bg-surface-muted px-3 py-2 text-right text-label font-semibold uppercase tracking-label text-fg-muted [box-shadow:inset_0_-1px_0_var(--border)]">Longest</th>
+<th scope="col" class="sticky top-12 z-1 bg-surface-muted px-3 py-2 text-right text-label font-semibold uppercase tracking-label text-fg-muted [box-shadow:inset_0_-1px_0_var(--border)]">Days with outages</th>
+<th scope="col" class="sticky top-12 z-1 bg-surface-muted py-2 pr-4 pl-3 text-right text-label font-semibold uppercase tracking-label text-fg-muted [box-shadow:inset_0_-1px_0_var(--border)]">Monitored</th>
+</tr>
+</thead>
+<tbody>
+{% for row in scoreboard %}<tr data-testid="compare-row" data-location-id="{{ row.key }}" data-rank="{{ row.rank }}" data-status="{{ row.status }}" class="group hover:bg-surface-muted motion-safe:transition-colors motion-safe:duration-150">
+<td class="num border-t border-border py-2 pr-2 pl-4 text-right align-middle text-fg-muted xl:py-1">{{ row.rank }}</td>
+<th scope="row" class="border-t border-border px-3 py-2 text-left align-middle font-normal xl:py-1"><span class="flex min-w-0 items-center gap-2"><span aria-hidden="true" class="size-2 shrink-0 rounded-led group-data-[status=on]:bg-st-on group-data-[status=off]:bg-st-off group-data-[status=maintenance]:bg-hatch group-data-[status=waiting]:border-2 group-data-[status=waiting]:border-st-wait"></span><a href="{% url 'location-detail' row.key %}" data-testid="compare-location-link" class="min-w-0 font-semibold break-words text-fg hover:text-accent-text hover:underline motion-safe:transition-colors motion-safe:duration-150">{{ row.name }}</a></span></th>
+<td class="border-t border-border px-3 py-2 align-middle xl:py-1"><span class="flex min-w-28 flex-col gap-1"><span class="num whitespace-nowrap{% if row.off_us %} font-semibold text-fg{% else %} text-fg-muted{% endif %}">{{ row.off_text }}</span><svg data-testid="off-bar" data-off-us="{{ row.off_us }}" aria-hidden="true" focusable="false" viewBox="0 0 100 4" preserveAspectRatio="none" class="h-1 w-full max-w-32 rounded-[1px] bg-surface-sunken"><rect width="{{ row.bar_width }}" height="4" rx="1" class="fill-st-off"></rect></svg></span></td>
+<td class="num border-t border-border px-3 py-2 text-right align-middle whitespace-nowrap xl:py-1">{{ row.off_share_text }}</td>
+<td class="num border-t border-border px-3 py-2 text-right align-middle whitespace-nowrap xl:py-1">{{ row.outages_text }}</td>
+<td class="num border-t border-border px-3 py-2 text-right align-middle whitespace-nowrap xl:py-1">{{ row.avg_text }}</td>
+<td class="num border-t border-border px-3 py-2 text-right align-middle whitespace-nowrap xl:py-1">{{ row.longest_text }}</td>
+<td class="num border-t border-border px-3 py-2 text-right align-middle whitespace-nowrap xl:py-1">{{ row.days_text }}</td>
+<td class="border-t border-border py-2 pr-4 pl-3 text-right align-middle xl:py-1"><span class="flex flex-col items-end gap-1"><span class="num whitespace-nowrap">{{ row.monitored_text }}</span>{% if row.partial %}<span data-testid="partial-data" class="rounded-control border border-warn-border bg-warn-bg px-1 text-label font-semibold whitespace-nowrap text-warn-text">partial data</span>{% endif %}</span></td>
+</tr>
+{% endfor %}</tbody>
+</table>
+</div>
+<ul class="flex flex-col gap-2 p-4 md:hidden">
+{% for row in scoreboard %}<li data-testid="compare-card" data-location-id="{{ row.key }}" data-status="{{ row.status }}" class="group flex flex-col gap-2 rounded-control border border-border px-3 py-2">
+<p class="flex min-w-0 items-center gap-2"><span class="num shrink-0 text-fg-muted"><span class="sr-only">Rank </span>{{ row.rank }}</span><span aria-hidden="true" class="size-2 shrink-0 rounded-led group-data-[status=on]:bg-st-on group-data-[status=off]:bg-st-off group-data-[status=maintenance]:bg-hatch group-data-[status=waiting]:border-2 group-data-[status=waiting]:border-st-wait"></span><a href="{% url 'location-detail' row.key %}" data-testid="compare-location-link" class="inline-flex min-h-11 min-w-0 items-center font-semibold break-words text-fg hover:text-accent-text hover:underline">{{ row.name }}</a></p>
+<svg aria-hidden="true" focusable="false" viewBox="0 0 100 4" preserveAspectRatio="none" class="h-1 w-full rounded-[1px] bg-surface-sunken"><rect width="{{ row.bar_width }}" height="4" rx="1" class="fill-st-off"></rect></svg>
+<dl class="grid grid-cols-2 gap-x-4 gap-y-1 text-body">
+<div class="flex flex-col"><dt class="text-label font-semibold uppercase tracking-label text-fg-muted">Off time</dt><dd class="num">{{ row.off_text }}</dd></div>
+<div class="flex flex-col"><dt class="text-label font-semibold uppercase tracking-label text-fg-muted">Off share</dt><dd class="num">{{ row.off_share_text }}</dd></div>
+<div class="flex flex-col"><dt class="text-label font-semibold uppercase tracking-label text-fg-muted">Outages</dt><dd class="num">{{ row.outages_text }}</dd></div>
+<div class="flex flex-col"><dt class="text-label font-semibold uppercase tracking-label text-fg-muted">Avg outage</dt><dd class="num">{{ row.avg_text }}</dd></div>
+<div class="flex flex-col"><dt class="text-label font-semibold uppercase tracking-label text-fg-muted">Longest</dt><dd class="num">{{ row.longest_text }}</dd></div>
+<div class="flex flex-col"><dt class="text-label font-semibold uppercase tracking-label text-fg-muted">Days with outages</dt><dd class="num">{{ row.days_text }}</dd></div>
+<div class="flex flex-col"><dt class="text-label font-semibold uppercase tracking-label text-fg-muted">Monitored</dt><dd class="flex flex-wrap items-center gap-1"><span class="num">{{ row.monitored_text }}</span>{% if row.partial %}<span class="rounded-control border border-warn-border bg-warn-bg px-1 text-label font-semibold text-warn-text">partial data</span>{% endif %}</dd></div>
+</dl>
+</li>
+{% endfor %}</ul>

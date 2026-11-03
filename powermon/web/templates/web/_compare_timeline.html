@@ -1,0 +1,70 @@
+{% comment %}
+The Compare page's timeline (quick task 261103-lfm, D-6): the Telegram weekly chart rebuilt
+in the browser. Parameter: timeline (compare_chart.Timeline).
+
+One inline svg[data-testid=compare-timeline-chart][role=img] with a direct <title> and an
+aria-describedby sentence, inside an overflow-x-auto wrapper (min width 880 px, so a phone
+scrolls the chart and never the page). Inside: the legend; the hour axis at the top and the
+bottom; the 3-hour gridlines; one g[data-testid=tl-day][data-day][data-today] per local
+day, oldest at the top, with the today band, a week divider g[data-testid=tl-week-divider]
+above each Monday group but the first, one g[data-testid=tl-lane][data-day]
+[data-location-id] per location (and "together" for two or more), each with a <title>
+holding the full name, its rect[data-testid=tl-seg][data-state][data-start-us][data-end-us]
+segments (drawn on, not monitored, off, each with a <title>; the lane g carries their
+stroke-width), the hour-cell separators (one <use> of #cmp-lane-seps, defined once in this
+svg's <defs>, so a 20 x 31 timeline stays small) and its text[data-testid=tl-total]; and
+today's now marker g[data-testid=tl-now] (line and pill HH:MM).
+
+Below md a muted line above the chart says it scrolls sideways (hidden from md up).
+
+The timeline shows up to 31 days at a time; Earlier/Later days page through the period.
+When the period is longer than the window: above the chart the line
+p[data-testid=compare-timeline-window] "Showing DD.MM – DD.MM of the period." with the
+links a[data-testid=compare-earlier] (absent at the period's start) and
+a[data-testid=compare-later] (absent at its end); the same two links again under the chart
+in p[data-testid=compare-timeline-pager] (a[data-testid=compare-earlier-bottom],
+a[data-testid=compare-later-bottom]). Each link keeps every other query parameter and sets
+only tl (compare_chart.page_query); every other section keeps the whole period. Then the
+details[data-testid=compare-daily] table of the shown window's lane totals (closed by
+default).
+
+Every geometry value comes from compare_chart; every class is spelled out (state classes
+through if chains); names are escaped by autoescape. No style attribute, no script.
+{% endcomment %}<div class="flex flex-col gap-3 p-4">
+<p id="compare-timeline-desc" class="sr-only">{{ timeline.desc }}</p>
+{% if timeline.paged %}<p data-testid="compare-timeline-window" class="flex flex-wrap items-center gap-x-4 text-body text-fg-muted"><span class="num">{{ timeline.window_text }}</span>{% if timeline.earlier_query %} <a data-testid="compare-earlier" href="?{{ timeline.earlier_query }}#compare-timeline" class="inline-flex min-h-11 items-center font-semibold text-accent-text underline-offset-3 hover:underline md:pointer-fine:min-h-6">Earlier days</a>{% endif %}{% if timeline.later_query %} <a data-testid="compare-later" href="?{{ timeline.later_query }}#compare-timeline" class="inline-flex min-h-11 items-center font-semibold text-accent-text underline-offset-3 hover:underline md:pointer-fine:min-h-6">Later days</a>{% endif %}</p>{% endif %}
+<p data-testid="compare-timeline-hint" class="text-label text-fg-muted md:hidden">Scroll sideways to see the whole day.</p>
+<div class="overflow-x-auto">
+<svg data-testid="compare-timeline-chart" role="img" aria-labelledby="compare-timeline-chart-title" aria-describedby="compare-timeline-desc" viewBox="{{ timeline.view_box }}" width="{{ timeline.width }}" height="{{ timeline.height }}" font-size="12" class="block h-auto w-full min-w-[880px] font-sans"><title id="compare-timeline-chart-title">{{ timeline.title }}</title>
+<defs><g id="cmp-lane-seps">{% for sep in timeline.separators %}<rect x="{{ sep.x }}" y="0" width="1" height="12" fill-opacity="{{ sep.opacity }}" class="pointer-events-none fill-surface"></rect>{% endfor %}</g></defs>
+<g data-part="legend">{% for item in timeline.legend %}<rect x="{{ item.x }}" y="7" width="20" height="12" rx="3"{% if item.kind == "on" %} class="fill-st-on"{% elif item.kind == "off" %} class="fill-st-off"{% elif item.kind == "not_monitored" %} fill="url(#cmp-hatch)"{% elif item.kind == "some_off" %} class="fill-cmp-some-off"{% else %} class="fill-cmp-track"{% endif %}></rect><text x="{{ item.text_x }}" y="17.5" class="fill-fg-muted">{{ item.label }}</text>{% endfor %}</g>
+<g data-part="axis-top" class="num fill-fg-subtle" text-anchor="middle">{% for label in timeline.axis %}<text x="{{ label.x }}" y="{{ timeline.top_axis_y }}">{{ label.text }}</text>{% endfor %}<text x="960" y="{{ timeline.top_axis_y }}" text-anchor="end" class="font-sans">off time · outages</text></g>
+{% for group in timeline.groups %}{% if group.is_today %}<rect x="-8" y="{{ group.top }}" width="976" height="{{ group.height }}" rx="6" class="fill-cmp-today"></rect>{% endif %}{% endfor %}
+<g data-part="grid" class="stroke-cmp-grid" stroke-width="1">{% for x in timeline.grid %}<line x1="{{ x }}" y1="{{ timeline.grid_y1 }}" x2="{{ x }}" y2="{{ timeline.grid_y2 }}"></line>{% endfor %}</g>
+{% for group in timeline.groups %}<g data-testid="tl-day" data-day="{{ group.day }}" data-today="{% if group.is_today %}true{% else %}false{% endif %}">
+{% if group.divider %}<g data-testid="tl-week-divider"><text x="0" y="{{ group.divider.text_y }}" class="num fill-fg-subtle">{{ group.divider.caption }}</text><line x1="{{ group.divider.line_x0 }}" y1="{{ group.divider.line_y }}" x2="960" y2="{{ group.divider.line_y }}" class="stroke-cmp-grid" stroke-width="1"></line></g>{% endif %}
+{% if group.separator_y %}<line x1="0" y1="{{ group.separator_y }}" x2="960" y2="{{ group.separator_y }}" class="stroke-cmp-grid" stroke-width="1"></line>{% endif %}
+<text x="0" y="{{ group.label_y }}"{% if group.is_today %} class="font-semibold fill-fg"{% else %} class="fill-fg"{% endif %}>{{ group.weekday }}</text><text x="30" y="{{ group.label_y }}"{% if group.is_today %} class="font-semibold tabular-nums fill-fg"{% else %} class="tabular-nums fill-fg-muted"{% endif %}>{{ group.date_text }}</text>
+{% for lane in group.lanes %}<g data-testid="tl-lane" data-day="{{ group.day }}" data-location-id="{{ lane.key }}"><title>{{ lane.name }}</title>
+<text x="72" y="{{ lane.text_y }}"{% if lane.together %} class="font-semibold fill-fg"{% else %} class="fill-fg-muted"{% endif %}>{{ lane.short }}</text>
+<g transform="{{ lane.transform }}" clip-path="url(#cmp-lane-clip)" stroke-width="1.5"><rect width="624" height="12" class="fill-cmp-track"></rect>{% for seg in lane.segments %}<rect data-testid="tl-seg" data-state="{{ seg.state }}" data-start-us="{{ seg.start_us }}" data-end-us="{{ seg.end_us }}" x="{{ seg.x }}" width="{{ seg.width }}" height="12"{% if seg.state == "on" or seg.state == "all_on" %} class="fill-st-on hover:stroke-fg"{% elif seg.state == "off" or seg.state == "all_off" %} class="fill-st-off hover:stroke-fg"{% elif seg.state == "some_off" %} class="fill-cmp-some-off hover:stroke-fg"{% else %} fill="url(#cmp-hatch)" class="hover:stroke-fg"{% endif %}><title>{{ seg.title }}</title></rect>{% endfor %}<use href="#cmp-lane-seps" class="pointer-events-none"></use></g>
+<text data-testid="tl-total" data-day="{{ group.day }}" data-location-id="{{ lane.key }}" x="960" y="{{ lane.text_y }}" text-anchor="end" class="num{% if group.is_today %} font-semibold{% endif %}">{% if lane.tone == "strong" %}<tspan class="fill-fg">{{ lane.total_main }}</tspan>{% if lane.total_suffix %}<tspan class="fill-fg-subtle">{{ lane.total_suffix }}</tspan>{% endif %}{% elif lane.tone == "muted" %}<tspan class="fill-fg-muted">{{ lane.total_main }}</tspan>{% else %}<tspan class="fill-fg-subtle">{{ lane.total_main }}</tspan>{% endif %}</text></g>
+{% endfor %}{% if group.now %}<g data-testid="tl-now" class="pointer-events-none"><line x1="{{ group.now.x }}" y1="{{ group.now.y1 }}" x2="{{ group.now.x }}" y2="{{ group.now.y2 }}" class="stroke-cmp-now" stroke-width="2"></line><rect x="{{ group.now.pill_x }}" y="{{ group.now.pill_y }}" width="46" height="18" rx="9" class="fill-cmp-now"></rect><text x="{{ group.now.pill_cx }}" y="{{ group.now.text_y }}" text-anchor="middle" class="num font-semibold fill-surface">{{ group.now.text }}</text></g>{% endif %}
+</g>
+{% endfor %}<g data-part="axis-bottom" class="num fill-fg-subtle" text-anchor="middle">{% for label in timeline.axis %}<text x="{{ label.x }}" y="{{ timeline.bottom_axis_y }}">{{ label.text }}</text>{% endfor %}</g>
+</svg>
+</div>
+{% if timeline.paged %}<p data-testid="compare-timeline-pager" class="flex flex-wrap items-center gap-x-4 text-body">{% if timeline.earlier_query %}<a data-testid="compare-earlier-bottom" href="?{{ timeline.earlier_query }}#compare-timeline" class="inline-flex min-h-11 items-center font-semibold text-accent-text underline-offset-3 hover:underline md:pointer-fine:min-h-6">Earlier days</a>{% endif %}{% if timeline.later_query %} <a data-testid="compare-later-bottom" href="?{{ timeline.later_query }}#compare-timeline" class="inline-flex min-h-11 items-center font-semibold text-accent-text underline-offset-3 hover:underline md:pointer-fine:min-h-6">Later days</a>{% endif %}</p>{% endif %}
+<details data-testid="compare-daily" class="group rounded-control border border-border">
+<summary class="flex min-h-11 cursor-pointer items-center px-3 text-body font-semibold text-fg md:pointer-fine:min-h-8">Daily totals as a table</summary>
+<div class="overflow-x-auto border-t border-border">
+<table data-testid="compare-daily-table" class="w-full border-collapse">
+<caption class="sr-only">Daily totals: off time · outages</caption>
+<thead><tr><th scope="col" class="bg-surface-muted px-3 py-2 text-left text-label font-semibold uppercase tracking-label text-fg-muted">Day</th>{% for column in timeline.columns %}<th scope="col" class="bg-surface-muted px-3 py-2 text-right text-label font-semibold uppercase tracking-label text-fg-muted">{{ column }}</th>{% endfor %}</tr></thead>
+<tbody>
+{% for row in timeline.daily %}<tr data-day="{{ row.day }}"><th scope="row" class="num border-t border-border px-3 py-1 text-left font-normal whitespace-nowrap text-fg">{{ row.label }}</th>{% for cell in row.cells %}<td class="num border-t border-border px-3 py-1 text-right whitespace-nowrap">{{ cell }}</td>{% endfor %}</tr>
+{% endfor %}</tbody>
+</table>
+</div>
+</details>
+</div>

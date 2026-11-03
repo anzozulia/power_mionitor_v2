@@ -953,6 +953,8 @@ def _matrix(location: Any, marker: str) -> list[Call]:
     detail = _detail(location)
     return [
         Call("location-list", "get", "/"),
+        # The Compare page (quick task 261103-lfm): GET only, a whole page.
+        Call("location-compare", "get", "/compare/"),
         Call("location-create", "get", "/locations/new/"),
         # An invalid create: the form again, nothing written.
         Call("location-create", "post", "/locations/new/", {"name": ""}),

@@ -1,0 +1,35 @@
+{% comment %}
+The Compare page's outages by hour of day (quick task 261103-lfm, D-8). Parameter: hours
+(compare_chart.Hours).
+
+One inline svg[data-testid=compare-hours-chart][role=img] with a direct <title>, in the
+timeline's x-geometry (the same viewBox width, bar start and end), so its hour columns line
+up with the timeline's. One lane per location, then "Together (all off)" for two or more;
+24 cells rect[data-testid=hour-cell][data-location-id][data-hour][data-pct], each with a
+<title>; the hour separators are one <use> of #cmp-hour-seps, defined once in this svg's
+<defs>. The fill comes from compare_chart.hour_fill through an if chain: the track colour
+with no monitored time, the on colour at 0.35 when the power was always on, else the off
+colour with a fill-opacity growing with the share. The Together lane never uses the on
+colour: an hour monitored together but never all off at once is the track colour too, and
+its <title> says "never all off at once" ("not monitored together" without joint time). The share is printed in the cell from
+10 %, as plain text (no halo) in the ink compare_chart.hour_ink picks from the cell's
+opacity bucket: fill-cmp-ink, or fill-cmp-ink-strong on the strongest off fills (each at
+least 4.5:1 on its composited fill in both themes). The totals column is
+text[data-testid=hour-peak]. The legend line p[data-testid=compare-hours-legend] follows
+the chart, with a sentence on the Together row for two or more locations. Below md a muted
+line above the chart says it scrolls sideways.
+{% endcomment %}<div class="flex flex-col gap-3 p-4">
+<p data-testid="compare-hours-hint" class="text-label text-fg-muted md:hidden">Scroll sideways to see the whole day.</p>
+<div class="overflow-x-auto">
+<svg data-testid="compare-hours-chart" role="img" aria-labelledby="compare-hours-chart-title" viewBox="{{ hours.view_box }}" width="{{ hours.width }}" height="{{ hours.height }}" font-size="12" class="block h-auto w-full min-w-[880px] font-sans"><title id="compare-hours-chart-title">{{ hours.title }}</title>
+<defs><g id="cmp-hour-seps">{% for sep in hours.separators %}<rect x="{{ sep.x }}" y="0" width="1" height="20" fill-opacity="{{ sep.opacity }}" class="pointer-events-none fill-surface"></rect>{% endfor %}</g></defs>
+<g data-part="axis-top" class="num fill-fg-subtle" text-anchor="middle">{% for label in hours.axis %}<text x="{{ label.x }}" y="{{ hours.axis_y }}">{{ label.text }}</text>{% endfor %}<text x="960" y="{{ hours.axis_y }}" text-anchor="end" class="font-sans">peak hour · off share</text></g>
+<g data-part="grid" class="stroke-cmp-grid" stroke-width="1">{% for x in hours.grid %}<line x1="{{ x }}" y1="{{ hours.grid_y1 }}" x2="{{ x }}" y2="{{ hours.grid_y2 }}"></line>{% endfor %}</g>
+{% for lane in hours.lanes %}<g data-testid="hour-lane" data-location-id="{{ lane.key }}"><title>{{ lane.name }}</title>
+<text x="0" y="{{ lane.text_y }}"{% if lane.together %} class="font-semibold fill-fg"{% else %} class="fill-fg-muted"{% endif %}>{{ lane.short }}</text>
+<g transform="{{ lane.transform }}" clip-path="url(#cmp-hour-clip)"><rect width="624" height="20" class="fill-cmp-track"></rect>{% for cell in lane.cells %}<rect data-testid="hour-cell" data-location-id="{{ lane.key }}" data-hour="{{ cell.hour }}" data-pct="{{ cell.pct }}" x="{{ cell.x }}" width="26" height="20" fill-opacity="{{ cell.opacity }}"{% if cell.fill == "off" %} class="fill-st-off"{% elif cell.fill == "on" %} class="fill-st-on"{% else %} class="fill-cmp-track"{% endif %}><title>{{ cell.title }}</title></rect>{% endfor %}<use href="#cmp-hour-seps" class="pointer-events-none"></use>{% for cell in lane.cells %}{% if cell.label %}<text x="{{ cell.text_x }}" y="14" text-anchor="middle"{% if cell.ink == "strong" %} class="num pointer-events-none fill-cmp-ink-strong"{% else %} class="num pointer-events-none fill-cmp-ink"{% endif %}>{{ cell.label }}</text>{% endif %}{% endfor %}</g>
+<text data-testid="hour-peak" data-location-id="{{ lane.key }}" x="960" y="{{ lane.text_y }}" text-anchor="end"{% if lane.tone == "strong" %} class="num fill-fg"{% elif lane.tone == "muted" %} class="num fill-fg-muted"{% else %} class="num fill-fg-subtle"{% endif %}>{{ lane.peak }}</text></g>
+{% endfor %}</svg>
+</div>
+<p data-testid="compare-hours-legend" class="text-label text-fg-muted">Red: share of monitored time the power was off in that hour (darker = more). Green: power always on in that hour. Grey: not monitored. The number in a cell is the off share in percent, shown from 10%.{% if hours.together %} Together: red = all selected locations off at once; grey = never all off at once, or not monitored together.{% endif %}</p>
+</div>

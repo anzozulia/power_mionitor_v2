@@ -678,6 +678,10 @@ INV23_ROWS: dict[str, tuple[frozenset[str], tuple[Proof, ...]]] = {
             ("test_history_confirm", "test_reset_pages_show_no_secret"),
         ),
     ),
+    "S14 compare page, every state": (
+        frozenset({"location-compare"}),
+        (MATRIX, ("test_compare_page", "test_compare_page_shows_no_secret")),
+    ),
     "Every action's redirect and the following page's toasts (switches, test message incl. "
     "Telegram errors carrying the token, edit, delete, remove, reset)": (
         ACTIONS,
@@ -749,7 +753,7 @@ def test_INV23_2_matrix_is_complete() -> None:
     doc = strategy_rows(STRATEGY.read_text(encoding="utf-8"))
 
     # Expected: every §9 row maps to the tests that prove it, and each one exists.
-    assert len(doc) == 19
+    assert len(doc) == 20
     assert inv23_gaps(INV23_ROWS, doc) == []
     assert {"location-status-json", "location-chart", "theme", "logout"} <= INV23_ROUTES
     # Failure: a §9 row with no mapping, a mapped row the table lacks, a missing test.

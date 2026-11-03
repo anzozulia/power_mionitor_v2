@@ -3,7 +3,8 @@ TEST-STRATEGY §5.2, §7.1, §7.5 UI-12 row, §9).
 
 One table, ``CASES``, names each screen and state of ADMIN-INVENTORY by its UI-SPEC id
 (S1 sign-in, S3 list, S4 add, S5 location page, S6 edit, S7 delete, S8 device setup, S9
-regenerate, S10 remove outage, S11 reset, E1-E3 the error pages) and builds it through the
+regenerate, S10 remove outage, S11 reset, S14 compare (quick task 261103-lfm), E1-E3 the
+error pages) and builds it through the
 signed-in test client, the real middleware and every context processor. Every case:
 
 - passes ``pages.assert_page`` (the 15 page invariants) with ``app=True`` on the app layout
@@ -82,6 +83,7 @@ from powermon.engine.models import LocationState, PowerInterval
 from powermon.locations import keys, validators
 from powermon.locations.models import Location
 from powermon.web import context_processors
+from powermon.web.compare_views import CompareView
 from powermon.web.history_views import (
     HISTORY_RESET_MESSAGE,
     NOTHING_TO_RESET_MESSAGE,
@@ -512,6 +514,44 @@ def _s3_after_delete(env: Env) -> HttpResponse:
     url = f"/locations/{gone.pk}/delete/"
     env.admin.get(url)
     return env.admin.post(url, follow=True)
+
+
+# S14 compare (quick task 261103-lfm): GET only, read-only
+
+
+def _s14_empty(env: Env) -> HttpResponse:
+    return env.admin.get("/compare/")
+
+
+def _s14_default(env: Env) -> HttpResponse:
+    _office(env)
+    _shop(env)
+    return env.admin.get("/compare/")
+
+
+def _s14_one(env: Env) -> HttpResponse:
+    office = _office(env)
+    _shop(env)
+    return env.admin.get(f"/compare/?loc={office.pk}&range=7d")
+
+
+def _s14_invalid(env: Env) -> HttpResponse:
+    _office(env)
+    _shop(env)
+    return env.admin.get("/compare/?range=year")
+
+
+def _s14_long_names(env: Env) -> HttpResponse:
+    office = _office(env, LONG_NAME)
+    other = _on(env.make(CYRILLIC_NAME))
+    return env.admin.get(f"/compare/?loc={office.pk}&loc={other.pk}")
+
+
+def _s14_dark(env: Env) -> HttpResponse:
+    _office(env)
+    _shop(env)
+    env.admin.cookies["theme"] = "dark"
+    return env.admin.get("/compare/")
 
 
 # S4 add location
@@ -1067,6 +1107,56 @@ CASES: list[Case] = [
         S3_LIVE,
         check=_both(_rows(1), _flash("success", LOCATION_DELETED_MESSAGE)),
     ),
+    # S14 compare (quick task 261103-lfm, R-4): empty, default, one location, invalid
+    # filters, long Latin and Cyrillic names, the dark theme.
+    Case(
+        "S14-compare-empty",
+        "location-compare",
+        _s14_empty,
+        "Compare locations",
+        SHELL,
+        check=_testid("empty-state"),
+    ),
+    Case(
+        "S14-compare-default",
+        "location-compare",
+        _s14_default,
+        "Compare locations",
+        SHELL,
+        check=_testid("compare-scoreboard-table"),
+    ),
+    Case(
+        "S14-compare-one-location",
+        "location-compare",
+        _s14_one,
+        "Compare locations",
+        SHELL,
+        check=_testid("compare-scoreboard-table"),
+    ),
+    Case(
+        "S14-compare-invalid",
+        "location-compare",
+        _s14_invalid,
+        "Compare locations",
+        SHELL | {"errorSummary"},
+        check=_testid("compare-invalid"),
+    ),
+    Case(
+        "S14-compare-long-names",
+        "location-compare",
+        _s14_long_names,
+        "Compare locations",
+        SHELL,
+        check=_testid("compare-scoreboard-table"),
+    ),
+    Case(
+        "S14-compare-theme-dark",
+        "location-compare",
+        _s14_dark,
+        "Compare locations",
+        SHELL,
+        theme="dark",
+    ),
     # S4 add: GET, invalid POST without and with a typed token.
     Case("S4-get", "location-create", _s4_get, "Add location", FORM),
     Case(
@@ -1426,6 +1516,7 @@ def env(
         SendTestMessageView,
         OutageRemoveView,
         HistoryResetView,
+        CompareView,
     ):
         monkeypatch.setattr(view, "clock", clock)
     client.force_login(User.objects.create_user("admin", password="not-used-here"))

@@ -1,0 +1,69 @@
+{% extends "layouts/app.html" %}
+{% comment %}
+S14 Compare locations (quick task 261103-lfm; D-1, D-2, D-5). Context from CompareView:
+rows (live.LiveRow, list order); with at least one row also form (CompareForm, bound to the
+query), invalid_line, chips, ranges, from_value, to_value, earliest and today (the filter
+card); with a valid form also results (True), summary, kpis, scoreboard several (two or
+more locations selected), timeline, overlap, hours and weeks (compare_chart view models).
+
+- No location at all: the empty state (No locations yet + Add location) and no form.
+- With results: the jump bar nav[data-testid=compare-jump][aria-label=Sections] (six links,
+  R-9), then the seven cards in D-5 order, each a section whose id equals its testid, with
+  tabindex -1 (a jump target) and aria-labelledby its h2: compare-filter, compare-kpis,
+  compare-scoreboard, compare-timeline, compare-overlap, compare-hours and compare-weeks.
+  The shared SVG defs (_compare_defs.html) come once before the cards; the four chart
+  cards include _compare_timeline, _compare_overlap, _compare_hours and _compare_weeks.
+- An invalid form: the filter card (with the error summary) and the one line
+  p[data-testid=compare-invalid] in place of every results card.
+
+No poll, no live indicator, no Alpine component of its own, no inline script and no style
+attribute: the page works without JS. Partials are included with only. Every class is
+spelled out; no class name is built from data.
+{% endcomment %}
+{% block title %}Compare locations{% endblock %}
+{% block page_title %}Compare locations{% endblock %}
+{% block content %}{% if rows %}
+{% if results %}<nav data-testid="compare-jump" aria-label="Sections" class="-mt-2 flex flex-wrap gap-x-4 gap-y-1 text-body">
+<a href="#compare-kpis" class="inline-flex min-h-11 items-center rounded-control font-semibold text-accent-text underline-offset-3 hover:underline md:pointer-fine:min-h-6">Summary</a>
+<a href="#compare-scoreboard" class="inline-flex min-h-11 items-center rounded-control font-semibold text-accent-text underline-offset-3 hover:underline md:pointer-fine:min-h-6">Outages by location</a>
+<a href="#compare-timeline" class="inline-flex min-h-11 items-center rounded-control font-semibold text-accent-text underline-offset-3 hover:underline md:pointer-fine:min-h-6">Timeline</a>
+<a href="#compare-overlap" class="inline-flex min-h-11 items-center rounded-control font-semibold text-accent-text underline-offset-3 hover:underline md:pointer-fine:min-h-6">Overlap</a>
+<a href="#compare-hours" class="inline-flex min-h-11 items-center rounded-control font-semibold text-accent-text underline-offset-3 hover:underline md:pointer-fine:min-h-6">Hours</a>
+<a href="#compare-weeks" class="inline-flex min-h-11 items-center rounded-control font-semibold text-accent-text underline-offset-3 hover:underline md:pointer-fine:min-h-6">Weeks</a>
+</nav>{% endif %}
+<section id="compare-filter" data-testid="compare-filter" tabindex="-1" aria-labelledby="compare-filter-title" class="rounded-card border border-border bg-surface focus:outline-none">
+<div class="rounded-t-[5px] border-b border-border bg-surface-muted px-4 py-2"><h2 id="compare-filter-title" class="text-label font-semibold uppercase tracking-label text-fg-muted">Filters</h2></div>
+{% include "web/_compare_filter.html" with form=form chips=chips ranges=ranges from_value=from_value to_value=to_value earliest=earliest today=today summary=summary only %}
+</section>
+{% if results %}
+{% include "web/_compare_defs.html" only %}
+<section id="compare-kpis" data-testid="compare-kpis" tabindex="-1" aria-labelledby="compare-kpis-title" class="scroll-mt-16 rounded-card border border-border bg-surface focus:outline-none">
+<div class="rounded-t-[5px] border-b border-border bg-surface-muted px-4 py-2"><h2 id="compare-kpis-title" class="text-label font-semibold uppercase tracking-label text-fg-muted">Summary</h2></div>
+{% include "web/_compare_kpis.html" with kpis=kpis only %}
+</section>
+<section id="compare-scoreboard" data-testid="compare-scoreboard" tabindex="-1" aria-labelledby="compare-scoreboard-title" class="scroll-mt-16 rounded-card border border-border bg-surface focus:outline-none">
+<div class="flex flex-wrap items-baseline gap-x-2 rounded-t-[5px] border-b border-border bg-surface-muted px-4 py-2"><h2 id="compare-scoreboard-title" class="text-label font-semibold uppercase tracking-label text-fg-muted">Outages by location</h2><p class="text-label text-fg-subtle">Most off time first</p></div>
+{% include "web/_compare_scoreboard.html" with scoreboard=scoreboard only %}
+</section>
+<section id="compare-timeline" data-testid="compare-timeline" tabindex="-1" aria-labelledby="compare-timeline-title" class="scroll-mt-16 rounded-card border border-border bg-surface focus:outline-none">
+<div class="rounded-t-[5px] border-b border-border bg-surface-muted px-4 py-2"><h2 id="compare-timeline-title" class="text-label font-semibold uppercase tracking-label text-fg-muted">Timeline</h2></div>
+{% include "web/_compare_timeline.html" with timeline=timeline only %}
+</section>
+<section id="compare-overlap" data-testid="compare-overlap" tabindex="-1" aria-labelledby="compare-overlap-title" class="scroll-mt-16 rounded-card border border-border bg-surface focus:outline-none">
+<div class="rounded-t-[5px] border-b border-border bg-surface-muted px-4 py-2"><h2 id="compare-overlap-title" class="text-label font-semibold uppercase tracking-label text-fg-muted">When outages overlap</h2></div>
+{% include "web/_compare_overlap.html" with overlap=overlap only %}
+</section>
+<section id="compare-hours" data-testid="compare-hours" tabindex="-1" aria-labelledby="compare-hours-title" class="scroll-mt-16 rounded-card border border-border bg-surface focus:outline-none">
+<div class="rounded-t-[5px] border-b border-border bg-surface-muted px-4 py-2"><h2 id="compare-hours-title" class="text-label font-semibold uppercase tracking-label text-fg-muted">Outages by hour of day</h2></div>
+{% include "web/_compare_hours.html" with hours=hours only %}
+</section>
+<section id="compare-weeks" data-testid="compare-weeks" tabindex="-1" aria-labelledby="compare-weeks-title" class="scroll-mt-16 rounded-card border border-border bg-surface focus:outline-none">
+<div class="rounded-t-[5px] border-b border-border bg-surface-muted px-4 py-2"><h2 id="compare-weeks-title" class="text-label font-semibold uppercase tracking-label text-fg-muted">By week</h2></div>
+{% include "web/_compare_weeks.html" with weeks=weeks only %}
+</section>
+{% else %}
+<p data-testid="compare-invalid" class="rounded-card border border-dashed border-border-strong px-4 py-3 text-body text-fg-muted">{{ invalid_line }}</p>
+{% endif %}
+{% else %}{% url 'location-create' as add_url %}
+<section class="rounded-card border border-border bg-surface">{% include "partials/_empty.html" with icon="map-pin" title="No locations yet" body="Add a location to compare its outages with other locations." testid="empty-state" accent=True cta_label="Add location" cta_href=add_url cta_testid="add-location" cta_icon="plus" only %}</section>
+{% endif %}{% endblock %}

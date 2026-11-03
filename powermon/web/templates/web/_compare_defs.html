@@ -1,0 +1,19 @@
+{% comment %}
+The Compare page's shared SVG definitions (quick task 261103-lfm, D-6, D-10), included once
+at the top of the results. No parameter.
+
+A 0x0 svg, aria-hidden and not focusable, kept in the layout (never display:none: a pattern
+or clipPath inside a display:none svg does not paint in every browser). It holds:
+- clipPath #cmp-lane-clip: a timeline lane's rounded track (624 x 12, radius 4) in the
+  lane's own user space (each lane is a g translated to the bar start), so segments get
+  square ends inside the rounded bar (chart-spec section 6);
+- clipPath #cmp-hour-clip: the same for the 20-unit lanes of the hours chart;
+- pattern #cmp-hatch: the not-monitored hatch, stripes at 45 degrees every 7 units, each 3
+  wide (the chart's 14/6 scaled), in the --cmp-hatch tokens of the active theme.
+{% endcomment %}<svg aria-hidden="true" focusable="false" width="0" height="0" class="pointer-events-none absolute overflow-hidden">
+<defs>
+<clipPath id="cmp-lane-clip" clipPathUnits="userSpaceOnUse"><rect x="0" y="0" width="624" height="12" rx="4"></rect></clipPath>
+<clipPath id="cmp-hour-clip" clipPathUnits="userSpaceOnUse"><rect x="0" y="0" width="624" height="20" rx="4"></rect></clipPath>
+<pattern id="cmp-hatch" patternUnits="userSpaceOnUse" width="7" height="7" patternTransform="rotate(45)"><rect x="0" y="0" width="7" height="7" class="fill-cmp-hatch-base"></rect><rect x="0" y="0" width="3" height="7" class="fill-cmp-hatch"></rect></pattern>
+</defs>
+</svg>

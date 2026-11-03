@@ -268,6 +268,9 @@ On a 400 px wide phone, the smallest text (27 px) shows at about 8.4 px, and the
 - **Changing a location's thresholds** (period, grace, router grace, boot delay) never changes the
   chart for past days (DATA-04), because the chart reads stored intervals only.
   (Amended 2026-11-01, quick task 261101-g9v.)
+- **Admin Compare page:** the admin's Compare page draws the same timeline in the browser
+  (quick task 261103-lfm); this spec stays the source of its colours and day rules.
+  (Added 2026-11-03, quick task 261103-lfm.)
 
 ## 10. Acceptance checklist
 
