@@ -4,7 +4,11 @@ Task 2a's part: the route and its access rules, the sidebar item and the breadcr
 GET search form (location chips with the status LED, the period radios, the dates and their
 validation), the seven section wrappers in D-5 order with the jump bar, the KPI tiles and
 the outage scoreboard, the escaping of user-typed names, the secret scan and the query
-budget. The page is read only through tests/web/pages.py and its test hooks.
+budget. Task 2b's part: the timeline (day groups, lanes, segment titles, totals, the now
+marker, the 31-day cap and "Earlier days", the daily-totals table), the overlap card
+(matrix, pairs, simultaneous outages, the one-location line), the hours chart, the weeks
+table, the escaping inside the SVGs and the decorative-SVG rule. The page is read only
+through tests/web/pages.py and its test hooks.
 
 The fixture is the plan's "Page test fixture": now is Thu 2026-10-01 16:00 UTC (19:00 in
 Kyiv); the default 7-day period is 25.09..01.10. All times below are UTC; every location is
@@ -560,3 +564,305 @@ def test_compare_page_needs_no_js(admin: Client, location_factory: Callable[...,
     assert main(page).find_all(attrs={"data-js-only": True}) == []
     # Failure: an invalid page adds only the error summary's focus component.
     assert _x_data(_page(admin, "?range=year")) == SHELL | {"errorSummary"}
+
+
+# Task 2b: the charts
+
+
+def _lane(page: Tag, day: str, key: str) -> Tag:
+    found = [
+        lane
+        for lane in all_by_testid(page, "tl-lane")
+        if (lane["data-day"], lane["data-location-id"]) == (day, key)
+    ]
+    assert len(found) == 1, (day, key)
+    return found[0]
+
+
+def _total(page: Tag, day: str, key: str) -> str:
+    found = [
+        total
+        for total in all_by_testid(page, "tl-total")
+        if (total["data-day"], total["data-location-id"]) == (day, key)
+    ]
+    assert len(found) == 1, (day, key)
+    return text(found[0])
+
+
+def _direct_title(svg: Tag) -> str:
+    found = svg.find("title", recursive=False)
+    assert isinstance(found, Tag), "no direct <title>"
+    return text(found)
+
+
+@pytest.mark.django_db
+def test_compare_page_timeline(admin: Client, location_factory: Callable[..., Any]) -> None:
+    home, office, shop = _fixture(location_factory)
+
+    page = _page(admin)
+
+    chart = by_testid(page, "compare-timeline-chart")
+    assert (chart.name, chart["role"]) == ("svg", "img")
+    assert _direct_title(chart).startswith("Timeline of power on and off")
+    desc = page.find(id=str(chart["aria-describedby"]))
+    assert isinstance(desc, Tag) and text(desc)
+    days = all_by_testid(chart, "tl-day")
+    assert [day["data-day"] for day in days] == [
+        "2026-09-25",
+        "2026-09-26",
+        "2026-09-27",
+        "2026-09-28",
+        "2026-09-29",
+        "2026-09-30",
+        "2026-10-01",
+    ]
+    assert [day["data-today"] for day in days] == ["false"] * 6 + ["true"]
+    assert text(by_testid(days[-1], "tl-now")) == "19:00"
+    assert len(all_by_testid(chart, "tl-now")) == 1
+    keys = [str(home.pk), str(office.pk), str(shop.pk), "together"]
+    for day in days:
+        lanes = all_by_testid(day, "tl-lane")
+        assert [lane["data-location-id"] for lane in lanes] == keys
+    # The lane title holds the full name; a segment its own hover title.
+    home_lane = _lane(page, "2026-10-01", str(home.pk))
+    assert _direct_title(home_lane) == "Home"
+    offs = [seg for seg in all_by_testid(home_lane, "tl-seg") if seg["data-state"] == "off"]
+    assert [_direct_title(seg) for seg in offs] == ["Home · Power off · 12:00–13:00 · 1h"]
+    assert (offs[0]["data-start-us"], offs[0]["data-end-us"]) == (
+        str(12 * 3_600_000_000),
+        str(13 * 3_600_000_000),
+    )
+    assert _total(page, "2026-10-01", "together") == "all off 30m"
+    assert _total(page, "2026-09-25", "together") == "no overlap"
+    assert _total(page, "2026-10-01", str(shop.pk)) == "3h 30m · 2"
+    assert _total(page, "2026-09-25", str(home.pk)) == "no outages"
+    # Monday 28.09 opens a new week: one divider.
+    assert len(all_by_testid(chart, "tl-week-divider")) == 1
+    # No cap for 7 days.
+    assert not all_by_testid(page, "compare-timeline-cap")
+    assert not all_by_testid(page, "compare-earlier")
+    # The daily totals as a table, closed by default.
+    daily = by_testid(page, "compare-daily")
+    assert daily.name == "details" and not daily.has_attr("open")
+    headers, rows = table(daily, "compare-daily-table")
+    assert headers == ["Day", "Home", "Office", "Shop", "Together"]
+    assert len(rows) == 7
+    assert rows[-1] == ["Thu 01.10", "1h · 1", "1h · 1", "3h 30m · 2", "all off 30m"]
+
+
+@pytest.mark.django_db
+def test_compare_page_timeline_cap(admin: Client, location_factory: Callable[..., Any]) -> None:
+    home, office, shop = _fixture(location_factory)
+
+    page = _page(admin, "?range=custom&from=2026-08-22&to=2026-10-01")
+
+    cap = by_testid(page, "compare-timeline-cap")
+    assert "The timeline shows the last 31 days of the period." in text(cap)
+    assert len(all_by_testid(page, "tl-day")) == 31
+    earlier = by_testid(cap, "compare-earlier")
+    assert text(earlier) == "Earlier days"
+    assert earlier["href"] == (
+        f"?loc={home.pk}&loc={office.pk}&loc={shop.pk}&range=custom&from=2026-08-22&to=2026-08-31"
+    )
+    # Expected: following the link shows the earlier window as a valid page.
+    shown = _page(admin, str(earlier["href"]))
+    assert len(all_by_testid(shown, "tl-day")) == 10
+    assert not all_by_testid(shown, "compare-timeline-cap")
+
+
+@pytest.mark.django_db
+def test_compare_page_overlap(admin: Client, location_factory: Callable[..., Any]) -> None:
+    home, office, shop = _fixture(location_factory)
+
+    page = _page(admin)
+
+    matrix = by_testid(page, "compare-matrix")
+    cells = {
+        (str(cell["data-row-id"]), str(cell["data-col-id"])): cell
+        for cell in all_by_testid(matrix, "matrix-cell")
+    }
+    h, o, s = str(home.pk), str(office.pk), str(shop.pk)
+    assert len(cells) == 9
+    assert (cells[(h, o)]["data-share"], cells[(h, o)]["data-bucket"]) == ("40", "3")
+    assert text(cells[(h, o)]) == "While Home was off, Office was also off 40% of the time (1h)."
+    assert (cells[(o, h)]["data-share"], cells[(o, h)]["data-bucket"]) == ("100", "5")
+    assert cells[(h, s)]["data-share"] == "20"
+    assert cells[(s, h)]["data-share"] == "14"
+    assert cells[(o, s)]["data-share"] == "50"
+    assert not cells[(h, h)].has_attr("data-share")
+    # The pairs, most both-off time first.
+    _headers, pairs = table(page, "compare-pairs")
+    assert pairs == [
+        [
+            "Home ↔ Office",
+            "1h",
+            "40%",
+            "100%",
+            "1 of Home's 2 · 1 of Office's 1",
+            "same minute",
+            "same minute",
+        ],
+        [
+            "Home ↔ Shop",
+            "30m",
+            "20%",
+            "14%",
+            "1 of Home's 2 · 1 of Shop's 2",
+            "Shop 30m later",
+            "Shop 1h later",
+        ],
+        [
+            "Office ↔ Shop",
+            "30m",
+            "50%",
+            "14%",
+            "1 of Office's 1 · 1 of Shop's 2",
+            "Shop 30m later",
+            "Shop 1h later",
+        ],
+    ]
+    rows = all_by_testid(page, "pair-row")
+    assert [(row["data-a"], row["data-b"]) for row in rows] == [(h, o), (h, s), (o, s)]
+    assert not all_by_testid(page, "compare-pairs-none")
+    # Exactly one simultaneous outage, all three off together inside it.
+    _headers, sims = table(page, "compare-simultaneous")
+    assert sims == [["Thu 01.10 12:00", "Thu 01.10 13:00", "1h", "Home, Office, Shop all 3"]]
+    assert len(all_by_testid(page, "sim-row")) == 1
+    assert text(by_testid(page, "sim-all")) == "all 3"
+    assert not all_by_testid(page, "compare-simultaneous-empty")
+    assert not all_by_testid(page, "compare-simultaneous-cap")
+    assert not all_by_testid(page, "compare-overlap-single")
+
+
+@pytest.mark.django_db
+def test_compare_page_one_location_charts(
+    admin: Client, location_factory: Callable[..., Any]
+) -> None:
+    home, _office_, _shop_ = _fixture(location_factory)
+
+    page = _page(admin, f"?loc={home.pk}&range=7d")
+
+    assert text(by_testid(page, "compare-overlap-single")) == (
+        "Pick two or more locations to see when their outages overlap."
+    )
+    assert not all_by_testid(page, "compare-matrix")
+    assert not all_by_testid(page, "compare-simultaneous")
+    lanes = all_by_testid(page, "tl-lane")
+    assert {lane["data-location-id"] for lane in lanes} == {str(home.pk)}
+    assert len(lanes) == 7
+    hour_keys = {cell["data-location-id"] for cell in all_by_testid(page, "hour-cell")}
+    assert hour_keys == {str(home.pk)}
+    headers, _rows = table(page, "compare-weeks-table")
+    assert headers == ["Week", "Home"]
+
+
+@pytest.mark.django_db
+def test_compare_page_hours(admin: Client, location_factory: Callable[..., Any]) -> None:
+    home, office, shop = _fixture(location_factory)
+
+    page = _page(admin)
+
+    chart = by_testid(page, "compare-hours-chart")
+    assert (chart.name, chart["role"]) == ("svg", "img")
+    assert _direct_title(chart)
+    cells = {
+        (str(cell["data-location-id"]), str(cell["data-hour"])): cell
+        for cell in all_by_testid(chart, "hour-cell")
+    }
+    assert len(cells) == 4 * 24
+    assert cells[(str(home.pk), "12")]["data-pct"] == "14"
+    assert _direct_title(cells[(str(home.pk), "12")]) == (
+        "Home · 12:00–13:00 · off 14% of monitored time (1h of 7h)"
+    )
+    assert cells[(str(office.pk), "3")]["data-pct"] == "0"
+    assert cells[(str(office.pk), "3")]["fill-opacity"] == "0.35"
+    assert cells[(str(shop.pk), "12")]["data-pct"] == "7"
+    peaks = {
+        str(peak["data-location-id"]): text(peak) for peak in all_by_testid(chart, "hour-peak")
+    }
+    assert peaks[str(home.pk)] == "peak 09–10 · 14%"
+    assert peaks["together"] == "peak 12–13 · 7%"
+    assert text(by_testid(page, "compare-hours-legend")).startswith(
+        "Red: share of monitored time the power was off in that hour (darker = more). "
+        "Green: power always on in that hour. Grey: not monitored."
+    )
+
+
+@pytest.mark.django_db
+def test_compare_page_weeks(admin: Client, location_factory: Callable[..., Any]) -> None:
+    home, office, shop = _fixture(location_factory)
+
+    page = _page(admin)
+
+    headers, rows = table(page, "compare-weeks-table")
+    assert headers == ["Week", "Home", "Office", "Shop", "All off together"]
+    assert [row[0] for row in rows] == ["28.09 – 04.10 partial", "21.09 – 27.09 partial"]
+    assert len(all_by_testid(page, "week-partial")) == 2
+    cells = {
+        (str(cell["data-week"]), str(cell["data-location-id"])): cell
+        for cell in all_by_testid(page, "week-cell")
+    }
+    assert text(cells[("2026-09-28", str(home.pk))]) == "2h 30m · 2"
+    assert text(cells[("2026-09-28", str(shop.pk))]) == "3h 30m · 2"
+    assert text(cells[("2026-09-28", "together")]) == "30m · 1"
+    assert text(cells[("2026-09-21", str(home.pk))]) == "no outages"
+    assert cells[("2026-09-28", str(office.pk))]["data-off-us"] == str(60 * 60_000_000)
+
+
+@pytest.mark.django_db
+def test_compare_page_escapes_names_in_the_charts(
+    admin: Client, location_factory: Callable[..., Any]
+) -> None:
+    home = _home(location_factory, MARKUP_NAME)
+    _shop(location_factory)
+
+    response = admin.get(URL)
+    page = assert_page(response, title="Compare locations", app=True)
+    body = response.content.decode()
+
+    assert "<b>x</b>" not in body
+    assert_no_injected_script(body, "compare charts")
+    lane = _lane(page, "2026-10-01", str(home.pk))
+    assert _direct_title(lane) == MARKUP_NAME
+    name_text = lane.find("text", recursive=False)
+    assert isinstance(name_text, Tag) and MARKUP_NAME.startswith(text(name_text).rstrip("…"))
+    matrix = by_testid(page, "compare-matrix")
+    heads = [str(th.get("title")) for th in matrix.find_all("th", attrs={"scope": "col"})]
+    assert MARKUP_NAME in heads
+    segs = [_direct_title(seg) for seg in all_by_testid(lane, "tl-seg")]
+    assert segs and all(title.startswith(f"{MARKUP_NAME} · ") for title in segs)
+
+
+@pytest.mark.django_db
+def test_compare_page_svgs_are_titled_or_hidden(
+    admin: Client, location_factory: Callable[..., Any]
+) -> None:
+    _fixture(location_factory)
+
+    page = _page(admin)
+
+    titled = [svg for svg in main(page).find_all("svg") if svg.find("title", recursive=False)]
+    assert [svg.get("data-testid") for svg in titled] == [
+        "compare-timeline-chart",
+        "compare-hours-chart",
+    ]
+    for svg in main(page).find_all("svg"):
+        if svg in titled:
+            continue
+        assert (svg.get("aria-hidden"), svg.get("focusable")) == ("true", "false")
+    # The shared defs exist once: the lane clip and the hatch pattern.
+    assert len(page.find_all(id="cmp-lane-clip")) == 1
+    assert len(page.find_all(id="cmp-hatch")) == 1
+
+
+@pytest.mark.django_db
+def test_compare_page_invalid_has_no_charts(
+    admin: Client, location_factory: Callable[..., Any]
+) -> None:
+    _fixture(location_factory)
+
+    page = _page(admin, "?range=year")
+
+    for hook in ("compare-timeline-chart", "compare-hours-chart", "compare-matrix"):
+        assert not all_by_testid(page, hook), hook
+    assert page.find(id="cmp-lane-clip") is None

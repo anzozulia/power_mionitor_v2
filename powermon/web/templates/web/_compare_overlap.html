@@ -1,0 +1,91 @@
+{% comment %}
+The Compare page's overlap card (quick task 261103-lfm, D-7). Parameter: overlap
+(compare_chart.Overlap).
+
+- One location: only p[data-testid=compare-overlap-single].
+- Two or more:
+  - the pair matrix table[data-testid=compare-matrix] after its one-sentence explanation:
+    cells td[data-testid=matrix-cell][data-row-id][data-col-id][data-share][data-bucket]
+    (the diagonal has data-col-id equal to data-row-id and no data-share), each read as one
+    visually hidden sentence; the shown percent and duration are aria-hidden. The bucket
+    tone goes through a spelled-out if chain (bg-st-off/10 to /70, never above 70 %, so
+    the fg text stays AA in both themes). Header names are truncated with the full name
+    in title;
+  - the pairs table[data-testid=compare-pairs] (tr[data-testid=pair-row][data-a][data-b],
+    most both-off time first) and p[data-testid=compare-pairs-none] for the pairs never
+    off together;
+  - the simultaneous outages table[data-testid=compare-simultaneous]
+    (tr[data-testid=sim-row], the [data-testid=sim-all] tag), or
+    p[data-testid=compare-simultaneous-empty]; p[data-testid=compare-simultaneous-cap]
+    when more than 100 were found.
+Every class is spelled out; names are escaped by autoescape.
+{% endcomment %}<div class="flex flex-col gap-4 p-4">
+{% if overlap.single %}<p data-testid="compare-overlap-single" class="text-body text-fg-muted">Pick two or more locations to see when their outages overlap.</p>
+{% else %}<div class="flex flex-col gap-2">
+<h3 class="text-body font-semibold text-fg">Pair matrix</h3>
+<p class="text-body text-fg-muted">Each cell: while the row's location was off, how much of that time the column's location was off too.</p>
+<div class="overflow-x-auto">
+<table data-testid="compare-matrix" class="border-collapse">
+<caption class="sr-only">Pair matrix: share of the row location's off time when the column location was also off</caption>
+<thead><tr><td class="p-1"></td>{% for head in overlap.heads %}<th scope="col" title="{{ head.name }}" class="max-w-32 px-2 py-1 text-left align-bottom text-label font-semibold break-words text-fg-muted">{{ head.short }}</th>{% endfor %}</tr></thead>
+<tbody>
+{% for row in overlap.matrix %}<tr><th scope="row" title="{{ row.name }}" class="max-w-40 py-1 pr-3 text-left text-body font-semibold break-words text-fg">{{ row.short }}</th>{% for cell in row.cells %}<td data-testid="matrix-cell" data-row-id="{{ row.key }}" data-col-id="{{ cell.col }}"{% if not cell.diagonal %} data-share="{{ cell.share }}"{% endif %} data-bucket="{{ cell.bucket }}" class="min-w-20 border border-border px-2 py-1 align-top text-fg{% if cell.diagonal %} bg-surface-muted{% elif cell.bucket == 1 %} bg-st-off/10{% elif cell.bucket == 2 %} bg-st-off/20{% elif cell.bucket == 3 %} bg-st-off/35{% elif cell.bucket == 4 %} bg-st-off/50{% elif cell.bucket == 5 %} bg-st-off/70{% endif %}"><span class="sr-only">{{ cell.sr }}</span><span aria-hidden="true" class="flex flex-col"><span class="num{% if cell.diagonal %} text-fg-muted{% else %} font-semibold{% endif %}">{{ cell.value }}</span>{% if cell.detail %}<span class="num text-label text-fg">{{ cell.detail }}</span>{% endif %}</span></td>{% endfor %}</tr>
+{% endfor %}</tbody>
+</table>
+</div>
+<p class="text-label text-fg-subtle">The diagonal shows each location's own off time.</p>
+</div>
+<div class="flex flex-col gap-2">
+<h3 class="text-body font-semibold text-fg">Pairs off at the same time</h3>
+{% if overlap.pairs %}<div class="overflow-x-auto">
+<table data-testid="compare-pairs" class="w-full border-collapse">
+<caption class="sr-only">Pairs of locations off at the same time</caption>
+<thead><tr>
+<th scope="col" class="bg-surface-muted px-3 py-2 text-left text-label font-semibold uppercase tracking-label text-fg-muted">Pair</th>
+<th scope="col" class="bg-surface-muted px-3 py-2 text-right text-label font-semibold uppercase tracking-label text-fg-muted">Both off</th>
+<th scope="col" class="bg-surface-muted px-3 py-2 text-right text-label font-semibold uppercase tracking-label text-fg-muted">% of A's off</th>
+<th scope="col" class="bg-surface-muted px-3 py-2 text-right text-label font-semibold uppercase tracking-label text-fg-muted">% of B's off</th>
+<th scope="col" class="bg-surface-muted px-3 py-2 text-left text-label font-semibold uppercase tracking-label text-fg-muted">Coinciding outages</th>
+<th scope="col" class="bg-surface-muted px-3 py-2 text-left text-label font-semibold uppercase tracking-label text-fg-muted">Start gap</th>
+<th scope="col" class="bg-surface-muted px-3 py-2 text-left text-label font-semibold uppercase tracking-label text-fg-muted">End gap</th>
+</tr></thead>
+<tbody>
+{% for pair in overlap.pairs %}<tr data-testid="pair-row" data-a="{{ pair.a }}" data-b="{{ pair.b }}">
+<th scope="row" class="border-t border-border px-3 py-2 text-left font-semibold break-words text-fg">{{ pair.label }}</th>
+<td class="num border-t border-border px-3 py-2 text-right whitespace-nowrap">{{ pair.both }}</td>
+<td class="num border-t border-border px-3 py-2 text-right whitespace-nowrap">{{ pair.share_a }}</td>
+<td class="num border-t border-border px-3 py-2 text-right whitespace-nowrap">{{ pair.share_b }}</td>
+<td class="border-t border-border px-3 py-2 text-left break-words">{{ pair.coinciding }}</td>
+<td class="border-t border-border px-3 py-2 text-left break-words">{{ pair.start_gap }}</td>
+<td class="border-t border-border px-3 py-2 text-left break-words">{{ pair.end_gap }}</td>
+</tr>
+{% endfor %}</tbody>
+</table>
+</div>{% endif %}
+{% if overlap.never %}<p data-testid="compare-pairs-none" class="text-body text-fg-muted">{{ overlap.never }}</p>{% endif %}
+</div>
+<div class="flex flex-col gap-2">
+<h3 class="text-body font-semibold text-fg">Simultaneous outages</h3>
+{% if overlap.simultaneous %}<div class="overflow-x-auto">
+<table data-testid="compare-simultaneous" class="w-full border-collapse">
+<caption class="sr-only">Simultaneous outages, newest first</caption>
+<thead><tr>
+<th scope="col" class="bg-surface-muted px-3 py-2 text-left text-label font-semibold uppercase tracking-label text-fg-muted">Start</th>
+<th scope="col" class="bg-surface-muted px-3 py-2 text-left text-label font-semibold uppercase tracking-label text-fg-muted">End</th>
+<th scope="col" class="bg-surface-muted px-3 py-2 text-right text-label font-semibold uppercase tracking-label text-fg-muted">Duration</th>
+<th scope="col" class="bg-surface-muted px-3 py-2 text-left text-label font-semibold uppercase tracking-label text-fg-muted">Locations off</th>
+</tr></thead>
+<tbody>
+{% for sim in overlap.simultaneous %}<tr data-testid="sim-row">
+<td class="num border-t border-border px-3 py-2 text-left whitespace-nowrap">{{ sim.start }}</td>
+<td class="num border-t border-border px-3 py-2 text-left whitespace-nowrap">{{ sim.end }}</td>
+<td class="num border-t border-border px-3 py-2 text-right whitespace-nowrap">{{ sim.duration }}</td>
+<td class="border-t border-border px-3 py-2 text-left"><span class="flex flex-wrap items-center gap-x-2 gap-y-1"><span class="break-words">{{ sim.names }}</span>{% if sim.all_n %} <span data-testid="sim-all" class="rounded-control border border-st-off/40 bg-st-off-bg px-1 text-label font-semibold whitespace-nowrap text-st-off-text">{{ sim.all_text }}</span>{% endif %}</span></td>
+</tr>
+{% endfor %}</tbody>
+</table>
+</div>
+{% if overlap.sim_cap %}<p data-testid="compare-simultaneous-cap" class="text-body text-fg-muted">{{ overlap.sim_cap }}</p>{% endif %}
+{% else %}<p data-testid="compare-simultaneous-empty" class="text-body text-fg-muted">No two selected locations were off at the same time in this period.</p>{% endif %}
+</div>
+{% endif %}</div>

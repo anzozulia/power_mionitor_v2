@@ -1,0 +1,23 @@
+{% comment %}
+The Compare page's by-week table (quick task 261103-lfm, D-9, R-2). Parameter: weeks
+(compare_chart.Weeks).
+
+table[data-testid=compare-weeks-table]: one row per Monday-to-Sunday week overlapping the
+period, newest first, labelled DD.MM – DD.MM with the [data-testid=week-partial] tag when
+fewer than 7 of its days are in the period; one cell per location (and "All off together"
+for two or more), td[data-testid=week-cell][data-week][data-location-id][data-off-us]: the
+chart's total ("3h 20m · 2", "no outages", "—") over a small decorative off bar (an
+aria-hidden, unfocusable svg, scaled to the largest cell of the table).
+Every class is spelled out; names are escaped by autoescape.
+{% endcomment %}<div class="overflow-x-auto p-4">
+<table data-testid="compare-weeks-table" class="w-full border-collapse">
+<caption class="sr-only">Off time and outages by week, newest first</caption>
+<thead><tr><th scope="col" class="bg-surface-muted px-3 py-2 text-left text-label font-semibold uppercase tracking-label text-fg-muted">Week</th>{% for column in weeks.columns %}<th scope="col" class="max-w-40 bg-surface-muted px-3 py-2 text-left text-label font-semibold uppercase tracking-label break-words text-fg-muted">{{ column }}</th>{% endfor %}</tr></thead>
+<tbody>
+{% for row in weeks.rows %}<tr data-week="{{ row.monday }}">
+<th scope="row" class="border-t border-border px-3 py-2 text-left align-top font-normal"><span class="flex flex-col items-start gap-1"><span class="num whitespace-nowrap text-fg">{{ row.label }}</span>{% if row.partial %} <span data-testid="week-partial" class="rounded-control border border-border px-1 text-label text-fg-muted">partial</span>{% endif %}</span></th>
+{% for cell in row.cells %}<td data-testid="week-cell" data-week="{{ row.monday }}" data-location-id="{{ cell.key }}" data-off-us="{{ cell.off_us }}" class="border-t border-border px-3 py-2 align-top"><span class="flex min-w-24 flex-col gap-1"><span class="num whitespace-nowrap{% if cell.tone == "strong" %} font-semibold text-fg{% elif cell.tone == "muted" %} text-fg-muted{% else %} text-fg-subtle{% endif %}">{{ cell.text }}</span><svg aria-hidden="true" focusable="false" viewBox="0 0 100 4" preserveAspectRatio="none" class="h-1 w-full max-w-32"><rect x="0" y="0" width="100" height="4" rx="1" class="fill-surface-sunken"></rect><rect x="0" y="0" width="{{ cell.bar }}" height="4" rx="1" class="fill-st-off"></rect></svg></span></td>
+{% endfor %}</tr>
+{% endfor %}</tbody>
+</table>
+</div>

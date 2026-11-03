@@ -13,7 +13,8 @@ nothing.
   366 days, from 01.01.2026). Every bad input is a field error on a 200 page, never a 500.
 - With a valid form the page reads the live rows (2 queries) and the selected locations'
   pieces and whole outages (``compare_data.load_series``, 2 queries in one snapshot), runs
-  the pure ``compare.compare`` and renders the view models of ``compare_chart``.
+  the pure ``compare.compare`` and renders the view models of ``compare_chart``: the KPI
+  tiles, the scoreboard, the timeline, the overlap card, the hours chart and the weeks.
 - With no location at all the page shows the empty state and no form.
 """
 
@@ -202,5 +203,9 @@ class CompareView(View):
                 kpis=compare_chart.kpi_tiles(result),
                 scoreboard=compare_chart.scoreboard(result, statuses),
                 several=len(selected) > 1,
+                timeline=compare_chart.timeline(result),
+                overlap=compare_chart.overlap(result),
+                hours=compare_chart.hours(result),
+                weeks=compare_chart.weeks(result),
             )
         return render(request, self.template_name, context)

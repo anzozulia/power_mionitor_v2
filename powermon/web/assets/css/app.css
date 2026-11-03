@@ -171,6 +171,13 @@
   --color-sb-focus: var(--sb-focus);
   --color-sb-off-text: var(--sb-off-text);
   --color-sb-fail-text: var(--sb-fail-text);
+  --color-cmp-track: var(--cmp-track);
+  --color-cmp-grid: var(--cmp-grid);
+  --color-cmp-today: var(--cmp-today);
+  --color-cmp-some-off: var(--cmp-some-off);
+  --color-cmp-hatch-base: var(--cmp-hatch-base);
+  --color-cmp-hatch: var(--cmp-hatch);
+  --color-cmp-now: var(--cmp-now);
   --shadow-pop: var(--sh-pop);
   --shadow-modal: var(--sh-modal);
   --shadow-knob: var(--sh-knob);
@@ -257,6 +264,14 @@
   --sb-focus: #22D3EE;
   --sb-off-text: #F97066;
   --sb-fail-text: #FDB022;
+  /* The Compare page's charts (quick task 261103-lfm): the Telegram chart's hexes. */
+  --cmp-track: #E5E4DE;
+  --cmp-grid: #E3E2DC;
+  --cmp-today: #F4F3EF;
+  --cmp-some-off: #DF8484;
+  --cmp-hatch-base: #E2E0DA;
+  --cmp-hatch: #A09D94;
+  --cmp-now: #1A1A19;
   --sh-pop: 0px 8px 24px #0206172E;
   --sh-modal: 0px 24px 48px #0206174D;
   --sh-knob: 0px 1px 2px #0206174D;
@@ -354,6 +369,13 @@
   --sb-focus: #22D3EE;
   --sb-off-text: #F97066;
   --sb-fail-text: #FDB022;
+  --cmp-track: #1C2533;
+  --cmp-grid: #253041;
+  --cmp-today: #151D2B;
+  --cmp-some-off: #8F3B3E;
+  --cmp-hatch-base: #5B5852;
+  --cmp-hatch: #A09D94;
+  --cmp-now: #E5E9F0;
   --sh-pop: 0px 12px 32px #0000008C;
   --sh-modal: 0px 24px 48px #000000A6;
   --sh-knob: 0px 1px 2px #00000080;
@@ -444,6 +466,13 @@
     --sb-focus: #22D3EE;
     --sb-off-text: #F97066;
     --sb-fail-text: #FDB022;
+    --cmp-track: #1C2533;
+    --cmp-grid: #253041;
+    --cmp-today: #151D2B;
+    --cmp-some-off: #8F3B3E;
+    --cmp-hatch-base: #5B5852;
+    --cmp-hatch: #A09D94;
+    --cmp-now: #E5E9F0;
     --sh-pop: 0px 12px 32px #0000008C;
     --sh-modal: 0px 24px 48px #000000A6;
     --sh-knob: 0px 1px 2px #00000080;
