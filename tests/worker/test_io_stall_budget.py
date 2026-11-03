@@ -5,8 +5,12 @@ preceded by a ``getMe`` probe (D-1). A pass over many locations whose every call
 full timeout can then last longer than ``IO_STALL_S`` (180 s). That is progress, not a
 stall: ``io_loop.run_iteration`` stamps the ``telegram-io`` progress after every
 subscriber head, the ops step, the delete step and the chart step, so the longest gap
-between two stamps is one step. The worst step is a chart post behind its probe:
-(5 + 5) + (5 + 30) s = 45 s, or 55 s with a second address family's connect attempt each,
+between two stamps is one step. A chart post behind its getMe probe takes
+(5 + 5) + (5 + 30) s = 45 s, or 55 s with a second address family's connect attempt each.
+While the bot's photo uploads fail, the post is preceded by a photo probe instead
+(quick task 261103-b2z): (5 + 30) + (5 + 30) s = 70 s. The worst step is a photo probe
+whose chart was deleted, the getMe probe it falls back to, and the post:
+(5 + 30) + (5 + 5) + (5 + 30) s = 80 s, or 95 s with a second connect attempt each, still
 well inside 180 s.
 
 The failure counterpart, a single call that blocks longer than the limit and fires the
@@ -21,7 +25,7 @@ turns any exception into ``maybe_delivered``.
 import dataclasses
 import json
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from itertools import pairwise
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -29,13 +33,14 @@ from zoneinfo import ZoneInfo
 import pytest
 import requests
 import responses
-from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, FakeClock
+from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, FakeClock, parse_multipart
 from django.db import transaction
 from django.db.models import F, Value
 from django.db.models.functions import Greatest
 from requests import PreparedRequest
 
 from powermon.alerts import outbox
+from powermon.chart.models import ChartMessage
 from powermon.engine.models import LocationState, PowerInterval, SystemState
 from powermon.telegram import client
 from powermon.worker import io_loop, supervision
@@ -51,10 +56,16 @@ def _kyiv(text: str) -> datetime:
 
 
 NOON_05 = _kyiv("2026-10-02 12:05")
+YESTERDAY_END = _kyiv("2026-10-02 00:02")
 SINCE = _kyiv("2026-10-01 08:00")
 # 13 alerts of 15 s each (5 s connect + 10 s read) already outlast IO_STALL_S.
 LOCATIONS = 13
 GET_ME_OK = {"ok": True, "result": {"id": 1, "is_bot": True, "first_name": "Fake bot"}}
+NOT_FOUND = {
+    "ok": False,
+    "error_code": 400,
+    "description": "Bad Request: message to edit not found",
+}
 
 
 @pytest.fixture(autouse=True)
@@ -165,3 +176,113 @@ def test_INV13_INV14_watchdog_never_fires_during_a_telegram_outage(
     assert client.PROBE_TIMEOUT == (5.0, 5.0)
     assert client.PHOTO_TIMEOUT == (5.0, 30.0)
     assert 2 * 5.0 + 5.0 + 2 * 5.0 + 30.0 < supervision.IO_STALL_S
+
+
+@pytest.mark.parametrize("refused", [False, True])
+def test_INV13_INV14_watchdog_never_fires_with_a_photo_probe_before_the_post(
+    refused: bool, location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    """The photo probe (261103-b2z) before the post; refused, it falls back to getMe too."""
+    for n in range(LOCATIONS):
+        location = location_factory(
+            name=f"Location {n}", bot_token=DEFAULT_BOT_TOKEN, chat_id=DEFAULT_CHAT_ID
+        )
+        if n == 0:
+            # Monitored, no chart today, and a finished yesterday in its own chat and bot:
+            # the post is due, and yesterday's chart is the photo probe's candidate.
+            _monitor(location, SINCE)
+            ChartMessage.objects.create(
+                location=location,
+                local_date=date(2026, 10, 1),
+                chat_id=DEFAULT_CHAT_ID,
+                bot_key=io_loop.bot_key(DEFAULT_BOT_TOKEN),
+                message_id=501,
+                pinned=False,
+                last_rendered_at=YESTERDAY_END,
+                finalized_at=YESTERDAY_END,
+                unpinned_at=YESTERDAY_END,
+                created_at=YESTERDAY_END,
+            )
+        _queue_alert(location)
+    clock = FakeClock(NOON_05)
+    progress = supervision.Progress(clock)
+    fired: list[str] = []
+    watchdog = supervision.Watchdog(
+        clock, progress, {"telegram-io": supervision.IO_STALL_S}, {}, fired.append
+    )
+    stamps: list[float] = []
+    seen: list[tuple[str, Any, str | None]] = []
+
+    def tick() -> None:
+        progress.stamp("telegram-io")
+        stamps.append(clock.monotonic())
+
+    def waits(
+        method: str, answer: Callable[[PreparedRequest], tuple[int, dict[str, str], str]]
+    ) -> Any:
+        def callback(request: PreparedRequest) -> tuple[int, dict[str, str], str]:
+            timeout = request.req_kwargs["timeout"]  # type: ignore[attr-defined]
+            # The call takes its full connect and read timeouts.
+            clock.advance(seconds=sum(timeout))
+            seen.append((method, timeout, watchdog.check()))
+            return answer(request)
+
+        return callback
+
+    def read_timeout(request: PreparedRequest) -> tuple[int, dict[str, str], str]:
+        raise requests.ReadTimeout()
+
+    def edit(request: PreparedRequest) -> tuple[int, dict[str, str], str]:
+        if refused:
+            return 400, {}, json.dumps(NOT_FOUND)
+        fields, _ = parse_multipart(request)
+        return (
+            200,
+            {},
+            json.dumps({"ok": True, "result": {"message_id": int(fields["message_id"])}}),
+        )
+
+    def probe_ok(request: PreparedRequest) -> tuple[int, dict[str, str], str]:
+        return 200, {}, json.dumps(GET_ME_OK)
+
+    answers = [
+        ("sendMessage", read_timeout),
+        ("editMessageMedia", edit),
+        ("sendPhoto", read_timeout),
+    ]
+    if refused:
+        answers.append(("getMe", probe_ok))
+    for method, answer in answers:
+        fake_telegram.rsps.add_callback(
+            responses.POST,
+            f"{fake_telegram.API}/bot{DEFAULT_BOT_TOKEN}/{method}",
+            callback=waits(method, answer),
+            content_type="application/json",
+        )
+    state = io_loop.RelayState()
+    state.photo_degraded.add(io_loop.bot_key(DEFAULT_BOT_TOKEN))
+    SystemState.objects.get_or_create(pk=1)
+    SystemState.objects.filter(pk=1).update(
+        last_cycle_completed_at=Greatest("last_cycle_completed_at", Value(NOON_05))
+    )
+
+    tick()
+    assert io_loop.run_iteration(clock, state, None, tick=tick, charts=True) is True
+
+    assert fired == []
+    assert [check for _, _, check in seen] == [None] * len(seen)
+    assert watchdog.check() is None
+    assert clock.monotonic() > supervision.IO_STALL_S
+    worst = 80.0 if refused else 70.0
+    assert max(b - a for a, b in pairwise(stamps)) <= worst
+    probes = [("editMessageMedia", (5.0, 30.0))]
+    if refused:
+        probes.append(("getMe", (5.0, 5.0)))
+    timeouts = [(method, timeout) for method, timeout, _ in seen]
+    assert timeouts == (
+        [("sendMessage", (5.0, 10.0))] * LOCATIONS + probes + [("sendPhoto", (5.0, 30.0))]
+    )
+    # The static bound: a photo probe, a getMe probe and a photo, each with a second
+    # connect attempt (95 s).
+    assert client.PHOTO_TIMEOUT == (5.0, 30.0)
+    assert 2 * 5.0 + 30.0 + 2 * 5.0 + 5.0 + 2 * 5.0 + 30.0 < supervision.IO_STALL_S

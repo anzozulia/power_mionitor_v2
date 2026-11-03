@@ -14,6 +14,10 @@ delivered every one, so each channel got 6-7 copies of the same chart. Now:
   post like a failed step (``step_delay``, plus the bot hold of a bot-wide outcome) and
   sends no photo. The incident replay: refreshes time out before midnight, the midnight
   post waits for a healthy probe, then exactly one photo is posted, recorded and pinned.
+  Since quick task 261103-b2z the evening's refresh timeouts also mark the bot's photo
+  uploads as failing, so the midnight post waits for a successful re-upload of
+  yesterday's chart (the photo probe, tests/chart/test_lifecycle_photo_probe.py) instead
+  of a getMe answer.
 - INV-14: a ``stop`` set while the probe is in flight sends no photo.
 
 Every test runs ``io_loop.run_iteration(..., charts=True)`` and is
@@ -34,7 +38,7 @@ import pytest
 import requests
 import responses
 from chart_fixtures import KYIV, kyiv, monitor
-from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, FakeClock
+from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, FakeClock, parse_multipart
 from django.db import transaction
 from django.db.models import Value
 from django.db.models.functions import Greatest
@@ -168,10 +172,28 @@ def test_INV17_incident_replay_midnight_post_waits_for_a_healthy_probe(
 ) -> None:
     location = _monitored(location_factory)
     _seed(location, YESTERDAY, message_id=501, pinned=True, rendered=kyiv("2026-10-01 23:30"))
-    # Telegram times out every edit and unpin of the bot, as from 21:33 UTC (registered
-    # once, so the last answer repeats), and the first getMe probe; the post and the pin
-    # go through. accept_chart is not used: it would accept the edits.
-    fake_telegram.fail_method(DEFAULT_BOT_TOKEN, "editMessageMedia", exc=requests.ReadTimeout())
+    # Telegram times out every edit of the bot while ``up`` is False and every unpin, as
+    # from 21:33 UTC (registered once, so the last answer repeats), and the first getMe
+    # probe; the post and the pin go through. accept_chart is not used: it would accept
+    # the edits. The edits recover with ``up`` (261103-b2z: the post's photo probe).
+    up = [False]
+
+    def edit(request: PreparedRequest) -> tuple[int, dict[str, str], str]:
+        if not up[0]:
+            raise requests.ReadTimeout()
+        fields, _ = parse_multipart(request)
+        return (
+            200,
+            {},
+            json.dumps({"ok": True, "result": {"message_id": int(fields["message_id"])}}),
+        )
+
+    fake_telegram.rsps.add_callback(
+        responses.POST,
+        f"{fake_telegram.API}/bot{DEFAULT_BOT_TOKEN}/editMessageMedia",
+        callback=edit,
+        content_type="application/json",
+    )
     fake_telegram.fail_method(DEFAULT_BOT_TOKEN, "unpinChatMessage", exc=requests.ReadTimeout())
     fake_telegram.fail_method(DEFAULT_BOT_TOKEN, "getMe", exc=requests.ReadTimeout())
     fake_telegram.accept_probe(DEFAULT_BOT_TOKEN)
@@ -186,26 +208,31 @@ def test_INV17_incident_replay_midnight_post_waits_for_a_healthy_probe(
     assert _requests(fake_telegram) == ["editMessageMedia"]
     assert _degraded(state)
 
-    # (B) Just after midnight today's post is due: the probe fails, so no photo is sent.
+    # (B) Just after midnight today's post is due: the photo probe (a re-upload of
+    # yesterday's chart, 261103-b2z) times out, so no photo is sent and getMe is not asked.
     t_b = kyiv("2026-10-02 00:00:30")
     clock.set(t_b)
     assert _pass(clock, state) is True
     assert fake_telegram.count(DEFAULT_BOT_TOKEN, "sendPhoto") == 0
-    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "getMe") == 1
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "getMe") == 0
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "editMessageMedia") == 2
     assert state.not_before[post_key] == t_b + _sec(30)
     assert state.chart_failures[post_key] == 1
-    [line] = [line for line in _lines(caplog) if "health probe" in line]
+    [line] = [line for line in _lines(caplog) if "photo uploads are failing" in line]
     assert "attempt 1" in line
     assert _degraded(state)
     # The idempotent steps (yesterday's unpin, its final edit) may run; still no photo.
     _run_until_idle(clock, state)
     assert fake_telegram.count(DEFAULT_BOT_TOKEN, "sendPhoto") == 0
-    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "getMe") == 1
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "getMe") == 0
 
-    # (C) After the step delay the probe answers ok: exactly one photo is posted.
+    # (C) Telegram recovers; after the step delay the photo probe answers ok: exactly one
+    # photo is posted.
+    up[0] = True
     clock.set(t_b + _sec(30))
+    start = len(fake_telegram.calls)
     assert _pass(clock, state) is True
-    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "getMe") == 2
+    assert _requests(fake_telegram, start) == ["editMessageMedia", "sendPhoto"]
     assert fake_telegram.count(DEFAULT_BOT_TOKEN, "sendPhoto") == 1
     today = ChartMessage.objects.get(local_date=TODAY, retired_at__isnull=True)
     assert today.message_id == 1001
@@ -215,7 +242,7 @@ def test_INV17_incident_replay_midnight_post_waits_for_a_healthy_probe(
     assert fake_telegram.count(DEFAULT_BOT_TOKEN, "sendPhoto") == 1
     today.refresh_from_db()
     assert today.pinned is True
-    assert any("chart probe for location" in r.getMessage() for r in caplog.records)
+    assert any("chart photo probe for location" in r.getMessage() for r in caplog.records)
 
 
 def test_INV17_healthy_bot_posts_without_a_probe(

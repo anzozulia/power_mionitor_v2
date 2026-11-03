@@ -239,6 +239,9 @@ _DEGRADED_KINDS = ("maybe_delivered", "transient")
 # Outcomes that show Telegram answered the bot: an ok, or a definite refusal other than a
 # 429. A 429 and a request that never left the client (not_sent) change nothing (D-1).
 _ANSWERED_KINDS = ("ok", "permanent", "edit_target_missing")
+# The only photo outcome that proves Telegram processes uploads again: a 400 does not
+# (quick task 261103-b2z, D-1). The kinds that set the photo mark are ``_DEGRADED_KINDS``.
+_PHOTO_OK_KINDS = ("ok",)
 
 
 @dataclass(frozen=True)
@@ -288,6 +291,12 @@ class RelayState:
     ``maybe_delivered`` or ``transient`` (``note_bot_health``). While a bot is in it, the
     chart lifecycle makes no post before a ``getMe`` probe answers ok (261030-11v, D-1). In
     memory, so a restart starts with every bot healthy.
+    ``photo_degraded``: the ``bot_key`` of each bot whose last photo upload (``sendPhoto``
+    or ``editMessageMedia``) ended ``maybe_delivered`` or ``transient``
+    (``note_photo_health``). While a bot is in it, a chart post is made only after a
+    re-upload of an existing chart answers ok (the photo probe), since getMe can answer
+    while uploads fail (quick task 261103-b2z). In memory, so a restart starts with every
+    bot healthy.
     ``failing``: the ``chat_key`` the relay holds for each location whose subscriber alert
     was refused permanently, by location id; that channel's 15-minute hold lasts while the
     location's ``delivery_failing`` incident is open, and goes once it closes (D-12).
@@ -307,6 +316,7 @@ class RelayState:
     )
     failing: dict[int, str] = field(default_factory=dict)
     degraded: set[str] = field(default_factory=set)
+    photo_degraded: set[str] = field(default_factory=set)
     last_wall: datetime | None = None
     last_mono: float | None = None
 
@@ -371,6 +381,28 @@ def note_bot_health(state: RelayState, token: str, result: SendResult) -> None:
 def is_degraded(state: RelayState, token: str) -> bool:
     """True while the bot's last telling Telegram outcome was a timeout or a 5xx (D-1)."""
     return bot_key(token) in state.degraded
+
+
+def note_photo_health(state: RelayState, token: str, result: SendResult) -> None:
+    """Update the bot's photo-path mark from one photo upload outcome (261103-b2z, D-1).
+
+    Callers pass ONLY the outcome of a photo method (``sendPhoto``, ``editMessageMedia``:
+    the chart steps post, refresh and finalize, and the photo probe); an alert never feeds
+    it. A ``maybe_delivered`` or ``transient`` outcome sets it; an ``ok`` (including
+    "message is not modified") clears it; every other kind changes nothing, since a 400
+    does not prove that Telegram processes uploads. Memory only; nothing is logged
+    (OPS-08).
+    """
+    key = bot_key(token)
+    if result.kind in _DEGRADED_KINDS:
+        state.photo_degraded.add(key)
+    elif result.kind in _PHOTO_OK_KINDS:
+        state.photo_degraded.discard(key)
+
+
+def is_photo_degraded(state: RelayState, token: str) -> bool:
+    """True while the bot's last telling photo upload timed out or got a 5xx (261103-b2z)."""
+    return bot_key(token) in state.photo_degraded
 
 
 def activate(state: RelayState, clock: Clock) -> int:
