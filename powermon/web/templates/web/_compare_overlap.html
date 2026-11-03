@@ -55,14 +55,14 @@ Every class is spelled out; names are escaped by autoescape.
 <th scope="col" class="bg-surface-muted px-3 py-2 text-left text-label font-semibold uppercase tracking-label text-fg-muted">End gap</th>
 </tr></thead>
 <tbody>
-{% for pair in overlap.pairs %}<tr data-testid="pair-row" data-a="{{ pair.a }}" data-b="{{ pair.b }}">
-<th scope="row" class="border-t border-border px-3 py-2 text-left align-top font-semibold text-fg"><span class="flex flex-col gap-0.5"><span class="break-words"><span class="num text-label font-normal text-fg-muted">A ·</span> {{ pair.name_a }}</span> <span class="break-words"><span class="num text-label font-normal text-fg-muted">B ·</span> {{ pair.name_b }}</span></span></th>
-<td class="num border-t border-border px-3 py-2 text-right align-top whitespace-nowrap">{{ pair.both }}</td>
-<td class="num border-t border-border px-3 py-2 text-right align-top whitespace-nowrap">{{ pair.share_a }}</td>
-<td class="num border-t border-border px-3 py-2 text-right align-top whitespace-nowrap">{{ pair.share_b }}</td>
-<td class="border-t border-border px-3 py-2 text-left align-top"><span class="flex flex-col gap-0.5"><span class="num whitespace-nowrap">{{ pair.coinciding_a }}</span> <span class="num whitespace-nowrap">{{ pair.coinciding_b }}</span></span></td>
-<td class="num border-t border-border px-3 py-2 text-left align-top whitespace-nowrap">{{ pair.start_gap }}</td>
-<td class="num border-t border-border px-3 py-2 text-left align-top whitespace-nowrap">{{ pair.end_gap }}</td>
+{% for pair in overlap.pairs %}<tr data-testid="pair-row" data-a="{{ pair.a }}" data-b="{{ pair.b }}" class="*:border-t *:border-border *:px-3 *:py-2 *:align-top">
+<th scope="row" class="text-left font-semibold text-fg"><span class="flex flex-col gap-0.5"><span class="break-words"><span class="num text-label font-normal text-fg-muted">A ·</span> {{ pair.name_a }}</span> <span class="break-words"><span class="num text-label font-normal text-fg-muted">B ·</span> {{ pair.name_b }}</span></span></th>
+<td class="num text-right whitespace-nowrap">{{ pair.both }}</td>
+<td class="num text-right whitespace-nowrap">{{ pair.share_a }}</td>
+<td class="num text-right whitespace-nowrap">{{ pair.share_b }}</td>
+<td class="text-left"><span class="flex flex-col gap-0.5"><span class="num whitespace-nowrap">{{ pair.coinciding_a }}</span> <span class="num whitespace-nowrap">{{ pair.coinciding_b }}</span></span></td>
+<td class="num text-left whitespace-nowrap">{{ pair.start_gap }}</td>
+<td class="num text-left whitespace-nowrap">{{ pair.end_gap }}</td>
 </tr>
 {% endfor %}</tbody>
 </table>
@@ -70,13 +70,13 @@ Every class is spelled out; names are escaped by autoescape.
 <ul class="flex flex-col gap-2 md:hidden">
 {% for pair in overlap.pairs %}<li data-testid="pair-card" data-a="{{ pair.a }}" data-b="{{ pair.b }}" class="flex flex-col gap-2 rounded-control border border-border px-3 py-2">
 <p class="flex flex-col gap-0.5 font-semibold text-fg"><span class="break-words"><span class="num text-label font-normal text-fg-muted">A ·</span> {{ pair.name_a }}</span> <span class="break-words"><span class="num text-label font-normal text-fg-muted">B ·</span> {{ pair.name_b }}</span></p>
-<dl class="grid grid-cols-2 gap-x-4 gap-y-1 text-body">
-<div class="flex flex-col"><dt class="text-label font-semibold uppercase tracking-label text-fg-muted">Both off</dt><dd class="num">{{ pair.both }}</dd></div>
-<div class="flex flex-col"><dt class="text-label font-semibold uppercase tracking-label text-fg-muted">Coinciding outages</dt><dd class="flex flex-col"><span class="num">{{ pair.coinciding_a }}</span> <span class="num">{{ pair.coinciding_b }}</span></dd></div>
-<div class="flex flex-col"><dt class="text-label font-semibold uppercase tracking-label text-fg-muted">% of A's off</dt><dd class="num">{{ pair.share_a }}</dd></div>
-<div class="flex flex-col"><dt class="text-label font-semibold uppercase tracking-label text-fg-muted">% of B's off</dt><dd class="num">{{ pair.share_b }}</dd></div>
-<div class="flex flex-col"><dt class="text-label font-semibold uppercase tracking-label text-fg-muted">Start gap</dt><dd class="num">{{ pair.start_gap }}</dd></div>
-<div class="flex flex-col"><dt class="text-label font-semibold uppercase tracking-label text-fg-muted">End gap</dt><dd class="num">{{ pair.end_gap }}</dd></div>
+<dl class="grid grid-cols-2 gap-x-4 gap-y-1 text-body *:flex *:flex-col [&_dt]:text-label [&_dt]:font-semibold [&_dt]:uppercase [&_dt]:tracking-label [&_dt]:text-fg-muted">
+<div><dt>Both off</dt><dd class="num">{{ pair.both }}</dd></div>
+<div><dt>Coinciding outages</dt><dd class="flex flex-col"><span class="num">{{ pair.coinciding_a }}</span> <span class="num">{{ pair.coinciding_b }}</span></dd></div>
+<div><dt>% of A's off</dt><dd class="num">{{ pair.share_a }}</dd></div>
+<div><dt>% of B's off</dt><dd class="num">{{ pair.share_b }}</dd></div>
+<div><dt>Start gap</dt><dd class="num">{{ pair.start_gap }}</dd></div>
+<div><dt>End gap</dt><dd class="num">{{ pair.end_gap }}</dd></div>
 </dl>
 </li>
 {% endfor %}</ul>{% endif %}
@@ -94,22 +94,22 @@ Every class is spelled out; names are escaped by autoescape.
 <th scope="col" class="bg-surface-muted px-3 py-2 text-left text-label font-semibold uppercase tracking-label text-fg-muted">Locations off</th>
 </tr></thead>
 <tbody>
-{% for sim in overlap.simultaneous %}<tr data-testid="sim-row">
-<td class="num border-t border-border px-3 py-2 text-left whitespace-nowrap">{{ sim.start }}</td>
-<td class="num border-t border-border px-3 py-2 text-left whitespace-nowrap">{{ sim.end }}</td>
-<td class="num border-t border-border px-3 py-2 text-right whitespace-nowrap">{{ sim.duration }}</td>
-<td class="border-t border-border px-3 py-2 text-left"><span class="flex flex-wrap items-center gap-x-2 gap-y-1"><span class="break-words">{{ sim.names }}</span>{% if sim.all_n %} <span data-testid="sim-all" class="rounded-control border border-st-off/40 bg-st-off-bg px-1 text-label font-semibold whitespace-nowrap text-st-off-text">{{ sim.all_text }}</span>{% endif %}</span></td>
+{% for sim in overlap.simultaneous %}<tr data-testid="sim-row" class="*:border-t *:border-border *:px-3 *:py-2">
+<td class="num text-left whitespace-nowrap">{{ sim.start }}</td>
+<td class="num text-left whitespace-nowrap">{{ sim.end }}</td>
+<td class="num text-right whitespace-nowrap">{{ sim.duration }}</td>
+<td class="text-left"><span class="flex flex-wrap items-center gap-x-2 gap-y-1"><span class="break-words">{{ sim.names }}</span>{% if sim.all_n %} <span data-testid="sim-all" class="rounded-control border border-st-off/40 bg-st-off-bg px-1 text-label font-semibold whitespace-nowrap text-st-off-text">{{ sim.all_text }}</span>{% endif %}</span></td>
 </tr>
 {% endfor %}</tbody>
 </table>
 </div>
 <ul class="flex flex-col gap-2 md:hidden">
 {% for sim in overlap.simultaneous %}<li data-testid="sim-card" class="flex flex-col gap-2 rounded-control border border-border px-3 py-2">
-<dl class="grid grid-cols-2 gap-x-4 gap-y-1 text-body">
-<div class="flex flex-col"><dt class="text-label font-semibold uppercase tracking-label text-fg-muted">Start</dt><dd class="num">{{ sim.start }}</dd></div>
-<div class="flex flex-col"><dt class="text-label font-semibold uppercase tracking-label text-fg-muted">End</dt><dd class="num">{{ sim.end }}</dd></div>
-<div class="flex flex-col"><dt class="text-label font-semibold uppercase tracking-label text-fg-muted">Duration</dt><dd class="num">{{ sim.duration }}</dd></div>
-<div class="col-span-2 flex flex-col"><dt class="text-label font-semibold uppercase tracking-label text-fg-muted">Locations off</dt><dd class="flex flex-wrap items-center gap-x-2 gap-y-1"><span class="break-words">{{ sim.names }}</span>{% if sim.all_n %} <span class="rounded-control border border-st-off/40 bg-st-off-bg px-1 text-label font-semibold whitespace-nowrap text-st-off-text">{{ sim.all_text }}</span>{% endif %}</dd></div>
+<dl class="grid grid-cols-2 gap-x-4 gap-y-1 text-body *:flex *:flex-col [&_dt]:text-label [&_dt]:font-semibold [&_dt]:uppercase [&_dt]:tracking-label [&_dt]:text-fg-muted">
+<div><dt>Start</dt><dd class="num">{{ sim.start }}</dd></div>
+<div><dt>End</dt><dd class="num">{{ sim.end }}</dd></div>
+<div><dt>Duration</dt><dd class="num">{{ sim.duration }}</dd></div>
+<div class="col-span-2"><dt>Locations off</dt><dd class="flex flex-wrap items-center gap-x-2 gap-y-1"><span class="break-words">{{ sim.names }}</span>{% if sim.all_n %} <span class="rounded-control border border-st-off/40 bg-st-off-bg px-1 text-label font-semibold whitespace-nowrap text-st-off-text">{{ sim.all_text }}</span>{% endif %}</dd></div>
 </dl>
 </li>
 {% endfor %}</ul>

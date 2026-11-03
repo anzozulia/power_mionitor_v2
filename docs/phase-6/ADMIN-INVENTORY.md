@@ -74,6 +74,7 @@
 | S11 | Reset-history confirmation | `location-reset`, `/locations/<pk>/reset/` | `HistoryResetView` history_views.py:144 | `web/history_reset.html` | GET (or 302 + flash); POST → 302 detail |
 | S12 | Switch POSTs ×3 | `location-maintenance` / `location-alerts` / `location-router-grace`, `/locations/<pk>/{maintenance,alerts,router-grace}/` | `SwitchView` subclasses location_views.py:268-343 | none | POST only; GET 405; bad `value` 400 with empty body |
 | S13 | Test message POST | `location-test-message`, `/locations/<pk>/test-message/` | `SendTestMessageView` location_views.py:377 | none | POST only; GET 405 |
+| S14 | Compare locations (added 2026-11-03, quick task 261103-lfm) | `location-compare`, `/compare/` | `CompareView` compare_views.py | `web/compare.html` (+ `_compare_*.html`) | GET 200 (bad filters → 200 with errors); POST 405 |
 | E1 | 404 | any unknown path; any unknown or deleted location | Django default handler | `404.html` | fixed copy; never echoes the path; rendered with the request (`page_not_found`, django/views/defaults.py:64), so every context processor runs |
 | E2 | 403 CSRF | any POST with a missing or stale token | Django `csrf_failure` | `403_csrf.html` | rendered with the request (Django 5.2.17 `csrf_failure` calls `t.render(request=request)`, django/views/csrf.py:70), so every context processor runs; the failure reason is never in the context |
 | E3 | 500 | any unhandled error | Django default handler | `500.html` (standalone, no `extends`) | no context at all |
@@ -295,6 +296,21 @@
 - Crumbs: Locations / {name} / Reset history. h1: "Reset the history of {name}?".
 - Body: lead, 5 consequences, and the alternative ("To remove a single false outage instead, use Recent outages …").
 - **One form:** the danger button "Reset history", next to the link "Keep history".
+
+**S14 Compare locations, `web/compare.html`** (Added 2026-11-03, quick task 261103-lfm.)
+- **Reach:** the sidebar's third Main item "Compare" (`a[data-testid=nav-compare]`, icon calendar-days, `aria-current="page"` on the page). Crumbs: the single item "Compare". h1: "Compare locations".
+- **Read-only:** GET only (a signed-in POST is 405; anonymous GET and POST redirect to sign-in). The view reads the live rows (2 queries) and, in one read-only REPEATABLE READ transaction, the pieces and the whole-outage off pieces (1 query each): at most 4 data queries whatever the number of locations. It writes, sends and queues nothing. No JS: no `x-data` component, no `admin.js` change.
+- **Code:** `powermon/chart/compare.py` (pure numbers, integer microseconds, the chart's day and DST rules), `powermon/web/compare_data.py` (the reads), `compare_views.py` (form and view), `compare_chart.py` (pure presentation geometry and texts).
+- **Filters (`compare-filter`):** `form[data-testid=compare-form][role=search][method=get]`, no CSRF input (pages.py invariant 10 allows exactly this, R-1). Location chips `label[data-testid=compare-loc-chip][data-location-id][data-status]`; period radios 7d/14d/30d/90d/custom (default 7d); `from`/`to` dates (custom: both required, from ≤ to, to ≤ today, at most 366 days, from ≥ 01.01.2026). Bad input: 200 with `error-summary` and `p[data-testid=compare-invalid]` "Fix the filters to see the comparison." in place of every result card. No locations: `empty-state`, no form.
+- **Sections in DOM order** (each a `section` whose id is its testid; the jump bar `nav[data-testid=compare-jump]` links to the six after the filters):
+  - `compare-kpis`: `[data-testid=compare-kpi][data-metric=off-most|outages-most|longest|all-off|power-somewhere]` with `compare-kpi-value`, `compare-kpi-name`, `compare-kpi-note`.
+  - `compare-scoreboard`: `table[data-testid=compare-scoreboard-table]`, rows `compare-row[data-location-id][data-rank]`, links `compare-location-link`, bars `svg[data-testid=off-bar]`, tag `partial-data`; phone cards `li[data-testid=compare-card]`.
+  - `compare-timeline`: `svg[data-testid=compare-timeline-chart][role=img]` (title `compare-timeline-chart-title`), `tl-day`, `tl-lane[data-location-id=<pk>|together]`, `tl-seg[data-state][data-start-us][data-end-us]`, `tl-total`, `tl-now`, `tl-week-divider`; `compare-timeline-hint` (phones), `compare-timeline-cap`, `compare-earlier`, `details[data-testid=compare-daily]` with `compare-daily-table`.
+  - `compare-overlap`: `compare-matrix` with `matrix-cell[data-row-id][data-col-id][data-share][data-bucket]`; `compare-pairs` rows `pair-row[data-a][data-b]` (phones: `pair-card`), `compare-pairs-none`; `compare-simultaneous` rows `sim-row` with `sim-all` (phones: `sim-card`), `compare-simultaneous-empty`, `compare-simultaneous-cap`; with one location only `compare-overlap-single`.
+  - `compare-hours`: `svg[data-testid=compare-hours-chart][role=img]`, `hour-lane`, `hour-cell[data-location-id][data-hour][data-pct]`, `hour-peak`, `compare-hours-legend`, `compare-hours-hint` (phones).
+  - `compare-weeks`: `table[data-testid=compare-weeks-table]` (R-2), `week-cell[data-week][data-location-id][data-off-us]`, `week-partial`.
+- **Limits:** custom period ≤ 366 days from 01.01.2026; the timeline shows the last 31 days ("Earlier days" link); at most 100 simultaneous outages with "Showing the latest 100 of M.".
+- **Tests:** `tests/chart/test_compare.py`, `tests/web/test_compare_data.py`, `test_compare_chart.py`, `test_compare_page.py`, `test_compare_perf.py` (D-10), plus the S14 rows of the render matrix, INV-23 pages and TEST-STRATEGY §9.
 
 **S7, S9, S10, S11 in Phase 6.** Each becomes the body of the confirmation modal (UI-07, D6-05): the modal loads the same server GET, so the pre-checks, refusal redirects, state block and HMAC marker are unchanged. The full pages stay as the no-JS and deep-link fallback.
 

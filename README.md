@@ -1478,6 +1478,42 @@ Each text is also a manifest entry. The chart's Inter TTFs have their own licenc
 - The only value the admin keeps in browser storage is the sidebar's collapsed-rail flag
   (`localStorage`). It never stores a secret.
 
+### Compare page
+
+(Added 2026-11-03, quick task 261103-lfm.)
+
+"Compare" in the sidebar (`/compare/`) compares locations over one period. Pick the
+locations (all by default) and a period: 7, 14, 30 or 90 days ending today, or a custom
+period. The filters are a plain GET form, so every comparison is a bookmarkable URL. The
+page has seven cards:
+
+1. **Filters.**
+2. **Summary:** who was off longest and had the most outages, the longest outage, the time
+   all locations were off together, and the time power was on somewhere.
+3. **Outages by location:** off time, off share, monitored share ("partial data" below
+   90 %), outage count, average, median and longest outage, days with outages and off time
+   per day.
+4. **Timeline:** the Telegram chart's day lanes drawn in the browser, one lane per location
+   plus a "Together" lane (all off at once) for two or more, with hover titles, the today
+   band and the now marker. A daily-totals table sits under it.
+5. **Overlap:** the share of each location's off time when another was off too, the
+   pairs (both off, coinciding outages, start and end gaps), and the simultaneous outages.
+6. **Hours:** the off share by hour of day.
+7. **Weeks:** off time and outage count per Monday-to-Sunday week.
+
+Limits:
+- A custom period starts on 01.01.2026 or later, ends today or earlier, and spans at most
+  366 days.
+- The timeline shows the last 31 days of the period. "Earlier days" opens the up to 31
+  days before them as a custom period.
+- At most 100 simultaneous outages are listed, newest first, with the total.
+
+The page only reads the stored timeline, in one consistent read-only snapshot (at most 4
+queries whatever the number of locations). It writes nothing, sends nothing and queues
+nothing. It needs no JavaScript: the charts are inline SVG drawn by the server, and every
+interaction is a link, a GET form, a `<details>` element or a hover title. The Telegram
+chart's colours and day rules (`docs/chart-spec.md`) apply, including the DST days.
+
 ### Phase 6 recorded checks
 
 The test suite covers the server side of every page, endpoint and rule. The checks below
