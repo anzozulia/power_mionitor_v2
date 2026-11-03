@@ -17,6 +17,7 @@ The trails, one per app page (06-UI-SPEC page contracts):
 - ``location-regenerate``: Locations › {name} › Device setup › Regenerate key
 - ``outage-remove``: Locations › {name} › Remove outage
 - ``location-reset``: Locations › {name} › Reset history
+- ``location-compare``: Compare (a root trail, ``ROOT_TRAILS``: not under Locations)
 
 A POST answered with another page shows that page's trail (``POST_TRAILS``): the
 Regenerate POST answers with the revealed setup page (D-14), so it gets
@@ -78,6 +79,9 @@ TRAILS: dict[str, tuple[Step, ...]] = {
     "location-reset": ((NAME, DETAIL_ROUTE), ("Reset history", None)),
 }
 
+# The pages that are not under Locations: their one-item trail (quick task 261103-lfm, R-3).
+ROOT_TRAILS: dict[str, str] = {"location-compare": "Compare"}
+
 # The routes whose POST answers with another page, mapped to that page's route: the
 # Regenerate POST renders the setup page (location_views.RegenerateKeyView.post).
 POST_TRAILS: dict[str, str] = {"location-regenerate": SETUP_ROUTE}
@@ -94,6 +98,8 @@ def trail_for(url_name: object, location: object) -> list[Crumb]:
     ``location`` needs a ``pk`` and a string ``name`` when the trail shows its name; any
     other object, None included, gives the one-item trail. So does an unknown name.
     """
+    if isinstance(url_name, str) and url_name in ROOT_TRAILS:
+        return [Crumb(ROOT_TRAILS[url_name], None)]
     steps = TRAILS.get(url_name) if isinstance(url_name, str) else None
     if steps is None:
         return fallback()

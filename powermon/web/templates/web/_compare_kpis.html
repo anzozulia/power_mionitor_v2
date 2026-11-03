@@ -1,0 +1,17 @@
+{% comment %}
+The Compare page's KPI tiles (quick task 261103-lfm, D-5 item 2). Parameter: kpis
+(compare_chart.Tile, in order: off-most, outages-most, longest, then all-off and
+power-somewhere for two or more locations).
+
+Each tile is a cell in the Fleet health style: the uppercase micro label, the 20 px mono
+value [data-testid=compare-kpi-value], the location it names [data-testid=compare-kpi-name]
+when there is one, and a short note (a date or a share). A tile that cannot be computed
+shows "—". Every class is spelled out; no class name is built from data.
+{% endcomment %}<div class="grid grid-cols-1 gap-2 p-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
+{% for tile in kpis %}<div data-testid="compare-kpi" data-metric="{{ tile.metric }}" class="flex min-h-11 min-w-0 flex-col items-start gap-1 rounded-control border border-border bg-surface px-3 py-2">
+<p class="text-label font-semibold uppercase tracking-label text-fg-muted">{{ tile.label }}</p>
+<p data-testid="compare-kpi-value" class="num text-title font-semibold text-fg">{{ tile.value }}</p>
+{% if tile.name %}<p data-testid="compare-kpi-name" class="min-w-0 max-w-full text-body font-semibold break-words text-fg">{{ tile.name }}</p>{% endif %}
+{% if tile.note %}<p data-testid="compare-kpi-note" class="num text-label text-fg-muted">{{ tile.note }}</p>{% endif %}
+</div>
+{% endfor %}</div>

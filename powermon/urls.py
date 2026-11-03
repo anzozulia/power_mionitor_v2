@@ -3,6 +3,7 @@
 from django.urls import path
 
 from powermon.web.chart_preview import LocationChartView
+from powermon.web.compare_views import CompareView
 from powermon.web.history_views import (
     HistoryResetView,
     OutageRemoveView,
@@ -32,6 +33,8 @@ from powermon.web.views import (
 urlpatterns = [
     path("", LocationListView.as_view(), name="location-list"),
     path("locations/new/", LocationCreateView.as_view(), name="location-create"),
+    # Compare locations (quick task 261103-lfm): GET only, reads the stored timeline.
+    path("compare/", CompareView.as_view(), name="location-compare"),
     # The live status of every location (UI-05): fixed vocabulary, no name, no secret.
     path("locations/status.json", LocationStatusJsonView.as_view(), name="location-status-json"),
     path("locations/<int:pk>/", LocationDetailView.as_view(), name="location-detail"),

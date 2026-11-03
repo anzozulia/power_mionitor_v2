@@ -606,6 +606,21 @@ def test_assert_page_accepts_a_valid_app_page() -> None:
     assert CSP == HEADERS["Content-Security-Policy"]
 
 
+def test_assert_page_accepts_a_search_get_form() -> None:
+    # R-1 (quick task 261103-lfm): a GET form with role="search" and no CSRF input passes;
+    # the same form without the role is still refused (the BROKEN case below).
+    search = APP_PAGE.replace(
+        "<h1>Office</h1>",
+        '<h1>Office</h1><form method="get" role="search" action="/compare/">'
+        '<label>From <input type="date" name="from"></label>'
+        '<input type="hidden" name="loc" value=""><button>Compare</button></form>',
+    )
+
+    page = assert_page(_page_response(search), title="Office", app=True)
+
+    assert page.find("form", attrs={"role": "search"}) is not None
+
+
 BARE_PAGE = APP_PAGE.replace(
     '<aside id="sidebar" data-testid="sidebar">', '<aside id="sidebar">'
 ).replace('<header data-testid="topbar">', "<header>")
@@ -646,6 +661,13 @@ BROKEN = [
         '<form method="dialog">',
         '<form method="get" action="/">',
         "form to '/' is not a POST form",
+    ),
+    # R-1 (quick task 261103-lfm): a role=search GET form must not carry a CSRF token.
+    (
+        '<form method="dialog">',
+        '<form method="get" role="search" action="/compare/">'
+        '<input type="hidden" name="csrfmiddlewaretoken" value="csrf-value">',
+        "GET form to '/compare/' carries a CSRF token",
     ),
     (
         '<input type="hidden" name="csrfmiddlewaretoken" value="csrf-value">',

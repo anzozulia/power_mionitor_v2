@@ -9,7 +9,8 @@ nav's aria-current (None for a bare request: nothing is current).
 
 - Brand row (48 px): zap mark, wordmark, aria-hidden ops tag, link to the list; below lg
   the drawer close button (JS only, rendered hidden) sits at the right.
-- Main nav: Locations and Add location, aria-current on the active one.
+- Main nav: Locations, Add location and Compare (quick task 261103-lfm, icon
+  calendar-days), aria-current on the active one.
 - Locations group: label and count (data-live=sidebar-count), the aria-hidden summary
   (shell.sb_summary) and its sr sentence (data-live=summary-sr), then one link per
   location in list order, each one click from its page, aria-current on the location the
@@ -46,6 +47,7 @@ page. Every class is spelled out: no class name is ever built from data.
       <ul class="flex flex-col gap-1">
         <li><a href="{% url 'location-list' %}" data-testid="nav-locations" title="Locations"{% if request.resolver_match.url_name == "location-list" %} aria-current="page"{% endif %} class="group flex min-h-11 items-center gap-2 rounded-control px-2 text-sb-fg hover:bg-sb-hover aria-[current=page]:bg-sb-active-bg aria-[current=page]:font-semibold aria-[current=page]:text-sb-active-fg aria-[current=page]:[box-shadow:inset_2px_0_0_var(--brand)] lg:min-h-(--nav-item-h) xl:in-data-[rail=collapsed]:justify-center motion-safe:transition-colors motion-safe:duration-150">{% icon "layout-grid" class="size-4 shrink-0 text-sb-fg-muted group-aria-[current=page]:text-current" %}<span class="truncate xl:in-data-[rail=collapsed]:sr-only">Locations</span></a></li>
         <li><a href="{% url 'location-create' %}" data-testid="nav-add-location" title="Add location"{% if request.resolver_match.url_name == "location-create" %} aria-current="page"{% endif %} class="group flex min-h-11 items-center gap-2 rounded-control px-2 text-sb-fg hover:bg-sb-hover aria-[current=page]:bg-sb-active-bg aria-[current=page]:font-semibold aria-[current=page]:text-sb-active-fg aria-[current=page]:[box-shadow:inset_2px_0_0_var(--brand)] lg:min-h-(--nav-item-h) xl:in-data-[rail=collapsed]:justify-center motion-safe:transition-colors motion-safe:duration-150">{% icon "plus" class="size-4 shrink-0 text-sb-fg-muted group-aria-[current=page]:text-current" %}<span class="truncate xl:in-data-[rail=collapsed]:sr-only">Add location</span></a></li>
+        <li><a href="{% url 'location-compare' %}" data-testid="nav-compare" title="Compare"{% if request.resolver_match.url_name == "location-compare" %} aria-current="page"{% endif %} class="group flex min-h-11 items-center gap-2 rounded-control px-2 text-sb-fg hover:bg-sb-hover aria-[current=page]:bg-sb-active-bg aria-[current=page]:font-semibold aria-[current=page]:text-sb-active-fg aria-[current=page]:[box-shadow:inset_2px_0_0_var(--brand)] lg:min-h-(--nav-item-h) xl:in-data-[rail=collapsed]:justify-center motion-safe:transition-colors motion-safe:duration-150">{% icon "calendar-days" class="size-4 shrink-0 text-sb-fg-muted group-aria-[current=page]:text-current" %}<span class="truncate xl:in-data-[rail=collapsed]:sr-only">Compare</span></a></li>
       </ul>
     </nav>
     {% if sidebar %}{% with now=sidebar.now counts=sidebar.counts %}

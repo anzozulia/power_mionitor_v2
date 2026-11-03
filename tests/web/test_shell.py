@@ -255,6 +255,8 @@ def test_UI01_breadcrumb_trails(location_factory: Callable[..., Any]) -> None:
         f"{setup}regenerate/": [home, named, ("Device setup", setup), ("Regenerate key", None)],
         f"{detail}outages/1790000000000000/remove/": [home, named, ("Remove outage", None)],
         f"{detail}reset/": [home, named, ("Reset history", None)],
+        # A root trail (quick task 261103-lfm, R-3): not under Locations.
+        "/compare/": [("Compare", None)],
     }
 
     for path, expected in cases.items():
