@@ -168,8 +168,8 @@
 1. **Status panel** (`dl`):
    - Status.
    - **Power state** row, only while maintenance is on. It has help text:
-     - when power is on: "OFF is not detected during maintenance.";
-     - when power is off: "The outage goes on. When power returns, the ON alert is sent as usual.".
+     - when power is on: "OFF is not detected and no new chart is posted during maintenance.";
+     - when power is off: "The outage goes on. When power returns, it is recorded with no ON alert.".
    - On since (power on) or Outage since (power off); neither while waiting.
    - Last heartbeat.
    - Delivery:

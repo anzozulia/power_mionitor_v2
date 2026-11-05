@@ -44,7 +44,7 @@ from urllib3.exceptions import MaxRetryError, NewConnectionError
 from powermon.alerts import ops, outbox
 from powermon.alerts.models import OutboxMessage
 from powermon.chart import lifecycle, model, render, source
-from powermon.chart.model import Piece, Week
+from powermon.chart.model import Week
 from powermon.chart.models import ChartMessage
 from powermon.engine import lapse, rules, transitions
 from powermon.locations.models import Location
@@ -213,6 +213,7 @@ def _location(
     *,
     router_grace: bool = False,
     refresh_min: int = 15,
+    maintenance: bool = False,
 ) -> lifecycle.ChartLocation:
     """A monitored location as the planner sees it: period 60 s, grace 30 s.
 
@@ -227,6 +228,7 @@ def _location(
         DEFAULT_CHAT_ID,
         settle,
         refresh_min=refresh_min,
+        maintenance=maintenance,
     )
 
 
@@ -713,13 +715,10 @@ def test_D03_waiting_location_makes_no_chart_call_until_its_first_heartbeat(
     assert fake_telegram.count(TOKEN_B, "sendPhoto") == 0
 
 
-def test_INV05_chart_ignores_alerts_enabled_and_maintenance(
+def test_INV05_chart_ignores_alerts_enabled(
     location_factory: Callable[..., Any], fake_telegram: Any
 ) -> None:
-    location = location_factory(alerts_enabled=False, maintenance=True)
-    # In maintenance the live piece is not monitored (INV-04); the status stays on.
-    set_status(location, "on", at=SINCE)
-    insert_pieces(location, [Piece("not_monitored", SINCE, None, None)])
+    location = _monitored(location_factory, alerts_enabled=False)
     fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
     clock = FakeClock(NOON_05)
     state = io_loop.RelayState()
@@ -735,12 +734,11 @@ def test_INV05_chart_ignores_alerts_enabled_and_maintenance(
         "editMessageMedia",
     ]
     [row] = _rows()
+    assert location.pk == row.location_id
     assert (row.pinned, row.last_rendered_at) == (True, clock.now())
 
 
-def test_D03_maintenance_all_day_caption(
-    location_factory: Callable[..., Any], fake_telegram: Any
-) -> None:
+def test_D03_maintenance_all_day_caption(location_factory: Callable[..., Any]) -> None:
     # Monitored since yesterday; in maintenance since yesterday 20:00, so today has no on
     # or off time at all: its row shows "—", and the caption no longer claims "no
     # outages" but says "not monitored" (D-03, Phase 3 IN-05).
@@ -755,12 +753,9 @@ def test_D03_maintenance_all_day_caption(
             ]
         ),
     )
-    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
 
-    assert _pass(FakeClock(NOON_05), io_loop.RelayState()) is True
-
-    [photo] = _chart_calls(fake_telegram, "sendPhoto")
-    assert photo.fields["caption"] == "Today: not monitored"
+    _, live = lifecycle.chart_content(_location(location.pk), TODAY, NOON_05, live=True, tz=KYIV)
+    assert live == "Today: not monitored"
     # The day's finished render: line 1 only, in the neutral form too (D-13).
     _, finished = lifecycle.chart_content(
         _location(location.pk), TODAY, kyiv("2026-10-02 00:00"), live=False, tz=KYIV
@@ -1198,6 +1193,74 @@ def test_pin_due_is_false_for_a_finalized_record() -> None:
     assert lifecycle._pin_due(dataclasses.replace(finalized, finalized_at=None)) is True
     pinned = dataclasses.replace(finalized, finalized_at=None, pinned=True)
     assert lifecycle._pin_due(pinned) is False
+
+
+# Maintenance: no new chart, and the last one stays pinned (quick task 261105-wsf)
+
+
+def _plan_at_noon(
+    location: lifecycle.ChartLocation, rows: list[lifecycle.ChartRow], settled: Any = frozenset()
+) -> lifecycle.Action | None:
+    return lifecycle.plan(
+        [location], rows, today=TODAY, now=NOON_05, not_before={}, settled=settled, tz=KYIV
+    )
+
+
+def test_plan_maintenance_posts_no_chart() -> None:
+    assert _plan_at_noon(_location(1, maintenance=True), []) is None
+    plain = _location(1)
+    assert _plan_at_noon(plain, []) == lifecycle.Action("post", plain)
+
+
+def test_plan_maintenance_pins_nothing_and_keeps_todays_updates() -> None:
+    fresh = _row(11, 1, rendered=NOON_05, pinned=False)
+    assert _plan_at_noon(_location(1, maintenance=True), [fresh]) is None
+    plain = _location(1)
+    assert _plan_at_noon(plain, [fresh]) == lifecycle.Action("pin", plain, fresh)
+
+    # A chart already posted for today still updates until its day ends.
+    in_maintenance = _location(1, maintenance=True)
+    earlier = _row(11, 1, rendered=NOON_05 - timedelta(hours=1))
+    assert _plan_at_noon(in_maintenance, [earlier]) == lifecycle.Action(
+        "refresh", in_maintenance, earlier
+    )
+
+
+def test_plan_maintenance_finalizes_the_old_chart_and_keeps_its_pin() -> None:
+    a = _location(1, maintenance=True)
+    older = _row(10, 1, rendered=NOON_05 - timedelta(days=1), day=TODAY - timedelta(days=1))
+
+    assert _plan_at_noon(a, [older]) is None
+    assert _plan_at_noon(a, [older], {10}) == lifecycle.Action("finalize", a, older)
+    # Finished and still pinned: nothing more is due, however long maintenance lasts.
+    finished = dataclasses.replace(older, finalized_at=NOON_05)
+    assert _plan_at_noon(a, [finished], {10}) is None
+
+
+def test_plan_maintenance_unpins_every_older_record_but_the_newest_pinned() -> None:
+    a = _location(1, maintenance=True)
+    oldest = _row(9, 1, rendered=NOON_05, day=TODAY - timedelta(days=3))
+    newest = _row(10, 1, rendered=NOON_05, day=TODAY - timedelta(days=1))
+    assert _plan_at_noon(a, [oldest, newest]) == lifecycle.Action("unpin", a, oldest)
+
+    # A newer record that is not pinned keeps nothing: the pinned one before it stays.
+    unpinned = _row(11, 1, rendered=NOON_05, day=TODAY - timedelta(days=1), pinned=False)
+    pinned = _row(10, 1, rendered=NOON_05, day=TODAY - timedelta(days=2))
+    assert _plan_at_noon(a, [pinned, unpinned]) == lifecycle.Action("unpin", a, unpinned)
+
+    # With no pinned record at all, there is no pin to keep.
+    lone = _row(10, 1, rendered=NOON_05, day=TODAY - timedelta(days=1), pinned=False)
+    assert _plan_at_noon(a, [lone]) == lifecycle.Action("unpin", a, lone)
+
+
+def test_plan_maintenance_unpins_the_old_chart_once_todays_is_pinned() -> None:
+    a = _location(1, maintenance=True)
+    older = _row(10, 1, rendered=NOON_05, day=TODAY - timedelta(days=1))
+    today_pinned = _row(11, 1, rendered=NOON_05)
+    assert _plan_at_noon(a, [older, today_pinned]) == lifecycle.Action("unpin", a, older)
+    # Posted but not pinned yet: the old pin stays, so the channel is never left without one.
+    today_unpinned = _row(11, 1, rendered=NOON_05, pinned=False)
+    assert _plan_at_noon(a, [older, today_unpinned]) is None
 
 
 def test_plan_final_edit_waits_for_its_day_and_never_holds_the_unpin() -> None:

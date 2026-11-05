@@ -14,13 +14,14 @@ Phase 4 writer uses, so the toggle cannot deadlock with a heartbeat or ``mark_of
 here does network I/O, and time always comes from the caller (``now``), never from SQL
 ``now()``. Parameters go in as ``%(name)s`` placeholders, never formatted into the SQL.
 
-Maintenance has exactly one effect: OFF is not detected (INV-05). The detector's snapshot
-and its OFF CAS skip a location in maintenance, so no OFF and no OFF alert is recorded while
-it is on. Everything else carries on:
+While it is on, subscribers hear nothing new (INV-05, amended by quick task 261105-wsf). OFF
+is not detected: the detector's snapshot and its OFF CAS skip a location in maintenance, so
+no OFF and no OFF alert is recorded. A restore queues no ON alert. No new chart is posted or
+pinned (``chart.lifecycle``). Everything else carries on:
 
 - Heartbeats are still recorded. A restore during maintenance takes ``record_heartbeat``'s
-  usual path and queues the ON alert (when alerts are on), "was OFF for" counted from the
-  original outage start (D-01); the open piece stays ``not_monitored`` until the exit.
+  usual path, with no ON alert and none saved for later (replaces D-01); the open piece stays
+  ``not_monitored`` until the exit.
 - Leaving maintenance with the location on writes ``window_start_at`` = the exit, a fresh
   detection window (INV-04 #2). Leaving it with the location off reopens ``off`` with the
   locked ``outage_started_at``: one outage, no second OFF alert, and its off time excludes

@@ -84,8 +84,8 @@ XSS_NAME = "<script>alert(1)</script>"
 ESCAPED_XSS_NAME = "&lt;script&gt;alert(1)&lt;/script&gt;"
 ROUTER_GRACE_S = int(rules.ROUTER_GRACE.total_seconds())
 # 06-UI-SPEC copy table, loc.banner_mnt_body.
-HELP_POWER_ON = "OFF is not detected during maintenance."
-HELP_POWER_OFF = "The outage goes on. When power returns, the ON alert is sent as usual."
+HELP_POWER_ON = "OFF is not detected and no new chart is posted during maintenance."
+HELP_POWER_OFF = "The outage goes on. When power returns, it is recorded with no ON alert."
 MIGRATED_CHAT_ID = -1001234567999
 MIGRATE_LINE = DELIVERY_MIGRATE_LINE.format(new_chat_id=MIGRATED_CHAT_ID)
 DELIVERY_OK_ROW = ("Delivery", f"OK {DELIVERY_OK_HELP}")

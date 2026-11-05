@@ -256,8 +256,9 @@ def record_heartbeat(location_id: int, now: datetime) -> str:
     locked status, all in one transaction with no network I/O (INV-01, HB-03). A heartbeat
     that arrives while another writer of this location is mid-transaction waits for it
     and sees its result (WR-01). Returns "restored" (off -> on, with one power_on alert
-    queued when alerts are on), "started" (waiting -> on, silent), "plain" (already on) or
-    "ignored" (this location has no state row, or it is deleted; nothing is written).
+    queued when alerts are on and maintenance is off), "started" (waiting -> on, silent),
+    "plain" (already on) or "ignored" (this location has no state row, or it is deleted;
+    nothing is written).
 
     The deleted check runs right after the row lock and before any gate (D-09, LOC-04).
     The heartbeat lookup already skips deleted locations, but a heartbeat that looked up
@@ -339,7 +340,9 @@ def record_heartbeat(location_id: int, now: datetime) -> str:
             timeline.set_open_state(
                 cur, location_id, at, rules.desired_open_state("on", maintenance)
             )
-            if alerts_enabled:
+            # No ON alert during maintenance, and none saved for later (quick task 261105-wsf):
+            # the restore itself is recorded as usual, above.
+            if alerts_enabled and not maintenance:
                 outbox.enqueue(
                     outbox.KIND_POWER_ON,
                     location_id,

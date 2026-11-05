@@ -160,15 +160,16 @@ DELIVERY_RETRY_LINE = "Queued alerts are retried every 15 minutes until they exp
 
 # UI-SPEC Copywriting › Switches, verbatim.
 MAINTENANCE_HELP = (
-    "While on, OFF is not detected, so no OFF alert is sent, and the chart shows the time as "
-    "not monitored. Heartbeats are still recorded: if an outage was already in progress, its "
-    "ON alert is sent as usual when power returns. Turning maintenance off starts a fresh "
-    "detection window."
+    "While on, OFF is not detected and subscribers get no OFF or ON alerts and no new chart. "
+    "The chart shows the time as not monitored. Heartbeats are still recorded: if an outage "
+    "was already in progress, its end is recorded with no ON alert. The chart already posted "
+    "stays pinned and stops at the end of its day. Turning maintenance off posts today's "
+    "chart and starts a fresh detection window."
 )
 MAINTENANCE_COPY = {
     "on": (
-        "Maintenance is on. OFF is not detected and no OFF alert is sent; the chart shows "
-        "this time as not monitored."
+        "Maintenance is on. Subscribers get no OFF or ON alerts and no new chart; the chart "
+        "shows this time as not monitored."
     ),
     "off": (
         "Maintenance is off. OFF detection starts again now; silence during maintenance does "
