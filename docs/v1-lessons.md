@@ -83,12 +83,14 @@ Source: a September 2026 investigation of the v1 codebase (Django, last changed 
   - Given maintenance switched off at 12:00 while the device is still silent (last heartbeat 09:58), then no OFF is recorded before 12:01:30, and the outage starts at 12:00, not 09:58.
 - **Covers:** LOC-08, MON-05, CHRT-01, CHRT-03
 
-#### INV-05 Each toggle has exactly one effect
-- **Rule:** "Alerts off" stops only the messages to subscribers. Transitions, the timeline, the chart and the midnight re-pin carry on. Maintenance suppresses off detection, the ON alert and any new chart post or pin; the chart already posted stops at the end of its day and stays pinned until maintenance ends (amended 2026-11-05, quick task 261105-wsf). Router grace only changes the effective timeout for future decisions. Whether an alert is sent is decided when its transition is recorded.
+#### INV-05 Each toggle does only what it says
+- **Rule:** "Alerts off" stops only the messages to subscribers. Transitions, the timeline, the chart and the midnight re-pin carry on. Maintenance suppresses off detection, the ON alert and any new chart post or pin; the chart already posted stops at the end of its day and stays pinned until maintenance ends, and alerts still queued when it starts are dropped (amended 2026-11-05, quick task 261105-wsf). Router grace only changes the effective timeout for future decisions. Whether an alert is sent is decided when its transition is recorded.
 - **v1 failure:** Every chart job (and the refresh/sync/reset commands) filtered on "alerting enabled". Muting alerts therefore also silently stopped the chart and left yesterday's chart pinned. (code read)
 - **Acceptance:**
   - Given alerts off for location A, when A has an outage, then subscribers get 0 messages, while the timeline, the 15-min refresh, the totals and the midnight re-pin all work as normal.
   - Given alerts off when the off transition is recorded and back on before power returns, then only the ON alert is sent.
+  - Given maintenance on while an outage is in progress, when power returns, then the restore is recorded and subscribers get 0 messages, and none is sent when maintenance ends.
+  - Given maintenance on across local midnight, then no chart is posted or pinned, yesterday's chart gets its final edit and stays pinned, and when maintenance ends today's chart is posted and pinned and yesterday's is unpinned.
 - **Covers:** LOC-08, LOC-09, LOC-10
 
 #### INV-06 Changing thresholds never rewrites history

@@ -38,7 +38,7 @@ from django.test import Client
 from powermon.alerts.models import OutboxMessage
 from powermon.chart import source
 from powermon.chart.models import ChartMessage
-from powermon.engine import rules, transitions
+from powermon.engine import maintenance, rules, transitions
 from powermon.engine.models import LocationState, PowerInterval, SystemState
 from powermon.locations.models import Location
 from powermon.worker import detection, io_loop
@@ -135,6 +135,33 @@ def test_INV05_1_alerts_off_outage_sends_nothing(
     # Subscribers got 0 messages for the whole outage.
     assert fake_telegram.count(DEFAULT_BOT_TOKEN, "sendMessage") == 0
     assert len(fake_telegram.calls) == 0
+
+
+def test_alert_queued_before_maintenance_is_dropped_and_nothing_follows(
+    location_factory: Callable[..., Any], fake_telegram: FakeTelegram
+) -> None:
+    location = _beating(location_factory, name="Office")
+    fake_telegram.accept(DEFAULT_BOT_TOKEN)
+    relay = io_loop.RelayState()
+
+    # The OFF is queued, not sent yet, when maintenance starts.
+    assert detection.run_cycle(_at(10, 6, 31)) == 1
+    [off] = OutboxMessage.objects.all()
+    assert off.status == "pending"
+    assert maintenance.set_maintenance(location.pk, True, _at(10, 6, 40)) is True
+
+    # The next pass drops it: subscribers never get a late OFF with no ON to follow it.
+    assert io_loop.run_iteration(FakeClock(_at(10, 6, 45)), relay) is False
+    off.refresh_from_db()
+    assert (off.status, off.last_error) == ("dropped", "maintenance")
+
+    # Power returns during maintenance: recorded, and nothing is queued, then or at the exit.
+    assert transitions.record_heartbeat(location.pk, _at(11, 0)) == "restored"
+    assert LocationState.objects.get(location=location).status == "on"
+    assert maintenance.set_maintenance(location.pk, False, _at(11, 5)) is True
+    assert io_loop.run_iteration(FakeClock(_at(11, 5, 5)), relay) is False
+    assert OutboxMessage.objects.count() == 1
+    assert fake_telegram.sent == []
 
 
 def test_alerts_already_queued_still_go_out(

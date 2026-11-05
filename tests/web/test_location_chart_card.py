@@ -194,6 +194,10 @@ def test_UI06_chart_card_waiting_with_history_and_maintenance(
         assert image["src"] == _chart(location)
         assert all_by_testid(page, "chart-full-size")
         assert not all_by_testid(page, "weekly-chart-empty")
+        # The channel's pinned chart stopped at its own day: this preview is not that chart.
+        in_maintenance = "Today's chart, not posted during maintenance" in text(_card(page))
+        assert in_maintenance is (status == "maintenance")
+        assert (CHART_DESC in text(_card(page))) is (status != "maintenance")
 
 
 @pytest.mark.django_db

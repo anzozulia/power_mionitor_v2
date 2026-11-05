@@ -429,9 +429,10 @@ changes the rules for `Europe/Kyiv`, bump the Python and postgres image tags.
   previous week, dimmed. The worker keeps it up to date by itself:
   - The first chart is posted at the location's first heartbeat; the chart starts there,
     and the time before it is empty (no data). A location still waiting for its first
-    heartbeat gets no chart.
+    heartbeat gets no chart, and neither does a location in maintenance until it ends.
   - At local midnight (`DISPLAY_TZ`) a new chart for the new day is posted silently and
-    pinned silently, and the previous day's chart is unpinned. Two charts are pinned for
+    pinned silently, and the previous day's chart is unpinned. During maintenance neither
+    happens: the previous day's chart stays pinned. Two charts are pinned for
     a few seconds at most. About two minutes later, once detection has run past
     midnight by the location's heartbeat timeout (or its boot delay, if longer; Amended
     2026-11-01, quick task 261101-g9v) plus a short margin, the previous day's
@@ -497,7 +498,8 @@ changes the rules for `Europe/Kyiv`, bump the Python and postgres image tags.
     - **Maintenance:** OFF is not detected, so no OFF alert is sent, and the chart shows
       the time as not monitored (hatched). Heartbeats are still recorded: an outage that
       was already in progress stays one outage, and its end is recorded with no ON alert,
-      none saved for later. No new chart is posted or pinned: the chart already posted
+      none saved for later. An alert still queued when maintenance starts is dropped too.
+      No new chart is posted or pinned: the chart already posted
       stays pinned, keeps updating until its day ends, gets its final edit and then stops.
       Turning maintenance off posts and pins today's chart and unpins the old one, and
       starts a fresh detection window: silence during maintenance does not count, and

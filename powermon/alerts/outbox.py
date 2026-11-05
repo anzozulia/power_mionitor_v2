@@ -22,6 +22,8 @@ during it:
     pending --expire_due (expires_at <= now)--> expired (never sent, ALRT-03)
     pending --mark_dropped (an ops notice that cannot be rendered)--> dropped (never sent)
     pending --drop_deleted_pending (its location was deleted)--> dropped (never sent, D-09)
+    pending --drop_maintenance_pending (its location is in maintenance)--> dropped (never
+        sent, quick task 261105-wsf)
     pending --make_due (a recorded success or a channel change)--> pending, due now
     pending --remove_outage (its outage was removed)--> dropped (outage_removed)
     dropped (outage_removed) --fail_delete of its OFF--> pending (sent after all, unless a
@@ -137,6 +139,8 @@ OPS_KINDS = (
 MAX_ERROR_LENGTH = 64
 # ``last_error`` of a subscriber row dropped because its location was deleted (D-09).
 LOCATION_DELETED = "location_deleted"
+# ``last_error`` of a subscriber alert dropped because maintenance is on (261105-wsf).
+IN_MAINTENANCE = "maintenance"
 # ``last_error`` of a subscriber alert dropped because its outage was removed (D-04).
 OUTAGE_REMOVED = "outage_removed"
 ONE_US = timedelta(microseconds=1)
@@ -426,6 +430,24 @@ def drop_deleted_pending() -> int:
         status="pending",
         location__deleted_at__isnull=False,
     ).update(status="dropped", last_error=LOCATION_DELETED)
+
+
+def drop_maintenance_pending() -> int:
+    """Drop every pending subscriber row of a location in maintenance; return how many.
+
+    During maintenance subscribers hear nothing new (INV-05 as amended by quick task
+    261105-wsf), including an alert queued before it started and not sent yet, for example
+    while the bot was backing off: a late OFF would otherwise go out with no ON to correct it.
+    A row whose send was in flight at the switch ("sending") is left alone, and is caught
+    here if it comes back to "pending" after a refusal, as is an ON that ``fail_delete``
+    put back. Nothing is saved for later. Runs on the caller's connection, inside its
+    transaction.
+    """
+    return OutboxMessage.objects.filter(
+        channel=CHANNEL_SUBSCRIBER,
+        status="pending",
+        location__maintenance=True,
+    ).update(status="dropped", last_error=IN_MAINTENANCE)
 
 
 def make_due(location_id: int, now: datetime) -> int:
