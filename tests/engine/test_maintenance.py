@@ -10,9 +10,9 @@ changes:
   monitored, never as off (INV-04 #1);
 - leaving it with the location on starts a fresh detection window (``window_start_at``):
   an outage then starts at the exit, not at the last heartbeat before it (INV-04 #2);
-- an outage in progress stays one outage through maintenance (INV-11) and its ON alert is
-  sent as usual when power returns, "was OFF for" counted from the original outage start
-  (D-01);
+- an outage in progress stays one outage through maintenance (INV-11). Its end is recorded
+  during maintenance with no ON alert (quick task 261105-wsf, replaces D-01); after the exit
+  the ON alert goes as usual, "was OFF for" counted from the original outage start;
 - the toggle clamps its instant to the open interval's start, so a lapse carve that moved
   that start never makes it fail (Pitfall 2).
 
@@ -215,7 +215,7 @@ def test_INV04_2_maintenance_exit_starts_a_fresh_window(
     ]
 
 
-# INV-11 and D-01: an outage in progress stays one outage, with its ON alert
+# INV-11: an outage in progress stays one outage; no ON alert during maintenance (261105-wsf)
 
 
 @pytest.mark.django_db(transaction=True)
@@ -255,7 +255,7 @@ def test_INV11_outage_in_progress_stays_one_outage_through_maintenance(
 
 
 @pytest.mark.django_db(transaction=True)
-def test_D01_restore_during_maintenance_sends_the_on_alert(
+def test_restore_during_maintenance_is_recorded_with_no_on_alert(
     location_factory: Callable[..., Any],
 ) -> None:
     location = _off_since_9(location_factory)
@@ -263,9 +263,10 @@ def test_D01_restore_during_maintenance_sends_the_on_alert(
 
     assert transitions.record_heartbeat(location.pk, _at(10, 5)) == "restored"
 
-    assert _kinds() == ["power_off", "power_on"]
-    on = _outbox()[1]
-    assert (on.event_at, on.payload) == (_at(10, 5), {"was_off_us": _us(hours=1, minutes=5)})
+    # Recorded: the location is on since the restore. Not sent: no ON alert is queued.
+    state = _state(location)
+    assert (state.status, state.on_since) == ("on", _at(10, 5))
+    assert _kinds() == ["power_off"]
     # The timeline stays not monitored until maintenance ends.
     assert _intervals(location) == [
         ("on", _at(8, 0), _at(9, 0), None),
@@ -281,7 +282,8 @@ def test_D01_restore_during_maintenance_sends_the_on_alert(
         ("not_monitored", _at(10, 0), _at(10, 10), None),
         ("on", _at(10, 10), None, None),
     ]
-    assert _kinds() == ["power_off", "power_on"]
+    # Nothing was saved for later: leaving maintenance sends no ON alert either.
+    assert _kinds() == ["power_off"]
 
 
 # Edges: waiting, idempotency, deleted, the clamp

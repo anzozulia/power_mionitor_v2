@@ -12,8 +12,8 @@ reads a snapshot of the monitored locations and their chart records and asks the
 ``plan`` for the one step that is due now. There is no timer: a step missed while the
 worker was down is simply due on the next pass.
 
-- Post: a monitored location (status on or off, not deleted; ``alerts_enabled`` and
-  ``maintenance`` never matter, INV-05) with no active record for today's local date gets
+- Post: a monitored location (status on or off, not deleted, not in maintenance;
+  ``alerts_enabled`` never matters, INV-05) with no active record for today's local date gets
   its chart posted silently (D-01, D-03). The record (location, date, the chat it was sent
   to, the bot that sent it, the message id) is written right after Telegram accepts the
   photo and before any pin (INV-17). The bot is named by ``io_loop.bot_key`` of the token
@@ -48,6 +48,11 @@ worker was down is simply due on the next pass.
 - Today's chart deleted in the channel ("message to edit / pin not found" on a refresh
   or a pin): the record is retired (``retired_at``, unpinned) and never called again, and
   the next pass posts exactly one replacement, records it and pins it (INV-17 #3, D-06).
+- Maintenance (quick task 261105-wsf): while it is on, no chart is posted or pinned. A chart
+  already posted for today keeps its regular updates until its day ends, then gets its final
+  edit, which draws that day only. The newest pinned older record keeps its pin, unless
+  today's chart is pinned, so the channel still has a chart to look at. Leaving maintenance
+  needs no extra state: the next passes post and pin today's chart and unpin the old one.
 - Finalize: every older record (``local_date`` before today) that has no final edit yet
   gets its finished-day render (chart-spec §7: now = the local midnight that ends its
   day, no now line, no pill, its one-line caption with the weekday and date, D-01, D-13),
@@ -300,10 +305,11 @@ _REFUSABLE: tuple[Step, ...] = ("post", "refresh")
 # first heartbeat after the reset. Those only get their records released, and leave the
 # snapshot once every such record is retired. The last three columns flag a waiting
 # location, give its chart update period in minutes and its boot delay in seconds (r[11],
-# which ``settle_time`` waits for).
+# which ``settle_time`` waits for). The maintenance flag (r[12]) comes after them.
 LOCATIONS_SQL = """
 SELECT l.id, l.name, l.language, l.bot_token, l.chat_id, l.period_s, l.grace_s, l.router_grace,
-       l.deleted_at IS NOT NULL, s.status = 'waiting', l.chart_refresh_min, l.boot_delay_s
+       l.deleted_at IS NOT NULL, s.status = 'waiting', l.chart_refresh_min, l.boot_delay_s,
+       l.maintenance
   FROM location l
   JOIN location_state s ON s.location_id = l.id
  WHERE (s.status IN ('on', 'off') AND l.deleted_at IS NULL)
@@ -360,6 +366,8 @@ class ChartLocation:
     # The location's chart update period in minutes, one of 1, 5, 10, 15, 30, 60 (CHRT-02,
     # 261006-of9); the DB CHECK location_chart_refresh_valid keeps any other value out.
     refresh_min: int = DEFAULT_CHART_REFRESH_MIN
+    # In maintenance: no chart is posted or pinned, and the pin in place stays (``_kept_pin``).
+    maintenance: bool = False
 
 
 @dataclass(frozen=True)
@@ -562,6 +570,7 @@ def read_snapshot(today: date) -> tuple[list[ChartLocation], list[ChartRow]]:
                 deleted=r[8],
                 awaiting_heartbeat=r[9],
                 refresh_min=r[10],
+                maintenance=r[12],
             )
             for r in cur.fetchall()
         ]
@@ -610,6 +619,8 @@ def plan(
     no step at all once none is left: the snapshot's two reads are separate statements, so
     it may come without rows, and it must never be posted or pinned (D-08, RESEARCH
     Pitfall 1).
+    A location in maintenance posts and pins nothing, and its last pin stays (``_kept_pin``,
+    quick task 261105-wsf).
     Within a location the steps go in D-02 order: post today's chart, pin it, give the
     oldest older record without one its final edit, unpin the oldest older record not
     unpinned yet, whatever ``pinned`` says (its pin may have taken effect unrecorded,
@@ -700,11 +711,17 @@ def _midnight_step(
     """
     location_id = location.location_id
     if today_row is None:
-        if not waiting(chart_key(location_id, "post")) and not waiting(
-            io_loop.chat_key(location.bot_token, location.chat_id)
+        if (
+            not location.maintenance
+            and not waiting(chart_key(location_id, "post"))
+            and not waiting(io_loop.chat_key(location.bot_token, location.chat_id))
         ):
             return Action("post", location)
-    elif _pin_due(today_row) and _free(location, "pin", today_row, waiting):
+    elif (
+        not location.maintenance
+        and _pin_due(today_row)
+        and _free(location, "pin", today_row, waiting)
+    ):
         return Action("pin", location, today_row)
     older = sorted(
         (row for row in rows if row.location_id == location_id and row.local_date < today),
@@ -717,10 +734,26 @@ def _midnight_step(
             and _free(location, "finalize", row, waiting)
         ):
             return Action("finalize", location, row)
+    kept = _kept_pin(location, older, today_row)
     for row in older:
-        if row.unpinned_at is None and _free(location, "unpin", row, waiting):
+        if row is not kept and row.unpinned_at is None and _free(location, "unpin", row, waiting):
             return Action("unpin", location, row)
     return None
+
+
+def _kept_pin(
+    location: ChartLocation, older: list[ChartRow], today_row: ChartRow | None
+) -> ChartRow | None:
+    """The older record that stays pinned during maintenance, or None (261105-wsf).
+
+    No new chart takes its place while maintenance is on, so the newest pinned older record
+    (``older`` is oldest first) keeps its pin, unless today's chart is pinned already. Once
+    maintenance ends, today's chart is posted and pinned and this record gets its one unpin.
+    """
+    if not location.maintenance or (today_row is not None and today_row.pinned):
+        return None
+    pinned = [row for row in older if row.pinned]
+    return pinned[-1] if pinned else None
 
 
 def _free(

@@ -48,8 +48,8 @@ from powermon.web.location_views import (
 User = get_user_model()
 
 MAINTENANCE_ON_FLASH = (
-    "Maintenance is on. OFF is not detected and no OFF alert is sent; the chart shows this "
-    "time as not monitored."
+    "Maintenance is on. Subscribers get no OFF or ON alerts and no new chart; the chart shows "
+    "this time as not monitored."
 )
 MAINTENANCE_OFF_FLASH = (
     "Maintenance is off. OFF detection starts again now; silence during maintenance does not count."

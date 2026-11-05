@@ -23,7 +23,7 @@ Source: a September 2026 investigation of the v1 codebase (Django, last changed 
 - **Start of monitoring:** the first heartbeat starts monitoring as **on**, silently.
 - **Off start:** an off transition is backdated to the last heartbeat. The on transition happens at the first heartbeat after the outage, minus the location's boot delay (0-600 s, default 0): the time its router, optical terminal and board need to boot after power returns. It is not backdated when the silence was no longer than the delay, and never to before the outage start or into a not-monitored interval. (Amended 2026-11-01, quick task 261101-g9v.)
 - **Durations:** "was ON for" = last heartbeat - on time. "was OFF for" = restore time - outage start. The on and off durations tile the timeline exactly. Example: heartbeats 10:00-10:05, then silence, then a heartbeat at 11:00 gives "ON for 5m" and "OFF for 55m".
-- **Maintenance mode:** no off detection or alerts, while heartbeats and restoration keep working.
+- **Maintenance mode:** no off detection, no alerts and no new chart, while heartbeats and restoration keep being recorded.
 - **Alert format:** emoji + bold localized status + previous-state duration, for example `🔴 POWER OFF` / `⚡ Power was ON for: 5h 12m`. The only text is static strings plus numbers, so there is no HTML-injection surface. Anything user-typed that gets added later must be escaped.
 - **i18n:** uk/en/ru tables with identical key sets and fallback to en. v1 had a test-worthy property here: no missing keys.
 - **Chart concept:** 7 rows, Mon-Sun × 24 h. Days after today show the same weekday of the previous week, dimmed. A new chart is posted and pinned at local 00:00, and the previous one gets a final edit and is unpinned. The chart is edited in place every 15 min. v1 installed Cyrillic-capable fonts in the image (its uk rendering was verified); the rebuild bundles its fonts for deterministic rendering.
@@ -84,7 +84,7 @@ Source: a September 2026 investigation of the v1 codebase (Django, last changed 
 - **Covers:** LOC-08, MON-05, CHRT-01, CHRT-03
 
 #### INV-05 Each toggle has exactly one effect
-- **Rule:** "Alerts off" stops only the messages to subscribers. Transitions, the timeline, the chart and the midnight re-pin carry on. Maintenance only suppresses off detection. Router grace only changes the effective timeout for future decisions. Whether an alert is sent is decided when its transition is recorded.
+- **Rule:** "Alerts off" stops only the messages to subscribers. Transitions, the timeline, the chart and the midnight re-pin carry on. Maintenance suppresses off detection, the ON alert and any new chart post or pin; the chart already posted stops at the end of its day and stays pinned until maintenance ends (amended 2026-11-05, quick task 261105-wsf). Router grace only changes the effective timeout for future decisions. Whether an alert is sent is decided when its transition is recorded.
 - **v1 failure:** Every chart job (and the refresh/sync/reset commands) filtered on "alerting enabled". Muting alerts therefore also silently stopped the chart and left yesterday's chart pinned. (code read)
 - **Acceptance:**
   - Given alerts off for location A, when A has an outage, then subscribers get 0 messages, while the timeline, the 15-min refresh, the totals and the midnight re-pin all work as normal.

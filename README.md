@@ -496,10 +496,13 @@ changes the rules for `Europe/Kyiv`, bump the Python and postgres image tags.
     switched back; a second click or an old page never flips it back.
     - **Maintenance:** OFF is not detected, so no OFF alert is sent, and the chart shows
       the time as not monitored (hatched). Heartbeats are still recorded: an outage that
-      was already in progress stays one outage and gets its ON alert as usual when power
-      returns ("was OFF for" includes the maintenance time). Turning maintenance off
+      was already in progress stays one outage, and its end is recorded with no ON alert,
+      none saved for later. No new chart is posted or pinned: the chart already posted
+      stays pinned, keeps updating until its day ends, gets its final edit and then stops.
+      Turning maintenance off posts and pins today's chart and unpins the old one, and
       starts a fresh detection window: silence during maintenance does not count, and
-      OFF can be reported at the earliest period + grace after the switch.
+      OFF can be reported at the earliest period + grace after the switch. (Amended
+      2026-11-05, quick task 261105-wsf.)
     - **Alerts:** while off, subscribers get no new alerts, and none are saved for
       later. Alerts already queued still go out. The chart, its regular updates and the
       midnight re-pin carry on. (Amended 2026-10-06, quick task 261006-of9.)

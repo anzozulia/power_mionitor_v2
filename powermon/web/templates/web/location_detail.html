@@ -80,7 +80,7 @@ Every class is spelled out: no class name is built from data.
 </div>
 {% endif %}
 {% if status.key == "maintenance" %}
-{% if status.power_key == "off" %}{% include "partials/_alert.html" with tone="muted" title="Maintenance is on" body="The outage goes on. When power returns, the ON alert is sent as usual." testid="maintenance-banner" only %}{% else %}{% include "partials/_alert.html" with tone="muted" title="Maintenance is on" body="OFF is not detected during maintenance." testid="maintenance-banner" only %}{% endif %}
+{% if status.power_key == "off" %}{% include "partials/_alert.html" with tone="muted" title="Maintenance is on" body="The outage goes on. When power returns, it is recorded with no ON alert." testid="maintenance-banner" only %}{% else %}{% include "partials/_alert.html" with tone="muted" title="Maintenance is on" body="OFF is not detected and no new chart is posted during maintenance." testid="maintenance-banner" only %}{% endif %}
 {% endif %}
 {% endblock %}
 {% block content %}

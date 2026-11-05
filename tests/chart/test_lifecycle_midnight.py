@@ -48,7 +48,7 @@ from PIL import Image
 from powermon.alerts.models import OpsIncident
 from powermon.chart import lifecycle, model
 from powermon.chart.models import ChartMessage
-from powermon.engine import lapse, transitions
+from powermon.engine import lapse, maintenance, transitions
 from powermon.engine.models import LocationState, PowerInterval, SystemState
 from powermon.locations.models import Location
 from powermon.worker import detection, io_loop
@@ -854,3 +854,54 @@ def test_INV19_display_tz_moved_west_after_finalize_makes_no_chart_call(
         older.last_rendered_at,
     )
     assert after.pinned is False
+
+
+# Maintenance across midnight (quick task 261105-wsf)
+
+
+def test_maintenance_posts_no_new_chart_until_it_ends(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    location = location_factory()
+    since = kyiv("2026-09-30 08:00")
+    monitor(location, since)
+    old = ChartMessage.objects.create(
+        location=location,
+        local_date=date(2026, 9, 30),
+        chat_id=location.chat_id,
+        bot_key=io_loop.bot_key(location.bot_token),
+        message_id=1001,
+        pinned=True,
+        last_rendered_at=kyiv("2026-09-30 23:55"),
+        created_at=since,
+    )
+    assert maintenance.set_maintenance(location.pk, True, kyiv("2026-09-30 22:00")) is True
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    clock = FakeClock(kyiv("2026-10-01 12:05"))
+    _detected(clock.now())
+    state = io_loop.RelayState()
+
+    # The old chart gets its final edit, which draws its own day, and nothing more happens.
+    assert lifecycle.run_step(clock, state) is True
+    for _ in range(3):
+        clock.advance(minutes=20)
+        assert lifecycle.run_step(clock, state) is False
+    assert [call.method for call in fake_telegram.chart_calls] == ["editMessageMedia"]
+    old.refresh_from_db()
+    assert old.finalized_at is not None
+    assert (old.pinned, old.unpinned_at) == (True, None)
+    assert ChartMessage.objects.count() == 1
+
+    # Leaving maintenance: today's chart is posted and pinned, then the old one is unpinned.
+    assert maintenance.set_maintenance(location.pk, False, clock.now()) is True
+    for _ in range(3):
+        assert lifecycle.run_step(clock, state) is True
+    assert [call.method for call in fake_telegram.chart_calls][1:] == [
+        "sendPhoto",
+        "pinChatMessage",
+        "unpinChatMessage",
+    ]
+    old.refresh_from_db()
+    assert old.pinned is False
+    today = ChartMessage.objects.get(local_date=date(2026, 10, 1))
+    assert today.pinned is True
