@@ -77,8 +77,9 @@ ALREADY_REGENERATED_MESSAGE = "The key was already regenerated. The key below is
 # UI-SPEC Copywriting › Edit form, verbatim.
 CHANGES_SAVED_MESSAGE = "Changes saved."
 CHANNEL_CHANGED_MESSAGE = (
-    "Changes saved. The weekly chart is posted again with the new bot or chat. The old one "
-    "is unpinned if this location's bot is an admin of the old channel."
+    "Changes saved. The weekly chart is posted again with the new bot or chat, after "
+    "maintenance if it is on. The old one is unpinned if this location's bot is an admin of "
+    "the old channel."
 )
 
 # UI-SPEC Copywriting › Delete, verbatim.

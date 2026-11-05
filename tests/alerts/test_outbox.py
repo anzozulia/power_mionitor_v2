@@ -390,6 +390,42 @@ def test_subscriber_heads_skip_deleted_locations(location_factory: Callable[...,
 
 
 @pytest.mark.django_db
+def test_drop_maintenance_pending_touches_only_pending_subscriber_rows(
+    location_factory: Callable[..., Any],
+) -> None:
+    plain = location_factory()
+    paused = location_factory()
+    later = RECORDED_AT + timedelta(minutes=15)
+    pending = [_enqueue(paused), _held(paused, later)]
+    sending = _held(paused, later, status="sending")
+    sent = _held(paused, later, status="sent")
+    plain_pending = _enqueue(plain)
+    with transaction.atomic():
+        notice = outbox.enqueue_ops(
+            outbox.KIND_OPS_GAP,
+            payload={"start_us": 1, "end_us": 2},
+            recorded_at=RECORDED_AT,
+            location_id=paused.pk,
+        )
+    # No location is in maintenance yet: nothing moves.
+    assert outbox.drop_maintenance_pending() == 0
+
+    Location.objects.filter(pk=paused.pk).update(maintenance=True)
+
+    assert outbox.drop_maintenance_pending() == 2
+    assert [_status(row) for row in pending] == [("dropped", "maintenance")] * 2
+    # In flight or finished rows, other locations' rows and ops notices stay as they are.
+    assert _status(sending) == ("sending", "")
+    assert _status(sent) == ("sent", "")
+    assert _status(plain_pending) == ("pending", "")
+    assert _status(notice) == ("pending", "")
+    # Nothing is saved for later: leaving maintenance brings nothing back.
+    Location.objects.filter(pk=paused.pk).update(maintenance=False)
+    assert outbox.drop_maintenance_pending() == 0
+    assert [_status(row) for row in pending] == [("dropped", "maintenance")] * 2
+
+
+@pytest.mark.django_db
 def test_drop_deleted_pending_touches_only_pending_subscriber_rows(
     location_factory: Callable[..., Any],
 ) -> None:

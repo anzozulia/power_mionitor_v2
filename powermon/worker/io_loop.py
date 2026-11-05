@@ -700,7 +700,9 @@ def _expire(now: datetime) -> int:
     never named in a notice, even one whose send was in flight at delete time. Pending ops
     notices about a deleted location are left alone: they render from the tombstone's
     name, and dropping them by location would also drop a global all-silent end notice
-    that names it. Then the rows past their age become "expired" and each subscriber row
+    that names it. The pending subscriber rows of locations in maintenance are dropped too
+    (``outbox.drop_maintenance_pending``, 261105-wsf). Then the rows past their age become
+    "expired" and each subscriber row
     queues (or, with no ops chat, logs) one ``ops_expired`` notice with them (D-08). An
     expired ops row is only logged: a notice about a notice would loop on a broken admin
     chat. Returns how many rows expired.
@@ -709,6 +711,9 @@ def _expire(now: datetime) -> int:
         dropped = outbox.drop_deleted_pending()
         if dropped:
             log.info("relay: %d queued alert(s) of deleted locations dropped", dropped)
+        in_maintenance = outbox.drop_maintenance_pending()
+        if in_maintenance:
+            log.info("relay: %d queued alert(s) dropped during maintenance", in_maintenance)
         rows = outbox.expire_due(now)
         for ref in rows:
             if ref.channel == outbox.CHANNEL_SUBSCRIBER:

@@ -1255,7 +1255,7 @@ def _apply(
         _retire(row, answered)
         log.warning(
             "chart %s for location %s: record %s is gone from the chat; it is retired and "
-            "today's chart is posted again",
+            "today's chart is posted again once a post is due",
             action.step,
             action.location.location_id,
             row.id,

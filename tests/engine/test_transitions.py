@@ -1002,8 +1002,8 @@ def test_LOC08_boot_delay_restore_in_maintenance_leaves_the_timeline(
         _at(10, 30),
         _at(10, 31),
     )
-    on = OutboxMessage.objects.get(location=location, kind="power_on")
-    assert (on.event_at, on.payload) == (_at(10, 30), {"was_off_us": 25 * 60 * 1_000_000})
+    # Maintenance: the restore is recorded with no ON alert (quick task 261105-wsf).
+    assert not OutboxMessage.objects.filter(location=location, kind="power_on").exists()
 
 
 @pytest.mark.django_db

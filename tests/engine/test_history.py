@@ -563,8 +563,17 @@ def test_D04_on_alert_matched_by_payload_when_power_returned_during_maintenance(
     assert maintenance.set_maintenance(location.pk, True, _at(10, 0)) is True
     assert transitions.record_heartbeat(location.pk, _at(10, 5)) == "restored"
     assert maintenance.set_maintenance(location.pk, False, _at(10, 10)) is True
+    # Since quick task 261105-wsf such a restore queues no ON alert; a row from before it
+    # can still be in the outbox, and is matched the same way.
+    with transaction.atomic():
+        outbox.enqueue(
+            outbox.KIND_POWER_ON,
+            location.pk,
+            event_at=_at(10, 5),
+            recorded_at=_at(10, 5),
+            payload={"was_off_us": _us(hours=1, minutes=5)},
+        )
     on = _row_of(location, "power_on", _at(10, 5))
-    assert on.payload == {"was_off_us": _us(hours=1, minutes=5)}
     # No timeline boundary lies at the restore: the outage's last off piece ends at 10:00.
     assert _intervals(location) == [
         ("on", _at(8, 0), _at(9, 0), None),
@@ -580,6 +589,24 @@ def test_D04_on_alert_matched_by_payload_when_power_returned_during_maintenance(
         history.OUTAGE_REMOVED,
     )
     assert _status(on) == ("dropped", history.OUTAGE_REMOVED)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_D04_outage_ended_during_maintenance_is_removed_with_no_on_alert(
+    location_factory: Callable[..., Any],
+) -> None:
+    location = _off_since_9(location_factory)
+    assert maintenance.set_maintenance(location.pk, True, _at(10, 0)) is True
+    assert transitions.record_heartbeat(location.pk, _at(10, 5)) == "restored"
+    assert maintenance.set_maintenance(location.pk, False, _at(10, 10)) is True
+
+    assert history.remove_outage(location.pk, _at(9, 0), now=REMOVAL, tz=KYIV) == "removed"
+
+    assert _status(_row_of(location, "power_off", _at(9, 0))) == (
+        "dropped",
+        history.OUTAGE_REMOVED,
+    )
+    assert not OutboxMessage.objects.filter(kind="power_on").exists()
 
 
 @pytest.mark.django_db(transaction=True)

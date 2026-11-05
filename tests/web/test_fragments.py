@@ -178,7 +178,8 @@ RESET_CONSEQUENCES = [
     "unpins its weekly chart in the channel if the bot can still pin there; otherwise unpin "
     "it by hand in Telegram (the posted messages stay in the channel);",
     "sets it to Waiting for first heartbeat: nothing is detected until the next heartbeat, "
-    "which restarts monitoring as On without an alert and posts and pins a new chart;",
+    "which restarts monitoring as On without an alert and posts and pins a new chart, after "
+    "maintenance if it is on;",
     "still sends the alerts already queued, because they report real events;",
     "keeps the settings, the device key, the switches and the Delivery status.",
 ]

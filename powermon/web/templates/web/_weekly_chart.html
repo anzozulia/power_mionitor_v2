@@ -23,7 +23,7 @@ chart_trouble).
 - The poll never touches this card, so the image is never requested again by it.
 {% endcomment %}<div class="flex items-center justify-between gap-4 rounded-t-[5px] border-b border-border bg-surface-muted px-4 py-2">
 <div class="flex min-w-0 flex-wrap items-baseline gap-x-2"><h2 id="weekly-chart-title" class="text-label font-semibold tracking-label text-fg-muted uppercase">Weekly chart</h2>
-<p class="text-label text-fg-subtle">The chart pinned in the channel</p></div>
+<p class="text-label text-fg-subtle">{% if location.maintenance %}Today's chart, not posted during maintenance{% else %}The chart pinned in the channel{% endif %}</p></div>
 {% if has_history %}<div class="-my-1 flex shrink-0 items-center"><a href="{% url 'location-chart' location.pk %}" target="_blank" rel="noopener" data-testid="chart-full-size" data-variant="ghost" class="-mr-2 inline-flex min-h-11 items-center justify-center gap-2 rounded-control border border-transparent bg-transparent px-2 text-body font-semibold whitespace-nowrap text-fg no-underline hover:bg-surface-sunken md:min-h-(--control-h-sm) motion-safe:transition-colors motion-safe:duration-150">{% icon "maximize-2" class="size-3.5 shrink-0 text-icon" %}Open full size<span class="sr-only"> (opens in a new tab)</span></a></div>{% endif %}
 </div>
 <div class="p-4">
