@@ -4,8 +4,9 @@
 RGB PNG of chart-spec §2: the 1280×1000 layout grid at ``SCALE`` 2, the largest photo
 Telegram keeps for a bot's upload (quick task 261110-053). It is a pure function of the
 week (built from the stored timeline, ``now`` and the display time zone), the language and
-the location name: the same inputs, font files and Pillow version give the same bytes (chart-spec §9, D-09). It
-draws exactly the model's wall-clock segments and real-time totals and recomputes no data.
+the location name: the same inputs, font files and Pillow version give the same bytes
+(chart-spec §9, D-09). It draws exactly the model's wall-clock segments and real-time
+totals and recomputes no data.
 Today's row shows only what happened up to ``now``; after it the track stays empty.
 
 How it draws (D-09, STACK Gotcha 1, 03-RESEARCH Pattern 2):

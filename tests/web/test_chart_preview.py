@@ -161,7 +161,7 @@ def test_UI06_chart_png_is_the_channel_render(
     body = response.content
     assert body.startswith(PNG_SIGNATURE)
     with Image.open(io.BytesIO(body)) as image:
-        assert image.size == (render.W, render.H)
+        assert image.size == (render.OUT_W, render.OUT_H)
     assert body == _expected(location, fixed_now)
 
 

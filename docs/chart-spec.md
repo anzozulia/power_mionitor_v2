@@ -38,9 +38,14 @@ chart, in scope for this milestone, has:
 
 ## 2. Canvas
 
-- **1280 x 1000 px PNG.** The height never changes, even when the layout leaves space unused.
-  - Telegram keeps a 1280 px long-side version as a photo's standard size. At exactly 1280 px wide
-    the text is not resampled. The legacy 1400 px image was scaled down, which softened its text.
+- **2560 x 2000 px PNG: the 1280 x 1000 layout grid at 2x.** Every size and position in this spec
+  is in layout px of that grid; the image has 2 px per layout px. The height never changes, even
+  when the layout leaves space unused. (Amended 2026-11-10, quick task 261110-053.)
+  - Telegram keeps a photo a bot uploads at up to 2560 px on its long side, next to its
+    1280, 800, 320 and 90 px versions (tested 2026-11-09 with `sendPhoto` and
+    `editMessageMedia`; a 3840 px upload is cut to 2560). At exactly 2560 x 2000 the largest
+    version is the image itself, and the 1280 px one is an exact 2:1 reduction, so neither
+    resamples the text unevenly. The legacy 1400 px image was scaled down, which softened its text.
   - The ratio is 1.28:1. On a phone the photo is about 400 px wide and 312 px tall, so Telegram does
     not crop or letterbox it.
   - Because the height is fixed, editing the message in place at every update never resizes the chat bubble. (Amended 2026-10-06, quick task 261006-of9.)
@@ -302,7 +307,7 @@ Interval-level tests (unit, no image):
       font's cmap, so no tofu boxes.
 
 Image-level tests:
-- [ ] The output is exactly 1280x1000 PNG with an opaque background.
+- [ ] The output is exactly 2560x2000 PNG (the 1280x1000 layout at 2x) with an opaque background.
 - [ ] Golden images: once the rendered sample week (below; uk and en) has been approved by eye against
       the mocks, commit the renderer's own output as goldens and compare later renders to those, with a
       small tolerance (e.g. ≤ 0.5% of pixels differing by more than 8/255, because font rasterization

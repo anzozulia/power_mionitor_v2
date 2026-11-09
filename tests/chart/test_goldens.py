@@ -118,7 +118,7 @@ def _golden(name: str) -> Image.Image:
             pytrace=False,
         )
     with Image.open(path) as img:
-        assert img.size == (render.W, render.H), img.size
+        assert img.size == (render.OUT_W, render.OUT_H), img.size
         return img.convert("RGB")
 
 
@@ -202,7 +202,8 @@ def test_dst_goldens_show_the_spec_positions() -> None:
         y = lay.bar_ys[week.today.weekday()] + 22
         golden = _golden(name)
         for hour, colour in probes:
-            pixel = golden.getpixel((int(lay.hx(round(hour * HOUR_US))), y))
+            x = int(lay.hx(round(hour * HOUR_US)) * render.SCALE)
+            pixel = golden.getpixel((x, y * render.SCALE))
             assert pixel == colour, (name, hour, pixel)
 
 
@@ -248,7 +249,7 @@ def test_golden_set_is_complete() -> None:
     assert {p.name for p in GOLDENS_DIR.iterdir()} == names
     for name in names:
         with Image.open(GOLDENS_DIR / name) as img:
-            assert (img.format, img.size, img.mode) == ("PNG", (1280, 1000), "RGB"), name
+            assert (img.format, img.size, img.mode) == ("PNG", (2560, 2000), "RGB"), name
     module = sys.modules[__name__]
     for name in CASES:
         assert callable(getattr(module, f"test_golden_{name.replace('-', '_')}", None)), name
@@ -264,7 +265,7 @@ def test_regeneration_mode_writes_the_render(
     written = tmp_path / "sample-en.png"
     assert written.read_bytes() == _render("sample-en")
     with Image.open(written) as img:
-        assert (img.format, img.size, img.mode) == ("PNG", (1280, 1000), "RGB")
+        assert (img.format, img.size, img.mode) == ("PNG", (2560, 2000), "RGB")
 
 
 def test_a_missing_golden_fails_with_the_regeneration_command(

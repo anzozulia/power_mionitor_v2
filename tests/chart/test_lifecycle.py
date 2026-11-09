@@ -278,7 +278,7 @@ def test_monitored_location_gets_todays_chart_posted_and_recorded(
         "caption": "No outages today",
         "disable_notification": "true",
     }
-    assert _png_size(photos[0].files["photo"]) == (1280, 1000)
+    assert _png_size(photos[0].files["photo"]) == (2560, 2000)
     [row] = _rows()
     assert (row.location_id, row.local_date.isoformat(), row.chat_id, row.message_id) == (
         location.pk,
@@ -564,7 +564,7 @@ def test_CHRT02_refresh_is_due_at_the_next_period_boundary(
         "media": "attach://chart",
         "caption": "No outages today",
     }
-    assert _png_size(edit.files["chart"]) == (1280, 1000)
+    assert _png_size(edit.files["chart"]) == (2560, 2000)
     assert _rows()[0].last_rendered_at == kyiv("2026-10-01 12:15:01")
 
     # The next slot is 12:30, not 15 min after the answer (12:30:01): no drift.
@@ -1695,7 +1695,7 @@ def test_chart_content_finished_day_caption(location_factory: Callable[..., Any]
     assert quiet_caption == "No outages on Thu 01.10"
     # A day with no on or off time claims no "no outages" (D-03).
     assert blank_caption == "Thu 01.10: not monitored"
-    assert _png_size(png) == (1280, 1000)
+    assert _png_size(png) == (2560, 2000)
 
 
 def test_stop_set_makes_no_chart_call(

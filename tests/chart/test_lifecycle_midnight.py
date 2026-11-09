@@ -293,7 +293,7 @@ def test_finalize_sends_the_finished_render(
     [final] = fake_telegram.chart_calls
     assert (final.method, final.fields["message_id"]) == ("editMessageMedia", "501")
     png = final.files["chart"]
-    assert _png_size(png) == (1280, 1000)
+    assert _png_size(png) == (2560, 2000)
     # The image is the finished day as of the midnight that ends it (chart-spec §7)...
     [snapshot], _ = lifecycle.read_snapshot(TODAY)
     assert snapshot.location_id == location.pk
