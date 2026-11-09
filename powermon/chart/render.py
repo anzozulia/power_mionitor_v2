@@ -1,9 +1,10 @@
 """The weekly chart image (CHRT-01, CHRT-02, CHRT-07, CHRT-08; docs/chart-spec.md §2-§7).
 
-``render_png(week, lang=..., name=...)`` draws one ``model.Week`` as the 1280×1000 opaque
-RGB PNG of chart-spec §2. It is a pure function of the week (built from the stored
-timeline, ``now`` and the display time zone), the language and the location name: the
-same inputs, font files and Pillow version give the same bytes (chart-spec §9, D-09). It
+``render_png(week, lang=..., name=...)`` draws one ``model.Week`` as the 2560×2000 opaque
+RGB PNG of chart-spec §2: the 1280×1000 layout grid at ``SCALE`` 2, the largest photo
+Telegram keeps for a bot's upload (quick task 261110-053). It is a pure function of the
+week (built from the stored timeline, ``now`` and the display time zone), the language and
+the location name: the same inputs, font files and Pillow version give the same bytes (chart-spec §9, D-09). It
 draws exactly the model's wall-clock segments and real-time totals and recomputes no data.
 Today's row shows only what happened up to ``now``; after it the track stays empty.
 
@@ -11,12 +12,16 @@ How it draws (D-09, STACK Gotcha 1, 03-RESEARCH Pattern 2):
 - Pillow with the bundled Inter 4.1 TTFs, loaded by file path from ``FONT_DIR`` with
   ``ImageFont.Layout.BASIC`` only, so no system font, fontconfig or RAQM shaping can
   change a render.
+- Every coordinate and size below is in layout px of the 1280×1000 grid (chart-spec §3);
+  the canvas has ``SCALE`` output px per layout px.
 - Each horizontal band (the legend, each row box, the pill zone above today's row, the
-  divider zone, the now pill) is cut from the 1× canvas, scaled up 4× with NEAREST, drawn
-  on with integer 4× coordinates, reduced with ``Image.reduce(4)`` (a box filter, so
-  shapes come out anti-aliased) and pasted back. Untouched pixels round-trip exactly, and
-  no full 4× canvas is ever allocated.
-- All text is drawn at 1× after every band is pasted, so no band can cover text.
+  divider zone, the now pill) is cut from the canvas, scaled up with NEAREST to ``S`` px
+  per layout px, drawn on with integer coordinates at that resolution, reduced with
+  ``Image.reduce(S // SCALE)`` (a box filter, so shapes come out anti-aliased) and pasted
+  back. Untouched pixels round-trip exactly, and no full ``S``× canvas is ever allocated.
+- All text is drawn on the canvas after every band is pasted, so no band can cover text:
+  at ``SCALE`` times its layout size and position. Text widths are measured at that same
+  size (``text_len``), so what is laid out is what is drawn.
 
 Pure: imports nothing from Django. No app module imports it at import time (it pulls in
 Pillow): ``lifecycle.chart_content`` imports it inside the call. The worker renders the
@@ -40,9 +45,14 @@ from powermon.i18n.times import hm
 
 RGB = tuple[int, int, int]
 
-# Canvas (chart-spec §2) and the supersampling factor of every band.
+# The layout grid (chart-spec §2, §3), the output px per layout px, and the canvas. Every
+# other size here is in layout px.
 W = 1280
 H = 1000
+SCALE = 2
+OUT_W = W * SCALE
+OUT_H = H * SCALE
+# The bands' drawing resolution, in px per layout px: 2× supersampling of the output.
 S = 4
 
 # Colour tokens (chart-spec §5).
@@ -176,6 +186,30 @@ def font(face: str, size: int) -> ImageFont.FreeTypeFont:
     return ImageFont.truetype(str(path), size, layout_engine=ImageFont.Layout.BASIC)
 
 
+def text_len(face: str, size: int, text: str) -> float:
+    """The width of ``text`` in layout px, measured at the size it is drawn (``SCALE``×)."""
+    return font(face, size * SCALE).getlength(text) / SCALE
+
+
+class _Pen:
+    """Draws text on the canvas at ``SCALE`` times its layout position and size."""
+
+    def __init__(self, canvas: Image.Image) -> None:
+        self.draw = ImageDraw.Draw(canvas)
+
+    def text(
+        self, xy: tuple[float, float], text: str, face: str, size: int, fill: RGB, anchor: str
+    ) -> None:
+        x, y = xy
+        self.draw.text(
+            (x * SCALE, y * SCALE),
+            text,
+            font=font(face, size * SCALE),
+            fill=fill,
+            anchor=anchor,
+        )
+
+
 @dataclass(frozen=True)
 class Layout:
     """Where the week's parts go on the canvas (chart-spec §3), in canvas px.
@@ -207,14 +241,13 @@ def layout(week: Week, lang: str) -> Layout:
     a 56 px divider zone above the first dimmed row; the hour axis is 30 px below them.
     """
     lang = resolve_language(lang)
-    label = font("semibold", LABEL_SIZE)
-    weekday_w = max(label.getlength(day) for day in chart_texts.WEEKDAYS[lang])
+    weekday_w = max(text_len("semibold", LABEL_SIZE, day) for day in chart_texts.WEEKDAYS[lang])
     date_x = PAD_X + weekday_w + DATE_GAP
-    bar_x0 = date_x + label.getlength("00.00") + GAP
+    bar_x0 = date_x + text_len("semibold", LABEL_SIZE, "00.00") + GAP
     totals_w = max(
-        font("medium", TOTAL_SIZE).getlength(chart_texts.NO_OUTAGES[lang]),
-        font("semibold", TOTAL_SIZE).getlength(chart_texts.worst_total(lang)),
-        font("medium", HEAD_SIZE).getlength(chart_texts.TOTALS_HEADER[lang]),
+        text_len("medium", TOTAL_SIZE, chart_texts.NO_OUTAGES[lang]),
+        text_len("semibold", TOTAL_SIZE, chart_texts.worst_total(lang)),
+        text_len("medium", HEAD_SIZE, chart_texts.TOTALS_HEADER[lang]),
     )
     bar_x1 = W - PAD_X - totals_w - GAP
     y = Y_PLOT
@@ -254,9 +287,8 @@ def subtitle_text(name: str, week: Week, lang: str) -> str:
     kept = printable_name(name)
     if not kept:
         return week_range
-    sub_font = font("regular", SUB_SIZE)
     text = f"{kept}{chart_texts.DOT}{week_range}"
-    while kept and sub_font.getlength(text) > SUBTITLE_MAX:
+    while kept and text_len("regular", SUB_SIZE, text) > SUBTITLE_MAX:
         kept = kept[:-1].rstrip()
         text = f"{kept}…{chart_texts.DOT}{week_range}" if kept else week_range
     return text
@@ -277,7 +309,7 @@ class _Band:
     def __init__(self, canvas: Image.Image, top: int, bottom: int) -> None:
         self.canvas = canvas
         self.top = top
-        strip = canvas.crop((0, top, W, bottom))
+        strip = canvas.crop((0, top * SCALE, OUT_W, bottom * SCALE))
         self.img = strip.resize((W * S, (bottom - top) * S), Image.Resampling.NEAREST)
         self.draw = ImageDraw.Draw(self.img)
 
@@ -294,7 +326,7 @@ class _Band:
         )
 
     def paste(self) -> None:
-        self.canvas.paste(self.img.reduce(S), (0, self.top))
+        self.canvas.paste(self.img.reduce(S // SCALE), (0, self.top * SCALE))
 
 
 def _hatch(w: int, h: int, x: float, y: float, base: RGB, ink: RGB) -> Image.Image:
@@ -334,7 +366,6 @@ def _rounded_mask(w: int, h: int, radius: int) -> Image.Image:
 def _draw_legend(canvas: Image.Image, lang: str) -> list[tuple[float, str]]:
     """The four swatches (chart-spec §7); returns each label's x and text."""
     band = _Band(canvas, SWATCH_TOP - 5, SWATCH_TOP + SWATCH_H + 5)
-    label_font = font("regular", LEGEND_SIZE)
     labels: list[tuple[float, str]] = []
     x: float = PAD_X
     for fill, label in zip((ON, OFF, None, NO_DATA), chart_texts.LEGEND[lang], strict=True):
@@ -346,7 +377,7 @@ def _draw_legend(canvas: Image.Image, lang: str) -> list[tuple[float, str]]:
             swatch = Image.new("RGB", (w, h), fill)
         band.img.paste(swatch, (left, band.y(SWATCH_TOP)), _rounded_mask(w, h, SWATCH_R * S))
         labels.append((x + SWATCH_W + LEGEND_LABEL_GAP, label))
-        x += SWATCH_W + LEGEND_LABEL_GAP + label_font.getlength(label) + LEGEND_ITEM_GAP
+        x += SWATCH_W + LEGEND_LABEL_GAP + text_len("regular", LEGEND_SIZE, label) + LEGEND_ITEM_GAP
     band.paste()
     return labels
 
@@ -428,7 +459,7 @@ def _draw_plot(canvas: Image.Image, lay: Layout, week: Week, lang: str) -> None:
         if top > y:
             band = _Band(canvas, y, top)
             if lay.divider_top == y:
-                caption = font("medium", HEAD_SIZE).getlength(chart_texts.DIVIDER[lang])
+                caption = text_len("medium", HEAD_SIZE, chart_texts.DIVIDER[lang])
                 mid = y + DIVIDER_MID
                 band.rect(
                     PAD_X + caption + HAIRLINE_GAP,
@@ -479,7 +510,7 @@ def _draw_pill(canvas: Image.Image, lay: Layout, week: Week) -> _Pill | None:
     bar_y = lay.bar_ys[week.today.weekday()]
     now_x = lay.hx(wall_us(week.now, week.tz, end=False))
     text = hm(week.now, week.tz)
-    w = font("semibold", NOW_SIZE).getlength(text) + 2 * PILL_PAD
+    w = text_len("semibold", NOW_SIZE, text) + 2 * PILL_PAD
     x = min(max(now_x - w / 2, lay.bar_x0 - PILL_CLAMP), lay.bar_x1 + PILL_CLAMP - w)
     y = bar_y - NOW_OVERHANG - PILL_GAP - PILL_H
     band = _Band(canvas, int(y) - 1, int(y) + PILL_H + 2)
@@ -488,7 +519,7 @@ def _draw_pill(canvas: Image.Image, lay: Layout, week: Week) -> _Pill | None:
     return _Pill(x, y, w, text)
 
 
-def _row_text(draw: ImageDraw.ImageDraw, lay: Layout, row: Row, bar_y: float, lang: str) -> None:
+def _row_text(pen: _Pen, lay: Layout, row: Row, bar_y: float, lang: str) -> None:
     """The weekday, date and daily total of one row (chart-spec §4, §7, §8)."""
     centre = bar_y + BAR_H / 2
     if row.dimmed:
@@ -498,21 +529,13 @@ def _row_text(draw: ImageDraw.ImageDraw, lay: Layout, row: Row, bar_y: float, la
     else:
         day_ink, date_ink = INK_PRIMARY, INK_SECONDARY
     label_y = centre + BASELINE * LABEL_SIZE
-    day_font = font("semibold" if row.is_today else "medium", LABEL_SIZE)
-    date_font = font("semibold" if row.is_today else "regular", LABEL_SIZE)
-    draw.text(
-        (PAD_X, label_y),
-        chart_texts.weekday(row.day, lang),
-        font=day_font,
-        fill=day_ink,
-        anchor="ls",
+    day_face = "semibold" if row.is_today else "medium"
+    date_face = "semibold" if row.is_today else "regular"
+    pen.text(
+        (PAD_X, label_y), chart_texts.weekday(row.day, lang), day_face, LABEL_SIZE, day_ink, "ls"
     )
-    draw.text(
-        (lay.date_x, label_y),
-        chart_texts.row_date(row.day),
-        font=date_font,
-        fill=date_ink,
-        anchor="ls",
+    pen.text(
+        (lay.date_x, label_y), chart_texts.row_date(row.day), date_face, LABEL_SIZE, date_ink, "ls"
     )
     main, suffix = chart_texts.row_total(row.off_us, row.count, row.monitored, lang)
     # Dimmed rows draw every part in ink-muted; "—" is ink-muted, the zero-outages text
@@ -523,13 +546,13 @@ def _row_text(draw: ImageDraw.ImageDraw, lay: Layout, row: Row, bar_y: float, la
         main_ink = INK_SECONDARY
     else:
         main_ink = INK_PRIMARY
-    total_font = font("semibold" if row.is_today else "medium", TOTAL_SIZE)
+    total_face = "semibold" if row.is_today else "medium"
     total_y = centre + BASELINE * TOTAL_SIZE - 1
     right: float = W - PAD_X
     if suffix:
-        draw.text((right, total_y), suffix, font=total_font, fill=INK_MUTED, anchor="rs")
-        right -= total_font.getlength(suffix)
-    draw.text((right, total_y), main, font=total_font, fill=main_ink, anchor="rs")
+        pen.text((right, total_y), suffix, total_face, TOTAL_SIZE, INK_MUTED, "rs")
+        right -= text_len(total_face, TOTAL_SIZE, suffix)
+    pen.text((right, total_y), main, total_face, TOTAL_SIZE, main_ink, "rs")
 
 
 def _draw_text(
@@ -541,59 +564,50 @@ def _draw_text(
     legend: list[tuple[float, str]],
     pill: _Pill | None,
 ) -> None:
-    """Every text of the chart at 1×, after all bands (chart-spec §4, §7, §8)."""
-    draw = ImageDraw.Draw(canvas)
-    draw.text(
-        (PAD_X, Y_TITLE),
-        chart_texts.TITLE[lang],
-        font=font("semibold", TITLE_SIZE),
-        fill=INK_PRIMARY,
-        anchor="ls",
+    """Every text of the chart, after all bands (chart-spec §4, §7, §8)."""
+    pen = _Pen(canvas)
+    pen.text((PAD_X, Y_TITLE), chart_texts.TITLE[lang], "semibold", TITLE_SIZE, INK_PRIMARY, "ls")
+    pen.text(
+        (PAD_X, Y_SUB), subtitle_text(name, week, lang), "regular", SUB_SIZE, INK_SECONDARY, "ls"
     )
-    draw.text(
-        (PAD_X, Y_SUB),
-        subtitle_text(name, week, lang),
-        font=font("regular", SUB_SIZE),
-        fill=INK_SECONDARY,
-        anchor="ls",
-    )
-    legend_font = font("regular", LEGEND_SIZE)
     for x, label in legend:
-        draw.text((x, Y_LEGEND), label, font=legend_font, fill=INK_SECONDARY, anchor="ls")
-    head_font = font("medium", HEAD_SIZE)
-    draw.text(
+        pen.text((x, Y_LEGEND), label, "regular", LEGEND_SIZE, INK_SECONDARY, "ls")
+    pen.text(
         (W - PAD_X, Y_COLHEAD),
         chart_texts.TOTALS_HEADER[lang],
-        font=head_font,
-        fill=INK_MUTED,
-        anchor="rs",
+        "medium",
+        HEAD_SIZE,
+        INK_MUTED,
+        "rs",
     )
     if lay.divider_top is not None:
-        draw.text(
+        pen.text(
             (PAD_X, lay.divider_top + DIVIDER_MID + BASELINE * HEAD_SIZE),
             chart_texts.DIVIDER[lang],
-            font=head_font,
-            fill=INK_MUTED,
-            anchor="ls",
+            "medium",
+            HEAD_SIZE,
+            INK_MUTED,
+            "ls",
         )
     for row, bar_y in zip(week.rows, lay.bar_ys, strict=True):
-        _row_text(draw, lay, row, bar_y, lang)
-    axis_font = font("medium", AXIS_SIZE)
+        _row_text(pen, lay, row, bar_y, lang)
     for h in range(0, 25, 3):
-        draw.text(
+        pen.text(
             (lay.hx(h * HOUR_US), lay.axis_baseline),
             f"{h:02d}",
-            font=axis_font,
-            fill=INK_MUTED,
-            anchor="ms",
+            "medium",
+            AXIS_SIZE,
+            INK_MUTED,
+            "ms",
         )
     if pill is not None:
-        draw.text(
+        pen.text(
             (pill.x + pill.w / 2, pill.y + PILL_H / 2 + BASELINE * NOW_SIZE),
             pill.text,
-            font=font("semibold", NOW_SIZE),
-            fill=SURFACE,
-            anchor="ms",
+            "semibold",
+            NOW_SIZE,
+            SURFACE,
+            "ms",
         )
 
 
@@ -609,7 +623,7 @@ def render_png(week: Week, *, lang: str, name: str) -> bytes:
     if len(week.rows) != 7:
         raise ValueError(f"a week has 7 rows, not {len(week.rows)}")
     lay = layout(week, lang)
-    canvas = Image.new("RGB", (W, H), SURFACE)
+    canvas = Image.new("RGB", (OUT_W, OUT_H), SURFACE)
     legend = _draw_legend(canvas, lang)
     _draw_plot(canvas, lay, week, lang)
     pill = _draw_pill(canvas, lay, week)
