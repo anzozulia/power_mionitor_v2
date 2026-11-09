@@ -70,7 +70,8 @@ def _render(week: Week, lang: str = "uk") -> Image.Image:
 
 
 def _px(img: Image.Image, x: float, y: float) -> RGB:
-    value = img.getpixel((int(x), int(y)))
+    """The pixel at layout px (x, y): the image has ``render.SCALE`` px per layout px."""
+    value = img.getpixel((int(x * render.SCALE), int(y * render.SCALE)))
     assert isinstance(value, tuple)
     return (value[0], value[1], value[2])
 
@@ -80,7 +81,7 @@ def _hours(h: float) -> int:
 
 
 def _region(img: Image.Image, x0: float, y0: float, x1: float, y1: float) -> list[RGB]:
-    """Every pixel of the box ``[x0, x1) × [y0, y1)``."""
+    """One pixel per layout px of the box ``[x0, x1) × [y0, y1)`` (layout px)."""
     return [_px(img, x, y) for y in range(int(y0), int(y1)) for x in range(int(x0), int(x1))]
 
 
@@ -98,12 +99,12 @@ def _total_box(lay: render.Layout, row: int) -> tuple[float, float]:
     return baseline - render.TOTAL_SIZE, baseline + 8
 
 
-def test_sample_week_png_is_1280x1000_opaque_rgb() -> None:
+def test_sample_week_png_is_2560x2000_opaque_rgb() -> None:
     png = render.render_png(_sample(), lang="uk", name=SAMPLE_NAMES["uk"])
     img = _open(png)
     assert png.startswith(b"\x89PNG\r\n\x1a\n")
     assert img.format == "PNG"
-    assert img.size == (1280, 1000)
+    assert img.size == (render.OUT_W, render.OUT_H) == (2560, 2000)
     # Opaque: no alpha channel at all (chart-spec §2).
     assert img.mode == "RGB"
     assert _px(img, 0, 0) == render.SURFACE
@@ -111,7 +112,7 @@ def test_sample_week_png_is_1280x1000_opaque_rgb() -> None:
 
 
 @pytest.mark.parametrize(
-    ("lang", "x0", "x1"), [("uk", 232.0, 954.0), ("en", 261.0, 983.0), ("ru", 231.0, 952.0)]
+    ("lang", "x0", "x1"), [("uk", 234.5, 953.0), ("en", 262.5, 982.5), ("ru", 233.5, 951.5)]
 )
 def test_layout_bar_range_per_language(lang: str, x0: float, x1: float) -> None:
     lay = render.layout(_sample(), lang)
@@ -128,13 +129,15 @@ def test_layout_bar_range_per_language(lang: str, x0: float, x1: float) -> None:
 
 
 def test_layout_label_column_fits_the_widest_weekday() -> None:
-    # Edge: the date starts 14 px after the widest weekday, measured at SemiBold 34.
-    label = render.font("semibold", render.LABEL_SIZE)
+    # Edge: the date starts 14 px after the widest weekday, measured at SemiBold 34 as drawn.
+    def label(text: str) -> float:
+        return render.text_len("semibold", render.LABEL_SIZE, text)
+
     for lang in ("uk", "en", "ru"):
-        widest = max(label.getlength(day) for day in chart_texts.WEEKDAYS[lang])
+        widest = max(label(day) for day in chart_texts.WEEKDAYS[lang])
         lay = render.layout(_sample(), lang)
         assert lay.date_x == pytest.approx(48 + widest + 14)
-        assert lay.bar_x0 == pytest.approx(lay.date_x + label.getlength("00.00") + 24)
+        assert lay.bar_x0 == pytest.approx(lay.date_x + label("00.00") + 24)
 
 
 def test_INV04_sample_segments_have_their_state_colours() -> None:
@@ -542,7 +545,7 @@ def test_previous_week_divider_and_dimmed_text() -> None:
     lay = render.layout(week, "uk")
     top = lay.divider_top
     assert top == 620
-    caption_end = 48 + render.font("medium", render.HEAD_SIZE).getlength(chart_texts.DIVIDER["uk"])
+    caption_end = 48 + render.text_len("medium", render.HEAD_SIZE, chart_texts.DIVIDER["uk"])
     caption = _region(img, 48, top, caption_end + 1, top + render.DIVIDER_H)
     assert _near(_darkest(caption), render.INK_MUTED, 12)
     # The 1.5 px hairline is centred at zone top + 32 and runs to x 1232.
@@ -572,7 +575,7 @@ def test_previous_week_divider_and_dimmed_text() -> None:
     assert sun_lay.grid_bottom == 866
     assert sun_lay.axis_baseline == 896
     sun_img = _render(sunday)
-    assert sun_img.size == (1280, 1000)
+    assert sun_img.size == (render.OUT_W, render.OUT_H) == (2560, 2000)
     assert set(_region(sun_img, 0, 930, 1280, 1000)) == {render.SURFACE}
 
 
@@ -595,13 +598,16 @@ def test_legend_axis_and_hour_cells() -> None:
     week = _sample()
     img = _render(week)
     lay = render.layout(week, "uk")
+
     # Four swatches in a fixed order: on, off, not monitored (hatched), no data.
-    legend_font = render.font("regular", render.LEGEND_SIZE)
+    def legend_len(text: str) -> float:
+        return render.text_len("regular", render.LEGEND_SIZE, text)
+
     lefts = []
     x = 48.0
     for label in chart_texts.LEGEND["uk"]:
         lefts.append(x)
-        x += 38 + 12 + legend_font.getlength(label) + 34
+        x += 38 + 12 + legend_len(label) + 34
     on_x, off_x, nm_x, no_data_x = lefts
     assert _px(img, on_x + 19, 165) == render.ON
     assert _px(img, on_x + 19, 188) == render.ON
@@ -611,7 +617,7 @@ def test_legend_axis_and_hour_cells() -> None:
     assert {render.NM_BASE, render.NM_INK} <= set(_region(img, nm_x + 3, 168, nm_x + 35, 186))
     assert _px(img, no_data_x + 19, 177) == render.NO_DATA
     # Each label is ink-secondary, 12 px after its swatch.
-    label = _region(img, on_x + 50, 160, on_x + 50 + legend_font.getlength("Світло є"), 194)
+    label = _region(img, on_x + 50, 160, on_x + 50 + legend_len("Світло є"), 194)
     assert _near(_darkest(label), render.INK_SECONDARY, 12)
     # The totals header, right-aligned at x 1232 on baseline 236, is ink-muted.
     header = _region(img, 1000, 236 - 27, 1232, 236 + 7)
@@ -647,7 +653,8 @@ def test_K5_uk_and_ru_draw_cyrillic_labels() -> None:
     legend_box = (48, 160, 1232, 195)
     renders = {lang: _render(week, lang) for lang in ("uk", "en", "ru")}
     for box, ink in ((title_box, render.INK_PRIMARY), (legend_box, render.INK_SECONDARY)):
-        crops = {lang: img.crop(box) for lang, img in renders.items()}
+        scaled = tuple(v * render.SCALE for v in box)
+        crops = {lang: img.crop(scaled) for lang, img in renders.items()}
         for lang in ("uk", "ru"):
             colours = crops[lang].getcolors(maxcolors=1 << 16) or []
             assert ink in {colour for _, colour in colours}, (lang, box)
@@ -683,15 +690,18 @@ def test_subtitle_drops_the_name_when_nothing_printable_is_left() -> None:
 def test_subtitle_truncates_long_names_with_an_ellipsis() -> None:
     # Edge (CHRT-08 encoding): measured in rendered pixels, cut at whole code points.
     week = _sample()
-    sub_font = render.font("regular", render.SUB_SIZE)
+
+    def sub_len(text: str) -> float:
+        return render.text_len("regular", render.SUB_SIZE, text)
+
     text = render.subtitle_text("Ш" * 100, week, "uk")
-    assert sub_font.getlength(text) <= render.SUBTITLE_MAX == 1184
+    assert sub_len(text) <= render.SUBTITLE_MAX == 1184
     suffix = f"… · {UK_RANGE}"
     assert text.endswith(suffix)
     kept = text.removesuffix(suffix)
     assert kept and set(kept) == {"Ш"}
     # The cut keeps as much of the name as fits: one more letter would not.
-    assert sub_font.getlength(f"{kept}Ш{suffix}") > render.SUBTITLE_MAX
+    assert sub_len(f"{kept}Ш{suffix}") > render.SUBTITLE_MAX
     # A cut that lands after a space drops the space too, never "Ш …".
     spaced = render.subtitle_text(f"{kept} {'Ш' * 50}", week, "uk")
     assert spaced == f"{kept}{suffix}"
@@ -738,7 +748,7 @@ MEMORY_PROBE = textwrap.dedent(
     )
     for face in ("regular", "medium", "semibold"):
         for size in sizes:
-            render.font(face, size)
+            render.font(face, size * render.SCALE)
     # Kyiv is UTC+3: monitoring from Fri 10:42, an outage, maintenance, an open on.
     pieces = [
         Piece("on", at("2026-09-25T07:42"), at("2026-09-28T05:00"), None),
