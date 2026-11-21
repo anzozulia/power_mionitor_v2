@@ -227,10 +227,11 @@ Source: a September 2026 investigation of the v1 codebase (Django, last changed 
 - **Covers:** CHRT-05
 
 #### INV-19 No orphaned pinned charts
-- **Rule:** Each location has at most one pinned chart. Every run of the daily job gives a final edit to, and unpins, every pinned chart not dated today, not only yesterday's. Edits and unpins use the chat id stored with the message. Changing the chat id, deleting the location or resetting its history unpins the old chart in its own chat, then removes the records. For a deleted location, alerts still queued are dropped. Telegram errors during this cleanup are logged and do not block the admin action.
+- **Rule:** Each location has at most one pinned chart. Every run of the daily job gives a final edit to, and unpins, every pinned chart not dated today, not only yesterday's. One exception: the newest of them keeps its pin until today's chart is pinned (during maintenance, or while today's post or pin fails), so a channel is never left without a chart; it is unpinned right after (amended 2026-11-22, quick task 261122-0cq). Edits and unpins use the chat id stored with the message. Changing the chat id, deleting the location or resetting its history unpins the old chart in its own chat, then removes the records. For a deleted location, alerts still queued are dropped. Telegram errors during this cleanup are logged and do not block the admin action.
 - **v1 failure:** Unpinning looked only at yesterday's chart, so a missed midnight left an old chart pinned forever. Reset deleted the chart records without unpinning. After a chat id change, v1 kept editing the old message id in the new chat and never unpinned the old chat. In the harness, one reset plus one manual send left 3 charts pinned, 2 of them untracked.
 - **Acceptance:**
   - Given charts for 10-01 and 10-02 both still pinned, when the daily job runs on 10-03, then both get a final edit and are unpinned, and only the 10-03 chart is pinned.
+  - Given yesterday's chart pinned and today's post refused by Telegram, then yesterday's chart gets its final edit and stays pinned, and it is unpinned once today's chart is pinned.
   - Given the admin changes the chat id, deletes the location or resets its history, then the old chart is unpinned in the old chat, no later edit targets it, and a deleted location's queued alerts are never sent.
 - **Covers:** CHRT-05, LOC-04, DATA-03
 

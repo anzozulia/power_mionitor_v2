@@ -470,11 +470,14 @@ changes the rules for `Europe/Kyiv`, bump the Python and postgres image tags.
     getMe check decides; any other refusal makes the post wait. (Amended 2026-11-03, quick task 261103-b2z.)
   - Charts are uploaded at 2560 x 2000. When Telegram answers that it could not process
     the image (`IMAGE_PROCESS_FAILED`; since 2026-11-20 it does for most 2560 x 2000
-    uploads and for no 1280 x 1000 one), the call is retried within a minute, like after
-    a 5xx, with no "chart failing" notice, and that bot's charts go at 1280 x 1000 for an
-    hour; then 2560 x 2000 is tried again. The worker logs `chart uploads for location
-    <id>: Telegram could not process the image; the bot's charts go at 1280x1000 for 60
-    min` when it switches. (Amended 2026-11-22, quick task 261122-0cq.)
+    uploads and for no 1280 x 1000 one), the call is retried after 30 s (then after the
+    usual growing wait), with no "chart failing" notice and without holding the bot's
+    alerts, and that bot's charts go at 1280 x 1000 for an hour; then 2560 x 2000 is tried
+    again. The worker logs `chart uploads for location <id>: Telegram could not process
+    the image; the bot's charts go at 1280x1000 for 60 min` when it switches, and one
+    WARNING per failed call. If Telegram refuses even the 1280 x 1000 image, today's chart
+    counts as failing (the "chart failing" notice). (Amended 2026-11-22, quick task
+    261122-0cq.)
   - A channel pin may leave a "pinned a photo" service message in the channel each day
     (Telegram's behaviour; it is checked once in section 12).
   - Cost: a render takes about 0.1 to 0.3 s of CPU and about 35 MB of extra worker memory

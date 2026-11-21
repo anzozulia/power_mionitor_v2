@@ -483,16 +483,17 @@ def test_photo_probe_telegram_could_not_process_defers_and_the_next_one_goes_sma
     assert _pass(clock, state) is True
 
     assert _requests(fake_telegram) == ["editMessageMedia"]
-    # The bot waits 2 s (a transient outcome), the post 30 s more.
-    assert state.not_before[post_key] == NOON_05 + _sec(2 + 30)
+    # Only the post waits, 30 s: Telegram answered, so the bot is not held.
+    assert state.not_before == {post_key: NOON_05 + _sec(30)}
     [line] = [
         line for line in _lines(caplog, logging.WARNING) if "photo uploads are failing" in line
     ]
     assert "(transient, image_process_failed)" in line
+    # The marks it found stay as they were: the answer proves nothing about the bot.
     assert _photo_degraded(state)
     assert lifecycle.small_photos(state, DEFAULT_BOT_TOKEN, NOON_05)
     # The retry's probe re-uploads at 1280 x 1000, answers ok, and the post goes small too.
-    clock.set(NOON_05 + _sec(32))
+    clock.set(NOON_05 + _sec(30))
     assert _pass(clock, state) is True
     uploads = [call for call in fake_telegram.chart_calls if call.files]
     assert [(call.method, _size(call)) for call in uploads] == [

@@ -642,12 +642,13 @@ def downscale(png: bytes) -> bytes:
     A Lanczos resize of the ``OUT_W`` × ``OUT_H`` render, so the picture is the same at half
     the resolution. The chart lifecycle uploads it while Telegram answers
     ``IMAGE_PROCESS_FAILED`` to the full size (quick task 261122-0cq). Deterministic like
-    ``render_png``. ValueError when ``png`` is not an image of ``OUT_W`` × ``OUT_H`` px.
+    ``render_png``. ValueError when ``png`` is an image of another size, and Pillow's
+    ``UnidentifiedImageError`` (an ``OSError``) when it is no image at all.
     """
     with Image.open(io.BytesIO(png)) as image:
         if image.size != (OUT_W, OUT_H):
             raise ValueError(f"a chart is {OUT_W}x{OUT_H} px, not {image.size[0]}x{image.size[1]}")
-        small = image.convert("RGB").resize((W, H), Image.Resampling.LANCZOS)
+        small = image.resize((W, H), Image.Resampling.LANCZOS)
     buf = io.BytesIO()
     small.save(buf, format="PNG")
     return buf.getvalue()

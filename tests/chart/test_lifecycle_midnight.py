@@ -599,6 +599,8 @@ def test_D02_failing_post_keeps_the_old_pin_and_never_blocks_its_final_edit(
     # The bot is held as an alert's 5xx would hold it; the post waits step_delay(1) longer.
     assert state.not_before == {bot: answer + _sec(2), post_key: answer + _sec(2 + 30)}
     assert not ChartMessage.objects.filter(local_date=TODAY).exists()
+    # A 5xx is not Telegram failing to process the image: uploads stay full size.
+    assert state.small_photos_until == {}
     clock.set(answer + _sec(1))
     assert _pass(clock, state) is False
     # Once the bot's hold ends, the older chart gets its final edit, but keeps its pin:
@@ -711,24 +713,31 @@ def test_midnight_post_telegram_could_not_process_is_retried_at_1280_and_the_old
     post_key = lifecycle.chart_key(location.pk, "post")
 
     assert _pass(clock, state) is True
-    # Retried soon, like a 5xx: the bot waits 2 s, the post 30 s more; no ops notice.
-    assert state.not_before[post_key] == answer + _sec(2 + 30)
+    # Only the post waits, 30 s: Telegram answered, so neither the bot (and its alerts) is
+    # held nor any degraded mark set; and no ops notice.
+    assert state.not_before == {post_key: answer + _sec(30)}
+    assert not io_loop.is_degraded(state, DEFAULT_BOT_TOKEN)
+    assert not io_loop.is_photo_degraded(state, DEFAULT_BOT_TOKEN)
     assert not OpsIncident.objects.filter(kind="chart_failing").exists()
     assert lifecycle.small_photos(state, DEFAULT_BOT_TOKEN, answer) is True
     assert lifecycle.small_photos(state, DEFAULT_BOT_TOKEN, answer + _min(60)) is False
-    [warning] = [r.getMessage() for r in caplog.records if "1280x1000" in r.getMessage()]
-    assert warning == (
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert (
         f"chart uploads for location {location.pk}: Telegram could not process the image; "
         "the bot's charts go at 1280x1000 for 60 min"
-    )
-    # The final edit goes at 1280 x 1000 too, and the old chart stays pinned meanwhile.
-    clock.set(answer + _sec(2))
+    ) in warnings
+    assert (
+        f"chart post for location {location.pk}: Telegram could not process the image; it "
+        "is tried again in 30 s (attempt 1)"
+    ) in warnings
+    assert not any("may have been delivered" in line for line in warnings)
+    # The final edit goes right away, at 1280 x 1000; the old chart stays pinned meanwhile.
     assert _pass(clock, state) is True
     assert _pass(clock, state) is False
     older.refresh_from_db()
-    assert (older.finalized_at, older.pinned) == (answer + _sec(2), True)
+    assert (older.finalized_at, older.pinned) == (answer, True)
     # The retry posts today's chart at 1280 x 1000; then it is pinned and the old one goes.
-    clock.set(answer + _sec(32))
+    clock.set(answer + _sec(30))
     assert _run_until_idle(clock, state) == 3
     older.refresh_from_db()
     assert older.pinned is False
@@ -763,24 +772,68 @@ def test_refresh_telegram_could_not_process_goes_small_and_a_repeat_extends_it_s
     state = io_loop.RelayState()
     refresh_key = lifecycle.chart_key(location.pk, "refresh")
 
-    # The full size fails; the step waits 2 s + 30 s and the bot goes small for an hour.
+    # The full size fails: the step waits 30 s, no notice, and the bot goes small.
     assert _pass(clock, state) is True
-    assert state.not_before[refresh_key] == first + _sec(32)
-    # The small retry fails too: the hold is extended from that answer, with no new line.
-    second = first + _sec(32)
+    assert state.not_before == {refresh_key: first + _sec(30)}
+    assert not OpsIncident.objects.filter(kind="chart_failing").exists()
+    # The small retry fails too: the hold is extended from that answer with no second
+    # switch line, and a chart Telegram cannot take even at 1280 x 1000 opens chart_failing.
+    second = first + _sec(30)
     clock.set(second)
     assert _pass(clock, state) is True
-    assert state.not_before[refresh_key] == second + _sec(4 + 60)
+    assert state.not_before == {refresh_key: second + _sec(60)}
     assert state.small_photos_until == {io_loop.bot_key(DEFAULT_BOT_TOKEN): second + _min(60)}
-    third = second + _sec(64)
+    [incident] = OpsIncident.objects.filter(kind="chart_failing")
+    assert (incident.started_at, incident.ended_at, incident.details) == (
+        second,
+        None,
+        {"http_status": 400},
+    )
+    # The next small upload works: the incident ends.
+    third = second + _sec(60)
     clock.set(third)
     assert _pass(clock, state) is True
 
     assert _sizes(fake_telegram) == [("editMessageMedia", (1280, 1000))]
-    assert len([r for r in caplog.records if "1280x1000" in r.getMessage()]) == 1
+    assert len([r for r in caplog.records if "1280x1000 for" in r.getMessage()]) == 1
     row.refresh_from_db()
     assert row.last_rendered_at == third
-    assert not OpsIncident.objects.filter(kind="chart_failing").exists()
+    incident.refresh_from_db()
+    assert incident.ended_at == third
+
+
+def test_final_edit_telegram_could_not_process_is_retried_never_finalized_best_effort(
+    location_factory: Callable[..., Any], fake_telegram: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The incident's other symptom: yesterday's final edit got the 400 and was marked
+    # finalized "best effort", so the channel kept a live image of an unfinished day.
+    location = _monitored(location_factory)
+    _seed(location, TODAY, message_id=900, pinned=True, rendered=AFTER_MIDNIGHT)
+    older = _seed(location, YESTERDAY, message_id=501, pinned=True)
+    fake_telegram.fail_method(
+        DEFAULT_BOT_TOKEN, "editMessageMedia", status=400, json_body=IMAGE_FAILED
+    )
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    caplog.set_level(logging.INFO, logger=LIFECYCLE_LOGGER)
+    clock = FakeClock(AFTER_MIDNIGHT)
+    state = io_loop.RelayState()
+    finalize_key = lifecycle.chart_key(location.pk, "finalize", older.pk)
+
+    assert _pass(clock, state) is True
+    older.refresh_from_db()
+    assert older.finalized_at is None
+    assert state.not_before[finalize_key] == AFTER_MIDNIGHT + _sec(30)
+    assert not any("best effort" in r.getMessage() for r in caplog.records)
+    # A waiting final edit never holds the unpin (D-02); the retry goes at 1280 x 1000.
+    assert _pass(clock, state) is True
+    assert _pass(clock, state) is False
+    retry = AFTER_MIDNIGHT + _sec(30)
+    clock.set(retry)
+    assert _run_until_idle(clock, state) == 1
+
+    older.refresh_from_db()
+    assert (older.finalized_at, older.pinned, older.unpinned_at) == (retry, False, AFTER_MIDNIGHT)
+    assert _sizes(fake_telegram) == [("editMessageMedia", (1280, 1000))]
 
 
 def test_small_photos_never_shrink_another_bots_uploads(

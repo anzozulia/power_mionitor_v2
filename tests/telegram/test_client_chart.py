@@ -503,7 +503,7 @@ def test_send_photo_and_send_message_keep_the_old_400_rule(
     fake_telegram: Any, method: str, description: str
 ) -> None:
     # The description mapping is limited to edit, pin and unpin: a 400 on a send is
-    # permanent whatever Telegram says.
+    # permanent whatever Telegram says, except IMAGE_PROCESS_FAILED on sendPhoto (below).
     fake_telegram.fail_method(TOKEN, method, **_bad_request(description))
     client = _client()
 

@@ -302,7 +302,9 @@ _REFUSABLE: tuple[Step, ...] = ("post", "refresh")
 # a ``transient`` outcome). Since 2026-11-20 Telegram answers it to most 2560 x 2000
 # uploads and to no 1280 x 1000 one, so the bot's uploads then go at 1280 x 1000
 # (``render.downscale``) for SMALL_PHOTO_HOLD, after which the full size is tried again
-# (quick task 261122-0cq).
+# (quick task 261122-0cq). Telegram did answer, so it holds neither the bot nor its alerts
+# and sets no degraded mark: the step alone waits ``step_delay``. Refused at 1280 x 1000
+# too, a post or refresh opens ``chart_failing`` like a permanent refusal (F-04).
 IMAGE_FAILED = "image_process_failed"
 SMALL_PHOTO_HOLD = timedelta(hours=1)
 
@@ -897,13 +899,18 @@ def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | No
         gate = _post_gate(client, action, key, now, tz, clock, state, stop)
         if gate is not None:
             return gate
+        # Whether this upload went at 1280 x 1000: ``_sized`` used the same check.
+        small = action.step in _RENDERED and small_photos(state, location.bot_token, now)
         called = clock.monotonic()
         result = _call(client, action, content)
         call_ms = _ms(clock.monotonic() - called)
         answered = clock.now()
-        io_loop.note_bot_health(state, location.bot_token, result)
-        if action.step in _RENDERED:
-            io_loop.note_photo_health(state, location.bot_token, result)
+        if result.code != IMAGE_FAILED:
+            # Telegram processed the call, or did not answer: the health marks (D-1).
+            io_loop.note_bot_health(state, location.bot_token, result)
+            if action.step in _RENDERED:
+                io_loop.note_photo_health(state, location.bot_token, result)
+        else:
             _note_photo_size(state, location, result, answered)
         log.info(
             "chart %s for location %s: %s (%s) render_ms=%d call_ms=%d",
@@ -915,7 +922,7 @@ def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | No
             call_ms,
         )
         try:
-            _apply(action, key, result, today, answered, state)
+            _apply(action, key, result, today, answered, state, small=small)
         except Error as exc:
             _unwritten(action, key, result, answered, state, exc)
         return True
@@ -973,8 +980,8 @@ def _note_photo_size(
     at 1280 x 1000 for ``SMALL_PHOTO_HOLD`` from the answer (261122-0cq).
 
     One WARNING when the bot switches to the small size; a failure while it is small
-    extends the hold silently. Memory only, like the other marks: a restart uploads the
-    full size first.
+    extends the hold (``_fail`` logs every failure). Memory only, like the other marks: a
+    restart uploads the full size first.
     """
     if result.code != IMAGE_FAILED:
         return
@@ -1163,9 +1170,11 @@ def _photo_probe(
     probe = client.edit_message_media(candidate.chat_id, candidate.message_id, png, caption)
     call_ms = _ms(clock.monotonic() - called)
     answered = clock.now()
-    io_loop.note_bot_health(state, location.bot_token, probe)
-    io_loop.note_photo_health(state, location.bot_token, probe)
-    _note_photo_size(state, location, probe, answered)
+    if probe.code != IMAGE_FAILED:
+        io_loop.note_bot_health(state, location.bot_token, probe)
+        io_loop.note_photo_health(state, location.bot_token, probe)
+    else:
+        _note_photo_size(state, location, probe, answered)
     log.info(
         "chart photo probe for location %s: %s (%s) render_ms=%d call_ms=%d",
         location.location_id,
@@ -1266,8 +1275,14 @@ def _apply(
     today: date,
     answered: datetime,
     state: io_loop.RelayState,
+    *,
+    small: bool = False,
 ) -> None:
-    """Write the step's outcome: its record on success, else its own backoff (``_fail``)."""
+    """Write the step's outcome: its record on success, else its own backoff (``_fail``).
+
+    ``small``: the upload went at 1280 x 1000 (``small_photos``); Telegram refusing to
+    process even that image counts as a refusal for the ``chart_failing`` notice (261122-0cq).
+    """
     row = action.row
     if action.step == "release" and row is not None:
         _released(action, row, key, result, answered, state)
@@ -1321,7 +1336,8 @@ def _apply(
     if result.kind == "permanent" and action.step == "pin" and row is not None:
         # The bot may not pin here: tried again after the next render, not before (D-07).
         _pin_refused(action.location, row, result, answered)
-    if result.kind == "permanent" and action.step in _REFUSABLE:
+    refused_small = small and result.code == IMAGE_FAILED
+    if (result.kind == "permanent" or refused_small) and action.step in _REFUSABLE:
         # Subscribers see no chart, or an old one: one notice when it starts (INV-20).
         _chart_refused(action.location, result, answered)
     _fail(action, key, result, answered, state)
@@ -1720,6 +1736,8 @@ def _fail(
 
     - permanent: the fixed PERMANENT_BACKOFF (a refused pin waits for the next render
       anyway, D-07; a refused post or refresh for its next try);
+    - ``IMAGE_FAILED`` (Telegram could not process the image): ``step_delay(n)``, with one
+      WARNING and no bot hold (261122-0cq);
     - rate_limited, transient, not_sent (``BOT_WIDE_KINDS``): the bot is held as an
       alert's outcome would hold it (retry_after capped at MAX_RETRY_AFTER_S, or
       min(2**n, BACKOFF_CAP_S) s), and the step waits ``step_delay(n)`` longer, so the
@@ -1750,6 +1768,17 @@ def _fail(
         return
     delay = step_delay(failures)
     state.not_before[key] = answered + delay
+    if result.code == IMAGE_FAILED:
+        # Nothing was posted or changed: no "may have been delivered" here (261122-0cq).
+        log.warning(
+            "chart %s for location %s: Telegram could not process the image; it is tried "
+            "again in %d s (attempt %d)",
+            action.step,
+            location_id,
+            delay // timedelta(seconds=1),
+            failures,
+        )
+        return
     if action.step == "post":
         log.warning(
             "chart post for location %s may have been delivered (%s); it is not recorded "
@@ -1762,8 +1791,12 @@ def _fail(
 
 
 def _bot_hold(result: SendResult, failures: int) -> timedelta | None:
-    """How long a bot-wide outcome holds the whole bot (``io_loop._apply``), else None."""
-    if result.kind not in io_loop.BOT_WIDE_KINDS:
+    """How long a bot-wide outcome holds the whole bot (``io_loop._apply``), else None.
+
+    ``IMAGE_FAILED`` is ``transient`` but holds nothing: Telegram answered, only one image
+    failed, and the bot's alerts must not wait for it (261122-0cq).
+    """
+    if result.kind not in io_loop.BOT_WIDE_KINDS or result.code == IMAGE_FAILED:
         return None
     if result.kind == "rate_limited":
         wait = min(result.retry_after or DEFAULT_RETRY_AFTER_S, io_loop.MAX_RETRY_AFTER_S)
