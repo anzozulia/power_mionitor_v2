@@ -44,7 +44,11 @@ No method raises across its boundary. Every outcome comes back as a ``SendResult
   accepted without a usable ``message_id`` is ``maybe_delivered`` too (code
   ``no_message_id``): the photo may exist but cannot be recorded.
 - ``rate_limited``: HTTP 429; ``retry_after`` is the wait in whole seconds.
-- ``transient``: HTTP 5xx.
+- ``transient``: HTTP 5xx, or a photo upload (``sendPhoto``, ``editMessageMedia``) that
+  Telegram answered 400 ``IMAGE_PROCESS_FAILED`` (code ``image_process_failed``): it could
+  not process the image, so nothing was posted or changed and the call may be made again
+  (quick task 261122-0cq). Since 2026-11-20 Telegram answers this to most 2560 x 2000
+  uploads and to no 1280 x 1000 one.
 - ``permanent``: any other answer (400, 401, 403, 404, ...). When Telegram says the group
   became a supergroup (``parameters.migrate_to_chat_id``), the result carries that new
   chat ID, if it is a 64-bit integer, for the admin's notice (D-10); no caller ever sends
@@ -123,6 +127,8 @@ _TARGET_MISSING = (
     "message to pin not found",
     "message to unpin not found",
 )
+# Lower-case substring of Telegram's 400 description for a photo it could not process.
+_IMAGE_FAILED = ("image_process_failed",)
 
 _RETRY_AFTER_TEXT = re.compile(r"[0-9]{1,9}")
 
@@ -244,6 +250,7 @@ class TelegramClient:
             data={"chat_id": str(chat_id), "caption": caption, "disable_notification": "true"},
             files={PHOTO_FIELD: (PHOTO_FILENAME, png, _PNG_TYPE)},
             want_message_id=True,
+            photo=True,
             timeout=self._photo_timeout,
         )
         return _logged("sendPhoto", result)
@@ -266,6 +273,7 @@ class TelegramClient:
             },
             files={MEDIA_ATTACH: (PHOTO_FILENAME, png, _PNG_TYPE)},
             chart=True,
+            photo=True,
             timeout=self._photo_timeout,
         )
         return _logged("editMessageMedia", result)
@@ -329,6 +337,7 @@ class TelegramClient:
         keep_message_id: bool = False,
         chart: bool = False,
         delete: bool = False,
+        photo: bool = False,
         timeout: tuple[float, float] | None = None,
     ) -> SendResult:
         """POST one Bot API ``method`` (a JSON body, or ``data`` + ``files`` as multipart).
@@ -368,6 +377,7 @@ class TelegramClient:
             keep_message_id=keep_message_id,
             chart=chart,
             delete=delete,
+            photo=photo,
         )
 
 
@@ -404,6 +414,7 @@ def _classify(
     keep_message_id: bool = False,
     chart: bool = False,
     delete: bool = False,
+    photo: bool = False,
 ) -> SendResult:
     """Classify an HTTP answer by its status and JSON body. The body is untrusted input.
 
@@ -412,7 +423,9 @@ def _classify(
     ``keep_message_id`` (sendMessage) an ``ok`` carries that id when it is usable and None
     otherwise, and stays ``ok`` either way. With ``chart`` (edit, pin, unpin) a 400 is read
     by its description first; with ``delete`` (deleteMessage) only "message to delete not
-    found" is, and it is ``ok`` with code ``not_found``.
+    found" is, and it is ``ok`` with code ``not_found``. With ``photo`` (sendPhoto,
+    editMessageMedia) a 400 saying ``IMAGE_PROCESS_FAILED`` is ``transient`` with code
+    ``image_process_failed``: nothing was posted or changed (261122-0cq).
     """
     try:
         payload: Any = resp.json()
@@ -439,6 +452,8 @@ def _classify(
         return SendResult("rate_limited", retry_after=retry_after, code="429")
     if resp.status_code >= 500:
         return SendResult("transient", code=f"http_{resp.status_code}")
+    if photo and code == 400 and _described(data.get("description"), _IMAGE_FAILED):
+        return SendResult("transient", code="image_process_failed")
     if chart and code == 400:
         known = _chart_bad_request(data.get("description"))
         if known is not None:
@@ -452,6 +467,14 @@ def _classify(
         code=f"http_{code}",
         migrate_to_chat_id=_chat_id(parameters.get("migrate_to_chat_id")),
     )
+
+
+def _described(description: object, parts: tuple[str, ...]) -> bool:
+    """True if the untrusted ``description`` holds one of the lower-case ``parts``.
+
+    The description is only matched here: it is never logged, stored or returned.
+    """
+    return isinstance(description, str) and any(part in description.lower() for part in parts)
 
 
 def _chart_bad_request(description: object) -> SendResult | None:

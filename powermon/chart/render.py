@@ -8,6 +8,8 @@ the location name: the same inputs, font files and Pillow version give the same 
 (chart-spec §9, D-09). It draws exactly the model's wall-clock segments and real-time
 totals and recomputes no data.
 Today's row shows only what happened up to ``now``; after it the track stays empty.
+``downscale(png)`` turns such a PNG into the 1280×1000 one the chart lifecycle uploads
+while Telegram fails to process the large image (quick task 261122-0cq).
 
 How it draws (D-09, STACK Gotcha 1, 03-RESEARCH Pattern 2):
 - Pillow with the bundled Inter 4.1 TTFs, loaded by file path from ``FONT_DIR`` with
@@ -631,4 +633,21 @@ def render_png(week: Week, *, lang: str, name: str) -> bytes:
     _draw_text(canvas, lay, week, lang, name, legend, pill)
     buf = io.BytesIO()
     canvas.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def downscale(png: bytes) -> bytes:
+    """The chart ``png`` at the 1280×1000 layout size (``W`` × ``H``), as PNG bytes.
+
+    A Lanczos resize of the ``OUT_W`` × ``OUT_H`` render, so the picture is the same at half
+    the resolution. The chart lifecycle uploads it while Telegram answers
+    ``IMAGE_PROCESS_FAILED`` to the full size (quick task 261122-0cq). Deterministic like
+    ``render_png``. ValueError when ``png`` is not an image of ``OUT_W`` × ``OUT_H`` px.
+    """
+    with Image.open(io.BytesIO(png)) as image:
+        if image.size != (OUT_W, OUT_H):
+            raise ValueError(f"a chart is {OUT_W}x{OUT_H} px, not {image.size[0]}x{image.size[1]}")
+        small = image.convert("RGB").resize((W, H), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    small.save(buf, format="PNG")
     return buf.getvalue()

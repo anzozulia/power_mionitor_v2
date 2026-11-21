@@ -297,6 +297,10 @@ class RelayState:
     re-upload of an existing chart answers ok (the photo probe), since getMe can answer
     while uploads fail (quick task 261103-b2z). In memory, so a restart starts with every
     bot healthy.
+    ``small_photos_until``: by ``bot_key``, until when the bot's chart uploads go at
+    1280 x 1000, set after Telegram could not process one (``IMAGE_PROCESS_FAILED``,
+    ``lifecycle._note_photo_size``, quick task 261122-0cq). In memory, so a restart uploads
+    the full size first.
     ``failing``: the ``chat_key`` the relay holds for each location whose subscriber alert
     was refused permanently, by location id; that channel's 15-minute hold lasts while the
     location's ``delivery_failing`` incident is open, and goes once it closes (D-12).
@@ -317,6 +321,7 @@ class RelayState:
     failing: dict[int, str] = field(default_factory=dict)
     degraded: set[str] = field(default_factory=set)
     photo_degraded: set[str] = field(default_factory=set)
+    small_photos_until: dict[str, datetime] = field(default_factory=dict)
     last_wall: datetime | None = None
     last_mono: float | None = None
 

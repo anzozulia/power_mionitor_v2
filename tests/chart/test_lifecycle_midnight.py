@@ -574,14 +574,21 @@ def test_D04_D08_moved_record_is_unpinned_in_its_stored_chat_and_never_finalized
 # D-02: a failing step never blocks the others (INV-19, T-03-34)
 
 
-def test_D02_failing_post_never_blocks_cleanup(
+def test_D02_failing_post_keeps_the_old_pin_and_never_blocks_its_final_edit(
     location_factory: Callable[..., Any], fake_telegram: Any
 ) -> None:
     location = _monitored(location_factory)
     older = _seed(location, YESTERDAY, message_id=501, pinned=True)
-    # Every sendPhoto answers 502; final edits and unpins are accepted.
+    # The first sendPhoto answers 502, the next ones are accepted, as is everything else.
     fake_telegram.fail_method(DEFAULT_BOT_TOKEN, "sendPhoto", status=502, json_body=BAD_GATEWAY)
-    _accept(fake_telegram, DEFAULT_BOT_TOKEN, "editMessageMedia", "unpinChatMessage")
+    _accept(
+        fake_telegram,
+        DEFAULT_BOT_TOKEN,
+        "sendPhoto",
+        "editMessageMedia",
+        "pinChatMessage",
+        "unpinChatMessage",
+    )
     answer = kyiv("2026-10-02 09:00")
     clock = FakeClock(answer)
     state = io_loop.RelayState()
@@ -594,33 +601,31 @@ def test_D02_failing_post_never_blocks_cleanup(
     assert not ChartMessage.objects.filter(local_date=TODAY).exists()
     clock.set(answer + _sec(1))
     assert _pass(clock, state) is False
-    # Once the bot's hold ends, the older chart is finalized and unpinned...
+    # Once the bot's hold ends, the older chart gets its final edit, but keeps its pin:
+    # the channel is never left without a chart (261122-0cq).
     clock.set(answer + _sec(2))
     assert _pass(clock, state) is True
-    assert _pass(clock, state) is True
     assert _pass(clock, state) is False
-    # ...and the post is retried at its own key.
-    clock.set(answer + _sec(31))
-    assert _pass(clock, state) is False
+    older.refresh_from_db()
+    assert (older.finalized_at, older.pinned, older.unpinned_at) == (answer + _sec(2), True, None)
+    # The post is retried at its own key; once today's chart is pinned, the old one goes.
     second = answer + _sec(32)
     clock.set(second)
-    assert _pass(clock, state) is True
-    assert state.not_before[bot] == second + _sec(4)
-    assert state.not_before[post_key] == second + _sec(4 + 60)
+    assert _run_until_idle(clock, state) == 3
 
     assert _requests(fake_telegram) == [
         ("A", "sendPhoto"),
         ("A", "editMessageMedia"),
-        ("A", "unpinChatMessage"),
         ("A", "sendPhoto"),
+        ("A", "pinChatMessage"),
+        ("A", "unpinChatMessage"),
     ]
     older.refresh_from_db()
-    assert (older.finalized_at, older.pinned) == (answer + _sec(2), False)
-    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "sendPhoto") == 2
-    assert not ChartMessage.objects.filter(local_date=TODAY).exists()
+    assert (older.pinned, older.unpinned_at) == (False, second)
+    assert ChartMessage.objects.get(local_date=TODAY).pinned is True
 
 
-def test_D02_failing_pin_never_blocks_cleanup(
+def test_D02_failing_pin_keeps_the_old_pin_and_never_blocks_its_final_edit(
     location_factory: Callable[..., Any], fake_telegram: Any
 ) -> None:
     location = _monitored(location_factory)
@@ -628,7 +633,14 @@ def test_D02_failing_pin_never_blocks_cleanup(
     fake_telegram.fail_method(
         DEFAULT_BOT_TOKEN, "pinChatMessage", status=502, json_body=BAD_GATEWAY
     )
-    _accept(fake_telegram, DEFAULT_BOT_TOKEN, "sendPhoto", "editMessageMedia", "unpinChatMessage")
+    _accept(
+        fake_telegram,
+        DEFAULT_BOT_TOKEN,
+        "sendPhoto",
+        "editMessageMedia",
+        "pinChatMessage",
+        "unpinChatMessage",
+    )
     answer = kyiv("2026-10-02 09:00")
     clock = FakeClock(answer)
     state = io_loop.RelayState()
@@ -645,24 +657,143 @@ def test_D02_failing_pin_never_blocks_cleanup(
     assert _pass(clock, state) is False
     clock.set(answer + _sec(2))
     assert _pass(clock, state) is True
-    assert _pass(clock, state) is True
     assert _pass(clock, state) is False
+    older.refresh_from_db()
+    assert (older.finalized_at, older.pinned) == (answer + _sec(2), True)
     clock.set(answer + _sec(32))
     assert _pass(clock, state) is True
+    assert _pass(clock, state) is True
+    assert _pass(clock, state) is False
 
     assert _requests(fake_telegram) == [
         ("A", "sendPhoto"),
         ("A", "pinChatMessage"),
         ("A", "editMessageMedia"),
-        ("A", "unpinChatMessage"),
         ("A", "pinChatMessage"),
+        ("A", "unpinChatMessage"),
     ]
     older.refresh_from_db()
-    assert (older.finalized_at, older.pinned) == (answer + _sec(2), False)
+    assert (older.pinned, older.unpinned_at) == (False, answer + _sec(32))
     today_row.refresh_from_db()
     # A 5xx is not "the bot may not pin": no pin failure, no incident (D-07).
-    assert (today_row.pinned, today_row.pin_failed_at) == (False, None)
+    assert (today_row.pinned, today_row.pin_failed_at) == (True, None)
     assert not OpsIncident.objects.filter(kind="chart_pin_failed").exists()
+
+
+# Telegram could not process the photo (IMAGE_PROCESS_FAILED, quick task 261122-0cq)
+
+IMAGE_FAILED = {"ok": False, "error_code": 400, "description": "Bad Request: IMAGE_PROCESS_FAILED"}
+
+
+def _sizes(fake: Any) -> list[tuple[str, tuple[int, int]]]:
+    """(method, PNG size) of every accepted photo upload, in order."""
+    out = []
+    for call in fake.chart_calls:
+        if call.method in ("sendPhoto", "editMessageMedia"):
+            [png] = call.files.values()
+            out.append((call.method, _png_size(png)))
+    return out
+
+
+def test_midnight_post_telegram_could_not_process_is_retried_at_1280_and_the_old_pin_stays(
+    location_factory: Callable[..., Any], fake_telegram: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The 2026-11-21 midnight: today's photo got 400 IMAGE_PROCESS_FAILED. It was taken
+    # as permanent (15 min, an ops notice) and yesterday's chart was unpinned anyway.
+    location = _monitored(location_factory)
+    older = _seed(location, YESTERDAY, message_id=501, pinned=True)
+    fake_telegram.fail_method(DEFAULT_BOT_TOKEN, "sendPhoto", status=400, json_body=IMAGE_FAILED)
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    caplog.set_level(logging.INFO, logger=LIFECYCLE_LOGGER)
+    answer = AFTER_MIDNIGHT
+    clock = FakeClock(answer)
+    state = io_loop.RelayState()
+    post_key = lifecycle.chart_key(location.pk, "post")
+
+    assert _pass(clock, state) is True
+    # Retried soon, like a 5xx: the bot waits 2 s, the post 30 s more; no ops notice.
+    assert state.not_before[post_key] == answer + _sec(2 + 30)
+    assert not OpsIncident.objects.filter(kind="chart_failing").exists()
+    assert lifecycle.small_photos(state, DEFAULT_BOT_TOKEN, answer) is True
+    assert lifecycle.small_photos(state, DEFAULT_BOT_TOKEN, answer + _min(60)) is False
+    [warning] = [r.getMessage() for r in caplog.records if "1280x1000" in r.getMessage()]
+    assert warning == (
+        f"chart uploads for location {location.pk}: Telegram could not process the image; "
+        "the bot's charts go at 1280x1000 for 60 min"
+    )
+    # The final edit goes at 1280 x 1000 too, and the old chart stays pinned meanwhile.
+    clock.set(answer + _sec(2))
+    assert _pass(clock, state) is True
+    assert _pass(clock, state) is False
+    older.refresh_from_db()
+    assert (older.finalized_at, older.pinned) == (answer + _sec(2), True)
+    # The retry posts today's chart at 1280 x 1000; then it is pinned and the old one goes.
+    clock.set(answer + _sec(32))
+    assert _run_until_idle(clock, state) == 3
+    older.refresh_from_db()
+    assert older.pinned is False
+    today_row = ChartMessage.objects.get(local_date=TODAY)
+    assert today_row.pinned is True
+    # An hour after the failure the full size is tried again.
+    clock.set(answer + _min(61))
+    assert _run_until_idle(clock, state) == 1
+
+    assert _sizes(fake_telegram) == [
+        ("editMessageMedia", (1280, 1000)),
+        ("sendPhoto", (1280, 1000)),
+        ("editMessageMedia", (2560, 2000)),
+    ]
+    assert fake_telegram.count(DEFAULT_BOT_TOKEN, "sendPhoto") == 2
+    assert not OpsIncident.objects.filter(kind="chart_failing").exists()
+
+
+def test_refresh_telegram_could_not_process_goes_small_and_a_repeat_extends_it_silently(
+    location_factory: Callable[..., Any], fake_telegram: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    location = _monitored(location_factory)
+    row = _seed(location, TODAY, message_id=900, pinned=True, rendered=kyiv("2026-10-02 08:59"))
+    for _ in range(2):
+        fake_telegram.fail_method(
+            DEFAULT_BOT_TOKEN, "editMessageMedia", status=400, json_body=IMAGE_FAILED
+        )
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    caplog.set_level(logging.INFO, logger=LIFECYCLE_LOGGER)
+    first = kyiv("2026-10-02 09:00")
+    clock = FakeClock(first)
+    state = io_loop.RelayState()
+    refresh_key = lifecycle.chart_key(location.pk, "refresh")
+
+    # The full size fails; the step waits 2 s + 30 s and the bot goes small for an hour.
+    assert _pass(clock, state) is True
+    assert state.not_before[refresh_key] == first + _sec(32)
+    # The small retry fails too: the hold is extended from that answer, with no new line.
+    second = first + _sec(32)
+    clock.set(second)
+    assert _pass(clock, state) is True
+    assert state.not_before[refresh_key] == second + _sec(4 + 60)
+    assert state.small_photos_until == {io_loop.bot_key(DEFAULT_BOT_TOKEN): second + _min(60)}
+    third = second + _sec(64)
+    clock.set(third)
+    assert _pass(clock, state) is True
+
+    assert _sizes(fake_telegram) == [("editMessageMedia", (1280, 1000))]
+    assert len([r for r in caplog.records if "1280x1000" in r.getMessage()]) == 1
+    row.refresh_from_db()
+    assert row.last_rendered_at == third
+    assert not OpsIncident.objects.filter(kind="chart_failing").exists()
+
+
+def test_small_photos_never_shrink_another_bots_uploads(
+    location_factory: Callable[..., Any], fake_telegram: Any
+) -> None:
+    state = io_loop.RelayState()
+    at = kyiv("2026-10-02 09:00")
+    state.small_photos_until[io_loop.bot_key(DEFAULT_BOT_TOKEN)] = at + _min(60)
+
+    assert lifecycle.small_photos(state, DEFAULT_BOT_TOKEN, at) is True
+    assert lifecycle.small_photos(state, "999999:" + "b" * 35, at) is False
+    # The hold ends exactly at its time.
+    assert lifecycle.small_photos(state, DEFAULT_BOT_TOKEN, at + _min(60)) is False
 
 
 # Older charts: cleanup is best effort, a gone chart is forgotten (INV-19, D-06)

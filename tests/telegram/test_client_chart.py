@@ -515,6 +515,56 @@ def test_send_photo_and_send_message_keep_the_old_400_rule(
     assert result == SendResult("permanent", code="http_400")
 
 
+# A photo Telegram could not process (quick task 261122-0cq)
+
+IMAGE_FAILED = "Bad Request: IMAGE_PROCESS_FAILED"
+
+
+@pytest.mark.parametrize("method", ["sendPhoto", "editMessageMedia"])
+@pytest.mark.parametrize(
+    "description", [IMAGE_FAILED, "Bad Request: image_process_failed"], ids=["upper", "lower"]
+)
+def test_photo_upload_telegram_could_not_process_is_transient(
+    fake_telegram: Any, caplog: Any, method: str, description: str
+) -> None:
+    # Nothing was posted or changed, so the caller may make the call again soon; the
+    # description is matched only, never logged.
+    fake_telegram.fail_method(TOKEN, method, **_bad_request(description))
+    caplog.set_level(logging.DEBUG)
+
+    result = CALLS[method](_client())
+
+    assert result == SendResult("transient", code="image_process_failed")
+    assert len(fake_telegram.calls) == 1
+    assert "Bad Request" not in caplog.text
+    assert f"telegram {method}: transient (image_process_failed)" in caplog.text
+
+
+@pytest.mark.parametrize("method", ["pinChatMessage", "unpinChatMessage", "deleteMessage"])
+def test_image_process_failed_outside_a_photo_upload_stays_permanent(
+    fake_telegram: Any, method: str
+) -> None:
+    # Only the two uploads carry an image: the same text on any other call is not mapped.
+    fake_telegram.fail_method(TOKEN, method, **_bad_request(IMAGE_FAILED))
+
+    assert CALLS[method](_client()) == SendResult("permanent", code="http_400")
+
+
+def test_image_process_failed_on_send_message_stays_permanent(fake_telegram: Any) -> None:
+    fake_telegram.fail_method(TOKEN, "sendMessage", **_bad_request(IMAGE_FAILED))
+
+    assert _client().send_message(DEFAULT_CHAT_ID, "x") == SendResult("permanent", code="http_400")
+
+
+@pytest.mark.parametrize("status", [403, 404])
+def test_image_process_failed_text_needs_a_400(fake_telegram: Any, status: int) -> None:
+    # Another status keeps its own rule, whatever the description says.
+    body = {"ok": False, "error_code": status, "description": IMAGE_FAILED}
+    fake_telegram.fail_method(TOKEN, "sendPhoto", status=status, json_body=body)
+
+    assert CALLS["sendPhoto"](_client()) == SendResult("permanent", code=f"http_{status}")
+
+
 # Transport (D-08)
 
 

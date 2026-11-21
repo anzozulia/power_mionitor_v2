@@ -560,14 +560,15 @@ def test_INV17_1_bot_can_post_but_not_pin(
         start,
     )
     # The channel's alerts are never held: an alert queued now goes out in its next pass,
-    # with the ops notice; the older chart is still finalized and unpinned (D-02).
+    # with the ops notice and the older chart's final edit (D-02); the older chart keeps
+    # its pin until today's chart is pinned (261122-0cq).
     off = _queue_alert(location, start)
     assert _pass(clock, state) is True
     assert OutboxMessage.objects.get(pk=off.pk).status == "sent"
     assert OutboxMessage.objects.get(pk=failed.pk).status == "sent"
-    assert _run_until_idle(clock, state) == 1
+    assert _run_until_idle(clock, state) == 0
     older.refresh_from_db()
-    assert (older.finalized_at, older.pinned) == (start, False)
+    assert (older.finalized_at, older.pinned) == (start, True)
     assert channel not in state.not_before
 
     # 09:15 and 09:30: the refresh keeps its cadence, the pin is retried right after it
@@ -582,18 +583,24 @@ def test_INV17_1_bot_can_post_but_not_pin(
         assert _incidents(location) == [(start, None)]
         assert channel not in state.not_before
 
-    # 09:45: the right was granted; after the refresh the pin goes through.
+    # 09:45: the right was granted; after the refresh the pin goes through, and then the
+    # older chart gets its unpin.
     restored_at = start + _min(45)
     clock.set(restored_at)
     assert _pass(clock, state) is True
     assert _pass(clock, state) is True
     today_row.refresh_from_db()
     assert (today_row.pinned, today_row.pin_failed_at) == (True, None)
+    older.refresh_from_db()
+    assert older.pinned is True
     assert _incidents(location) == [(start, restored_at)]
     [restored] = _ops_rows(outbox.KIND_OPS_PIN_RESTORED)
     assert (restored.payload, restored.location_id) == ({}, location.pk)
+    # The next pass sends the notice first, then makes the older chart's unpin.
     assert _pass(clock, state) is True
     assert OutboxMessage.objects.get(pk=restored.pk).status == "sent"
+    older.refresh_from_db()
+    assert (older.pinned, older.unpinned_at) == (False, restored_at)
     assert _pass(clock, state) is False
 
     assert fake_telegram.count(DEFAULT_BOT_TOKEN, "pinChatMessage") == 4

@@ -111,6 +111,52 @@ def test_sample_week_png_is_2560x2000_opaque_rgb() -> None:
     assert _px(img, 1279, 999) == render.SURFACE
 
 
+# downscale: the 1280x1000 upload while Telegram cannot process the full size (261122-0cq)
+
+
+def test_downscale_is_the_same_chart_at_the_layout_size() -> None:
+    png = render.render_png(_sample(), lang="uk", name=SAMPLE_NAMES["uk"])
+    big = _open(png)
+
+    small = _open(render.downscale(png))
+
+    assert small.format == "PNG"
+    assert small.mode == "RGB"
+    assert small.size == (render.W, render.H) == (1280, 1000)
+    # The same picture: each small pixel is close to the mean of its 2x2 block.
+    reduced = big.reduce(render.SCALE)
+    worst = max(
+        max(
+            abs(p - q)
+            for p, q in zip(small.getpixel((x, y)), reduced.getpixel((x, y)), strict=True)
+        )
+        for y in range(0, render.H, 7)
+        for x in range(0, render.W, 7)
+    )
+    assert worst <= 64
+    assert small.getpixel((0, 0)) == render.SURFACE
+
+
+def test_downscale_is_deterministic() -> None:
+    png = render.render_png(_sample(live=False), lang="en", name="Home")
+
+    assert render.downscale(png) == render.downscale(png)
+
+
+@pytest.mark.parametrize("size", [(1280, 1000), (2560, 1999), (100, 100)])
+def test_downscale_rejects_an_image_of_another_size(size: tuple[int, int]) -> None:
+    buf = io.BytesIO()
+    Image.new("RGB", size, render.SURFACE).save(buf, format="PNG")
+
+    with pytest.raises(ValueError, match="a chart is 2560x2000 px"):
+        render.downscale(buf.getvalue())
+
+
+def test_downscale_rejects_bytes_that_are_no_image() -> None:
+    with pytest.raises(OSError):
+        render.downscale(b"not a png")
+
+
 @pytest.mark.parametrize(
     ("lang", "x0", "x1"), [("uk", 234.5, 953.0), ("en", 262.5, 982.5), ("ru", 233.5, 951.5)]
 )

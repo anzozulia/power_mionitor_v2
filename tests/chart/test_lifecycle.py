@@ -1263,6 +1263,69 @@ def test_plan_maintenance_unpins_the_old_chart_once_todays_is_pinned() -> None:
     assert _plan_at_noon(a, [older, today_unpinned]) is None
 
 
+def test_plan_old_pin_stays_until_todays_chart_is_pinned() -> None:
+    # 261122-0cq: Telegram refused today's photo at midnight and yesterday's chart was
+    # unpinned anyway, leaving the channel with no chart. Now the newest pinned older
+    # record keeps its pin until today's chart is pinned, maintenance or not.
+    a = _location(1)
+    yesterday = TODAY - timedelta(days=1)
+    older = _row(10, 1, rendered=NOON_05 - timedelta(days=1), day=yesterday)
+    post_held = {lifecycle.chart_key(1, "post"): NOON_05 + timedelta(seconds=30)}
+
+    # No today's chart and its post waiting: nothing, not even the unpin.
+    assert (
+        lifecycle.plan([a], [older], today=TODAY, now=NOON_05, not_before=post_held, tz=KYIV)
+        is None
+    )
+    # Its final edit is never held by the failing post.
+    assert lifecycle.plan(
+        [a], [older], today=TODAY, now=NOON_05, not_before=post_held, settled={10}, tz=KYIV
+    ) == lifecycle.Action("finalize", a, older)
+    # Posted, its pin waiting: still nothing; pinned: the old chart's unpin is due.
+    today_unpinned = _row(11, 1, rendered=NOON_05, pinned=False)
+    pin_held = {lifecycle.chart_key(1, "pin", 11): NOON_05 + timedelta(seconds=30)}
+    assert (
+        lifecycle.plan(
+            [a], [older, today_unpinned], today=TODAY, now=NOON_05, not_before=pin_held, tz=KYIV
+        )
+        is None
+    )
+    today_pinned = _row(11, 1, rendered=NOON_05)
+    assert _plan_at_noon(a, [older, today_pinned]) == lifecycle.Action("unpin", a, older)
+
+
+def test_plan_only_the_newest_pinned_older_record_is_kept() -> None:
+    a = _location(1)
+    held = {lifecycle.chart_key(1, "post"): NOON_05 + timedelta(seconds=30)}
+    oldest = _row(9, 1, rendered=NOON_05, day=TODAY - timedelta(days=2))
+    newest = _row(10, 1, rendered=NOON_05, day=TODAY - timedelta(days=1))
+    rows = [oldest, newest]
+
+    # Every pinned chart not dated today but one still gets its unpin (INV-19).
+    assert lifecycle.plan([a], rows, today=TODAY, now=NOON_05, not_before=held, tz=KYIV) == (
+        lifecycle.Action("unpin", a, oldest)
+    )
+    # A record whose pin may have taken effect unrecorded (pinned False) is never the
+    # kept one: it gets its unpin, and the pinned one before it stays.
+    ambiguous = dataclasses.replace(newest, pinned=False)
+    assert lifecycle.plan(
+        [a], [oldest, ambiguous], today=TODAY, now=NOON_05, not_before=held, tz=KYIV
+    ) == lifecycle.Action("unpin", a, ambiguous)
+
+
+def test_kept_pin_is_none_once_today_is_pinned_or_finalized() -> None:
+    older = _row(10, 1, rendered=NOON_05, day=TODAY - timedelta(days=1))
+    today = _row(11, 1, rendered=NOON_05, pinned=False)
+
+    assert lifecycle._kept_pin([older], None) == older
+    assert lifecycle._kept_pin([older], today) == older
+    assert lifecycle._kept_pin([older], dataclasses.replace(today, pinned=True)) is None
+    # A finished day that is today again is never pinned again (F-21): nothing waits for it.
+    finished = dataclasses.replace(today, finalized_at=NOON_05)
+    assert lifecycle._kept_pin([older], finished) is None
+    assert lifecycle._kept_pin([], None) is None
+
+
 def test_plan_final_edit_waits_for_its_day_and_never_holds_the_unpin() -> None:
     a = _location(1)
     older = _row(10, 1, rendered=NOON_05 - timedelta(days=1), day=TODAY - timedelta(days=1))
