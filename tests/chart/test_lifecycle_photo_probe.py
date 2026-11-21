@@ -24,6 +24,7 @@ at the HTTP boundary (``fake_telegram``); renders are real unless a test wraps
 """
 
 import dataclasses
+import io
 import json
 import logging
 import threading
@@ -39,6 +40,7 @@ from conftest import DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, FakeClock, parse_multip
 from django.db import transaction
 from django.db.models import Value
 from django.db.models.functions import Greatest
+from PIL import Image
 from requests import PreparedRequest
 
 from powermon.alerts import outbox
@@ -413,7 +415,7 @@ def test_INV17_photo_probe_refused_and_get_me_failing_sends_no_photo(
 
 @pytest.mark.parametrize(
     ("status", "description"),
-    [(400, "Bad Request: IMAGE_PROCESS_FAILED"), (403, "Forbidden: bot is not a member")],
+    [(400, "Bad Request: PHOTO_INVALID_DIMENSIONS"), (403, "Forbidden: bot is not a member")],
 )
 def test_INV17_photo_probe_refused_otherwise_defers_without_get_me(
     status: int,
@@ -451,6 +453,59 @@ def test_INV17_photo_probe_refused_otherwise_defers_without_get_me(
     assert "attempt 1" in line
     assert _photo_degraded(state)
     assert _row_fields(yesterday) == before
+
+
+def test_photo_probe_telegram_could_not_process_defers_and_the_next_one_goes_small(
+    location_factory: Callable[..., Any],
+    fake_telegram: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # 261122-0cq: IMAGE_PROCESS_FAILED is transient, not a refusal: the post waits like
+    # after a 5xx, and the bot's next uploads (the probe first) go at 1280 x 1000.
+    location = _monitored(location_factory)
+    _finished_yesterday(location)
+    fake_telegram.fail_method(
+        DEFAULT_BOT_TOKEN,
+        "editMessageMedia",
+        status=400,
+        json_body={
+            "ok": False,
+            "error_code": 400,
+            "description": "Bad Request: IMAGE_PROCESS_FAILED",
+        },
+    )
+    fake_telegram.accept_chart(DEFAULT_BOT_TOKEN)
+    caplog.set_level(logging.INFO, logger=LIFECYCLE_LOGGER)
+    clock = FakeClock(NOON_05)
+    state = _marked()
+    post_key = lifecycle.chart_key(location.pk, "post")
+
+    assert _pass(clock, state) is True
+
+    assert _requests(fake_telegram) == ["editMessageMedia"]
+    # Only the post waits, 30 s: Telegram answered, so the bot is not held.
+    assert state.not_before == {post_key: NOON_05 + _sec(30)}
+    [line] = [
+        line for line in _lines(caplog, logging.WARNING) if "photo uploads are failing" in line
+    ]
+    assert "(transient, image_process_failed)" in line
+    # The marks it found stay as they were: the answer proves nothing about the bot.
+    assert _photo_degraded(state)
+    assert lifecycle.small_photos(state, DEFAULT_BOT_TOKEN, NOON_05)
+    # The retry's probe re-uploads at 1280 x 1000, answers ok, and the post goes small too.
+    clock.set(NOON_05 + _sec(30))
+    assert _pass(clock, state) is True
+    uploads = [call for call in fake_telegram.chart_calls if call.files]
+    assert [(call.method, _size(call)) for call in uploads] == [
+        ("editMessageMedia", (1280, 1000)),
+        ("sendPhoto", (1280, 1000)),
+    ]
+
+
+def _size(call: Any) -> tuple[int, int]:
+    [png] = call.files.values()
+    with Image.open(io.BytesIO(png)) as image:
+        return image.size
 
 
 @pytest.mark.parametrize("also_degraded", [True, False])

@@ -298,6 +298,15 @@ _CLEANUP: tuple[Step, ...] = ("finalize", "unpin")
 _TODAYS: tuple[Step, ...] = ("pin", "refresh")
 # The steps whose permanent refusal leaves subscribers with no chart or an old one (F-04).
 _REFUSABLE: tuple[Step, ...] = ("post", "refresh")
+# The client's code for a photo upload Telegram could not process (``IMAGE_PROCESS_FAILED``,
+# a ``transient`` outcome). Since 2026-11-20 Telegram answers it to most 2560 x 2000
+# uploads and to no 1280 x 1000 one, so the bot's uploads then go at 1280 x 1000
+# (``render.downscale``) for SMALL_PHOTO_HOLD, after which the full size is tried again
+# (quick task 261122-0cq). Telegram did answer, so it holds neither the bot nor its alerts
+# and sets no degraded mark: the step alone waits ``step_delay``. Refused at 1280 x 1000
+# too, a post or refresh opens ``chart_failing`` like a permanent refusal (F-04).
+IMAGE_FAILED = "image_process_failed"
+SMALL_PHOTO_HOLD = timedelta(hours=1)
 
 # The monitored locations (status on or off, not deleted), and the ones that still have an
 # active record (ROWS_SQL's predicate) to release: a deleted location's (D-09), or a
@@ -619,8 +628,9 @@ def plan(
     no step at all once none is left: the snapshot's two reads are separate statements, so
     it may come without rows, and it must never be posted or pinned (D-08, RESEARCH
     Pitfall 1).
-    A location in maintenance posts and pins nothing, and its last pin stays (``_kept_pin``,
-    quick task 261105-wsf).
+    A location in maintenance posts and pins nothing (quick task 261105-wsf). Until today's
+    chart is pinned, in maintenance or while its post or pin fails, the newest pinned older
+    record keeps its pin (``_kept_pin``, 261122-0cq).
     Within a location the steps go in D-02 order: post today's chart, pin it, give the
     oldest older record without one its final edit, unpin the oldest older record not
     unpinned yet, whatever ``pinned`` says (its pin may have taken effect unrecorded,
@@ -636,7 +646,8 @@ def plan(
     today's record, so nothing is posted either (F-21). ``tz`` is the display zone the
     slots are aligned in. A step whose own key
     in ``not_before`` is in the future is skipped, so the next due step goes instead: a
-    failing post never blocks the older charts' cleanup (D-02, INV-19). The alert relay's
+    failing post never blocks the older charts' final edits, nor the unpins of all but the
+    kept pin (D-02, INV-19). The alert relay's
     backoff is respected, read only: a location whose bot waits (``bot_wide_key``) makes
     no step, and a step whose channel waits (``chat_key`` of the chat it would call) is
     skipped (D-06). A release is the exception: it never waits for its stored chat's
@@ -707,7 +718,8 @@ def _midnight_step(
     """The location's first due step of D-02 (post, pin, finalize, unpin), or None.
 
     A final edit is due only once its record's day has settled (``settled``). Every older
-    record gets its one unpin, pinned or not as far as the record knows (INV-19).
+    record gets its one unpin, pinned or not as far as the record knows (INV-19); the kept
+    pin (``_kept_pin``) gets it once today's chart is pinned.
     """
     location_id = location.location_id
     if today_row is None:
@@ -734,23 +746,24 @@ def _midnight_step(
             and _free(location, "finalize", row, waiting)
         ):
             return Action("finalize", location, row)
-    kept = _kept_pin(location, older, today_row)
+    kept = _kept_pin(older, today_row)
     for row in older:
         if row is not kept and row.unpinned_at is None and _free(location, "unpin", row, waiting):
             return Action("unpin", location, row)
     return None
 
 
-def _kept_pin(
-    location: ChartLocation, older: list[ChartRow], today_row: ChartRow | None
-) -> ChartRow | None:
-    """The older record that stays pinned during maintenance, or None (261105-wsf).
+def _kept_pin(older: list[ChartRow], today_row: ChartRow | None) -> ChartRow | None:
+    """The older record that stays pinned until today's chart is pinned, or None.
 
-    No new chart takes its place while maintenance is on, so the newest pinned older record
-    (``older`` is oldest first) keeps its pin, unless today's chart is pinned already. Once
-    maintenance ends, today's chart is posted and pinned and this record gets its one unpin.
+    The newest pinned older record (``older`` is oldest first) keeps its pin while today's
+    chart is not pinned: during maintenance no new chart is posted (261105-wsf), and while
+    today's post or pin fails (Telegram refused the photo at midnight, 261122-0cq) the
+    channel would otherwise show no chart at all. Once today's chart is pinned this record
+    gets its one unpin, seconds later, as in the D-02 order. A finalized today record is
+    never pinned again (F-21), so it keeps nothing.
     """
-    if not location.maintenance or (today_row is not None and today_row.pinned):
+    if today_row is not None and (today_row.pinned or today_row.finalized_at is not None):
         return None
     pinned = [row for row in older if row.pinned]
     return pinned[-1] if pinned else None
@@ -864,7 +877,7 @@ def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | No
         started = clock.monotonic()
         if action.step in _RENDERED:
             try:
-                content = _content(action, today, now, tz)
+                content = _sized(_content(action, today, now, tz), state, location, now)
             except Error:
                 raise  # the database, not the chart: handled below
             except Exception as exc:
@@ -886,13 +899,19 @@ def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | No
         gate = _post_gate(client, action, key, now, tz, clock, state, stop)
         if gate is not None:
             return gate
+        # Whether this upload went at 1280 x 1000: ``_sized`` used the same check.
+        small = action.step in _RENDERED and small_photos(state, location.bot_token, now)
         called = clock.monotonic()
         result = _call(client, action, content)
         call_ms = _ms(clock.monotonic() - called)
         answered = clock.now()
-        io_loop.note_bot_health(state, location.bot_token, result)
-        if action.step in _RENDERED:
-            io_loop.note_photo_health(state, location.bot_token, result)
+        if result.code != IMAGE_FAILED:
+            # Telegram processed the call, or did not answer: the health marks (D-1).
+            io_loop.note_bot_health(state, location.bot_token, result)
+            if action.step in _RENDERED:
+                io_loop.note_photo_health(state, location.bot_token, result)
+        else:
+            _note_photo_size(state, location, result, answered)
         log.info(
             "chart %s for location %s: %s (%s) render_ms=%d call_ms=%d",
             label,
@@ -903,7 +922,7 @@ def run_step(clock: Clock, state: io_loop.RelayState, stop: threading.Event | No
             call_ms,
         )
         try:
-            _apply(action, key, result, today, answered, state)
+            _apply(action, key, result, today, answered, state, small=small)
         except Error as exc:
             _unwritten(action, key, result, answered, state, exc)
         return True
@@ -931,6 +950,49 @@ def _content(action: Action, today: date, now: datetime, tz: str) -> tuple[bytes
         end_of_day = model.next_midnight(row.local_date, tz)
         return chart_content(action.location, row.local_date, end_of_day, live=False, tz=tz)
     return chart_content(action.location, today, action.as_of or now, live=True, tz=tz)
+
+
+def small_photos(state: io_loop.RelayState, token: str, now: datetime) -> bool:
+    """True while the bot's chart uploads go at 1280 x 1000 (``SMALL_PHOTO_HOLD``)."""
+    until = state.small_photos_until.get(io_loop.bot_key(token))
+    return until is not None and now < until
+
+
+def _sized(
+    content: tuple[bytes, str], state: io_loop.RelayState, location: ChartLocation, now: datetime
+) -> tuple[bytes, str]:
+    """The render as it is uploaded: downscaled to 1280 x 1000 while the bot's uploads go
+    small (``small_photos``, 261122-0cq), else unchanged. Called inside the render's error
+    handling, so a failed downscale is a render error.
+    """
+    if not small_photos(state, location.bot_token, now):
+        return content
+    from powermon.chart import render  # Pillow: imported per call, never at import time
+
+    png, caption = content
+    return render.downscale(png), caption
+
+
+def _note_photo_size(
+    state: io_loop.RelayState, location: ChartLocation, result: SendResult, answered: datetime
+) -> None:
+    """After Telegram could not process an upload (``IMAGE_FAILED``), the bot's uploads go
+    at 1280 x 1000 for ``SMALL_PHOTO_HOLD`` from the answer (261122-0cq).
+
+    One WARNING when the bot switches to the small size; a failure while it is small
+    extends the hold (``_fail`` logs every failure). Memory only, like the other marks: a
+    restart uploads the full size first.
+    """
+    if result.code != IMAGE_FAILED:
+        return
+    if not small_photos(state, location.bot_token, answered):
+        log.warning(
+            "chart uploads for location %s: Telegram could not process the image; the "
+            "bot's charts go at 1280x1000 for %d min",
+            location.location_id,
+            SMALL_PHOTO_HOLD // timedelta(minutes=1),
+        )
+    state.small_photos_until[io_loop.bot_key(location.bot_token)] = answered + SMALL_PHOTO_HOLD
 
 
 def _call(client: TelegramClient, action: Action, content: tuple[bytes, str] | None) -> SendResult:
@@ -1089,7 +1151,7 @@ def _photo_probe(
     location = action.location
     started = clock.monotonic()
     try:
-        png, caption = _probe_content(location, candidate, now, tz)
+        png, caption = _sized(_probe_content(location, candidate, now, tz), state, location, now)
     except Error:
         raise  # the database, not the chart: handled by run_step
     except Exception as exc:
@@ -1108,8 +1170,11 @@ def _photo_probe(
     probe = client.edit_message_media(candidate.chat_id, candidate.message_id, png, caption)
     call_ms = _ms(clock.monotonic() - called)
     answered = clock.now()
-    io_loop.note_bot_health(state, location.bot_token, probe)
-    io_loop.note_photo_health(state, location.bot_token, probe)
+    if probe.code != IMAGE_FAILED:
+        io_loop.note_bot_health(state, location.bot_token, probe)
+        io_loop.note_photo_health(state, location.bot_token, probe)
+    else:
+        _note_photo_size(state, location, probe, answered)
     log.info(
         "chart photo probe for location %s: %s (%s) render_ms=%d call_ms=%d",
         location.location_id,
@@ -1210,8 +1275,14 @@ def _apply(
     today: date,
     answered: datetime,
     state: io_loop.RelayState,
+    *,
+    small: bool = False,
 ) -> None:
-    """Write the step's outcome: its record on success, else its own backoff (``_fail``)."""
+    """Write the step's outcome: its record on success, else its own backoff (``_fail``).
+
+    ``small``: the upload went at 1280 x 1000 (``small_photos``); Telegram refusing to
+    process even that image counts as a refusal for the ``chart_failing`` notice (261122-0cq).
+    """
     row = action.row
     if action.step == "release" and row is not None:
         _released(action, row, key, result, answered, state)
@@ -1265,7 +1336,8 @@ def _apply(
     if result.kind == "permanent" and action.step == "pin" and row is not None:
         # The bot may not pin here: tried again after the next render, not before (D-07).
         _pin_refused(action.location, row, result, answered)
-    if result.kind == "permanent" and action.step in _REFUSABLE:
+    refused_small = small and result.code == IMAGE_FAILED
+    if (result.kind == "permanent" or refused_small) and action.step in _REFUSABLE:
         # Subscribers see no chart, or an old one: one notice when it starts (INV-20).
         _chart_refused(action.location, result, answered)
     _fail(action, key, result, answered, state)
@@ -1664,6 +1736,8 @@ def _fail(
 
     - permanent: the fixed PERMANENT_BACKOFF (a refused pin waits for the next render
       anyway, D-07; a refused post or refresh for its next try);
+    - ``IMAGE_FAILED`` (Telegram could not process the image): ``step_delay(n)``, with one
+      WARNING and no bot hold (261122-0cq);
     - rate_limited, transient, not_sent (``BOT_WIDE_KINDS``): the bot is held as an
       alert's outcome would hold it (retry_after capped at MAX_RETRY_AFTER_S, or
       min(2**n, BACKOFF_CAP_S) s), and the step waits ``step_delay(n)`` longer, so the
@@ -1694,6 +1768,17 @@ def _fail(
         return
     delay = step_delay(failures)
     state.not_before[key] = answered + delay
+    if result.code == IMAGE_FAILED:
+        # Nothing was posted or changed: no "may have been delivered" here (261122-0cq).
+        log.warning(
+            "chart %s for location %s: Telegram could not process the image; it is tried "
+            "again in %d s (attempt %d)",
+            action.step,
+            location_id,
+            delay // timedelta(seconds=1),
+            failures,
+        )
+        return
     if action.step == "post":
         log.warning(
             "chart post for location %s may have been delivered (%s); it is not recorded "
@@ -1706,8 +1791,12 @@ def _fail(
 
 
 def _bot_hold(result: SendResult, failures: int) -> timedelta | None:
-    """How long a bot-wide outcome holds the whole bot (``io_loop._apply``), else None."""
-    if result.kind not in io_loop.BOT_WIDE_KINDS:
+    """How long a bot-wide outcome holds the whole bot (``io_loop._apply``), else None.
+
+    ``IMAGE_FAILED`` is ``transient`` but holds nothing: Telegram answered, only one image
+    failed, and the bot's alerts must not wait for it (261122-0cq).
+    """
+    if result.kind not in io_loop.BOT_WIDE_KINDS or result.code == IMAGE_FAILED:
         return None
     if result.kind == "rate_limited":
         wait = min(result.retry_after or DEFAULT_RETRY_AFTER_S, io_loop.MAX_RETRY_AFTER_S)

@@ -432,7 +432,9 @@ changes the rules for `Europe/Kyiv`, bump the Python and postgres image tags.
     heartbeat gets no chart, and neither does a location in maintenance until it ends.
   - At local midnight (`DISPLAY_TZ`) a new chart for the new day is posted silently and
     pinned silently, and the previous day's chart is unpinned. During maintenance neither
-    happens: the previous day's chart stays pinned. Two charts are pinned for
+    happens: the previous day's chart stays pinned. It also stays pinned while today's
+    chart cannot be posted or pinned yet, so a channel is never left without a chart.
+    (Amended 2026-11-22, quick task 261122-0cq.) Two charts are pinned for
     a few seconds at most. About two minutes later, once detection has run past
     midnight by the location's heartbeat timeout (or its boot delay, if longer; Amended
     2026-11-01, quick task 261101-g9v) plus a short margin, the previous day's
@@ -466,6 +468,16 @@ changes the rules for `Europe/Kyiv`, bump the Python and postgres image tags.
     latest chart, with the picture it already shows, succeeds; a getMe answer alone is
     not enough. With no such chart, or if Telegram answers that the chart was deleted, the
     getMe check decides; any other refusal makes the post wait. (Amended 2026-11-03, quick task 261103-b2z.)
+  - Charts are uploaded at 2560 x 2000. When Telegram answers that it could not process
+    the image (`IMAGE_PROCESS_FAILED`; since 2026-11-20 it does for most 2560 x 2000
+    uploads and for no 1280 x 1000 one), the call is retried after 30 s (then after the
+    usual growing wait), with no "chart failing" notice and without holding the bot's
+    alerts, and that bot's charts go at 1280 x 1000 for an hour; then 2560 x 2000 is tried
+    again. The worker logs `chart uploads for location <id>: Telegram could not process
+    the image; the bot's charts go at 1280x1000 for 60 min` when it switches, and one
+    WARNING per failed call. If Telegram refuses even the 1280 x 1000 image, today's chart
+    counts as failing (the "chart failing" notice). (Amended 2026-11-22, quick task
+    261122-0cq.)
   - A channel pin may leave a "pinned a photo" service message in the channel each day
     (Telegram's behaviour; it is checked once in section 12).
   - Cost: a render takes about 0.1 to 0.3 s of CPU and about 35 MB of extra worker memory
